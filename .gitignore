@@ -1,0 +1,44 @@
+# ビルド成果物
+bin/
+dist/
+
+# バックアップ・一時ファイル
+_backup/
+*.tmp
+*.bak
+.serena/cache
+
+# セッション引き継ぎ（個人用）
+#context.md
+#design.md
+#milestone.md
+.claude/settings.local.json
+
+# ログ
+*.log
+
+# 環境変数・機密情報
+.env
+.env.*
+
+# エディタ・IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum

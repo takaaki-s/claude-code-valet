@@ -1,0 +1,335 @@
+# ccvalet (claude-code-valet)
+
+複数の Claude Code セッションを同時に稼働させ、一元管理するための CLI ツール。
+
+git worktree を活用した並行開発と、プロンプト自動注入機能による自動化をサポートします。
+
+## 特徴
+
+- **複数セッション管理**: 複数の Claude Code セッションをバックグラウンドで同時実行
+- **並列数制御**: 同時実行セッション数を制限し、リソースを効率的に管理
+- **TUI**: セッション一覧・状態確認・操作を対話的に行えるターミナル UI
+- **git worktree 連携**: セッションごとに独立したワークディレクトリを自動作成
+- **プロンプト自動注入**: 事前定義したプロンプトテンプレートでタスクを自動開始
+- **アタッチ/デタッチ**: セッション間を素早く切り替え（`Ctrl+]` でデタッチ）
+
+## インストール
+
+### Go install
+
+```bash
+go install github.com/takaaki-s/claude-code-valet/cmd/ccvalet@latest
+```
+
+### ソースからビルド
+
+```bash
+git clone https://github.com/takaaki-s/claude-code-valet.git
+cd claude-code-valet
+make build    # bin/ccvalet にビルド
+make install  # $GOPATH/bin にインストール
+```
+
+## クイックスタート
+
+### 1. デーモンを起動
+
+```bash
+ccvalet daemon start
+```
+
+### 2. リポジトリを登録
+
+```bash
+ccvalet repo add /path/to/your/repo
+```
+
+### 3. TUI を起動
+
+```bash
+ccvalet ui
+```
+
+### 4. セッションを作成・アタッチ
+
+TUI 内で `n` キーを押してセッション作成、`Enter` でアタッチ。
+
+`Ctrl+]` でデタッチして TUI に戻ります。
+
+## セッションステータス
+
+| ステータス | アイコン | 説明 |
+|-----------|---------|------|
+| `thinking` | ⚡ | 処理中（並列カウント対象） |
+| `permission` | ? | 許可待ち（並列カウント対象） |
+| `running` | ▶ | 実行中（並列カウント対象） |
+| `creating` | + | 作成中（worktree作成/CC起動中） |
+| `queued` | … | キュー待機中（並列上限に達している） |
+| `idle` | ○ | 入力待ち（カウント外） |
+| `confirm` | ⚠ | Trust確認待ち |
+| `stopped` | ■ | 停止済み |
+| `error` | ✗ | エラー |
+
+## CLI コマンド
+
+### デーモン管理
+
+```bash
+ccvalet daemon start   # デーモン起動
+ccvalet daemon stop    # デーモン停止
+ccvalet daemon status  # 状態確認
+```
+
+### セッション管理
+
+```bash
+# セッション作成（TUI で対話的に作成 - 推奨）
+ccvalet new
+
+# セッション作成（既存ディレクトリ使用）
+ccvalet new --repo myrepo --workdir ~/repos/myrepo --branch main
+
+# セッション作成（新規 worktree 作成）
+ccvalet new --repo myrepo --new-worktree --branch feature-x --new-branch --base main
+
+# セッション作成（プロンプト自動注入）
+ccvalet new --repo myrepo --workdir ~/repos/myrepo --branch main \
+  --prompt coding-task --args "ログイン機能を実装"
+
+# セッション一覧
+ccvalet list
+
+# セッションにアタッチ
+ccvalet attach <session-name>
+
+# セッション終了
+ccvalet kill <session-name>
+
+# セッション削除
+ccvalet delete <session-name>
+
+# 停止済みセッションの一括削除
+ccvalet cleanup stopped
+ccvalet cleanup stopped --worktree  # worktree も削除
+ccvalet cleanup stopped --dry-run   # 削除対象の確認
+```
+
+### リポジトリ管理
+
+```bash
+ccvalet repo add <path>           # リポジトリ登録
+ccvalet repo list                 # 一覧表示
+ccvalet repo show <name>          # 詳細表示
+ccvalet repo remove <name>        # 削除
+ccvalet repo update <name> --setup "pnpm install"  # セットアップコマンド設定
+```
+
+### worktree 管理
+
+```bash
+ccvalet worktree list <repo-name>              # worktree 一覧
+ccvalet worktree create <repo-name> <branch>   # worktree 作成
+ccvalet worktree delete <repo-name> <worktree-name>  # worktree 削除
+```
+
+### プロンプト管理
+
+```bash
+ccvalet prompt list               # プロンプト一覧
+ccvalet prompt show <name>        # プロンプト内容表示
+```
+
+### ユーティリティ
+
+```bash
+ccvalet workdir <session-name>    # セッションの作業ディレクトリパスを出力
+ccvalet edit <session-name>       # EDITOR でセッションの作業ディレクトリを開く
+```
+
+以下のシェル関数を定義すると便利です：
+
+```bash
+# セッションの作業ディレクトリに移動
+cc-cd() { cd "$(ccvalet workdir "$1")"; }
+
+# fzf でセッションを選択して作業ディレクトリに移動
+cc-cdf() {
+  local session
+  session=$(ccvalet session list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
+  [[ -n "$session" ]] && cd "$(ccvalet workdir "$session")"
+}
+
+# fzf でセッションを選択してアタッチ
+cc-attach() {
+  local session
+  session=$(ccvalet session list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
+  [[ -n "$session" ]] && ccvalet session attach "$session"
+}
+```
+
+### シェル補完
+
+```bash
+# bash
+source <(ccvalet completion bash)
+
+# zsh
+source <(ccvalet completion zsh)
+
+# fish
+ccvalet completion fish | source
+```
+
+## 設定
+
+設定ファイルとデータは `~/.ccvalet/` に保存されます。
+
+```
+~/.ccvalet/
+├── config.yaml      # 設定ファイル
+├── state.yaml       # 状態ファイル（前回使用したリポジトリ等）
+├── sessions/        # セッションデータ
+├── worktrees/       # 自動作成された worktree
+├── prompts/         # プロンプトテンプレート
+└── daemon.sock      # デーモンソケット
+```
+
+### 設定例 (`~/.ccvalet/config.yaml`)
+
+```yaml
+parallel:
+  max_parallel: 3  # 同時実行セッション数の上限
+
+repositories:
+  - name: myproject
+    path: /path/to/myproject
+    base_branch: main
+    setup:
+      - pnpm install
+
+# キーバインドのカスタマイズ（省略時はデフォルト値を使用）
+keybindings:
+  # セッション一覧画面
+  up: [up, k]
+  down: [down, j]
+  attach: [enter]
+  new: ["n"]
+  kill: [s, x]
+  delete: [d]
+  cancel: [c]
+  refresh: [r]
+  resume: [R]
+  quit: [q, ctrl+c]
+  help: ["?"]
+  # セッション作成フォーム
+  next_field: [tab]
+  prev_field: [shift+tab]
+  toggle_worktree: [ctrl+w]
+  toggle_branch: [ctrl+b]
+  submit: [enter]
+  cancel_form: [esc]
+  # アタッチ中
+  detach: [ctrl+]]  # デフォルト: ctrl+]（ctrl+^, ctrl+\, ctrl+g も使用可）
+```
+
+## プロンプトテンプレート
+
+`~/.ccvalet/prompts/` に Markdown ファイルを配置します。ファイル名（拡張子なし）がプロンプト名になります。
+
+```bash
+# 例: ~/.ccvalet/prompts/coding-task.md
+```
+
+```markdown
+# タスク
+
+${args}
+
+## 対象リポジトリ
+
+- リポジトリ: ${repository}
+- ブランチ: ${branch}
+- 作業ディレクトリ: ${workdir}
+```
+
+### 利用可能な変数
+
+| 変数 | 説明 |
+|------|------|
+| `${args}` | ユーザー指定の引数 |
+| `${branch}` | ブランチ名 |
+| `${repository}` | リポジトリ名 |
+| `${session}` | セッション名 |
+| `${workdir}` | 作業ディレクトリパス |
+| `${base_branch}` | ベースブランチ名 |
+
+## TUI キーバインド
+
+### セッション一覧画面
+
+| キー | 動作 |
+|------|------|
+| `↑/k` | 上に移動 |
+| `↓/j` | 下に移動 |
+| `Enter` | セッションにアタッチ |
+| `n` | 新規セッション作成 |
+| `x` | セッション終了 |
+| `d` | セッション削除 |
+| `c` | キュー待機中のセッションをキャンセル |
+| `r` | 一覧更新 |
+| `?` | ヘルプ表示 |
+| `q` | 終了 |
+
+### セッション作成フォーム
+
+| キー | 動作 |
+|------|------|
+| `Tab` | 次のフィールドへ移動 |
+| `Shift+Tab` | 前のフィールドへ移動 |
+| `Ctrl+W` | Worktree モード切替（新規/既存） |
+| `Ctrl+B` | ブランチモード切替（新規/既存） |
+| `Enter` | セッション作成 |
+| `Esc` | キャンセル |
+
+アタッチ中は `Ctrl+]` でデタッチして TUI に戻ります。
+
+## 並列管理
+
+並列数の上限（`max_parallel`）を超えた場合、新規セッションは `queued` 状態でキューに入ります。
+アクティブなセッションが終了またはアイドル状態になると、自動的にキューからセッションが起動されます。
+
+### 並列カウント対象
+
+- `creating`: セッション作成中
+- `running`: 実行中
+- `thinking`: 処理中
+- `permission`: 許可待ち
+
+### カウント対象外
+
+- `idle`: 入力待ち
+- `queued`: キュー待機中
+- `stopped`: 停止済み
+- `error`: エラー
+
+## デバッグ
+
+```bash
+# デバッグログを有効化
+export CCVALET_DEBUG=1
+
+# デーモン起動
+ccvalet daemon start
+
+# ログ確認
+tail -f ~/.ccvalet/debug.log
+```
+
+## 必要要件
+
+- Go 1.21+
+- Claude Code CLI がインストールされていること
+
+## ライセンス
+
+MIT
