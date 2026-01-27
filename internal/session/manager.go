@@ -368,20 +368,13 @@ func (m *Manager) AttachToConn(id string, conn io.ReadWriter) error {
 	debugLog("[ATTACH] subscribed to broadcaster")
 	defer broadcaster.Unsubscribe(outputCh)
 
-	// Send screen buffer to restore the current screen state
+	// Note: We don't send the screen buffer here because it may contain stale content
+	// (e.g., after sleep/wake, Claude Code may have cleared and redrawn minimally).
+	// Instead, we rely on the resize command from the client to trigger a full redraw.
+	// The resize handler (below) will send SIGWINCH which causes Claude Code to redraw.
 	if screenBuffer != nil {
 		bufferData := screenBuffer.Bytes()
-		debugLog("[ATTACH] screenBuffer size: %d bytes", len(bufferData))
-		if len(bufferData) > 0 {
-			conn.Write(bufferData)
-		}
-	}
-
-	// Send SIGWINCH to trigger Claude Code to redraw the screen
-	// This helps restore the full screen after sleep/wake or when buffer is stale
-	if cmd != nil && cmd.Process != nil {
-		cmd.Process.Signal(syscall.SIGWINCH)
-		debugLog("[ATTACH] sent SIGWINCH to trigger redraw")
+		debugLog("[ATTACH] screenBuffer size: %d bytes (not sending, waiting for resize)", len(bufferData))
 	}
 
 	done := make(chan struct{}, 2)
