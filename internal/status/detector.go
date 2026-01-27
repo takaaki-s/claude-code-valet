@@ -185,6 +185,14 @@ func (d *Detector) Detect(text string) DetectedStatus {
 			// Error detection: use lastFewLines (last 2 lines) only
 			// This prevents false positives from error messages in code output
 			// (e.g., Claude showing error logs, discussing errors, etc.)
+			//
+			// Skip error detection if idle prompt is present
+			// Claude may discuss errors while waiting for input
+			hasIdlePrompt := strings.Contains(lastFewLines, "❯") || strings.Contains(lastFewLines, "> ")
+			if hasIdlePrompt {
+				debugLog("Skipping error detection: idle prompt found")
+				continue
+			}
 			for _, pattern := range p.Patterns {
 				if strings.Contains(lastFewLines, pattern) {
 					debugLog("Detected %s (pattern: %q in last 2 lines)", p.Status, pattern)

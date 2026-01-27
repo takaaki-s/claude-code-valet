@@ -22,6 +22,7 @@ import (
 	"github.com/takaaki-s/claude-code-valet/internal/notify"
 	"github.com/takaaki-s/claude-code-valet/internal/prompt"
 	"github.com/takaaki-s/claude-code-valet/internal/status"
+	"github.com/takaaki-s/claude-code-valet/internal/transcript"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
 	"golang.org/x/term"
 )
@@ -164,9 +165,27 @@ func (m *Manager) List() []Info {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	reader := transcript.NewReader()
 	infos := make([]Info, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		infos = append(infos, s.ToInfo())
+		info := s.ToInfo()
+
+		// Fetch last messages from transcript if Claude session exists
+		// Use larger limit here; actual truncation happens in TUI based on window width
+		if s.ClaudeSessionID != "" && s.WorkDir != "" {
+			if msgs, err := reader.GetLastMessages(s.WorkDir, s.ClaudeSessionID); err == nil && msgs != nil {
+				if msgs.User != nil {
+					info.LastUserMessage = transcript.TruncateMessage(msgs.User.Content, 500)
+				}
+				if msgs.Assistant != nil {
+					// Use TruncateMessageFromEnd for assistant messages
+					// Important content (like questions) is often at the end
+					info.LastAssistantMessage = transcript.TruncateMessageFromEnd(msgs.Assistant.Content, 500)
+				}
+			}
+		}
+
+		infos = append(infos, info)
 	}
 
 	// Sort by CreatedAt (oldest first)
@@ -356,6 +375,13 @@ func (m *Manager) AttachToConn(id string, conn io.ReadWriter) error {
 		if len(bufferData) > 0 {
 			conn.Write(bufferData)
 		}
+	}
+
+	// Send SIGWINCH to trigger Claude Code to redraw the screen
+	// This helps restore the full screen after sleep/wake or when buffer is stale
+	if cmd != nil && cmd.Process != nil {
+		cmd.Process.Signal(syscall.SIGWINCH)
+		debugLog("[ATTACH] sent SIGWINCH to trigger redraw")
 	}
 
 	done := make(chan struct{}, 2)

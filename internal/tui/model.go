@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/daemon"
 	"github.com/takaaki-s/claude-code-valet/internal/prompt"
@@ -1514,16 +1515,76 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 		}
 		if len(details) > 0 {
 			detailStr := strings.Join(details, " │ ")
+			// Use │ instead of └─ if we have last messages to show
+			lineChar := "└─"
+			if sess.LastUserMessage != "" || sess.LastAssistantMessage != "" {
+				lineChar = "├─"
+			}
 			detailStr = truncateString(detailStr, width-6)
 			if selected {
-				detailLine := "  └─ " + detailStr
+				detailLine := "  " + lineChar + " " + detailStr
 				detailPadding := width - lipgloss.Width(detailLine)
 				if detailPadding > 0 {
 					detailLine += strings.Repeat(" ", detailPadding)
 				}
 				b.WriteString(selectedItemStyle.Render(detailLine))
 			} else {
-				b.WriteString("  └─ " + helpStyle.Render(detailStr))
+				b.WriteString("  " + lineChar + " " + helpStyle.Render(detailStr))
+			}
+			b.WriteString("\n")
+		}
+
+		// Show last user message (line 3)
+		if sess.LastUserMessage != "" {
+			// Determine line prefix: ├─ if assistant message follows, └─ if last line
+			linePrefix := "└─"
+			if sess.LastAssistantMessage != "" {
+				linePrefix = "├─"
+			}
+
+			// Calculate prefix width using lipgloss for accurate Unicode width
+			prefix := "  " + linePrefix + " 👤 "
+			prefixWidth := lipgloss.Width(prefix)
+			msgWidth := width - prefixWidth
+			if msgWidth < 10 {
+				msgWidth = 10
+			}
+			msgStr := truncateString(sess.LastUserMessage, msgWidth)
+
+			if selected {
+				msgLine := prefix + msgStr
+				msgPadding := width - lipgloss.Width(msgLine)
+				if msgPadding > 0 {
+					msgLine += strings.Repeat(" ", msgPadding)
+				}
+				b.WriteString(selectedItemStyle.Render(msgLine))
+			} else {
+				b.WriteString("  " + linePrefix + " " + helpStyle.Render("👤 "+msgStr))
+			}
+			b.WriteString("\n")
+		}
+
+		// Show last assistant message (line 4)
+		// Truncate from end because important content (like questions) is often at the end
+		if sess.LastAssistantMessage != "" {
+			// Calculate prefix width using lipgloss for accurate Unicode width
+			prefix := "  └─ 🤖 "
+			prefixWidth := lipgloss.Width(prefix)
+			msgWidth := width - prefixWidth
+			if msgWidth < 10 {
+				msgWidth = 10
+			}
+			msgStr := truncateStringFromEnd(sess.LastAssistantMessage, msgWidth)
+
+			if selected {
+				msgLine := prefix + msgStr
+				msgPadding := width - lipgloss.Width(msgLine)
+				if msgPadding > 0 {
+					msgLine += strings.Repeat(" ", msgPadding)
+				}
+				b.WriteString(selectedItemStyle.Render(msgLine))
+			} else {
+				b.WriteString("  └─ " + helpStyle.Render("🤖 "+msgStr))
 			}
 			b.WriteString("\n")
 		}
@@ -1532,15 +1593,57 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 	return b.String()
 }
 
-// truncateString truncates a string to maxLen characters
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
+// truncateString truncates a string to fit within maxWidth display width from the beginning
+func truncateString(s string, maxWidth int) string {
+	if runewidth.StringWidth(s) <= maxWidth {
 		return s
 	}
-	if maxLen <= 3 {
-		return s[:maxLen]
+	if maxWidth <= 3 {
+		return truncateToWidth(s, maxWidth)
 	}
-	return s[:maxLen-3] + "..."
+	return truncateToWidth(s, maxWidth-3) + "..."
+}
+
+// truncateStringFromEnd truncates a string, keeping the last maxWidth display width
+func truncateStringFromEnd(s string, maxWidth int) string {
+	if runewidth.StringWidth(s) <= maxWidth {
+		return s
+	}
+	if maxWidth <= 3 {
+		return truncateFromEndToWidth(s, maxWidth)
+	}
+	return "..." + truncateFromEndToWidth(s, maxWidth-3)
+}
+
+// truncateToWidth truncates a string from the beginning to fit within maxWidth
+func truncateToWidth(s string, maxWidth int) string {
+	var result []rune
+	width := 0
+	for _, r := range s {
+		w := runewidth.RuneWidth(r)
+		if width+w > maxWidth {
+			break
+		}
+		result = append(result, r)
+		width += w
+	}
+	return string(result)
+}
+
+// truncateFromEndToWidth truncates a string from the end, keeping the last maxWidth
+func truncateFromEndToWidth(s string, maxWidth int) string {
+	runes := []rune(s)
+	width := 0
+	startIdx := len(runes)
+	for i := len(runes) - 1; i >= 0; i-- {
+		w := runewidth.RuneWidth(runes[i])
+		if width+w > maxWidth {
+			break
+		}
+		startIdx = i
+		width += w
+	}
+	return string(runes[startIdx:])
 }
 
 // timeAgo returns a human-readable relative time string

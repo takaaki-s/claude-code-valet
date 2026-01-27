@@ -204,24 +204,30 @@ type Info struct {
 	LastActiveAt  time.Time `json:"last_active_at,omitempty"`
 	Repository    string    `json:"repository,omitempty"`
 	Branch        string    `json:"branch,omitempty"`
-	IsNewWorktree bool      `json:"is_new_worktree,omitempty"`
-	WorktreeName  string    `json:"worktree_name,omitempty"`
-	ErrorMessage  string    `json:"error_message,omitempty"`
+	IsNewWorktree    bool   `json:"is_new_worktree,omitempty"`
+	WorktreeName     string `json:"worktree_name,omitempty"`
+	ErrorMessage     string `json:"error_message,omitempty"`
+	ClaudeSessionID  string `json:"claude_session_id,omitempty"` // Claude Code session ID for transcript lookup
+
+	// Last messages from transcript
+	LastUserMessage      string `json:"last_user_message,omitempty"`      // Last user message content (truncated)
+	LastAssistantMessage string `json:"last_assistant_message,omitempty"` // Last assistant message content (truncated)
 }
 
 // ToInfo converts Session to Info
 func (s *Session) ToInfo() Info {
 	return Info{
-		ID:            s.ID,
-		Name:          s.Name,
-		WorkDir:       s.WorkDir,
-		Status:        s.Status,
-		CreatedAt:     s.CreatedAt,
-		LastActiveAt:  s.LastActiveAt,
-		Repository:    s.Repository,
-		Branch:        s.Branch,
-		IsNewWorktree: s.IsNewWorktree,
-		WorktreeName:  s.WorktreeName,
-		ErrorMessage:  s.ErrorMessage,
+		ID:              s.ID,
+		Name:            s.Name,
+		WorkDir:         s.WorkDir,
+		Status:          s.Status,
+		CreatedAt:       s.CreatedAt,
+		LastActiveAt:    s.LastActiveAt,
+		Repository:      s.Repository,
+		Branch:          s.Branch,
+		IsNewWorktree:   s.IsNewWorktree,
+		WorktreeName:    s.WorktreeName,
+		ErrorMessage:    s.ErrorMessage,
+		ClaudeSessionID: s.ClaudeSessionID,
 	}
 }
