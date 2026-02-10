@@ -2,15 +2,20 @@ package tui
 
 import (
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/vt"
 	"github.com/mattn/go-runewidth"
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/daemon"
@@ -26,6 +31,14 @@ type Mode int
 const (
 	ModeList Mode = iota
 	ModeCreate
+)
+
+// FocusPane represents which pane has focus in 2-pane layout
+type FocusPane int
+
+const (
+	FocusLeft  FocusPane = iota // Session list pane
+	FocusRight                  // Preview/action pane
 )
 
 // KeyMap defines key bindings
@@ -200,6 +213,24 @@ type Model struct {
 	confirmDelete    bool   // 削除確認中かどうか
 	deleteTargetID   string // 削除対象のセッションID
 	deleteTargetName string // 削除対象のセッション名（表示用）
+
+	// Preview pane (2-pane layout)
+	previewLines      []string // ANSIストリップ済みのプレビュー行（creating用）
+	previewSessionID  string   // プレビュー中のセッションID
+	previewConn       net.Conn // daemon への subscribe 接続
+	previewBuffered   io.Reader // JSON decoder のバッファデータ
+	previewStopCh     chan struct{} // プレビュー停止シグナル
+
+	// VT emulator (2-pane terminal)
+	vtEmulator  *vt.SafeEmulator // VT 端末エミュレータ（スレッドセーフ）
+	vtWidth     int              // VT エミュレータの幅
+	vtHeight    int              // VT エミュレータの高さ
+
+	// Focus management (2-pane layout)
+	focusPane    FocusPane       // 現在フォーカスされているペイン
+	promptField  textinput.Model // 右ペインのプロンプト入力フィールド
+	sendSuccess  bool            // プロンプト送信成功フラグ（一時表示用）
+	sendSuccessAt time.Time      // 送信成功時刻
 }
 
 // NewModel creates a new TUI model
@@ -280,6 +311,11 @@ func NewModel(client *daemon.Client) Model {
 		}
 	}
 
+	// Prompt input field for right pane
+	promptField := textinput.New()
+	promptField.Placeholder = "Send a message to CC..."
+	promptField.CharLimit = 2000
+
 	return Model{
 		client:            client,
 		attachSignal:      make(chan string, 1),
@@ -299,6 +335,8 @@ func NewModel(client *daemon.Client) Model {
 		filteredRepos:     repos,
 		prompts:           promptNames,
 		filteredPrompts:   promptNames,
+		focusPane:         FocusLeft,
+		promptField:       promptField,
 	}
 }
 
@@ -355,6 +393,20 @@ func (m *Model) getPageSessions() []session.Info {
 type sessionsMsg []session.Info
 type errMsg error
 type tickMsg time.Time
+type previewDataMsg struct {
+	lines []string
+}
+type vtOutputMsg struct {
+	data []byte
+}
+
+// ansiStripRegex strips ANSI escape sequences from text
+var ansiStripRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[hl]|\x1b[()][AB012]|\x1b\[\?[0-9;]*[a-zA-Z]`)
+
+// stripANSI removes ANSI escape sequences from a string
+func stripANSI(s string) string {
+	return ansiStripRegex.ReplaceAllString(s, "")
+}
 
 // Commands
 func (m *Model) fetchSessions() tea.Msg {
@@ -371,6 +423,336 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+// startPreview starts subscribing to a session's output (legacy ANSI-stripped mode for creating)
+func (m *Model) startPreview(sessionID string) tea.Cmd {
+	// Stop any existing preview
+	m.stopPreview()
+
+	m.previewSessionID = sessionID
+	m.previewLines = nil
+
+	conn, buffered, err := m.client.Subscribe(sessionID)
+	if err != nil {
+		return nil
+	}
+
+	m.previewConn = conn
+	m.previewBuffered = buffered
+	m.previewStopCh = make(chan struct{})
+
+	stopCh := m.previewStopCh
+
+	return func() tea.Msg {
+		buf := make([]byte, 4096)
+		var accumulated strings.Builder
+
+		if buffered != nil {
+			n, _ := buffered.Read(buf)
+			if n > 0 {
+				accumulated.Write(buf[:n])
+			}
+		}
+
+		for {
+			select {
+			case <-stopCh:
+				return nil
+			default:
+			}
+
+			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, err := conn.Read(buf)
+			if n > 0 {
+				accumulated.Write(buf[:n])
+				raw := accumulated.String()
+				stripped := stripANSI(raw)
+				allLines := strings.Split(stripped, "\n")
+
+				maxLines := 100
+				if len(allLines) > maxLines {
+					allLines = allLines[len(allLines)-maxLines:]
+				}
+
+				return previewDataMsg{lines: allLines}
+			}
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				return nil
+			}
+		}
+	}
+}
+
+// continuePreview continues reading from the preview connection (legacy mode)
+func (m *Model) continuePreview() tea.Cmd {
+	if m.previewConn == nil || m.previewStopCh == nil {
+		return nil
+	}
+
+	conn := m.previewConn
+	stopCh := m.previewStopCh
+	existingLines := m.previewLines
+
+	return func() tea.Msg {
+		buf := make([]byte, 4096)
+		var accumulated strings.Builder
+
+		for {
+			select {
+			case <-stopCh:
+				return nil
+			default:
+			}
+
+			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, err := conn.Read(buf)
+			if n > 0 {
+				accumulated.Write(buf[:n])
+				raw := accumulated.String()
+				stripped := stripANSI(raw)
+				newLines := strings.Split(stripped, "\n")
+
+				allLines := append(existingLines, newLines...)
+				maxLines := 100
+				if len(allLines) > maxLines {
+					allLines = allLines[len(allLines)-maxLines:]
+				}
+
+				return previewDataMsg{lines: allLines}
+			}
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				return nil
+			}
+		}
+	}
+}
+
+// startVT starts VT emulator mode for an active session
+func (m *Model) startVT(sessionID string, width, height int) tea.Cmd {
+	m.stopPreview()
+
+	m.previewSessionID = sessionID
+
+	conn, buffered, err := m.client.Subscribe(sessionID)
+	if err != nil {
+		return nil
+	}
+
+	m.previewConn = conn
+	m.previewBuffered = buffered
+	m.previewStopCh = make(chan struct{})
+
+	// Create VT emulator with right pane dimensions
+	m.vtWidth = width
+	m.vtHeight = height
+	m.vtEmulator = vt.NewSafeEmulator(width, height)
+
+	// Resize the PTY to match the right pane dimensions
+	_ = m.client.Resize(sessionID, width, height)
+
+	stopCh := m.previewStopCh
+
+	return func() tea.Msg {
+		buf := make([]byte, 4096)
+
+		// Read buffered data first
+		if buffered != nil {
+			n, _ := buffered.Read(buf)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				return vtOutputMsg{data: data}
+			}
+		}
+
+		// Read from connection
+		for {
+			select {
+			case <-stopCh:
+				return nil
+			default:
+			}
+
+			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, err := conn.Read(buf)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				return vtOutputMsg{data: data}
+			}
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				return nil
+			}
+		}
+	}
+}
+
+// continueVT continues reading VT output
+func (m *Model) continueVT() tea.Cmd {
+	if m.previewConn == nil || m.previewStopCh == nil {
+		return nil
+	}
+
+	conn := m.previewConn
+	stopCh := m.previewStopCh
+
+	return func() tea.Msg {
+		buf := make([]byte, 4096)
+
+		for {
+			select {
+			case <-stopCh:
+				return nil
+			default:
+			}
+
+			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, err := conn.Read(buf)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				return vtOutputMsg{data: data}
+			}
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				return nil
+			}
+		}
+	}
+}
+
+// stopPreview stops the current preview subscription and VT emulator
+func (m *Model) stopPreview() {
+	if m.previewStopCh != nil {
+		close(m.previewStopCh)
+		m.previewStopCh = nil
+	}
+	if m.previewConn != nil {
+		m.previewConn.Close()
+		m.previewConn = nil
+	}
+	if m.vtEmulator != nil {
+		m.vtEmulator.Close()
+		m.vtEmulator = nil
+	}
+	m.previewSessionID = ""
+	m.previewLines = nil
+	m.previewBuffered = nil
+	m.vtWidth = 0
+	m.vtHeight = 0
+}
+
+// isActiveSession returns true if the session is in an active state where VT display is useful
+func isActiveSession(status session.Status) bool {
+	switch status {
+	case session.StatusCreating, session.StatusRunning, session.StatusThinking,
+		session.StatusIdle, session.StatusPermission, session.StatusConfirm:
+		return true
+	}
+	return false
+}
+
+// updatePreviewForCurrentSession starts/updates preview for the currently selected session
+func (m *Model) updatePreviewForCurrentSession() tea.Cmd {
+	// Only in 2-pane mode
+	if m.width < minTwoPaneWidth {
+		return nil
+	}
+
+	pageSessions := m.getPageSessions()
+	if len(pageSessions) == 0 || m.cursor >= len(pageSessions) {
+		m.stopPreview()
+		return nil
+	}
+
+	sess := pageSessions[m.cursor]
+
+	// Already previewing this session - check if mode needs to change
+	if sess.ID == m.previewSessionID {
+		// If session became active and we don't have VT emulator, start it
+		if isActiveSession(sess.Status) && m.vtEmulator == nil {
+			vtW, vtH := m.calcVTDimensions()
+			if vtW > 0 && vtH > 0 {
+				return m.startVT(sess.ID, vtW, vtH)
+			}
+		}
+		// If session became inactive and we have VT emulator, stop it
+		if !isActiveSession(sess.Status) && m.vtEmulator != nil {
+			m.stopPreview()
+			m.previewSessionID = sess.ID
+		}
+		return nil
+	}
+
+	// Active sessions: use VT emulator for live terminal display
+	if isActiveSession(sess.Status) {
+		vtW, vtH := m.calcVTDimensions()
+		if vtW > 0 && vtH > 0 {
+			return m.startVT(sess.ID, vtW, vtH)
+		}
+	}
+
+	// For stopped/queued/error: stop any existing stream and just set the session ID
+	m.stopPreview()
+	m.previewSessionID = sess.ID
+	return nil
+}
+
+// calcVTDimensions calculates the VT emulator dimensions based on the right pane size
+func (m *Model) calcVTDimensions() (width, height int) {
+	totalAvailable := m.width
+	gap := 1
+	borderOverhead := 4 // 2 per pane
+
+	usableWidth := totalAvailable - gap - borderOverhead
+	if usableWidth < 60 {
+		usableWidth = 60
+	}
+
+	leftContentWidth := usableWidth * 25 / 100
+	rightContentWidth := usableWidth - leftContentWidth
+
+	if leftContentWidth < 28 {
+		leftContentWidth = 28
+	}
+	if rightContentWidth < 30 {
+		rightContentWidth = 30
+	}
+
+	totalNeeded := leftContentWidth + rightContentWidth + borderOverhead + gap
+	if totalNeeded > m.width {
+		excess := totalNeeded - m.width
+		rightContentWidth -= excess
+		if rightContentWidth < 20 {
+			rightContentWidth = 20
+		}
+	}
+
+	boxHeight := m.height - 3
+	if boxHeight < 10 {
+		boxHeight = 10
+	}
+
+	// VT dimensions are the content area of the right pane (inside border)
+	return rightContentWidth, boxHeight
+}
+
+// minTwoPaneWidth is the minimum terminal width for 2-pane layout
+const minTwoPaneWidth = 100
+
+// minPaneWidth is the minimum width for each pane
+const minPaneWidth = 40
+
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
@@ -385,6 +767,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if msg, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width = msg.Width
 		m.height = msg.Height
+		// Resize VT emulator if active
+		if m.vtEmulator != nil && m.previewSessionID != "" {
+			newW, newH := m.calcVTDimensions()
+			if newW > 0 && newH > 0 && (newW != m.vtWidth || newH != m.vtHeight) {
+				m.vtWidth = newW
+				m.vtHeight = newH
+				m.vtEmulator.Resize(newW, newH)
+				_ = m.client.Resize(m.previewSessionID, newW, newH)
+			}
+		}
 	}
 
 	// Mode-specific handling
@@ -396,28 +788,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// sendSuccessMsg is sent after a delay to clear the success message
+type sendSuccessMsg struct{}
+
 func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Handle sendSuccessMsg to clear the success indicator
+	if _, ok := msg.(sendSuccessMsg); ok {
+		m.sendSuccess = false
+		return m, nil
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		// 削除確認モード中の処理
 		if m.confirmDelete {
 			switch msg.String() {
 			case "y", "Y", "enter":
-				// 削除実行
 				if err := m.client.Delete(m.deleteTargetID); err != nil {
 					m.err = err
 				}
 				m.confirmDelete = false
 				m.deleteTargetID = ""
 				m.deleteTargetName = ""
-				// Reset cursor if needed
 				newPageSessions := m.getPageSessions()
 				if m.cursor >= len(newPageSessions) && m.cursor > 0 {
 					m.cursor--
 				}
 				return m, m.fetchSessions
 			case "n", "N", "esc":
-				// キャンセル
 				m.confirmDelete = false
 				m.deleteTargetID = ""
 				m.deleteTargetName = ""
@@ -426,27 +824,48 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Tab key: switch focus from left to right pane (only in 2-pane mode)
+		// Right→Left is handled by Ctrl+] in updateRightPane (for VT mode compatibility)
+		if msg.String() == "tab" && m.width >= minTwoPaneWidth && m.focusPane == FocusLeft {
+			m.focusPane = FocusRight
+			// Only focus prompt field if not in VT mode
+			if m.vtEmulator == nil {
+				m.promptField.Focus()
+				return m, textinput.Blink
+			}
+			return m, nil
+		}
+
+		// Route to pane-specific handler
+		if m.focusPane == FocusRight && m.width >= minTwoPaneWidth {
+			return m.updateRightPane(msg)
+		}
+
+		// Left pane key handling (original logic)
 		switch {
 		case key.Matches(msg, m.keys.Quit):
+			m.stopPreview()
 			return m, tea.Quit
 
 		case key.Matches(msg, m.keys.Up):
 			if m.cursor > 0 {
 				m.cursor--
+				cmd := m.updatePreviewForCurrentSession()
+				return m, cmd
 			}
 
 		case key.Matches(msg, m.keys.Down):
-			// Limit cursor to current page
 			pageSessions := m.getPageSessions()
 			if m.cursor < len(pageSessions)-1 {
 				m.cursor++
+				cmd := m.updatePreviewForCurrentSession()
+				return m, cmd
 			}
 
 		case key.Matches(msg, m.keys.Enter):
 			pageSessions := m.getPageSessions()
 			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 				sess := pageSessions[m.cursor]
-				// Don't attach to queued or creating sessions
 				if sess.Status == session.StatusQueued {
 					m.err = fmt.Errorf("cannot attach to queued session")
 					return m, nil
@@ -455,12 +874,14 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.err = fmt.Errorf("cannot attach to creating session")
 					return m, nil
 				}
+				m.stopPreview()
 				m.attachSignal <- sess.ID
 				return m, tea.Quit
 			}
 
 		case key.Matches(msg, m.keys.New):
 			// Switch to create mode
+			m.stopPreview()
 			m.mode = ModeCreate
 			m.nameInput.Reset()
 			m.worktreeInput.Reset()
@@ -527,14 +948,18 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.PrevPage):
 			if m.currentPage > 0 {
 				m.currentPage--
-				m.cursor = 0 // Reset cursor to first item on new page
+				m.cursor = 0
+				cmd := m.updatePreviewForCurrentSession()
+				return m, cmd
 			}
 
 		case key.Matches(msg, m.keys.NextPage):
 			totalPages := m.getTotalPages()
 			if m.currentPage < totalPages-1 {
 				m.currentPage++
-				m.cursor = 0 // Reset cursor to first item on new page
+				m.cursor = 0
+				cmd := m.updatePreviewForCurrentSession()
+				return m, cmd
 			}
 		}
 
@@ -544,6 +969,19 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.sessions) && m.cursor > 0 {
 			m.cursor = len(m.sessions) - 1
 		}
+		// Start or update preview for current selection
+		cmd := m.updatePreviewForCurrentSession()
+		return m, cmd
+
+	case previewDataMsg:
+		m.previewLines = msg.lines
+		return m, m.continuePreview()
+
+	case vtOutputMsg:
+		if m.vtEmulator != nil {
+			m.vtEmulator.Write(msg.data)
+		}
+		return m, m.continueVT()
 
 	case errMsg:
 		m.err = msg
@@ -553,6 +991,196 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// updateRightPane handles key events when the right pane has focus
+func (m Model) updateRightPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Ctrl+] or Esc: always return focus to left pane regardless of state
+	if msg.Type == tea.KeyCtrlCloseBracket || msg.Type == tea.KeyEscape {
+		m.focusPane = FocusLeft
+		m.promptField.Blur()
+		return m, nil
+	}
+
+	// Get current session
+	pageSessions := m.getPageSessions()
+	if len(pageSessions) == 0 || m.cursor >= len(pageSessions) {
+		return m, nil
+	}
+	sess := pageSessions[m.cursor]
+
+	// VT mode: active sessions with VT emulator running
+	if m.vtEmulator != nil && isActiveSession(sess.Status) {
+		// Forward all other key events to PTY
+		rawBytes := keyMsgToBytes(msg)
+		if len(rawBytes) > 0 {
+			if err := m.client.Write(sess.ID, string(rawBytes)); err != nil {
+				m.err = err
+			}
+		}
+		return m, nil
+	}
+
+	// Non-VT mode: info panel with action hints (stopped/queued/error)
+
+	// q (when input is empty): quit
+	if msg.String() == "q" && m.promptField.Value() == "" {
+		m.stopPreview()
+		return m, tea.Quit
+	}
+
+	switch sess.Status {
+	case session.StatusStopped:
+		if msg.String() == "enter" || msg.String() == "r" {
+			if err := m.client.Start(sess.ID); err != nil {
+				m.err = err
+			}
+			return m, m.fetchSessions
+		}
+		if msg.String() == "a" {
+			m.stopPreview()
+			m.attachSignal <- sess.ID
+			return m, tea.Quit
+		}
+
+	case session.StatusError:
+		if msg.String() == "r" {
+			if err := m.client.Start(sess.ID); err != nil {
+				m.err = err
+			}
+			return m, m.fetchSessions
+		}
+	}
+
+	return m, nil
+}
+
+// keyMsgToBytes converts a Bubble Tea KeyMsg to raw terminal bytes for PTY forwarding
+func keyMsgToBytes(msg tea.KeyMsg) []byte {
+	// Alt modifier: prepend ESC
+	prefix := ""
+	if msg.Alt {
+		prefix = "\x1b"
+	}
+
+	switch msg.Type {
+	case tea.KeyRunes:
+		return []byte(prefix + string(msg.Runes))
+	case tea.KeySpace:
+		return []byte(prefix + " ")
+	case tea.KeyEnter:
+		return []byte(prefix + "\r")
+	case tea.KeyTab:
+		return []byte(prefix + "\t")
+	case tea.KeyBackspace:
+		return []byte(prefix + "\x7f")
+	case tea.KeyEscape:
+		return []byte("\x1b")
+	case tea.KeyUp:
+		return []byte(prefix + "\x1b[A")
+	case tea.KeyDown:
+		return []byte(prefix + "\x1b[B")
+	case tea.KeyRight:
+		return []byte(prefix + "\x1b[C")
+	case tea.KeyLeft:
+		return []byte(prefix + "\x1b[D")
+	case tea.KeyHome:
+		return []byte(prefix + "\x1b[H")
+	case tea.KeyEnd:
+		return []byte(prefix + "\x1b[F")
+	case tea.KeyPgUp:
+		return []byte(prefix + "\x1b[5~")
+	case tea.KeyPgDown:
+		return []byte(prefix + "\x1b[6~")
+	case tea.KeyDelete:
+		return []byte(prefix + "\x1b[3~")
+	case tea.KeyInsert:
+		return []byte(prefix + "\x1b[2~")
+	case tea.KeyShiftTab:
+		return []byte(prefix + "\x1b[Z")
+	case tea.KeyF1:
+		return []byte(prefix + "\x1bOP")
+	case tea.KeyF2:
+		return []byte(prefix + "\x1bOQ")
+	case tea.KeyF3:
+		return []byte(prefix + "\x1bOR")
+	case tea.KeyF4:
+		return []byte(prefix + "\x1bOS")
+	case tea.KeyF5:
+		return []byte(prefix + "\x1b[15~")
+	case tea.KeyF6:
+		return []byte(prefix + "\x1b[17~")
+	case tea.KeyF7:
+		return []byte(prefix + "\x1b[18~")
+	case tea.KeyF8:
+		return []byte(prefix + "\x1b[19~")
+	case tea.KeyF9:
+		return []byte(prefix + "\x1b[20~")
+	case tea.KeyF10:
+		return []byte(prefix + "\x1b[21~")
+	case tea.KeyF11:
+		return []byte(prefix + "\x1b[23~")
+	case tea.KeyF12:
+		return []byte(prefix + "\x1b[24~")
+
+	// Ctrl+key combinations (they map to control characters)
+	case tea.KeyCtrlA:
+		return []byte{0x01}
+	case tea.KeyCtrlB:
+		return []byte{0x02}
+	case tea.KeyCtrlC:
+		return []byte{0x03}
+	case tea.KeyCtrlD:
+		return []byte{0x04}
+	case tea.KeyCtrlE:
+		return []byte{0x05}
+	case tea.KeyCtrlF:
+		return []byte{0x06}
+	case tea.KeyCtrlG:
+		return []byte{0x07}
+	case tea.KeyCtrlH:
+		return []byte{0x08}
+	// KeyCtrlI = Tab, KeyCtrlJ = LF, KeyCtrlM = Enter (handled above)
+	case tea.KeyCtrlK:
+		return []byte{0x0b}
+	case tea.KeyCtrlL:
+		return []byte{0x0c}
+	case tea.KeyCtrlN:
+		return []byte{0x0e}
+	case tea.KeyCtrlO:
+		return []byte{0x0f}
+	case tea.KeyCtrlP:
+		return []byte{0x10}
+	case tea.KeyCtrlQ:
+		return []byte{0x11}
+	case tea.KeyCtrlR:
+		return []byte{0x12}
+	case tea.KeyCtrlS:
+		return []byte{0x13}
+	case tea.KeyCtrlT:
+		return []byte{0x14}
+	case tea.KeyCtrlU:
+		return []byte{0x15}
+	case tea.KeyCtrlV:
+		return []byte{0x16}
+	case tea.KeyCtrlW:
+		return []byte{0x17}
+	case tea.KeyCtrlX:
+		return []byte{0x18}
+	case tea.KeyCtrlY:
+		return []byte{0x19}
+	case tea.KeyCtrlZ:
+		return []byte{0x1a}
+	case tea.KeyCtrlBackslash:
+		return []byte{0x1c}
+	// KeyCtrlCloseBracket (0x1d) is handled as detach key above
+	case tea.KeyCtrlCaret:
+		return []byte{0x1e}
+	case tea.KeyCtrlUnderscore:
+		return []byte{0x1f}
+	}
+
+	return nil
 }
 
 func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1306,13 +1934,103 @@ func (m Model) View() string {
 		return m.viewCreateMode()
 	}
 
+	// Determine if we should use 2-pane layout
+	twoPaneMode := m.width >= minTwoPaneWidth
+
+	if twoPaneMode {
+		return m.viewTwoPane()
+	}
+	return m.viewSinglePane()
+}
+
+// viewSinglePane renders the original 1-pane layout
+func (m Model) viewSinglePane() string {
 	// Calculate box width based on terminal size
 	boxWidth := m.width - 2
 	if boxWidth < 60 {
 		boxWidth = 60
 	}
-	contentWidth := boxWidth - 4 // Account for border and padding
 
+	listContent := m.renderListContent(boxWidth - 4)
+
+	// Calculate box height based on terminal size
+	boxHeight := m.height - 3
+	if boxHeight < 10 {
+		boxHeight = 10
+	}
+
+	boxStyle := createBoxStyle(boxWidth, boxHeight)
+	box := boxStyle.Render(listContent)
+
+	helpLine := m.renderHelpLine()
+	return box + "\n" + helpLine
+}
+
+// viewTwoPane renders the 2-pane layout (left: session list, right: preview)
+func (m Model) viewTwoPane() string {
+	// Total available width for both panes + gap
+	// Border takes 2 chars per pane (left+right), gap is 1 char
+	totalAvailable := m.width
+	gap := 1
+	borderOverhead := 2 + 2 // 2 per pane (left border + right border)
+
+	// Distribute width: left 25%, right 75%
+	usableWidth := totalAvailable - gap - borderOverhead
+	if usableWidth < 60 {
+		usableWidth = 60
+	}
+
+	leftContentWidth := usableWidth * 25 / 100
+	rightContentWidth := usableWidth - leftContentWidth
+
+	if leftContentWidth < 28 {
+		leftContentWidth = 28
+	}
+	if rightContentWidth < 30 {
+		rightContentWidth = 30
+	}
+
+	// Ensure total doesn't exceed terminal width
+	totalNeeded := leftContentWidth + rightContentWidth + borderOverhead + gap
+	if totalNeeded > m.width {
+		// Scale down proportionally
+		excess := totalNeeded - m.width
+		rightContentWidth -= excess
+		if rightContentWidth < 20 {
+			rightContentWidth = 20
+			leftContentWidth = m.width - rightContentWidth - borderOverhead - gap
+		}
+	}
+
+	// Box dimensions (lipgloss Width is content width, border is added on top)
+	leftBoxWidth := leftContentWidth
+	rightBoxWidth := rightContentWidth
+
+	// Calculate box height
+	boxHeight := m.height - 3 // help line + margin
+	if boxHeight < 10 {
+		boxHeight = 10
+	}
+
+	// Render left pane (session list)
+	listContent := m.renderListContent(leftContentWidth)
+	leftStyle := createPaneStyle(leftBoxWidth, boxHeight, m.focusPane == FocusLeft)
+	leftPane := leftStyle.Render(listContent)
+
+	// Render right pane (preview)
+	previewContent := m.renderPreviewContent(rightContentWidth, boxHeight-2)
+	rightStyle := createPaneStyle(rightBoxWidth, boxHeight, m.focusPane == FocusRight)
+	rightPane := rightStyle.Render(previewContent)
+
+	// Join panes horizontally with a gap
+	panes := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, strings.Repeat(" ", gap), rightPane)
+
+	helpLine := m.renderHelpLine()
+	return panes + "\n" + helpLine
+}
+
+// renderListContent renders the session list content (shared between 1-pane and 2-pane)
+func (m Model) renderListContent(contentWidth int) string {
 	var content strings.Builder
 
 	// Header line: title + current time
@@ -1320,7 +2038,6 @@ func (m Model) View() string {
 	currentTime := time.Now().Format("15:04:05")
 	timeDisplay := fmt.Sprintf("[ %s ]", currentTime)
 
-	// Calculate spacing for right-aligned time
 	titleLen := lipgloss.Width(title)
 	timeLen := len(timeDisplay)
 	headerSpacing := contentWidth - titleLen - timeLen
@@ -1333,7 +2050,7 @@ func (m Model) View() string {
 	content.WriteString(timeStyle.Render(timeDisplay))
 	content.WriteString("\n")
 
-	// STATS line: status summary
+	// STATS line
 	statusSummary := buildStatusSummary(m.sessions)
 	if statusSummary != "" {
 		content.WriteString("STATS: ")
@@ -1341,7 +2058,7 @@ func (m Model) View() string {
 		content.WriteString("\n")
 	}
 
-	// Separator line
+	// Separator
 	content.WriteString(strings.Repeat("─", contentWidth))
 	content.WriteString("\n")
 
@@ -1351,31 +2068,25 @@ func (m Model) View() string {
 		content.WriteString("\n\n")
 	}
 
-	// Separate sessions into active and queued
-	var activeSessions, queuedSessions []session.Info
+	// Queued sessions count
+	var queuedSessions []session.Info
 	for _, sess := range m.sessions {
 		if sess.Status == session.StatusQueued {
 			queuedSessions = append(queuedSessions, sess)
-		} else {
-			activeSessions = append(activeSessions, sess)
 		}
 	}
 
-	// Sessions list with pagination
+	// Sessions list
 	if len(m.sessions) == 0 {
 		content.WriteString("\n")
 		content.WriteString(helpStyle.Render("No sessions. Press 'n' to create one."))
 		content.WriteString("\n")
 	} else {
-		// Get sessions for current page
 		pageSessions := m.getPageSessions()
-
-		// Render sessions (1-line format)
 		for i, sess := range pageSessions {
 			content.WriteString(m.renderSession(sess, i == m.cursor, contentWidth))
 		}
 
-		// Render queued sessions note if any
 		if len(queuedSessions) > 0 {
 			content.WriteString("\n")
 			queueNote := fmt.Sprintf("(%d queued)", len(queuedSessions))
@@ -1384,13 +2095,12 @@ func (m Model) View() string {
 		}
 	}
 
-	// Page info line
+	// Page info
 	totalPages := m.getTotalPages()
 	if totalPages > 1 {
 		content.WriteString("\n")
 		pageInfo := fmt.Sprintf("Page %d/%d", m.currentPage+1, totalPages)
 		pageInfoStyled := helpStyle.Render(pageInfo)
-		// Center the page info
 		pageInfoLen := lipgloss.Width(pageInfoStyled)
 		leftPad := (contentWidth - pageInfoLen) / 2
 		if leftPad > 0 {
@@ -1399,30 +2109,307 @@ func (m Model) View() string {
 		content.WriteString(pageInfoStyled)
 	}
 
-	// Calculate box height based on terminal size
-	// Terminal height - border (2 lines) - help line (1 line)
-	boxHeight := m.height - 3
-	if boxHeight < 10 {
-		boxHeight = 10
+	return content.String()
+}
+
+// renderPreviewContent renders the right pane content
+func (m Model) renderPreviewContent(contentWidth, contentHeight int) string {
+	// Get the currently selected session
+	pageSessions := m.getPageSessions()
+	if len(pageSessions) == 0 || m.cursor >= len(pageSessions) {
+		return "\n" + previewDimStyle.Render("  No session selected")
 	}
 
-	// Build the box
-	boxStyle := createBoxStyle(boxWidth, boxHeight)
-	box := boxStyle.Render(content.String())
+	sess := pageSessions[m.cursor]
 
-	// Help line (outside box)
-	var helpLine string
+	// VT mode: render live terminal output for active sessions
+	if m.vtEmulator != nil && m.previewSessionID == sess.ID && isActiveSession(sess.Status) {
+		return m.renderVTContent(contentWidth, contentHeight)
+	}
+
+	// Info panel mode: for stopped/queued/error sessions
+	return m.renderInfoPanel(sess, contentWidth, contentHeight)
+}
+
+// renderVTContent renders the VT emulator output for the right pane
+func (m Model) renderVTContent(contentWidth, contentHeight int) string {
+	if m.vtEmulator == nil {
+		return ""
+	}
+
+	// Get rendered output from VT emulator (ANSI color codes included)
+	rendered := m.vtEmulator.Render()
+
+	// Split into lines and ensure we don't exceed pane height
+	lines := strings.Split(rendered, "\n")
+	if len(lines) > contentHeight {
+		lines = lines[:contentHeight]
+	}
+
+	// Truncate lines that exceed content width (ANSI-aware)
+	for i, line := range lines {
+		visibleWidth := runewidth.StringWidth(stripANSI(line))
+		if visibleWidth > contentWidth {
+			lines[i] = truncateANSI(line, contentWidth)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// truncateANSI truncates an ANSI-encoded string to maxWidth visible characters,
+// preserving escape sequences and appending a reset at the end.
+func truncateANSI(s string, maxWidth int) string {
+	var result strings.Builder
+	width := 0
+	inEscape := false
+
+	for i := 0; i < len(s); {
+		b := s[i]
+
+		// Start of escape sequence
+		if b == '\x1b' {
+			inEscape = true
+			result.WriteByte(b)
+			i++
+			continue
+		}
+
+		// Inside escape sequence: pass through until terminator
+		if inEscape {
+			result.WriteByte(b)
+			// CSI sequences end with a letter (0x40-0x7e)
+			// OSC sequences end with ST (\x1b\\) or BEL (\x07)
+			if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '~' {
+				inEscape = false
+			}
+			i++
+			continue
+		}
+
+		// Decode rune for width calculation
+		r, size := utf8.DecodeRuneInString(s[i:])
+		rw := runewidth.RuneWidth(r)
+		if width+rw > maxWidth {
+			break
+		}
+		result.WriteString(s[i : i+size])
+		width += rw
+		i += size
+	}
+
+	// Reset styling at truncation point
+	result.WriteString("\x1b[0m")
+	return result.String()
+}
+
+// renderInfoPanel renders the info panel for stopped/queued/error sessions
+func (m Model) renderInfoPanel(sess session.Info, contentWidth, contentHeight int) string {
+	var content strings.Builder
+
+	// Preview header: session name + status
+	headerTitle := previewTitleStyle.Render(truncateString(sess.Name, contentWidth/2))
+	statusIcon, statusLabel, statusSty := getStatusDisplay(sess.Status)
+	statusStr := statusSty.Render(statusIcon + " " + statusLabel)
+	headerSpacing := contentWidth - lipgloss.Width(headerTitle) - lipgloss.Width(statusStr)
+	if headerSpacing < 2 {
+		headerSpacing = 2
+	}
+	content.WriteString(headerTitle)
+	content.WriteString(strings.Repeat(" ", headerSpacing))
+	content.WriteString(statusStr)
+	content.WriteString("\n")
+	content.WriteString(strings.Repeat("─", contentWidth))
+	content.WriteString("\n")
+
+	// Session metadata section
+	if sess.Repository != "" || sess.Branch != "" {
+		if sess.Repository != "" {
+			content.WriteString(previewDimStyle.Render("  Repo: "))
+			content.WriteString(truncateString(sess.Repository, contentWidth-8))
+			content.WriteString("\n")
+		}
+		if sess.Branch != "" {
+			content.WriteString(previewDimStyle.Render("  Branch: "))
+			content.WriteString(truncateString(sess.Branch, contentWidth-10))
+			content.WriteString("\n")
+		}
+	}
+	if sess.WorkDir != "" {
+		workDir := sess.WorkDir
+		if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(workDir, home) {
+			workDir = "~" + workDir[len(home):]
+		}
+		content.WriteString(previewDimStyle.Render("  Dir: "))
+		content.WriteString(truncateString(workDir, contentWidth-7))
+		content.WriteString("\n")
+	}
+	content.WriteString("\n")
+
+	isFocused := m.focusPane == FocusRight
+
+	switch sess.Status {
+	case session.StatusStopped:
+		content.WriteString(previewStoppedStyle.Render("  ■ Session stopped"))
+		content.WriteString("\n\n")
+		m.renderLastMessages(&content, sess, contentWidth)
+		content.WriteString("\n")
+		if isFocused {
+			content.WriteString(lipgloss.NewStyle().Foreground(successColor).Render("  [enter/r] Resume  [a] Attach"))
+		} else {
+			content.WriteString(previewDimStyle.Render("  [tab] to focus this pane"))
+		}
+		content.WriteString("\n")
+
+	case session.StatusQueued:
+		content.WriteString(previewDimStyle.Render("  … Waiting in queue..."))
+		content.WriteString("\n")
+
+	case session.StatusError:
+		content.WriteString(lipgloss.NewStyle().Foreground(errorColor).Bold(true).Render("  ✗ Error"))
+		content.WriteString("\n\n")
+		if sess.ErrorMessage != "" {
+			errLines := wrapText(sess.ErrorMessage, contentWidth-4)
+			for _, line := range errLines {
+				content.WriteString("  " + lipgloss.NewStyle().Foreground(errorColor).Render(line))
+				content.WriteString("\n")
+			}
+		}
+		content.WriteString("\n")
+		if isFocused {
+			content.WriteString(lipgloss.NewStyle().Foreground(warningColor).Render("  [r] Retry"))
+		}
+		content.WriteString("\n")
+
+	default:
+		// Fallback for any other state without VT emulator
+		m.renderLastMessages(&content, sess, contentWidth)
+		content.WriteString("\n")
+		if isFocused {
+			content.WriteString(previewDimStyle.Render("  [a] Attach"))
+		}
+		content.WriteString("\n")
+	}
+
+	return content.String()
+}
+
+// renderLastMessages renders the last user and assistant messages in the preview pane
+func (m Model) renderLastMessages(content *strings.Builder, sess session.Info, contentWidth int) {
+	if sess.LastUserMessage == "" && sess.LastAssistantMessage == "" {
+		return
+	}
+
+	content.WriteString("\n")
+	content.WriteString(strings.Repeat("─", contentWidth))
+	content.WriteString("\n")
+
+	if sess.LastUserMessage != "" {
+		content.WriteString(lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("  User:"))
+		content.WriteString("\n")
+		msgLines := wrapText(sess.LastUserMessage, contentWidth-4)
+		maxLines := 5
+		if len(msgLines) > maxLines {
+			msgLines = msgLines[:maxLines]
+			msgLines = append(msgLines, "...")
+		}
+		for _, line := range msgLines {
+			content.WriteString("  " + line)
+			content.WriteString("\n")
+		}
+	}
+
+	if sess.LastAssistantMessage != "" {
+		content.WriteString("\n")
+		content.WriteString(lipgloss.NewStyle().Foreground(successColor).Bold(true).Render("  Assistant:"))
+		content.WriteString("\n")
+		msgLines := wrapText(sess.LastAssistantMessage, contentWidth-4)
+		maxLines := 10
+		if len(msgLines) > maxLines {
+			msgLines = msgLines[:maxLines]
+			msgLines = append(msgLines, "...")
+		}
+		for _, line := range msgLines {
+			content.WriteString("  " + line)
+			content.WriteString("\n")
+		}
+	}
+}
+
+// cleanPreviewLine removes control characters from a preview line
+func cleanPreviewLine(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 32 || r == '\t' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// wrapText wraps text to fit within the specified width
+func wrapText(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+
+	var lines []string
+	// First split by existing newlines
+	rawLines := strings.Split(text, "\n")
+	for _, rawLine := range rawLines {
+		if runewidth.StringWidth(rawLine) <= width {
+			lines = append(lines, rawLine)
+			continue
+		}
+		// Wrap long lines
+		runes := []rune(rawLine)
+		current := 0
+		for current < len(runes) {
+			end := current
+			lineWidth := 0
+			for end < len(runes) && lineWidth < width {
+				w := runewidth.RuneWidth(runes[end])
+				if lineWidth+w > width {
+					break
+				}
+				lineWidth += w
+				end++
+			}
+			if end == current {
+				end++ // Avoid infinite loop for very wide characters
+			}
+			lines = append(lines, string(runes[current:end]))
+			current = end
+		}
+	}
+	return lines
+}
+
+// renderHelpLine renders the help line (shared between 1-pane and 2-pane)
+func (m Model) renderHelpLine() string {
 	if m.confirmDelete {
-		// 削除確認メッセージ
 		confirmMsg := fmt.Sprintf(" Delete session '%s'? [y/Enter] yes  [n/Esc] no", m.deleteTargetName)
-		helpLine = lipgloss.NewStyle().Foreground(warningColor).Bold(true).Render(confirmMsg)
-	} else if m.showHelp {
-		helpLine = helpStyle.Render(" [↑/k] up [↓/j] down [←/h] prev [→/l] next [enter] attach [n] new [s] kill [d] delete [q] quit")
-	} else {
-		helpLine = helpStyle.Render(" [n] new [s] kill [d] del [enter] attach [←→] page [q] quit [?] help")
+		return lipgloss.NewStyle().Foreground(warningColor).Bold(true).Render(confirmMsg)
 	}
 
-	return box + "\n" + helpLine
+	// In 2-pane mode, show pane-aware help
+	if m.width >= minTwoPaneWidth {
+		if m.focusPane == FocusRight {
+			if m.vtEmulator != nil {
+				return helpStyle.Render(" [ctrl+]] left pane  (terminal mode)")
+			}
+			return helpStyle.Render(" [ctrl+]] left pane [esc] left pane [q] quit")
+		}
+		if m.showHelp {
+			return helpStyle.Render(" [↑/k] up [↓/j] down [tab] right pane [enter] attach [n] new [s] kill [d] del [q] quit")
+		}
+		return helpStyle.Render(" [tab] right pane [enter] attach [n] new [s] kill [d] del [←→] page [q] quit [?] help")
+	}
+
+	if m.showHelp {
+		return helpStyle.Render(" [↑/k] up [↓/j] down [←/h] prev [→/l] next [enter] attach [n] new [s] kill [d] delete [q] quit")
+	}
+	return helpStyle.Render(" [n] new [s] kill [d] del [enter] attach [←→] page [q] quit [?] help")
 }
 
 // renderSession renders a single session in 1-line format with optional output preview

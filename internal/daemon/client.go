@@ -184,6 +184,65 @@ func (c *Client) Stop() error {
 	return nil
 }
 
+// Write sends data to a session's PTY input
+func (c *Client) Write(id string, data string) error {
+	reqData, _ := json.Marshal(WriteRequest{ID: id, Data: data})
+	resp, err := c.send(Request{Action: "write", Data: reqData})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return errors.New(resp.Error)
+	}
+	return nil
+}
+
+// Resize resizes a session's PTY
+func (c *Client) Resize(id string, cols, rows int) error {
+	data, _ := json.Marshal(ResizeRequest{ID: id, Cols: cols, Rows: rows})
+	resp, err := c.send(Request{Action: "resize", Data: data})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return errors.New(resp.Error)
+	}
+	return nil
+}
+
+// Subscribe connects to a session's output stream (read-only).
+// Returns the connection for reading PTY output, and any buffered data from the JSON decoder.
+// The caller is responsible for closing the connection when done.
+func (c *Client) Subscribe(id string) (conn net.Conn, buffered io.Reader, err error) {
+	conn, err = net.Dial("unix", c.socketPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("daemon not running. Start with: ccvalet daemon")
+	}
+
+	// Send subscribe request
+	data, _ := json.Marshal(IDRequest{ID: id})
+	encoder := json.NewEncoder(conn)
+	if err := encoder.Encode(Request{Action: "subscribe", Data: data}); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+
+	// Read response
+	decoder := json.NewDecoder(conn)
+	var resp Response
+	if err := decoder.Decode(&resp); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	if !resp.Success {
+		conn.Close()
+		return nil, nil, errors.New(resp.Error)
+	}
+
+	// Return connection and any buffered data
+	return conn, decoder.Buffered(), nil
+}
+
 // Attach attaches to a session interactively
 // detachKey is the byte value of the key to detach (e.g., 0x1d for Ctrl+])
 // detachKeyHint is the human-readable hint (e.g., "Ctrl+]")

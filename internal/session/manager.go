@@ -1111,6 +1111,94 @@ func (m *Manager) Delete(id string) error {
 	return nil
 }
 
+// WriteToSession writes data to a session's PTY (e.g., user prompt input).
+func (m *Manager) WriteToSession(id string, data []byte) error {
+	m.mu.RLock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.RUnlock()
+		return fmt.Errorf("session %s not found", id)
+	}
+
+	if !isProcessRunning(session) {
+		m.mu.RUnlock()
+		return fmt.Errorf("session %s is not running", id)
+	}
+
+	ptyFile := session.PTY
+	m.mu.RUnlock()
+
+	if ptyFile == nil {
+		return fmt.Errorf("session %s has no PTY", id)
+	}
+
+	_, err := ptyFile.Write(data)
+	return err
+}
+
+// ResizePTY resizes a session's PTY to the given dimensions.
+func (m *Manager) ResizePTY(id string, cols, rows int) error {
+	m.mu.RLock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.RUnlock()
+		return fmt.Errorf("session %s not found", id)
+	}
+
+	if !isProcessRunning(session) {
+		m.mu.RUnlock()
+		return fmt.Errorf("session %s is not running", id)
+	}
+
+	ptyFile := session.PTY
+	m.mu.RUnlock()
+
+	if ptyFile == nil {
+		return fmt.Errorf("session %s has no PTY", id)
+	}
+
+	return pty.Setsize(ptyFile, &pty.Winsize{
+		Cols: uint16(cols),
+		Rows: uint16(rows),
+	})
+}
+
+// SubscribeOutput subscribes to a session's PTY output (read-only, no input).
+// It sends the current screen buffer contents, then streams new output via the writer.
+// The done channel is closed when the caller should stop (e.g., session ended).
+// Returns the broadcaster channel and a cleanup function.
+func (m *Manager) SubscribeOutput(id string) (screenData []byte, outputCh chan []byte, cleanup func(), err error) {
+	m.mu.RLock()
+	session, ok := m.sessions[id]
+	if !ok {
+		m.mu.RUnlock()
+		return nil, nil, nil, fmt.Errorf("session %s not found", id)
+	}
+
+	broadcaster := session.Broadcaster
+	screenBuffer := session.ScreenBuffer
+	m.mu.RUnlock()
+
+	// Get current screen buffer content
+	if screenBuffer != nil {
+		screenData = screenBuffer.Bytes()
+	}
+
+	// Subscribe to broadcaster for new output
+	if broadcaster != nil {
+		outputCh = broadcaster.Subscribe()
+		cleanup = func() {
+			broadcaster.Unsubscribe(outputCh)
+		}
+	} else {
+		// No broadcaster (session not running) - return nil channel
+		outputCh = nil
+		cleanup = func() {}
+	}
+
+	return screenData, outputCh, cleanup, nil
+}
+
 // ClaudeSettings represents the structure of ~/.claude/settings.local.json
 type ClaudeSettings struct {
 	Projects map[string]ClaudeProjectSettings `json:"projects,omitempty"`
