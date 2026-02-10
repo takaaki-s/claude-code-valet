@@ -67,6 +67,12 @@ func NewManager(dataDir, configDir string, configMgr *config.Manager) (*Manager,
 		return nil, err
 	}
 	for _, s := range sessions {
+		// 作成に失敗したセッション（一度も起動していない）はスキップして削除
+		if s.Status == StatusError && !s.ClaudeSessionStarted {
+			debugLog("[SESSION] Removing failed creation session: %s (%s)", s.Name, s.ID)
+			store.Delete(s.ID)
+			continue
+		}
 		s.Status = StatusStopped // All loaded sessions start as stopped
 		m.sessions[s.ID] = s
 	}
@@ -111,6 +117,17 @@ func (m *Manager) CreateWithOptions(opts CreateOptions) (*Session, error) {
 		for _, s := range m.sessions {
 			if s.WorkDir == opts.WorkDir {
 				return nil, fmt.Errorf("session already exists for directory: %s (session: %s)", opts.WorkDir, s.Name)
+			}
+		}
+	}
+
+	// 重複ブランチチェック（Repository + Branch の組み合わせ）
+	// 同じリポジトリの同じブランチで複数のセッションを作成することを防止
+	if opts.Repository != "" && opts.Branch != "" {
+		for _, s := range m.sessions {
+			if s.Repository == opts.Repository && s.Branch == opts.Branch {
+				return nil, fmt.Errorf("session already exists for %s/%s (session: %s)",
+					opts.Repository, opts.Branch, s.Name)
 			}
 		}
 	}
@@ -368,13 +385,13 @@ func (m *Manager) AttachToConn(id string, conn io.ReadWriter) error {
 	debugLog("[ATTACH] subscribed to broadcaster")
 	defer broadcaster.Unsubscribe(outputCh)
 
-	// Note: We don't send the screen buffer here because it may contain stale content
-	// (e.g., after sleep/wake, Claude Code may have cleared and redrawn minimally).
-	// Instead, we rely on the resize command from the client to trigger a full redraw.
-	// The resize handler (below) will send SIGWINCH which causes Claude Code to redraw.
+	// Send screen buffer to restore the current screen state
 	if screenBuffer != nil {
 		bufferData := screenBuffer.Bytes()
-		debugLog("[ATTACH] screenBuffer size: %d bytes (not sending, waiting for resize)", len(bufferData))
+		debugLog("[ATTACH] screenBuffer size: %d bytes", len(bufferData))
+		if len(bufferData) > 0 {
+			conn.Write(bufferData)
+		}
 	}
 
 	done := make(chan struct{}, 2)
@@ -421,6 +438,12 @@ func (m *Manager) AttachToConn(id string, conn io.ReadWriter) error {
 								Cols: uint16(cols),
 								Rows: uint16(rows),
 							})
+							// Record resize time to prevent false thinking detection
+							m.mu.Lock()
+							if sess, ok := m.sessions[id]; ok {
+								sess.LastResizeTime = time.Now()
+							}
+							m.mu.Unlock()
 							// Send SIGWINCH to trigger TUI redraw
 							if cmd != nil && cmd.Process != nil {
 								cmd.Process.Signal(syscall.SIGWINCH)
@@ -490,26 +513,36 @@ func (m *Manager) startSession(session *Session) error {
 			debugLog("[SESSION] Failed to get current branch: %v", err)
 			// Continue anyway - might not be a git repo
 		} else if currentBranch != session.Branch {
-			// Need to checkout - check for uncommitted changes first
-			hasChanges, err := worktree.HasUncommittedChanges(session.WorkDir)
-			if err != nil {
-				return fmt.Errorf("failed to check uncommitted changes: %w", err)
-			}
-			if hasChanges {
-				return fmt.Errorf("cannot checkout branch %s: uncommitted changes exist in %s", session.Branch, session.WorkDir)
-			}
-
-			if session.NewBranch {
-				// Create and checkout a new branch
-				debugLog("[SESSION] Creating and checking out new branch %s from %s in %s", session.Branch, session.BaseBranch, session.WorkDir)
-				if err := worktree.CreateAndCheckoutBranch(session.WorkDir, session.Branch, session.BaseBranch); err != nil {
-					return fmt.Errorf("failed to create and checkout branch: %w", err)
-				}
+			if session.ClaudeSessionStarted {
+				// 既に一度起動済み: セッション内でブランチが変更された
+				// チェックアウトせず、現在のブランチ情報でセッションを更新
+				debugLog("[SESSION] Branch changed externally: %s -> %s (skipping checkout, using current branch)",
+					session.Branch, currentBranch)
+				session.Branch = currentBranch
+				session.NewBranch = false
+				m.store.Save(session)
 			} else {
-				// Checkout existing branch
-				debugLog("[SESSION] Checking out branch %s in %s", session.Branch, session.WorkDir)
-				if err := worktree.CheckoutBranch(session.WorkDir, session.Branch); err != nil {
-					return fmt.Errorf("failed to checkout branch: %w", err)
+				// 初回起動: 従来通りチェックアウトを実行
+				hasChanges, err := worktree.HasUncommittedChanges(session.WorkDir)
+				if err != nil {
+					return fmt.Errorf("failed to check uncommitted changes: %w", err)
+				}
+				if hasChanges {
+					return fmt.Errorf("cannot checkout branch %s: uncommitted changes exist in %s", session.Branch, session.WorkDir)
+				}
+
+				if session.NewBranch {
+					// Create and checkout a new branch
+					debugLog("[SESSION] Creating and checking out new branch %s from %s in %s", session.Branch, session.BaseBranch, session.WorkDir)
+					if err := worktree.CreateAndCheckoutBranch(session.WorkDir, session.Branch, session.BaseBranch); err != nil {
+						return fmt.Errorf("failed to create and checkout branch: %w", err)
+					}
+				} else {
+					// Checkout existing branch
+					debugLog("[SESSION] Checking out branch %s in %s", session.Branch, session.WorkDir)
+					if err := worktree.CheckoutBranch(session.WorkDir, session.Branch); err != nil {
+						return fmt.Errorf("failed to checkout branch: %w", err)
+					}
 				}
 			}
 		}
@@ -661,10 +694,12 @@ func (m *Manager) captureOutput(session *Session) {
 
 					newStatus := convertStatus(detected)
 
-					// 出力安定性ベースのidle検出
-					// idle以外（thinking/permission/error）は即時反映
-					// idleは出力が一定時間安定している場合のみ反映
-					const idleStabilityTime = 3 * time.Second
+					// 出力安定性ベースのステータス検出
+					// permission: 即時反映
+					// thinking: idleからの遷移は出力安定後のみ（リサイズ時の誤検出防止）
+					// idle: 出力が一定時間安定している場合のみ反映
+					// error: 起動直後は無視
+					const stabilityTime = 1 * time.Second
 					const startupGracePeriod = 5 * time.Second // 起動直後のエラー誤検出防止
 					m.mu.Lock()
 					oldStatus := session.Status
@@ -676,9 +711,20 @@ func (m *Manager) captureOutput(session *Session) {
 						newStatus = StatusRunning
 					}
 
+					// thinking検出時はリサイズ直後かチェック（idleからの遷移時のみ）
+					// リサイズ時の一時的な再描画でthinkingと誤検出されることを防止
+					const resizeGracePeriod = 500 * time.Millisecond
+					if newStatus == StatusThinking && oldStatus == StatusIdle {
+						timeSinceResize := time.Since(session.LastResizeTime)
+						if timeSinceResize < resizeGracePeriod {
+							// リサイズ直後 - idleを維持
+							newStatus = StatusIdle
+						}
+					}
+
 					// idle検出時は出力安定性をチェック
 					if newStatus == StatusIdle {
-						if timeSinceLastOutput < idleStabilityTime {
+						if timeSinceLastOutput < stabilityTime {
 							// まだ出力が安定していない - 現在のステータスを維持
 							// ただし、初回起動時（ステータスがrunning）の場合はidleに遷移可能
 							if oldStatus != StatusRunning {

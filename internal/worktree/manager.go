@@ -574,9 +574,9 @@ func (m *Manager) ensureUniqueWorktreeName(repoName, baseName string) string {
 	}
 }
 
-// HasUncommittedChanges は未コミットの変更があるか確認する
+// HasUncommittedChanges は未コミットの変更があるか確認する（untracked filesは除外）
 func HasUncommittedChanges(workDir string) (bool, error) {
-	cmd := exec.Command("git", "-C", workDir, "status", "--porcelain")
+	cmd := exec.Command("git", "-C", workDir, "status", "--porcelain", "-uno")
 	output, err := cmd.Output()
 	if err != nil {
 		return false, fmt.Errorf("failed to check git status: %w", err)

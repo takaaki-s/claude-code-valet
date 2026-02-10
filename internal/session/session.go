@@ -135,6 +135,7 @@ type Session struct {
 	PromptInjected bool          `json:"-"` // プロンプト注入済みか
 	LastOutputTime time.Time     `json:"-"` // 最後にPTY出力を受信した時刻（idle安定性検出用）
 	StartedAt      time.Time     `json:"-"` // プロセス起動時刻（起動直後のエラー誤検出防止用）
+	LastResizeTime time.Time     `json:"-"` // 最後にリサイズコマンドを受信した時刻（リサイズ時の誤検出防止用）
 }
 
 // Broadcaster broadcasts PTY output to multiple listeners

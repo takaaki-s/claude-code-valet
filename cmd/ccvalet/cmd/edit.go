@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/takaaki-s/claude-code-valet/internal/daemon"
+	"golang.org/x/term"
 )
 
 var editCmd = &cobra.Command{
@@ -47,13 +48,26 @@ Examples:
 			editor = "vim"
 		}
 
+		// ターミナル状態を保存（エディタ終了後に復元するため）
+		oldState, err := term.GetState(int(os.Stdin.Fd()))
+		if err != nil {
+			oldState = nil
+		}
+
 		editorCmd := exec.Command(editor, ".")
 		editorCmd.Dir = workDir
 		editorCmd.Stdin = os.Stdin
 		editorCmd.Stdout = os.Stdout
 		editorCmd.Stderr = os.Stderr
 
-		return editorCmd.Run()
+		runErr := editorCmd.Run()
+
+		// ターミナル状態を復元
+		if oldState != nil {
+			term.Restore(int(os.Stdin.Fd()), oldState)
+		}
+
+		return runErr
 	},
 }
 

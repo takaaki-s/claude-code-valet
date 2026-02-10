@@ -120,6 +120,24 @@ func (m *Manager) load() error {
 	return nil
 }
 
+// Reload は設定ファイルを再読み込みする
+func (m *Manager) Reload() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.v.ReadInConfig(); err != nil {
+		return err
+	}
+
+	cfg := &Config{}
+	if err := m.v.Unmarshal(cfg); err != nil {
+		return err
+	}
+
+	m.config = cfg
+	return nil
+}
+
 // Save は設定をファイルに保存する
 func (m *Manager) Save() error {
 	m.mu.Lock()

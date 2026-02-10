@@ -601,6 +601,9 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.isNewWorktree {
 				// 新規worktreeモード: ドロップダウンを閉じる
 				m.worktreeDropdownOpen = false
+				// 新規worktreeの場合は新規ブランチモードをデフォルトにする
+				m.newBranchMode = true
+				m.baseBranchInput.Reset()
 			} else {
 				// 既存worktree選択モード: ドロップダウンを開く
 				m.filterWorktrees()
@@ -1285,6 +1288,11 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 				_ = m.stateMgr.Save()
 			}
 		}
+	}
+
+	// エラー発生時は ModeCreate を維持してエラーを表示
+	if m.err != nil {
+		return m, nil
 	}
 
 	m.mode = ModeList

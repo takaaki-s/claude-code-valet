@@ -20,11 +20,26 @@ import (
 
 // debugEnabled controls debug logging output
 var debugEnabled = os.Getenv("CCVALET_DEBUG") == "1"
+var debugLogPath string
+
+func init() {
+	if debugEnabled {
+		home, _ := os.UserHomeDir()
+		debugLogPath = filepath.Join(home, ".ccvalet", "daemon-debug.log")
+	}
+}
 
 func debugLog(format string, args ...interface{}) {
-	if debugEnabled {
-		log.Printf(format, args...)
+	if !debugEnabled || debugLogPath == "" {
+		return
 	}
+	f, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
 // Server is the daemon server
@@ -183,6 +198,11 @@ func (s *Server) handleNew(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 
+	// 設定を再読み込み（CLI で repo add された場合に対応）
+	if s.configMgr != nil {
+		_ = s.configMgr.Reload()
+	}
+
 	// リポジトリが指定されている場合は存在チェック
 	if req.Repository != "" && s.configMgr != nil {
 		if s.configMgr.GetRepository(req.Repository) == nil {
@@ -323,6 +343,10 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 		if err != nil {
 			debugLog("[ASYNC] Failed to create worktree: %v", err)
 			s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("worktree creation failed: %v", err))
+			// ロールバック：worktree作成に失敗したセッションを削除して再作成可能にする
+			if delErr := s.manager.Delete(sessionID); delErr != nil {
+				debugLog("[ASYNC] Failed to delete session on rollback: %v", delErr)
+			}
 			return
 		}
 		// WorktreeNameを更新
@@ -343,6 +367,10 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 			if err != nil {
 				debugLog("[ASYNC] Failed to create worktree: %v", err)
 				s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("worktree creation failed: %v", err))
+				// ロールバック：worktree作成に失敗したセッションを削除して再作成可能にする
+				if delErr := s.manager.Delete(sessionID); delErr != nil {
+					debugLog("[ASYNC] Failed to delete session on rollback: %v", delErr)
+				}
 				return
 			}
 			// WorktreeNameを更新
@@ -356,6 +384,10 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 	if err := s.manager.SetWorkDir(sessionID, workDir); err != nil {
 		debugLog("[ASYNC] Failed to set WorkDir: %v", err)
 		s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("failed to set WorkDir: %v", err))
+		// ロールバック：WorkDir設定に失敗したセッションを削除して再作成可能にする
+		if delErr := s.manager.Delete(sessionID); delErr != nil {
+			debugLog("[ASYNC] Failed to delete session on rollback: %v", delErr)
+		}
 		return
 	}
 

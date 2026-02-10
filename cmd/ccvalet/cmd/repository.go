@@ -11,6 +11,7 @@ import (
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/repository"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
+	"golang.org/x/term"
 )
 
 var repositoryCmd = &cobra.Command{
@@ -258,13 +259,26 @@ var repoEditScriptCmd = &cobra.Command{
 			editor = "vi"
 		}
 
+		// ターミナル状態を保存（エディタ終了後に復元するため）
+		oldState, err := term.GetState(int(os.Stdin.Fd()))
+		if err != nil {
+			oldState = nil
+		}
+
 		editorCmd := exec.Command(editor, scriptPath)
 		editorCmd.Stdin = os.Stdin
 		editorCmd.Stdout = os.Stdout
 		editorCmd.Stderr = os.Stderr
 
-		if err := editorCmd.Run(); err != nil {
-			return fmt.Errorf("editor failed: %w", err)
+		runErr := editorCmd.Run()
+
+		// ターミナル状態を復元
+		if oldState != nil {
+			term.Restore(int(os.Stdin.Fd()), oldState)
+		}
+
+		if runErr != nil {
+			return fmt.Errorf("editor failed: %w", runErr)
 		}
 
 		// 実行権限を付与

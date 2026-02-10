@@ -240,6 +240,7 @@ func (c *Client) Attach(id string, detachKey byte, detachKeyHint string, detachK
 
 	// Switch to alternate screen buffer
 	os.Stdout.WriteString("\x1b[?1049h") // Enter alternate screen
+	os.Stdout.WriteString("\x1b[2J")     // Clear screen
 	os.Stdout.WriteString("\x1b[H")      // Move cursor to home
 	defer os.Stdout.WriteString("\x1b[?1049l") // Exit alternate screen on return
 
