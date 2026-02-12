@@ -423,3 +423,8 @@ func (c *Client) IsPaneDead(target string) bool {
 func (c *Client) GetPaneID(target string) (string, error) {
 	return c.run("display-message", "-t", target, "-p", "#{pane_id}")
 }
+
+// ZoomPane toggles the zoom state of a pane (resize-pane -Z).
+func (c *Client) ZoomPane(target string) error {
+	return c.runSilent("resize-pane", "-Z", "-t", target)
+}

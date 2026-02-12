@@ -986,6 +986,10 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Switch to create mode
 			m.stopPreview()
 			m.mode = ModeCreate
+			// tmuxモード: TUIペインをzoomしてフルスクリーン化
+			if m.tmuxClient != nil && m.tuiPaneID != "" {
+				m.tmuxClient.ZoomPane(m.tuiPaneID)
+			}
 			m.nameInput.Reset()
 			m.worktreeInput.Reset()
 			m.worktreeNameInput.Reset()
@@ -1306,6 +1310,10 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			// Cancel and return to list mode
 			m.mode = ModeList
+			// tmuxモード: zoom解除
+			if m.tmuxClient != nil && m.tuiPaneID != "" {
+				m.tmuxClient.ZoomPane(m.tuiPaneID)
+			}
 			return m, nil
 
 		case "ctrl+b":
@@ -2027,24 +2035,35 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 	}
 
 	m.mode = ModeList
+	// tmuxモード: zoom解除
+	if m.tmuxClient != nil && m.tuiPaneID != "" {
+		m.tmuxClient.ZoomPane(m.tuiPaneID)
+	}
 	return m, tea.Batch(m.fetchSessions, tickCmd())
 }
 
 // View renders the UI
 func (m Model) View() string {
-	// Handle create mode separately
-	if m.mode == ModeCreate {
-		return m.viewCreateMode()
-	}
-
 	// Determine if we should use 2-pane layout
 	// In tmux mode, always use single pane (tmux manages the right pane)
 	twoPaneMode := m.width >= minTwoPaneWidth && m.tmuxClient == nil
 
+	var bg string
 	if twoPaneMode {
-		return m.viewTwoPane()
+		bg = m.viewTwoPane()
+	} else {
+		bg = m.viewSinglePane()
 	}
-	return m.viewSinglePane()
+
+	// Create mode
+	if m.mode == ModeCreate {
+		if m.tmuxClient != nil {
+			return m.viewCreateMode() // tmux: ズームしてフルスクリーン表示
+		}
+		return m.viewCreatePopup(bg) // 非tmux: ポップアップオーバーレイ
+	}
+
+	return bg
 }
 
 // viewSinglePane renders the original 1-pane layout
@@ -2875,6 +2894,200 @@ func getStatusDisplay(status session.Status) (icon, label string, style lipgloss
 	default:
 		return "?", "UNKNOWN", stoppedStyle
 	}
+}
+
+// viewCreatePopup renders the create form as a centered popup over the background.
+func (m Model) viewCreatePopup(bg string) string {
+	formContent := m.viewCreateMode()
+
+	// Popup dimensions: 70% width, fit content height up to 80% of terminal
+	popupWidth := m.width * 70 / 100
+	if popupWidth < 60 {
+		popupWidth = 60
+	}
+	if popupWidth > m.width-4 {
+		popupWidth = m.width - 4
+	}
+
+	// Count content lines to size the popup
+	contentLines := strings.Count(formContent, "\n") + 1
+	popupHeight := contentLines + 2 // +2 for border padding
+	maxHeight := m.height * 80 / 100
+	if popupHeight > maxHeight {
+		popupHeight = maxHeight
+	}
+	if popupHeight < 10 {
+		popupHeight = 10
+	}
+
+	popupStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(primaryColor).
+		Width(popupWidth).
+		Height(popupHeight).
+		Padding(0, 1)
+
+	popup := popupStyle.Render(formContent)
+
+	return overlayCenter(bg, popup, m.width, m.height)
+}
+
+// overlayCenter places the foreground string centered on top of the background string.
+func overlayCenter(bg, fg string, width, height int) string {
+	bgLines := strings.Split(bg, "\n")
+	fgLines := strings.Split(fg, "\n")
+
+	// Pad background to fill the terminal
+	for len(bgLines) < height {
+		bgLines = append(bgLines, "")
+	}
+
+	// Calculate vertical and horizontal offset for centering
+	fgHeight := len(fgLines)
+	fgWidth := 0
+	for _, line := range fgLines {
+		if w := runewidth.StringWidth(stripAnsi(line)); w > fgWidth {
+			fgWidth = w
+		}
+	}
+
+	topOffset := (height - fgHeight) / 2
+	if topOffset < 0 {
+		topOffset = 0
+	}
+	leftOffset := (width - fgWidth) / 2
+	if leftOffset < 0 {
+		leftOffset = 0
+	}
+
+	// Overlay foreground onto background
+	result := make([]string, len(bgLines))
+	for i, bgLine := range bgLines {
+		fgIdx := i - topOffset
+		if fgIdx >= 0 && fgIdx < len(fgLines) && fgLines[fgIdx] != "" {
+			fgLine := fgLines[fgIdx]
+			result[i] = overlayLine(bgLine, fgLine, leftOffset, width)
+		} else {
+			result[i] = bgLine
+		}
+	}
+
+	return strings.Join(result, "\n")
+}
+
+// stripAnsi removes ANSI escape sequences from a string.
+func stripAnsi(s string) string {
+	re := regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+	return re.ReplaceAllString(s, "")
+}
+
+// overlayLine overlays a foreground line onto a background line at the given column offset.
+func overlayLine(bgLine, fgLine string, leftOffset, totalWidth int) string {
+	// Convert to rune-width aware operations
+	bgPlain := stripAnsi(bgLine)
+	bgWidth := runewidth.StringWidth(bgPlain)
+
+	// Pad background if needed
+	if bgWidth < totalWidth {
+		bgLine += strings.Repeat(" ", totalWidth-bgWidth)
+	}
+
+	fgLineWidth := runewidth.StringWidth(stripAnsi(fgLine))
+
+	// Build: [bg left part] + [fg line] + [bg right part]
+	var result strings.Builder
+
+	// Extract left portion of background (leftOffset columns)
+	result.WriteString(truncateAnsiToWidth(bgLine, leftOffset))
+
+	// Write the foreground line
+	result.WriteString(fgLine)
+
+	// Extract right portion of background
+	rightStart := leftOffset + fgLineWidth
+	if rightStart < totalWidth {
+		result.WriteString(sliceFromWidth(bgLine, rightStart, totalWidth))
+	}
+
+	return result.String()
+}
+
+// truncateAnsiToWidth returns the prefix of an ANSI-styled string that fits within maxWidth display columns,
+// padding with spaces to exactly fill the width.
+func truncateAnsiToWidth(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	w := 0
+	inEsc := false
+	var result strings.Builder
+	for _, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			result.WriteRune(r)
+			continue
+		}
+		if inEsc {
+			result.WriteRune(r)
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inEsc = false
+			}
+			continue
+		}
+		rw := runewidth.RuneWidth(r)
+		if w+rw > maxWidth {
+			break
+		}
+		result.WriteRune(r)
+		w += rw
+	}
+	// Pad to exact width
+	for w < maxWidth {
+		result.WriteByte(' ')
+		w++
+	}
+	return result.String()
+}
+
+// sliceFromWidth returns the portion of s from startCol to endCol in display columns.
+func sliceFromWidth(s string, startCol, endCol int) string {
+	if startCol >= endCol {
+		return ""
+	}
+	w := 0
+	inEsc := false
+	started := false
+	var result strings.Builder
+	for _, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			if started {
+				result.WriteRune(r)
+			}
+			continue
+		}
+		if inEsc {
+			if started {
+				result.WriteRune(r)
+			}
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inEsc = false
+			}
+			continue
+		}
+		rw := runewidth.RuneWidth(r)
+		if w+rw > startCol && !started {
+			started = true
+		}
+		if started {
+			if w >= endCol {
+				break
+			}
+			result.WriteRune(r)
+		}
+		w += rw
+	}
+	return result.String()
 }
 
 // viewCreateMode renders the create session form
