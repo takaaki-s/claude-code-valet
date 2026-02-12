@@ -15,6 +15,7 @@ import (
 
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
+	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
 )
 
@@ -79,6 +80,15 @@ func NewServer(socketPath, dataDir, configDir string) (*Server, error) {
 	mgr, err := session.NewManager(dataDir, configDir, configMgr)
 	if err != nil {
 		return nil, err
+	}
+
+	// Set up tmux client if tmux is available and ccvalet tmux session exists
+	if tc, err := tmux.NewClient(); err == nil {
+		if tc.HasSession(tmux.SessionName) {
+			mgr.SetTmuxClient(tc)
+			mgr.RecoverTmuxSessions()
+			debugLog("tmux client initialized (session: %s)", tmux.SessionName)
+		}
 	}
 
 	return &Server{

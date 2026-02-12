@@ -22,6 +22,7 @@ import (
 	"github.com/takaaki-s/claude-code-valet/internal/notify"
 	"github.com/takaaki-s/claude-code-valet/internal/prompt"
 	"github.com/takaaki-s/claude-code-valet/internal/status"
+	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/transcript"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
 	"golang.org/x/term"
@@ -38,12 +39,91 @@ func debugLog(format string, args ...interface{}) {
 
 // Manager manages multiple Claude Code sessions
 type Manager struct {
-	sessions  map[string]*Session
-	store     *Store
-	notifier  *notify.Notifier
-	promptMgr *prompt.Manager
-	configMgr *config.Manager
-	mu        sync.RWMutex
+	sessions    map[string]*Session
+	store       *Store
+	notifier    *notify.Notifier
+	promptMgr   *prompt.Manager
+	configMgr   *config.Manager
+	tmuxClient  *tmux.Client // tmux client (nil in legacy/non-tmux mode)
+	mu          sync.RWMutex
+}
+
+// SetTmuxClient sets the tmux client for tmux-based session management.
+// When set, sessions are started in tmux windows instead of PTY directly.
+func (m *Manager) SetTmuxClient(tc *tmux.Client) {
+	m.tmuxClient = tc
+}
+
+// RecoverTmuxSessions checks for sessions with existing tmux windows after daemon restart
+// and resumes monitoring for live ones, or clears stale TmuxWindowName for dead ones.
+func (m *Manager) RecoverTmuxSessions() {
+	if m.tmuxClient == nil {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.recoverTmuxSessionsLocked()
+}
+
+// recoverTmuxSessionsLocked is the lock-held version of RecoverTmuxSessions.
+// Caller must hold m.mu.
+func (m *Manager) recoverTmuxSessionsLocked() {
+	if m.tmuxClient == nil {
+		return
+	}
+
+	for _, session := range m.sessions {
+		if session.TmuxWindowName == "" {
+			continue
+		}
+
+		// Check if the tmux window still exists
+		windowTarget := tmux.SessionName + ":" + session.TmuxWindowName
+		if _, err := m.tmuxClient.PaneCount(windowTarget); err != nil {
+			// Window doesn't exist anymore
+			session.TmuxWindowName = ""
+			m.store.Save(session)
+			debugLog("[RECOVER] Session %s tmux window gone, cleared TmuxWindowName", session.Name)
+			continue
+		}
+
+		target := tmux.WindowTarget(session.TmuxWindowName, 0)
+
+		// Check if pane is dead — keep TmuxWindowName (window alive via remain-on-exit)
+		if m.tmuxClient.IsPaneDead(target) {
+			session.Status = StatusStopped
+			m.store.Save(session)
+			debugLog("[RECOVER] Session %s tmux pane dead, kept TmuxWindowName (window preserved)", session.Name)
+			continue
+		}
+
+		// Window exists and pane is alive - resume monitoring
+		session.Status = StatusRunning
+		session.LastOutputTime = time.Now()
+		m.store.Save(session)
+		debugLog("[RECOVER] Session %s has live tmux window, resuming monitoring", session.Name)
+
+		go m.captureOutputTmux(session)
+	}
+}
+
+// ensureTmuxClient lazily initializes the tmux client if the ccvalet tmux session exists.
+// This handles the case where the daemon starts before the TUI creates the tmux session.
+func (m *Manager) ensureTmuxClient() {
+	if m.tmuxClient != nil {
+		return
+	}
+	tc, err := tmux.NewClient()
+	if err != nil {
+		return
+	}
+	if tc.HasSession(tmux.SessionName) {
+		m.tmuxClient = tc
+		debugLog("[TMUX] tmux client lazily initialized (session: %s)", tmux.SessionName)
+		m.recoverTmuxSessionsLocked()
+	}
 }
 
 // NewManager creates a new session manager
@@ -330,7 +410,15 @@ func (m *Manager) StartBackground(id string) error {
 // isProcessRunning returns true if the session process is running
 // (any status except StatusStopped means the process is alive)
 func isProcessRunning(s *Session) bool {
-	return s.Status != StatusStopped && s.PTY != nil
+	if s.Status == StatusStopped {
+		return false
+	}
+	// tmux mode: process is running if we have a tmux window name
+	if s.TmuxWindowName != "" {
+		return true
+	}
+	// Legacy mode: check PTY
+	return s.PTY != nil
 }
 
 // Attach attaches to a session and runs interactively
@@ -503,8 +591,287 @@ func parseResizeCmd(cmd string) (cols, rows int, ok bool) {
 	return c, r, true
 }
 
-// startSession starts a session's PTY process
+// startSession starts a session's process (tmux window or PTY).
 func (m *Manager) startSession(session *Session) error {
+	// Try to detect tmux session if not already connected
+	// (may trigger recovery which sets session to Running)
+	m.ensureTmuxClient()
+
+	// Re-check: recovery in ensureTmuxClient may have found this session alive
+	if isProcessRunning(session) {
+		return nil
+	}
+
+	if m.tmuxClient != nil {
+		return m.startSessionTmux(session)
+	}
+	return m.startSessionPTY(session)
+}
+
+// startSessionTmux starts a session in a tmux window.
+func (m *Manager) startSessionTmux(session *Session) error {
+	// Branch checkout handling (same as PTY mode)
+	if session.Branch != "" && session.WorkDir != "" && !session.IsNewWorktree {
+		currentBranch, err := worktree.GetCurrentBranch(session.WorkDir)
+		if err != nil {
+			debugLog("[SESSION] Failed to get current branch: %v", err)
+		} else if currentBranch != session.Branch {
+			if session.ClaudeSessionStarted {
+				debugLog("[SESSION] Branch changed externally: %s -> %s", session.Branch, currentBranch)
+				session.Branch = currentBranch
+				session.NewBranch = false
+				m.store.Save(session)
+			} else {
+				hasChanges, err := worktree.HasUncommittedChanges(session.WorkDir)
+				if err != nil {
+					return fmt.Errorf("failed to check uncommitted changes: %w", err)
+				}
+				if hasChanges {
+					return fmt.Errorf("cannot checkout branch %s: uncommitted changes exist in %s", session.Branch, session.WorkDir)
+				}
+				if session.NewBranch {
+					if err := worktree.CreateAndCheckoutBranch(session.WorkDir, session.Branch, session.BaseBranch); err != nil {
+						return fmt.Errorf("failed to create and checkout branch: %w", err)
+					}
+				} else {
+					if err := worktree.CheckoutBranch(session.WorkDir, session.Branch); err != nil {
+						return fmt.Errorf("failed to checkout branch: %w", err)
+					}
+				}
+			}
+		}
+	}
+
+	// Set trust state
+	if err := ensureClaudeTrustState(session.WorkDir); err != nil {
+		debugLog("[TRUST] Warning: failed to set trust state: %v", err)
+	}
+
+	// Build Claude command
+	shell := m.configMgr.GetShell()
+	claudeCmd := "claude"
+	if session.ClaudeSessionID != "" {
+		if session.ClaudeSessionStarted {
+			claudeCmd = fmt.Sprintf("claude --resume %s", session.ClaudeSessionID)
+			debugLog("[SESSION] Resuming Claude session: %s", session.ClaudeSessionID)
+		} else {
+			claudeCmd = fmt.Sprintf("claude --session-id %s", session.ClaudeSessionID)
+			debugLog("[SESSION] Starting new Claude session with ID: %s", session.ClaudeSessionID)
+			session.ClaudeSessionStarted = true
+		}
+	}
+
+	// Build shell command with environment setup
+	// Unset TMUX/TMUX_PANE to prevent nested tmux detection
+	shellCmd := fmt.Sprintf("env -u TMUX -u TMUX_PANE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic '%s'",
+		shell, claudeCmd)
+
+	// Try to revive CC in existing window (preserves user panes)
+	windowName := tmux.WindowName(session.ID)
+	if session.TmuxWindowName != "" {
+		existingTarget := tmux.SessionName + ":" + session.TmuxWindowName
+		if _, err := m.tmuxClient.PaneCount(existingTarget); err == nil {
+			// Window exists → RespawnPane on pane 0 to revive CC in place
+			target := tmux.WindowTarget(session.TmuxWindowName, 0)
+			if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
+				session.Status = StatusRunning
+				session.LastOutputTime = time.Now()
+				session.StartedAt = time.Now()
+				m.store.Save(session)
+				debugLog("[TMUX] Session %s CC revived via RespawnPane (layout preserved)", session.Name)
+				go m.captureOutputTmux(session)
+				return nil
+			}
+		}
+		// Fall through: window gone or respawn failed → create new
+		session.TmuxWindowName = ""
+	}
+
+	// Kill existing window with the same name if it exists (stale from daemon restart)
+	existingWindowTarget := tmux.SessionName + ":" + windowName
+	m.tmuxClient.KillWindow(existingWindowTarget) // ignore error (window might not exist)
+
+	if err := m.tmuxClient.NewWindowInDir(tmux.SessionName, windowName, session.WorkDir, shellCmd, true); err != nil {
+		return fmt.Errorf("failed to create tmux window: %w", err)
+	}
+
+	// Tag CC pane so pane-died hook preserves it (user-added panes auto-close)
+	target := tmux.WindowTarget(windowName, 0)
+	m.tmuxClient.TagManagedPane(target)
+
+	session.TmuxWindowName = windowName
+	session.Status = StatusRunning
+	session.LastOutputTime = time.Now()
+	session.StartedAt = time.Now()
+
+	// Persist tmux window name
+	m.store.Save(session)
+
+	// Start status detection via capture-pane polling
+	go m.captureOutputTmux(session)
+
+	return nil
+}
+
+// captureOutputTmux polls tmux capture-pane for status detection.
+func (m *Manager) captureOutputTmux(session *Session) {
+	detector := status.NewDetector()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	target := tmux.WindowTarget(session.TmuxWindowName, 0)
+	consecutiveErrors := 0
+
+	for range ticker.C {
+		m.mu.RLock()
+		if session.Status == StatusStopped {
+			m.mu.RUnlock()
+			return
+		}
+		sessionID := session.ID
+		sessionName := session.Name
+		promptName := session.PromptName
+		promptArgs := session.PromptArgs
+		promptInjected := session.PromptInjected
+		repository := session.Repository
+		branch := session.Branch
+		baseBranch := session.BaseBranch
+		workDir := session.WorkDir
+		m.mu.RUnlock()
+
+		// Check if pane process has exited
+		if m.tmuxClient.IsPaneDead(target) {
+			m.mu.Lock()
+			session.Status = StatusStopped
+			session.LastActiveAt = time.Now()
+			// Keep TmuxWindowName: window survives (remain-on-exit), only CC pane is dead.
+			// RespawnPane can revive CC while preserving user panes in the same window.
+			m.mu.Unlock()
+			m.store.Save(session)
+			debugLog("[TMUX] Session %s pane died, marked as stopped (window preserved)", sessionName)
+			return
+		}
+
+		// Capture pane content for status detection
+		content, err := m.tmuxClient.CapturePane(target, false)
+		if err != nil {
+			consecutiveErrors++
+			// After 3 consecutive failures, the tmux window/session is likely gone
+			// (e.g., user quit ccvalet and the tmux session was destroyed)
+			if consecutiveErrors >= 3 {
+				m.mu.Lock()
+				session.Status = StatusStopped
+				session.LastActiveAt = time.Now()
+				session.TmuxWindowName = ""
+				m.mu.Unlock()
+				m.store.Save(session)
+				debugLog("[TMUX] Session %s tmux window gone (capture failed %d times), marked as stopped", sessionName, consecutiveErrors)
+				return
+			}
+			continue
+		}
+		consecutiveErrors = 0
+
+		detected := detector.Detect(content)
+		if detected == "" {
+			continue
+		}
+
+		// Trust dialog detection
+		if detected == status.StatusTrust {
+			m.mu.Lock()
+			oldStatus := session.Status
+			session.Status = StatusConfirm
+			m.mu.Unlock()
+			if oldStatus != StatusConfirm {
+				debugLog("[STATUS] Session %s: %s -> %s (tmux)", sessionName, oldStatus, StatusConfirm)
+			}
+			continue
+		}
+
+		newStatus := convertStatus(detected)
+
+		// Apply status stability logic
+		m.mu.Lock()
+		oldStatus := session.Status
+		timeSinceStart := time.Since(session.StartedAt)
+
+		// Skip error detection during startup grace period
+		if newStatus == StatusError && timeSinceStart < 5*time.Second {
+			newStatus = StatusRunning
+		}
+
+		session.Status = newStatus
+		session.LastOutputTime = time.Now()
+		m.mu.Unlock()
+
+		// Handle status change notifications
+		if oldStatus != newStatus {
+			m.handleStatusChange(sessionID, sessionName, oldStatus, newStatus)
+		}
+
+		// Inject prompt when idle and not yet injected
+		if newStatus == StatusIdle && !promptInjected && promptName != "" {
+			m.mu.Lock()
+			session.PromptInjected = true
+			m.mu.Unlock()
+
+			debugLog("[PROMPT] Triggering tmux prompt injection for session %s", sessionID)
+			go m.injectPromptTmux(session, promptName, prompt.Variables{
+				Args:       promptArgs,
+				Branch:     branch,
+				Repository: repository,
+				Session:    sessionName,
+				WorkDir:    workDir,
+				BaseBranch: baseBranch,
+			})
+		}
+	}
+}
+
+// injectPromptTmux injects a prompt into the session via tmux send-keys.
+func (m *Manager) injectPromptTmux(session *Session, promptName string, vars prompt.Variables) {
+	expandedPrompt, err := m.promptMgr.GetExpanded(promptName, vars)
+	if err != nil {
+		debugLog("[PROMPT] Failed to expand prompt template '%s': %v", promptName, err)
+		return
+	}
+
+	debugLog("[PROMPT] Expanded prompt (%d chars)", len(expandedPrompt))
+
+	// Wait for Claude Code to be fully ready
+	time.Sleep(1 * time.Second)
+
+	m.mu.RLock()
+	windowName := session.TmuxWindowName
+	m.mu.RUnlock()
+
+	if windowName == "" {
+		debugLog("[PROMPT] No tmux window, cannot inject prompt")
+		return
+	}
+
+	target := tmux.WindowTarget(windowName, 0)
+
+	// Send prompt text via send-keys (literal mode)
+	if err := m.tmuxClient.SendKeysLiteral(target, expandedPrompt); err != nil {
+		debugLog("[PROMPT] Failed to send prompt via tmux: %v", err)
+		return
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Send Enter
+	if err := m.tmuxClient.SendKeys(target, "Enter"); err != nil {
+		debugLog("[PROMPT] Failed to send Enter via tmux: %v", err)
+		return
+	}
+
+	debugLog("[PROMPT] Tmux injection complete for '%s'", promptName)
+}
+
+// startSessionPTY starts a session's PTY process (legacy mode).
+func (m *Manager) startSessionPTY(session *Session) error {
 	// Branch checkout handling (v3 design)
 	if session.Branch != "" && session.WorkDir != "" && !session.IsNewWorktree {
 		// Get current branch
@@ -1060,6 +1427,13 @@ func (m *Manager) Kill(id string) error {
 		return fmt.Errorf("session %s not found", id)
 	}
 
+	// Kill tmux window if exists
+	if m.tmuxClient != nil && session.TmuxWindowName != "" {
+		windowTarget := tmux.SessionName + ":" + session.TmuxWindowName
+		m.tmuxClient.KillWindow(windowTarget)
+		session.TmuxWindowName = ""
+	}
+
 	if session.Cmd != nil && session.Cmd.Process != nil {
 		session.Cmd.Process.Kill()
 	}
@@ -1092,6 +1466,12 @@ func (m *Manager) Delete(id string) error {
 	session, ok := m.sessions[id]
 	if !ok {
 		return fmt.Errorf("session %s not found", id)
+	}
+
+	// Kill tmux window if exists
+	if m.tmuxClient != nil && session.TmuxWindowName != "" {
+		windowTarget := tmux.SessionName + ":" + session.TmuxWindowName
+		m.tmuxClient.KillWindow(windowTarget)
 	}
 
 	// Kill if running

@@ -126,6 +126,9 @@ type Session struct {
 	ClaudeSessionID        string `json:"claude_session_id,omitempty"`
 	ClaudeSessionStarted   bool   `json:"claude_session_started,omitempty"` // CCセッションが一度でも起動されたか
 
+	// tmux integration
+	TmuxWindowName string `json:"tmux_window_name,omitempty"` // tmux window name for this session
+
 	// Runtime fields (not persisted)
 	PTY            *os.File      `json:"-"`
 	Cmd            *exec.Cmd     `json:"-"`
@@ -209,6 +212,7 @@ type Info struct {
 	WorktreeName     string `json:"worktree_name,omitempty"`
 	ErrorMessage     string `json:"error_message,omitempty"`
 	ClaudeSessionID  string `json:"claude_session_id,omitempty"` // Claude Code session ID for transcript lookup
+	TmuxWindowName   string `json:"tmux_window_name,omitempty"` // tmux window name
 
 	// Last messages from transcript
 	LastUserMessage      string `json:"last_user_message,omitempty"`      // Last user message content (truncated)
@@ -230,5 +234,6 @@ func (s *Session) ToInfo() Info {
 		WorktreeName:    s.WorktreeName,
 		ErrorMessage:    s.ErrorMessage,
 		ClaudeSessionID: s.ClaudeSessionID,
+		TmuxWindowName:  s.TmuxWindowName,
 	}
 }

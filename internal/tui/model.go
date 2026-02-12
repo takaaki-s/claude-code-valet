@@ -22,6 +22,7 @@ import (
 	"github.com/takaaki-s/claude-code-valet/internal/prompt"
 	"github.com/takaaki-s/claude-code-valet/internal/repository"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
+	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
 )
 
@@ -231,6 +232,11 @@ type Model struct {
 	promptField  textinput.Model // 右ペインのプロンプト入力フィールド
 	sendSuccess  bool            // プロンプト送信成功フラグ（一時表示用）
 	sendSuccessAt time.Time      // 送信成功時刻
+
+	// tmux integration
+	tmuxClient           *tmux.Client // tmux client (nil in legacy mode)
+	tuiPaneID            string       // TUIペインの固有ID (例: "%42")
+	currentSessionWindow string       // TUIが現在いるセッションwindow名 ("" = UIウィンドウ)
 }
 
 // NewModel creates a new TUI model
@@ -338,6 +344,17 @@ func NewModel(client *daemon.Client) Model {
 		focusPane:         FocusLeft,
 		promptField:       promptField,
 	}
+}
+
+// NewModelWithTmux creates a new TUI model with tmux integration.
+// In tmux mode, the TUI pane moves between session windows as a floating sidebar.
+func NewModelWithTmux(client *daemon.Client, tc *tmux.Client, tuiPaneID string) Model {
+	m := NewModel(client)
+	m.tmuxClient = tc
+	m.tuiPaneID = tuiPaneID
+	// Restore which session window TUI was in (for reattach)
+	m.currentSessionWindow = tc.GetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW")
+	return m
 }
 
 // AttachSignal returns the attach signal channel
@@ -652,6 +669,41 @@ func (m *Model) stopPreview() {
 	m.vtHeight = 0
 }
 
+// switchToSession moves the TUI sidebar to the given session's tmux window.
+// Each session has its own tmux window; the TUI pane floats between them via join-pane.
+func (m *Model) switchToSession(sessionID string) {
+	if m.tmuxClient == nil || m.tuiPaneID == "" || sessionID == "" {
+		return
+	}
+
+	// Find session info
+	var sess *session.Info
+	for i := range m.sessions {
+		if m.sessions[i].ID == sessionID {
+			sess = &m.sessions[i]
+			break
+		}
+	}
+	if sess == nil || sess.TmuxWindowName == "" {
+		return
+	}
+
+	// Already in this session's window
+	if m.currentSessionWindow == sess.TmuxWindowName {
+		return
+	}
+
+	// join-pane: move TUI to session window as left sidebar (25%)
+	target := tmux.WindowTarget(sess.TmuxWindowName, 0)
+	if err := m.tmuxClient.JoinPane(m.tuiPaneID, target, true, 25, true, true); err != nil {
+		// Join failed — window might not exist
+		return
+	}
+
+	m.currentSessionWindow = sess.TmuxWindowName
+	m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW", sess.TmuxWindowName)
+}
+
 // isActiveSession returns true if the session is in an active state where VT display is useful
 func isActiveSession(status session.Status) bool {
 	switch status {
@@ -664,6 +716,12 @@ func isActiveSession(status session.Status) bool {
 
 // updatePreviewForCurrentSession starts/updates preview for the currently selected session
 func (m *Model) updatePreviewForCurrentSession() tea.Cmd {
+	// tmux sidebar mode: no preview switching on cursor move
+	// The TUI pane only moves to a session window on Enter
+	if m.tmuxClient != nil {
+		return nil
+	}
+
 	// Only in 2-pane mode
 	if m.width < minTwoPaneWidth {
 		return nil
@@ -804,6 +862,17 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.confirmDelete {
 			switch msg.String() {
 			case "y", "Y", "enter":
+				// If TUI is in the session's window being deleted, evacuate to UI window first
+				if m.tmuxClient != nil && m.tuiPaneID != "" {
+					for _, s := range m.sessions {
+						if s.ID == m.deleteTargetID && s.TmuxWindowName != "" && m.currentSessionWindow == s.TmuxWindowName {
+							m.tmuxClient.BreakPane(m.tuiPaneID, true, tmux.UIWindowName)
+							m.currentSessionWindow = ""
+							m.tmuxClient.UnsetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW")
+							break
+						}
+					}
+				}
 				if err := m.client.Delete(m.deleteTargetID); err != nil {
 					m.err = err
 				}
@@ -821,6 +890,13 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.deleteTargetName = ""
 				return m, nil
 			}
+			return m, nil
+		}
+
+		// Tab key: in tmux sidebar mode, move focus to the right workspace pane
+		if msg.String() == "tab" && m.tmuxClient != nil && m.currentSessionWindow != "" {
+			// Select the pane to the right of TUI (the workspace)
+			m.tmuxClient.SelectPaneRight()
 			return m, nil
 		}
 
@@ -874,6 +950,33 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.err = fmt.Errorf("cannot attach to creating session")
 					return m, nil
 				}
+
+				// tmux sidebar mode: start session and move TUI to session window
+				if m.tmuxClient != nil {
+					needsStart := sess.Status == session.StatusStopped || sess.Status == session.StatusError
+					if needsStart {
+						if err := m.client.Start(sess.ID); err != nil {
+							m.err = err
+							return m, nil
+						}
+						// Update local session data immediately (daemon has already created the tmux window)
+						for i := range m.sessions {
+							if m.sessions[i].ID == sess.ID {
+								if m.sessions[i].TmuxWindowName == "" {
+									m.sessions[i].TmuxWindowName = tmux.WindowName(sess.ID)
+								}
+								m.sessions[i].Status = session.StatusRunning
+								break
+							}
+						}
+						// Force switchToSession to run (clear current window tracking)
+						m.currentSessionWindow = ""
+					}
+					m.switchToSession(sess.ID)
+					return m, m.fetchSessions
+				}
+
+				// Legacy mode: signal attach
 				m.stopPreview()
 				m.attachSignal <- sess.ID
 				return m, tea.Quit
@@ -1935,7 +2038,8 @@ func (m Model) View() string {
 	}
 
 	// Determine if we should use 2-pane layout
-	twoPaneMode := m.width >= minTwoPaneWidth
+	// In tmux mode, always use single pane (tmux manages the right pane)
+	twoPaneMode := m.width >= minTwoPaneWidth && m.tmuxClient == nil
 
 	if twoPaneMode {
 		return m.viewTwoPane()
