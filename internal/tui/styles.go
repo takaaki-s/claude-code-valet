@@ -78,38 +78,11 @@ var (
 				Foreground(secondaryColor)
 )
 
-// Preview pane styles
-var (
-	previewTitleStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(cyanColor)
-
-	previewDimStyle = lipgloss.NewStyle().
-			Foreground(secondaryColor)
-
-	previewStoppedStyle = lipgloss.NewStyle().
-				Foreground(dimColor).
-				Bold(true)
-)
-
 // createBoxStyle creates a box style with specified width and height
 func createBoxStyle(width, height int) lipgloss.Style {
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(boxBorderColor).
-		Width(width).
-		Height(height)
-}
-
-// createPaneStyle creates a pane style with specified width, height, and focus state
-func createPaneStyle(width, height int, focused bool) lipgloss.Style {
-	borderColor := dimColor
-	if focused {
-		borderColor = primaryColor
-	}
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
 		Width(width).
 		Height(height)
 }

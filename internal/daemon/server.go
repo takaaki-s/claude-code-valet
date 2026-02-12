@@ -162,11 +162,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	resp := s.handleRequest(&req, conn)
+	resp := s.handleRequest(&req)
 	encoder.Encode(resp)
 }
 
-func (s *Server) handleRequest(req *Request, conn net.Conn) Response {
+func (s *Server) handleRequest(req *Request) Response {
 	switch req.Action {
 	case "new":
 		return s.handleNew(req.Data)
@@ -178,14 +178,6 @@ func (s *Server) handleRequest(req *Request, conn net.Conn) Response {
 		return s.handleKill(req.Data)
 	case "delete":
 		return s.handleDelete(req.Data)
-	case "attach":
-		return s.handleAttach(req.Data, conn)
-	case "subscribe":
-		return s.handleSubscribe(req.Data, conn)
-	case "write":
-		return s.handleWrite(req.Data)
-	case "resize":
-		return s.handleResize(req.Data)
 	case "stop":
 		return s.handleStop()
 	default:
@@ -576,120 +568,6 @@ func (s *Server) handleDelete(data json.RawMessage) Response {
 	s.tryStartQueued()
 
 	return Response{Success: true}
-}
-
-func (s *Server) handleAttach(data json.RawMessage, conn net.Conn) Response {
-	var req IDRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	// Auto-start stopped sessions
-	if err := s.manager.StartBackground(req.ID); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	// Wait for session to be fully running (with timeout)
-	// This handles the race condition where the session process
-	// might not be fully initialized before AttachToConn is called
-	sess, ok := s.manager.Get(req.ID)
-	if ok {
-		for i := 0; i < 30; i++ { // 3 seconds timeout
-			if sess.Status != session.StatusStopped && sess.PTY != nil && sess.Broadcaster != nil {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-			sess, _ = s.manager.Get(req.ID)
-		}
-	}
-
-	// Send success first, then stream PTY data
-	resp := Response{Success: true}
-	encoder := json.NewEncoder(conn)
-	encoder.Encode(resp)
-
-	// Stream PTY I/O over the connection
-	if err := s.manager.AttachToConn(req.ID, conn); err != nil {
-		log.Printf("Attach error: %v", err)
-	}
-
-	return Response{} // Already sent
-}
-
-// WriteRequest contains session ID and data to write to PTY
-type WriteRequest struct {
-	ID   string `json:"id"`
-	Data string `json:"data"` // base64 or raw text to write to PTY
-}
-
-func (s *Server) handleWrite(data json.RawMessage) Response {
-	var req WriteRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	if err := s.manager.WriteToSession(req.ID, []byte(req.Data)); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	return Response{Success: true}
-}
-
-// ResizeRequest contains session ID and terminal dimensions
-type ResizeRequest struct {
-	ID   string `json:"id"`
-	Cols int    `json:"cols"`
-	Rows int    `json:"rows"`
-}
-
-func (s *Server) handleResize(data json.RawMessage) Response {
-	var req ResizeRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	if err := s.manager.ResizePTY(req.ID, req.Cols, req.Rows); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	return Response{Success: true}
-}
-
-func (s *Server) handleSubscribe(data json.RawMessage, conn net.Conn) Response {
-	var req IDRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	screenData, outputCh, cleanup, err := s.manager.SubscribeOutput(req.ID)
-	if err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	// Send success response first
-	resp := Response{Success: true}
-	encoder := json.NewEncoder(conn)
-	encoder.Encode(resp)
-
-	// Send current screen buffer content
-	if len(screenData) > 0 {
-		conn.Write(screenData)
-	}
-
-	// If no broadcaster (session not running), we're done
-	if outputCh == nil {
-		return Response{}
-	}
-	defer cleanup()
-
-	// Stream new output until connection closes
-	for data := range outputCh {
-		if _, err := conn.Write(data); err != nil {
-			break
-		}
-	}
-
-	return Response{} // Already sent
 }
 
 func (s *Server) handleStop() Response {

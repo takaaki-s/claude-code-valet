@@ -2,20 +2,15 @@ package tui
 
 import (
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/vt"
 	"github.com/mattn/go-runewidth"
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/daemon"
@@ -32,14 +27,6 @@ type Mode int
 const (
 	ModeList Mode = iota
 	ModeCreate
-)
-
-// FocusPane represents which pane has focus in 2-pane layout
-type FocusPane int
-
-const (
-	FocusLeft  FocusPane = iota // Session list pane
-	FocusRight                  // Preview/action pane
 )
 
 // KeyMap defines key bindings
@@ -158,7 +145,6 @@ type Model struct {
 	height       int
 	err          error
 	showHelp     bool
-	attachSignal chan string // Signal to attach to a session
 	keys         KeyMap      // キーバインド設定
 
 	// Create mode
@@ -214,24 +200,6 @@ type Model struct {
 	confirmDelete    bool   // 削除確認中かどうか
 	deleteTargetID   string // 削除対象のセッションID
 	deleteTargetName string // 削除対象のセッション名（表示用）
-
-	// Preview pane (2-pane layout)
-	previewLines      []string // ANSIストリップ済みのプレビュー行（creating用）
-	previewSessionID  string   // プレビュー中のセッションID
-	previewConn       net.Conn // daemon への subscribe 接続
-	previewBuffered   io.Reader // JSON decoder のバッファデータ
-	previewStopCh     chan struct{} // プレビュー停止シグナル
-
-	// VT emulator (2-pane terminal)
-	vtEmulator  *vt.SafeEmulator // VT 端末エミュレータ（スレッドセーフ）
-	vtWidth     int              // VT エミュレータの幅
-	vtHeight    int              // VT エミュレータの高さ
-
-	// Focus management (2-pane layout)
-	focusPane    FocusPane       // 現在フォーカスされているペイン
-	promptField  textinput.Model // 右ペインのプロンプト入力フィールド
-	sendSuccess  bool            // プロンプト送信成功フラグ（一時表示用）
-	sendSuccessAt time.Time      // 送信成功時刻
 
 	// tmux integration
 	tmuxClient           *tmux.Client // tmux client (nil in legacy mode)
@@ -317,14 +285,8 @@ func NewModel(client *daemon.Client) Model {
 		}
 	}
 
-	// Prompt input field for right pane
-	promptField := textinput.New()
-	promptField.Placeholder = "Send a message to CC..."
-	promptField.CharLimit = 2000
-
 	return Model{
 		client:            client,
-		attachSignal:      make(chan string, 1),
 		keys:              keys,
 		mode:              ModeList,
 		nameInput:         nameInput,
@@ -341,8 +303,6 @@ func NewModel(client *daemon.Client) Model {
 		filteredRepos:     repos,
 		prompts:           promptNames,
 		filteredPrompts:   promptNames,
-		focusPane:         FocusLeft,
-		promptField:       promptField,
 	}
 }
 
@@ -355,11 +315,6 @@ func NewModelWithTmux(client *daemon.Client, tc *tmux.Client, tuiPaneID string) 
 	// Restore which session window TUI was in (for reattach)
 	m.currentSessionWindow = tc.GetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW")
 	return m
-}
-
-// AttachSignal returns the attach signal channel
-func (m *Model) AttachSignal() <-chan string {
-	return m.attachSignal
 }
 
 // getItemsPerPage calculates how many items fit on one page
@@ -410,20 +365,6 @@ func (m *Model) getPageSessions() []session.Info {
 type sessionsMsg []session.Info
 type errMsg error
 type tickMsg time.Time
-type previewDataMsg struct {
-	lines []string
-}
-type vtOutputMsg struct {
-	data []byte
-}
-
-// ansiStripRegex strips ANSI escape sequences from text
-var ansiStripRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[hl]|\x1b[()][AB012]|\x1b\[\?[0-9;]*[a-zA-Z]`)
-
-// stripANSI removes ANSI escape sequences from a string
-func stripANSI(s string) string {
-	return ansiStripRegex.ReplaceAllString(s, "")
-}
 
 // Commands
 func (m *Model) fetchSessions() tea.Msg {
@@ -438,235 +379,6 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
-}
-
-// startPreview starts subscribing to a session's output (legacy ANSI-stripped mode for creating)
-func (m *Model) startPreview(sessionID string) tea.Cmd {
-	// Stop any existing preview
-	m.stopPreview()
-
-	m.previewSessionID = sessionID
-	m.previewLines = nil
-
-	conn, buffered, err := m.client.Subscribe(sessionID)
-	if err != nil {
-		return nil
-	}
-
-	m.previewConn = conn
-	m.previewBuffered = buffered
-	m.previewStopCh = make(chan struct{})
-
-	stopCh := m.previewStopCh
-
-	return func() tea.Msg {
-		buf := make([]byte, 4096)
-		var accumulated strings.Builder
-
-		if buffered != nil {
-			n, _ := buffered.Read(buf)
-			if n > 0 {
-				accumulated.Write(buf[:n])
-			}
-		}
-
-		for {
-			select {
-			case <-stopCh:
-				return nil
-			default:
-			}
-
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			n, err := conn.Read(buf)
-			if n > 0 {
-				accumulated.Write(buf[:n])
-				raw := accumulated.String()
-				stripped := stripANSI(raw)
-				allLines := strings.Split(stripped, "\n")
-
-				maxLines := 100
-				if len(allLines) > maxLines {
-					allLines = allLines[len(allLines)-maxLines:]
-				}
-
-				return previewDataMsg{lines: allLines}
-			}
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				return nil
-			}
-		}
-	}
-}
-
-// continuePreview continues reading from the preview connection (legacy mode)
-func (m *Model) continuePreview() tea.Cmd {
-	if m.previewConn == nil || m.previewStopCh == nil {
-		return nil
-	}
-
-	conn := m.previewConn
-	stopCh := m.previewStopCh
-	existingLines := m.previewLines
-
-	return func() tea.Msg {
-		buf := make([]byte, 4096)
-		var accumulated strings.Builder
-
-		for {
-			select {
-			case <-stopCh:
-				return nil
-			default:
-			}
-
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			n, err := conn.Read(buf)
-			if n > 0 {
-				accumulated.Write(buf[:n])
-				raw := accumulated.String()
-				stripped := stripANSI(raw)
-				newLines := strings.Split(stripped, "\n")
-
-				allLines := append(existingLines, newLines...)
-				maxLines := 100
-				if len(allLines) > maxLines {
-					allLines = allLines[len(allLines)-maxLines:]
-				}
-
-				return previewDataMsg{lines: allLines}
-			}
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				return nil
-			}
-		}
-	}
-}
-
-// startVT starts VT emulator mode for an active session
-func (m *Model) startVT(sessionID string, width, height int) tea.Cmd {
-	m.stopPreview()
-
-	m.previewSessionID = sessionID
-
-	conn, buffered, err := m.client.Subscribe(sessionID)
-	if err != nil {
-		return nil
-	}
-
-	m.previewConn = conn
-	m.previewBuffered = buffered
-	m.previewStopCh = make(chan struct{})
-
-	// Create VT emulator with right pane dimensions
-	m.vtWidth = width
-	m.vtHeight = height
-	m.vtEmulator = vt.NewSafeEmulator(width, height)
-
-	// Resize the PTY to match the right pane dimensions
-	_ = m.client.Resize(sessionID, width, height)
-
-	stopCh := m.previewStopCh
-
-	return func() tea.Msg {
-		buf := make([]byte, 4096)
-
-		// Read buffered data first
-		if buffered != nil {
-			n, _ := buffered.Read(buf)
-			if n > 0 {
-				data := make([]byte, n)
-				copy(data, buf[:n])
-				return vtOutputMsg{data: data}
-			}
-		}
-
-		// Read from connection
-		for {
-			select {
-			case <-stopCh:
-				return nil
-			default:
-			}
-
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			n, err := conn.Read(buf)
-			if n > 0 {
-				data := make([]byte, n)
-				copy(data, buf[:n])
-				return vtOutputMsg{data: data}
-			}
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				return nil
-			}
-		}
-	}
-}
-
-// continueVT continues reading VT output
-func (m *Model) continueVT() tea.Cmd {
-	if m.previewConn == nil || m.previewStopCh == nil {
-		return nil
-	}
-
-	conn := m.previewConn
-	stopCh := m.previewStopCh
-
-	return func() tea.Msg {
-		buf := make([]byte, 4096)
-
-		for {
-			select {
-			case <-stopCh:
-				return nil
-			default:
-			}
-
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			n, err := conn.Read(buf)
-			if n > 0 {
-				data := make([]byte, n)
-				copy(data, buf[:n])
-				return vtOutputMsg{data: data}
-			}
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				return nil
-			}
-		}
-	}
-}
-
-// stopPreview stops the current preview subscription and VT emulator
-func (m *Model) stopPreview() {
-	if m.previewStopCh != nil {
-		close(m.previewStopCh)
-		m.previewStopCh = nil
-	}
-	if m.previewConn != nil {
-		m.previewConn.Close()
-		m.previewConn = nil
-	}
-	if m.vtEmulator != nil {
-		m.vtEmulator.Close()
-		m.vtEmulator = nil
-	}
-	m.previewSessionID = ""
-	m.previewLines = nil
-	m.previewBuffered = nil
-	m.vtWidth = 0
-	m.vtHeight = 0
 }
 
 // switchToSession moves the TUI sidebar to the given session's tmux window.
@@ -704,113 +416,6 @@ func (m *Model) switchToSession(sessionID string) {
 	m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW", sess.TmuxWindowName)
 }
 
-// isActiveSession returns true if the session is in an active state where VT display is useful
-func isActiveSession(status session.Status) bool {
-	switch status {
-	case session.StatusCreating, session.StatusRunning, session.StatusThinking,
-		session.StatusIdle, session.StatusPermission, session.StatusConfirm:
-		return true
-	}
-	return false
-}
-
-// updatePreviewForCurrentSession starts/updates preview for the currently selected session
-func (m *Model) updatePreviewForCurrentSession() tea.Cmd {
-	// tmux sidebar mode: no preview switching on cursor move
-	// The TUI pane only moves to a session window on Enter
-	if m.tmuxClient != nil {
-		return nil
-	}
-
-	// Only in 2-pane mode
-	if m.width < minTwoPaneWidth {
-		return nil
-	}
-
-	pageSessions := m.getPageSessions()
-	if len(pageSessions) == 0 || m.cursor >= len(pageSessions) {
-		m.stopPreview()
-		return nil
-	}
-
-	sess := pageSessions[m.cursor]
-
-	// Already previewing this session - check if mode needs to change
-	if sess.ID == m.previewSessionID {
-		// If session became active and we don't have VT emulator, start it
-		if isActiveSession(sess.Status) && m.vtEmulator == nil {
-			vtW, vtH := m.calcVTDimensions()
-			if vtW > 0 && vtH > 0 {
-				return m.startVT(sess.ID, vtW, vtH)
-			}
-		}
-		// If session became inactive and we have VT emulator, stop it
-		if !isActiveSession(sess.Status) && m.vtEmulator != nil {
-			m.stopPreview()
-			m.previewSessionID = sess.ID
-		}
-		return nil
-	}
-
-	// Active sessions: use VT emulator for live terminal display
-	if isActiveSession(sess.Status) {
-		vtW, vtH := m.calcVTDimensions()
-		if vtW > 0 && vtH > 0 {
-			return m.startVT(sess.ID, vtW, vtH)
-		}
-	}
-
-	// For stopped/queued/error: stop any existing stream and just set the session ID
-	m.stopPreview()
-	m.previewSessionID = sess.ID
-	return nil
-}
-
-// calcVTDimensions calculates the VT emulator dimensions based on the right pane size
-func (m *Model) calcVTDimensions() (width, height int) {
-	totalAvailable := m.width
-	gap := 1
-	borderOverhead := 4 // 2 per pane
-
-	usableWidth := totalAvailable - gap - borderOverhead
-	if usableWidth < 60 {
-		usableWidth = 60
-	}
-
-	leftContentWidth := usableWidth * 25 / 100
-	rightContentWidth := usableWidth - leftContentWidth
-
-	if leftContentWidth < 28 {
-		leftContentWidth = 28
-	}
-	if rightContentWidth < 30 {
-		rightContentWidth = 30
-	}
-
-	totalNeeded := leftContentWidth + rightContentWidth + borderOverhead + gap
-	if totalNeeded > m.width {
-		excess := totalNeeded - m.width
-		rightContentWidth -= excess
-		if rightContentWidth < 20 {
-			rightContentWidth = 20
-		}
-	}
-
-	boxHeight := m.height - 3
-	if boxHeight < 10 {
-		boxHeight = 10
-	}
-
-	// VT dimensions are the content area of the right pane (inside border)
-	return rightContentWidth, boxHeight
-}
-
-// minTwoPaneWidth is the minimum terminal width for 2-pane layout
-const minTwoPaneWidth = 100
-
-// minPaneWidth is the minimum width for each pane
-const minPaneWidth = 40
-
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
@@ -825,16 +430,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if msg, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width = msg.Width
 		m.height = msg.Height
-		// Resize VT emulator if active
-		if m.vtEmulator != nil && m.previewSessionID != "" {
-			newW, newH := m.calcVTDimensions()
-			if newW > 0 && newH > 0 && (newW != m.vtWidth || newH != m.vtHeight) {
-				m.vtWidth = newW
-				m.vtHeight = newH
-				m.vtEmulator.Resize(newW, newH)
-				_ = m.client.Resize(m.previewSessionID, newW, newH)
-			}
-		}
 	}
 
 	// Mode-specific handling
@@ -846,16 +441,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// sendSuccessMsg is sent after a delay to clear the success message
-type sendSuccessMsg struct{}
-
 func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Handle sendSuccessMsg to clear the success indicator
-	if _, ok := msg.(sendSuccessMsg); ok {
-		m.sendSuccess = false
-		return m, nil
-	}
-
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		// 削除確認モード中の処理
@@ -900,43 +486,23 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Tab key: switch focus from left to right pane (only in 2-pane mode)
-		// Right→Left is handled by Ctrl+] in updateRightPane (for VT mode compatibility)
-		if msg.String() == "tab" && m.width >= minTwoPaneWidth && m.focusPane == FocusLeft {
-			m.focusPane = FocusRight
-			// Only focus prompt field if not in VT mode
-			if m.vtEmulator == nil {
-				m.promptField.Focus()
-				return m, textinput.Blink
-			}
-			return m, nil
-		}
-
-		// Route to pane-specific handler
-		if m.focusPane == FocusRight && m.width >= minTwoPaneWidth {
-			return m.updateRightPane(msg)
-		}
-
-		// Left pane key handling (original logic)
+		// Left pane key handling
 		switch {
 		case key.Matches(msg, m.keys.Quit):
-			m.stopPreview()
 			return m, tea.Quit
 
 		case key.Matches(msg, m.keys.Up):
 			if m.cursor > 0 {
 				m.cursor--
-				cmd := m.updatePreviewForCurrentSession()
-				return m, cmd
 			}
+			return m, nil
 
 		case key.Matches(msg, m.keys.Down):
 			pageSessions := m.getPageSessions()
 			if m.cursor < len(pageSessions)-1 {
 				m.cursor++
-				cmd := m.updatePreviewForCurrentSession()
-				return m, cmd
 			}
+			return m, nil
 
 		case key.Matches(msg, m.keys.Enter):
 			pageSessions := m.getPageSessions()
@@ -975,16 +541,10 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.switchToSession(sess.ID)
 					return m, m.fetchSessions
 				}
-
-				// Legacy mode: signal attach
-				m.stopPreview()
-				m.attachSignal <- sess.ID
-				return m, tea.Quit
 			}
 
 		case key.Matches(msg, m.keys.New):
 			// Switch to create mode
-			m.stopPreview()
 			m.mode = ModeCreate
 			// tmuxモード: TUIペインをzoomしてフルスクリーン化
 			if m.tmuxClient != nil && m.tuiPaneID != "" {
@@ -1056,18 +616,16 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentPage > 0 {
 				m.currentPage--
 				m.cursor = 0
-				cmd := m.updatePreviewForCurrentSession()
-				return m, cmd
 			}
+			return m, nil
 
 		case key.Matches(msg, m.keys.NextPage):
 			totalPages := m.getTotalPages()
 			if m.currentPage < totalPages-1 {
 				m.currentPage++
 				m.cursor = 0
-				cmd := m.updatePreviewForCurrentSession()
-				return m, cmd
 			}
+			return m, nil
 		}
 
 	case sessionsMsg:
@@ -1076,19 +634,7 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.sessions) && m.cursor > 0 {
 			m.cursor = len(m.sessions) - 1
 		}
-		// Start or update preview for current selection
-		cmd := m.updatePreviewForCurrentSession()
-		return m, cmd
-
-	case previewDataMsg:
-		m.previewLines = msg.lines
-		return m, m.continuePreview()
-
-	case vtOutputMsg:
-		if m.vtEmulator != nil {
-			m.vtEmulator.Write(msg.data)
-		}
-		return m, m.continueVT()
+		return m, nil
 
 	case errMsg:
 		m.err = msg
@@ -1098,196 +644,6 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
-}
-
-// updateRightPane handles key events when the right pane has focus
-func (m Model) updateRightPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Ctrl+] or Esc: always return focus to left pane regardless of state
-	if msg.Type == tea.KeyCtrlCloseBracket || msg.Type == tea.KeyEscape {
-		m.focusPane = FocusLeft
-		m.promptField.Blur()
-		return m, nil
-	}
-
-	// Get current session
-	pageSessions := m.getPageSessions()
-	if len(pageSessions) == 0 || m.cursor >= len(pageSessions) {
-		return m, nil
-	}
-	sess := pageSessions[m.cursor]
-
-	// VT mode: active sessions with VT emulator running
-	if m.vtEmulator != nil && isActiveSession(sess.Status) {
-		// Forward all other key events to PTY
-		rawBytes := keyMsgToBytes(msg)
-		if len(rawBytes) > 0 {
-			if err := m.client.Write(sess.ID, string(rawBytes)); err != nil {
-				m.err = err
-			}
-		}
-		return m, nil
-	}
-
-	// Non-VT mode: info panel with action hints (stopped/queued/error)
-
-	// q (when input is empty): quit
-	if msg.String() == "q" && m.promptField.Value() == "" {
-		m.stopPreview()
-		return m, tea.Quit
-	}
-
-	switch sess.Status {
-	case session.StatusStopped:
-		if msg.String() == "enter" || msg.String() == "r" {
-			if err := m.client.Start(sess.ID); err != nil {
-				m.err = err
-			}
-			return m, m.fetchSessions
-		}
-		if msg.String() == "a" {
-			m.stopPreview()
-			m.attachSignal <- sess.ID
-			return m, tea.Quit
-		}
-
-	case session.StatusError:
-		if msg.String() == "r" {
-			if err := m.client.Start(sess.ID); err != nil {
-				m.err = err
-			}
-			return m, m.fetchSessions
-		}
-	}
-
-	return m, nil
-}
-
-// keyMsgToBytes converts a Bubble Tea KeyMsg to raw terminal bytes for PTY forwarding
-func keyMsgToBytes(msg tea.KeyMsg) []byte {
-	// Alt modifier: prepend ESC
-	prefix := ""
-	if msg.Alt {
-		prefix = "\x1b"
-	}
-
-	switch msg.Type {
-	case tea.KeyRunes:
-		return []byte(prefix + string(msg.Runes))
-	case tea.KeySpace:
-		return []byte(prefix + " ")
-	case tea.KeyEnter:
-		return []byte(prefix + "\r")
-	case tea.KeyTab:
-		return []byte(prefix + "\t")
-	case tea.KeyBackspace:
-		return []byte(prefix + "\x7f")
-	case tea.KeyEscape:
-		return []byte("\x1b")
-	case tea.KeyUp:
-		return []byte(prefix + "\x1b[A")
-	case tea.KeyDown:
-		return []byte(prefix + "\x1b[B")
-	case tea.KeyRight:
-		return []byte(prefix + "\x1b[C")
-	case tea.KeyLeft:
-		return []byte(prefix + "\x1b[D")
-	case tea.KeyHome:
-		return []byte(prefix + "\x1b[H")
-	case tea.KeyEnd:
-		return []byte(prefix + "\x1b[F")
-	case tea.KeyPgUp:
-		return []byte(prefix + "\x1b[5~")
-	case tea.KeyPgDown:
-		return []byte(prefix + "\x1b[6~")
-	case tea.KeyDelete:
-		return []byte(prefix + "\x1b[3~")
-	case tea.KeyInsert:
-		return []byte(prefix + "\x1b[2~")
-	case tea.KeyShiftTab:
-		return []byte(prefix + "\x1b[Z")
-	case tea.KeyF1:
-		return []byte(prefix + "\x1bOP")
-	case tea.KeyF2:
-		return []byte(prefix + "\x1bOQ")
-	case tea.KeyF3:
-		return []byte(prefix + "\x1bOR")
-	case tea.KeyF4:
-		return []byte(prefix + "\x1bOS")
-	case tea.KeyF5:
-		return []byte(prefix + "\x1b[15~")
-	case tea.KeyF6:
-		return []byte(prefix + "\x1b[17~")
-	case tea.KeyF7:
-		return []byte(prefix + "\x1b[18~")
-	case tea.KeyF8:
-		return []byte(prefix + "\x1b[19~")
-	case tea.KeyF9:
-		return []byte(prefix + "\x1b[20~")
-	case tea.KeyF10:
-		return []byte(prefix + "\x1b[21~")
-	case tea.KeyF11:
-		return []byte(prefix + "\x1b[23~")
-	case tea.KeyF12:
-		return []byte(prefix + "\x1b[24~")
-
-	// Ctrl+key combinations (they map to control characters)
-	case tea.KeyCtrlA:
-		return []byte{0x01}
-	case tea.KeyCtrlB:
-		return []byte{0x02}
-	case tea.KeyCtrlC:
-		return []byte{0x03}
-	case tea.KeyCtrlD:
-		return []byte{0x04}
-	case tea.KeyCtrlE:
-		return []byte{0x05}
-	case tea.KeyCtrlF:
-		return []byte{0x06}
-	case tea.KeyCtrlG:
-		return []byte{0x07}
-	case tea.KeyCtrlH:
-		return []byte{0x08}
-	// KeyCtrlI = Tab, KeyCtrlJ = LF, KeyCtrlM = Enter (handled above)
-	case tea.KeyCtrlK:
-		return []byte{0x0b}
-	case tea.KeyCtrlL:
-		return []byte{0x0c}
-	case tea.KeyCtrlN:
-		return []byte{0x0e}
-	case tea.KeyCtrlO:
-		return []byte{0x0f}
-	case tea.KeyCtrlP:
-		return []byte{0x10}
-	case tea.KeyCtrlQ:
-		return []byte{0x11}
-	case tea.KeyCtrlR:
-		return []byte{0x12}
-	case tea.KeyCtrlS:
-		return []byte{0x13}
-	case tea.KeyCtrlT:
-		return []byte{0x14}
-	case tea.KeyCtrlU:
-		return []byte{0x15}
-	case tea.KeyCtrlV:
-		return []byte{0x16}
-	case tea.KeyCtrlW:
-		return []byte{0x17}
-	case tea.KeyCtrlX:
-		return []byte{0x18}
-	case tea.KeyCtrlY:
-		return []byte{0x19}
-	case tea.KeyCtrlZ:
-		return []byte{0x1a}
-	case tea.KeyCtrlBackslash:
-		return []byte{0x1c}
-	// KeyCtrlCloseBracket (0x1d) is handled as detach key above
-	case tea.KeyCtrlCaret:
-		return []byte{0x1e}
-	case tea.KeyCtrlUnderscore:
-		return []byte{0x1f}
-	}
-
-	return nil
 }
 
 func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -2044,115 +1400,25 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 
 // View renders the UI
 func (m Model) View() string {
-	// Determine if we should use 2-pane layout
-	// In tmux mode, always use single pane (tmux manages the right pane)
-	twoPaneMode := m.width >= minTwoPaneWidth && m.tmuxClient == nil
-
-	var bg string
-	if twoPaneMode {
-		bg = m.viewTwoPane()
-	} else {
-		bg = m.viewSinglePane()
-	}
-
-	// Create mode
 	if m.mode == ModeCreate {
-		if m.tmuxClient != nil {
-			return m.viewCreateMode() // tmux: ズームしてフルスクリーン表示
-		}
-		return m.viewCreatePopup(bg) // 非tmux: ポップアップオーバーレイ
+		return m.viewCreateMode()
 	}
 
-	return bg
-}
-
-// viewSinglePane renders the original 1-pane layout
-func (m Model) viewSinglePane() string {
-	// Calculate box width based on terminal size
 	boxWidth := m.width - 2
 	if boxWidth < 60 {
 		boxWidth = 60
 	}
-
-	listContent := m.renderListContent(boxWidth - 4)
-
-	// Calculate box height based on terminal size
 	boxHeight := m.height - 3
 	if boxHeight < 10 {
 		boxHeight = 10
 	}
-
 	boxStyle := createBoxStyle(boxWidth, boxHeight)
-	box := boxStyle.Render(listContent)
-
+	box := boxStyle.Render(m.renderListContent(boxWidth - 4))
 	helpLine := m.renderHelpLine()
 	return box + "\n" + helpLine
 }
 
-// viewTwoPane renders the 2-pane layout (left: session list, right: preview)
-func (m Model) viewTwoPane() string {
-	// Total available width for both panes + gap
-	// Border takes 2 chars per pane (left+right), gap is 1 char
-	totalAvailable := m.width
-	gap := 1
-	borderOverhead := 2 + 2 // 2 per pane (left border + right border)
-
-	// Distribute width: left 25%, right 75%
-	usableWidth := totalAvailable - gap - borderOverhead
-	if usableWidth < 60 {
-		usableWidth = 60
-	}
-
-	leftContentWidth := usableWidth * 25 / 100
-	rightContentWidth := usableWidth - leftContentWidth
-
-	if leftContentWidth < 28 {
-		leftContentWidth = 28
-	}
-	if rightContentWidth < 30 {
-		rightContentWidth = 30
-	}
-
-	// Ensure total doesn't exceed terminal width
-	totalNeeded := leftContentWidth + rightContentWidth + borderOverhead + gap
-	if totalNeeded > m.width {
-		// Scale down proportionally
-		excess := totalNeeded - m.width
-		rightContentWidth -= excess
-		if rightContentWidth < 20 {
-			rightContentWidth = 20
-			leftContentWidth = m.width - rightContentWidth - borderOverhead - gap
-		}
-	}
-
-	// Box dimensions (lipgloss Width is content width, border is added on top)
-	leftBoxWidth := leftContentWidth
-	rightBoxWidth := rightContentWidth
-
-	// Calculate box height
-	boxHeight := m.height - 3 // help line + margin
-	if boxHeight < 10 {
-		boxHeight = 10
-	}
-
-	// Render left pane (session list)
-	listContent := m.renderListContent(leftContentWidth)
-	leftStyle := createPaneStyle(leftBoxWidth, boxHeight, m.focusPane == FocusLeft)
-	leftPane := leftStyle.Render(listContent)
-
-	// Render right pane (preview)
-	previewContent := m.renderPreviewContent(rightContentWidth, boxHeight-2)
-	rightStyle := createPaneStyle(rightBoxWidth, boxHeight, m.focusPane == FocusRight)
-	rightPane := rightStyle.Render(previewContent)
-
-	// Join panes horizontally with a gap
-	panes := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, strings.Repeat(" ", gap), rightPane)
-
-	helpLine := m.renderHelpLine()
-	return panes + "\n" + helpLine
-}
-
-// renderListContent renders the session list content (shared between 1-pane and 2-pane)
+// renderListContent renders the session list content
 func (m Model) renderListContent(contentWidth int) string {
 	var content strings.Builder
 
@@ -2182,7 +1448,7 @@ func (m Model) renderListContent(contentWidth int) string {
 	}
 
 	// Separator
-	content.WriteString(strings.Repeat("─", contentWidth))
+	content.WriteString(strings.Repeat("-", contentWidth))
 	content.WriteString("\n")
 
 	// Error message
@@ -2235,309 +1501,22 @@ func (m Model) renderListContent(contentWidth int) string {
 	return content.String()
 }
 
-// renderPreviewContent renders the right pane content
-func (m Model) renderPreviewContent(contentWidth, contentHeight int) string {
-	// Get the currently selected session
-	pageSessions := m.getPageSessions()
-	if len(pageSessions) == 0 || m.cursor >= len(pageSessions) {
-		return "\n" + previewDimStyle.Render("  No session selected")
-	}
-
-	sess := pageSessions[m.cursor]
-
-	// VT mode: render live terminal output for active sessions
-	if m.vtEmulator != nil && m.previewSessionID == sess.ID && isActiveSession(sess.Status) {
-		return m.renderVTContent(contentWidth, contentHeight)
-	}
-
-	// Info panel mode: for stopped/queued/error sessions
-	return m.renderInfoPanel(sess, contentWidth, contentHeight)
-}
-
-// renderVTContent renders the VT emulator output for the right pane
-func (m Model) renderVTContent(contentWidth, contentHeight int) string {
-	if m.vtEmulator == nil {
-		return ""
-	}
-
-	// Get rendered output from VT emulator (ANSI color codes included)
-	rendered := m.vtEmulator.Render()
-
-	// Split into lines and ensure we don't exceed pane height
-	lines := strings.Split(rendered, "\n")
-	if len(lines) > contentHeight {
-		lines = lines[:contentHeight]
-	}
-
-	// Truncate lines that exceed content width (ANSI-aware)
-	for i, line := range lines {
-		visibleWidth := runewidth.StringWidth(stripANSI(line))
-		if visibleWidth > contentWidth {
-			lines[i] = truncateANSI(line, contentWidth)
-		}
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-// truncateANSI truncates an ANSI-encoded string to maxWidth visible characters,
-// preserving escape sequences and appending a reset at the end.
-func truncateANSI(s string, maxWidth int) string {
-	var result strings.Builder
-	width := 0
-	inEscape := false
-
-	for i := 0; i < len(s); {
-		b := s[i]
-
-		// Start of escape sequence
-		if b == '\x1b' {
-			inEscape = true
-			result.WriteByte(b)
-			i++
-			continue
-		}
-
-		// Inside escape sequence: pass through until terminator
-		if inEscape {
-			result.WriteByte(b)
-			// CSI sequences end with a letter (0x40-0x7e)
-			// OSC sequences end with ST (\x1b\\) or BEL (\x07)
-			if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '~' {
-				inEscape = false
-			}
-			i++
-			continue
-		}
-
-		// Decode rune for width calculation
-		r, size := utf8.DecodeRuneInString(s[i:])
-		rw := runewidth.RuneWidth(r)
-		if width+rw > maxWidth {
-			break
-		}
-		result.WriteString(s[i : i+size])
-		width += rw
-		i += size
-	}
-
-	// Reset styling at truncation point
-	result.WriteString("\x1b[0m")
-	return result.String()
-}
-
-// renderInfoPanel renders the info panel for stopped/queued/error sessions
-func (m Model) renderInfoPanel(sess session.Info, contentWidth, contentHeight int) string {
-	var content strings.Builder
-
-	// Preview header: session name + status
-	headerTitle := previewTitleStyle.Render(truncateString(sess.Name, contentWidth/2))
-	statusIcon, statusLabel, statusSty := getStatusDisplay(sess.Status)
-	statusStr := statusSty.Render(statusIcon + " " + statusLabel)
-	headerSpacing := contentWidth - lipgloss.Width(headerTitle) - lipgloss.Width(statusStr)
-	if headerSpacing < 2 {
-		headerSpacing = 2
-	}
-	content.WriteString(headerTitle)
-	content.WriteString(strings.Repeat(" ", headerSpacing))
-	content.WriteString(statusStr)
-	content.WriteString("\n")
-	content.WriteString(strings.Repeat("─", contentWidth))
-	content.WriteString("\n")
-
-	// Session metadata section
-	if sess.Repository != "" || sess.Branch != "" {
-		if sess.Repository != "" {
-			content.WriteString(previewDimStyle.Render("  Repo: "))
-			content.WriteString(truncateString(sess.Repository, contentWidth-8))
-			content.WriteString("\n")
-		}
-		if sess.Branch != "" {
-			content.WriteString(previewDimStyle.Render("  Branch: "))
-			content.WriteString(truncateString(sess.Branch, contentWidth-10))
-			content.WriteString("\n")
-		}
-	}
-	if sess.WorkDir != "" {
-		workDir := sess.WorkDir
-		if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(workDir, home) {
-			workDir = "~" + workDir[len(home):]
-		}
-		content.WriteString(previewDimStyle.Render("  Dir: "))
-		content.WriteString(truncateString(workDir, contentWidth-7))
-		content.WriteString("\n")
-	}
-	content.WriteString("\n")
-
-	isFocused := m.focusPane == FocusRight
-
-	switch sess.Status {
-	case session.StatusStopped:
-		content.WriteString(previewStoppedStyle.Render("  ■ Session stopped"))
-		content.WriteString("\n\n")
-		m.renderLastMessages(&content, sess, contentWidth)
-		content.WriteString("\n")
-		if isFocused {
-			content.WriteString(lipgloss.NewStyle().Foreground(successColor).Render("  [enter/r] Resume  [a] Attach"))
-		} else {
-			content.WriteString(previewDimStyle.Render("  [tab] to focus this pane"))
-		}
-		content.WriteString("\n")
-
-	case session.StatusQueued:
-		content.WriteString(previewDimStyle.Render("  … Waiting in queue..."))
-		content.WriteString("\n")
-
-	case session.StatusError:
-		content.WriteString(lipgloss.NewStyle().Foreground(errorColor).Bold(true).Render("  ✗ Error"))
-		content.WriteString("\n\n")
-		if sess.ErrorMessage != "" {
-			errLines := wrapText(sess.ErrorMessage, contentWidth-4)
-			for _, line := range errLines {
-				content.WriteString("  " + lipgloss.NewStyle().Foreground(errorColor).Render(line))
-				content.WriteString("\n")
-			}
-		}
-		content.WriteString("\n")
-		if isFocused {
-			content.WriteString(lipgloss.NewStyle().Foreground(warningColor).Render("  [r] Retry"))
-		}
-		content.WriteString("\n")
-
-	default:
-		// Fallback for any other state without VT emulator
-		m.renderLastMessages(&content, sess, contentWidth)
-		content.WriteString("\n")
-		if isFocused {
-			content.WriteString(previewDimStyle.Render("  [a] Attach"))
-		}
-		content.WriteString("\n")
-	}
-
-	return content.String()
-}
-
-// renderLastMessages renders the last user and assistant messages in the preview pane
-func (m Model) renderLastMessages(content *strings.Builder, sess session.Info, contentWidth int) {
-	if sess.LastUserMessage == "" && sess.LastAssistantMessage == "" {
-		return
-	}
-
-	content.WriteString("\n")
-	content.WriteString(strings.Repeat("─", contentWidth))
-	content.WriteString("\n")
-
-	if sess.LastUserMessage != "" {
-		content.WriteString(lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("  User:"))
-		content.WriteString("\n")
-		msgLines := wrapText(sess.LastUserMessage, contentWidth-4)
-		maxLines := 5
-		if len(msgLines) > maxLines {
-			msgLines = msgLines[:maxLines]
-			msgLines = append(msgLines, "...")
-		}
-		for _, line := range msgLines {
-			content.WriteString("  " + line)
-			content.WriteString("\n")
-		}
-	}
-
-	if sess.LastAssistantMessage != "" {
-		content.WriteString("\n")
-		content.WriteString(lipgloss.NewStyle().Foreground(successColor).Bold(true).Render("  Assistant:"))
-		content.WriteString("\n")
-		msgLines := wrapText(sess.LastAssistantMessage, contentWidth-4)
-		maxLines := 10
-		if len(msgLines) > maxLines {
-			msgLines = msgLines[:maxLines]
-			msgLines = append(msgLines, "...")
-		}
-		for _, line := range msgLines {
-			content.WriteString("  " + line)
-			content.WriteString("\n")
-		}
-	}
-}
-
-// cleanPreviewLine removes control characters from a preview line
-func cleanPreviewLine(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if r >= 32 || r == '\t' {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-// wrapText wraps text to fit within the specified width
-func wrapText(text string, width int) []string {
-	if width <= 0 {
-		return []string{text}
-	}
-
-	var lines []string
-	// First split by existing newlines
-	rawLines := strings.Split(text, "\n")
-	for _, rawLine := range rawLines {
-		if runewidth.StringWidth(rawLine) <= width {
-			lines = append(lines, rawLine)
-			continue
-		}
-		// Wrap long lines
-		runes := []rune(rawLine)
-		current := 0
-		for current < len(runes) {
-			end := current
-			lineWidth := 0
-			for end < len(runes) && lineWidth < width {
-				w := runewidth.RuneWidth(runes[end])
-				if lineWidth+w > width {
-					break
-				}
-				lineWidth += w
-				end++
-			}
-			if end == current {
-				end++ // Avoid infinite loop for very wide characters
-			}
-			lines = append(lines, string(runes[current:end]))
-			current = end
-		}
-	}
-	return lines
-}
-
-// renderHelpLine renders the help line (shared between 1-pane and 2-pane)
+// renderHelpLine renders the help line at the bottom
 func (m Model) renderHelpLine() string {
 	if m.confirmDelete {
 		confirmMsg := fmt.Sprintf(" Delete session '%s'? [y/Enter] yes  [n/Esc] no", m.deleteTargetName)
 		return lipgloss.NewStyle().Foreground(warningColor).Bold(true).Render(confirmMsg)
 	}
 
-	// In 2-pane mode, show pane-aware help
-	if m.width >= minTwoPaneWidth {
-		if m.focusPane == FocusRight {
-			if m.vtEmulator != nil {
-				return helpStyle.Render(" [ctrl+]] left pane  (terminal mode)")
-			}
-			return helpStyle.Render(" [ctrl+]] left pane [esc] left pane [q] quit")
-		}
-		if m.showHelp {
-			return helpStyle.Render(" [↑/k] up [↓/j] down [tab] right pane [enter] attach [n] new [s] kill [d] del [q] quit")
-		}
-		return helpStyle.Render(" [tab] right pane [enter] attach [n] new [s] kill [d] del [←→] page [q] quit [?] help")
-	}
-
 	if m.showHelp {
-		return helpStyle.Render(" [↑/k] up [↓/j] down [←/h] prev [→/l] next [enter] attach [n] new [s] kill [d] delete [q] quit")
+		return helpStyle.Render(" [up/k] up [down/j] down [left/h] prev [right/l] next [enter] attach [n] new [s] kill [d] delete [q] quit")
 	}
-	return helpStyle.Render(" [n] new [s] kill [d] del [enter] attach [←→] page [q] quit [?] help")
+	return helpStyle.Render(" [n] new [s] kill [d] del [enter] attach [<>] page [q] quit [?] help")
 }
 
 // renderSession renders a single session in 1-line format with optional output preview
 // Format: >name (branch)                    STATUS    Last Active
-//         └─ output preview...
+//         details...
 func (m Model) renderSession(sess session.Info, selected bool, width int) string {
 	var b strings.Builder
 
@@ -2584,7 +1563,7 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 
 	if selected {
 		// Selected: highlight with background
-		cursor := "› "
+		cursor := "> "
 		line := cursor + namePadded + statusCol + " " + timeCol
 		// Pad to full width
 		if lipgloss.Width(line) < width {
@@ -2606,19 +1585,18 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 	if sess.Status == session.StatusError && sess.ErrorMessage != "" {
 		errMsg := truncateString(sess.ErrorMessage, width-4)
 		if selected {
-			errLine := "  └─ " + errMsg
+			errLine := "  -- " + errMsg
 			errPadding := width - lipgloss.Width(errLine)
 			if errPadding > 0 {
 				errLine += strings.Repeat(" ", errPadding)
 			}
 			b.WriteString(selectedItemStyle.Render(errLine))
 		} else {
-			b.WriteString("  └─ " + lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
+			b.WriteString("  -- " + lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
 		}
 		b.WriteString("\n")
 	} else {
 		// Show repository and work directory on second line
-		// (Branch is already shown in the session name on the first line)
 		var details []string
 		if sess.Repository != "" {
 			details = append(details, sess.Repository)
@@ -2632,11 +1610,11 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 			details = append(details, workDir)
 		}
 		if len(details) > 0 {
-			detailStr := strings.Join(details, " │ ")
-			// Use │ instead of └─ if we have last messages to show
-			lineChar := "└─"
+			detailStr := strings.Join(details, " | ")
+			// Use | instead of tree chars if we have last messages to show
+			lineChar := "--"
 			if sess.LastUserMessage != "" || sess.LastAssistantMessage != "" {
-				lineChar = "├─"
+				lineChar = "|-"
 			}
 			detailStr = truncateString(detailStr, width-6)
 			if selected {
@@ -2654,14 +1632,13 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 
 		// Show last user message (line 3)
 		if sess.LastUserMessage != "" {
-			// Determine line prefix: ├─ if assistant message follows, └─ if last line
-			linePrefix := "└─"
+			// Determine line prefix
+			linePrefix := "--"
 			if sess.LastAssistantMessage != "" {
-				linePrefix = "├─"
+				linePrefix = "|-"
 			}
 
-			// Calculate prefix width using lipgloss for accurate Unicode width
-			prefix := "  " + linePrefix + " 👤 "
+			prefix := "  " + linePrefix + " U: "
 			prefixWidth := lipgloss.Width(prefix)
 			msgWidth := width - prefixWidth
 			if msgWidth < 10 {
@@ -2677,16 +1654,14 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 				}
 				b.WriteString(selectedItemStyle.Render(msgLine))
 			} else {
-				b.WriteString("  " + linePrefix + " " + helpStyle.Render("👤 "+msgStr))
+				b.WriteString("  " + linePrefix + " " + helpStyle.Render("U: "+msgStr))
 			}
 			b.WriteString("\n")
 		}
 
 		// Show last assistant message (line 4)
-		// Truncate from end because important content (like questions) is often at the end
 		if sess.LastAssistantMessage != "" {
-			// Calculate prefix width using lipgloss for accurate Unicode width
-			prefix := "  └─ 🤖 "
+			prefix := "  -- A: "
 			prefixWidth := lipgloss.Width(prefix)
 			msgWidth := width - prefixWidth
 			if msgWidth < 10 {
@@ -2702,7 +1677,7 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 				}
 				b.WriteString(selectedItemStyle.Render(msgLine))
 			} else {
-				b.WriteString("  └─ " + helpStyle.Render("🤖 "+msgStr))
+				b.WriteString("  -- " + helpStyle.Render("A: "+msgStr))
 			}
 			b.WriteString("\n")
 		}
@@ -2834,34 +1809,33 @@ func countStatuses(sessions []session.Info) statusCounts {
 }
 
 // buildStatusSummary builds the status summary string for header
-// Format: STATS: ⚡ 1 Thinking ? 1 Permission ▶ 2 Running ○ 2 Idle
 func buildStatusSummary(sessions []session.Info) string {
 	counts := countStatuses(sessions)
 
 	var parts []string
 	if counts.thinking > 0 {
-		parts = append(parts, thinkingStyle.Render(fmt.Sprintf("⚡%d Thinking", counts.thinking)))
+		parts = append(parts, thinkingStyle.Render(fmt.Sprintf("*%d Thinking", counts.thinking)))
 	}
 	if counts.permission > 0 {
 		parts = append(parts, permissionStyle.Render(fmt.Sprintf("?%d Permission", counts.permission)))
 	}
 	if counts.confirm > 0 {
-		parts = append(parts, confirmStyle.Render(fmt.Sprintf("⚠%d Confirm", counts.confirm)))
+		parts = append(parts, confirmStyle.Render(fmt.Sprintf("!%d Confirm", counts.confirm)))
 	}
 	if counts.running > 0 {
-		parts = append(parts, runningStyle.Render(fmt.Sprintf("▶%d Running", counts.running)))
+		parts = append(parts, runningStyle.Render(fmt.Sprintf(">%d Running", counts.running)))
 	}
 	if counts.creating > 0 {
 		parts = append(parts, creatingStyle.Render(fmt.Sprintf("+%d Creating", counts.creating)))
 	}
 	if counts.idle > 0 {
-		parts = append(parts, idleStyle.Render(fmt.Sprintf("○%d Idle", counts.idle)))
+		parts = append(parts, idleStyle.Render(fmt.Sprintf("o%d Idle", counts.idle)))
 	}
 	if counts.queued > 0 {
-		parts = append(parts, queuedStyle.Render(fmt.Sprintf("…%d Queued", counts.queued)))
+		parts = append(parts, queuedStyle.Render(fmt.Sprintf(".%d Queued", counts.queued)))
 	}
 	if counts.errorCount > 0 {
-		parts = append(parts, errorStatusStyle.Render(fmt.Sprintf("✗%d Error", counts.errorCount)))
+		parts = append(parts, errorStatusStyle.Render(fmt.Sprintf("x%d Error", counts.errorCount)))
 	}
 
 	if len(parts) == 0 {
@@ -2874,220 +1848,64 @@ func buildStatusSummary(sessions []session.Info) string {
 func getStatusDisplay(status session.Status) (icon, label string, style lipgloss.Style) {
 	switch status {
 	case session.StatusThinking:
-		return "⚡", "THINKING", thinkingStyle
+		return "*", "THINKING", thinkingStyle
 	case session.StatusPermission:
 		return "?", "PERMISSION", permissionStyle
 	case session.StatusRunning:
-		return "▶", "RUNNING", runningStyle
+		return ">", "RUNNING", runningStyle
 	case session.StatusCreating:
 		return "+", "CREATING", creatingStyle
 	case session.StatusQueued:
-		return "…", "QUEUED", queuedStyle
+		return ".", "QUEUED", queuedStyle
 	case session.StatusIdle:
-		return "○", "IDLE", idleStyle
+		return "o", "IDLE", idleStyle
 	case session.StatusStopped:
-		return "■", "STOPPED", stoppedStyle
+		return "#", "STOPPED", stoppedStyle
 	case session.StatusConfirm:
-		return "⚠", "CONFIRM", confirmStyle
+		return "!", "CONFIRM", confirmStyle
 	case session.StatusError:
-		return "✗", "ERROR", errorStatusStyle
+		return "x", "ERROR", errorStatusStyle
 	default:
 		return "?", "UNKNOWN", stoppedStyle
 	}
 }
 
-// viewCreatePopup renders the create form as a centered popup over the background.
-func (m Model) viewCreatePopup(bg string) string {
-	formContent := m.viewCreateMode()
-
-	// Popup dimensions: 70% width, fit content height up to 80% of terminal
-	popupWidth := m.width * 70 / 100
-	if popupWidth < 60 {
-		popupWidth = 60
-	}
-	if popupWidth > m.width-4 {
-		popupWidth = m.width - 4
+// wrapText wraps text to fit within the specified width
+func wrapText(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
 	}
 
-	// Count content lines to size the popup
-	contentLines := strings.Count(formContent, "\n") + 1
-	popupHeight := contentLines + 2 // +2 for border padding
-	maxHeight := m.height * 80 / 100
-	if popupHeight > maxHeight {
-		popupHeight = maxHeight
-	}
-	if popupHeight < 10 {
-		popupHeight = 10
-	}
-
-	popupStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(primaryColor).
-		Width(popupWidth).
-		Height(popupHeight).
-		Padding(0, 1)
-
-	popup := popupStyle.Render(formContent)
-
-	return overlayCenter(bg, popup, m.width, m.height)
-}
-
-// overlayCenter places the foreground string centered on top of the background string.
-func overlayCenter(bg, fg string, width, height int) string {
-	bgLines := strings.Split(bg, "\n")
-	fgLines := strings.Split(fg, "\n")
-
-	// Pad background to fill the terminal
-	for len(bgLines) < height {
-		bgLines = append(bgLines, "")
-	}
-
-	// Calculate vertical and horizontal offset for centering
-	fgHeight := len(fgLines)
-	fgWidth := 0
-	for _, line := range fgLines {
-		if w := runewidth.StringWidth(stripAnsi(line)); w > fgWidth {
-			fgWidth = w
-		}
-	}
-
-	topOffset := (height - fgHeight) / 2
-	if topOffset < 0 {
-		topOffset = 0
-	}
-	leftOffset := (width - fgWidth) / 2
-	if leftOffset < 0 {
-		leftOffset = 0
-	}
-
-	// Overlay foreground onto background
-	result := make([]string, len(bgLines))
-	for i, bgLine := range bgLines {
-		fgIdx := i - topOffset
-		if fgIdx >= 0 && fgIdx < len(fgLines) && fgLines[fgIdx] != "" {
-			fgLine := fgLines[fgIdx]
-			result[i] = overlayLine(bgLine, fgLine, leftOffset, width)
-		} else {
-			result[i] = bgLine
-		}
-	}
-
-	return strings.Join(result, "\n")
-}
-
-// stripAnsi removes ANSI escape sequences from a string.
-func stripAnsi(s string) string {
-	re := regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-	return re.ReplaceAllString(s, "")
-}
-
-// overlayLine overlays a foreground line onto a background line at the given column offset.
-func overlayLine(bgLine, fgLine string, leftOffset, totalWidth int) string {
-	// Convert to rune-width aware operations
-	bgPlain := stripAnsi(bgLine)
-	bgWidth := runewidth.StringWidth(bgPlain)
-
-	// Pad background if needed
-	if bgWidth < totalWidth {
-		bgLine += strings.Repeat(" ", totalWidth-bgWidth)
-	}
-
-	fgLineWidth := runewidth.StringWidth(stripAnsi(fgLine))
-
-	// Build: [bg left part] + [fg line] + [bg right part]
-	var result strings.Builder
-
-	// Extract left portion of background (leftOffset columns)
-	result.WriteString(truncateAnsiToWidth(bgLine, leftOffset))
-
-	// Write the foreground line
-	result.WriteString(fgLine)
-
-	// Extract right portion of background
-	rightStart := leftOffset + fgLineWidth
-	if rightStart < totalWidth {
-		result.WriteString(sliceFromWidth(bgLine, rightStart, totalWidth))
-	}
-
-	return result.String()
-}
-
-// truncateAnsiToWidth returns the prefix of an ANSI-styled string that fits within maxWidth display columns,
-// padding with spaces to exactly fill the width.
-func truncateAnsiToWidth(s string, maxWidth int) string {
-	if maxWidth <= 0 {
-		return ""
-	}
-	w := 0
-	inEsc := false
-	var result strings.Builder
-	for _, r := range s {
-		if r == '\x1b' {
-			inEsc = true
-			result.WriteRune(r)
+	var lines []string
+	// First split by existing newlines
+	rawLines := strings.Split(text, "\n")
+	for _, rawLine := range rawLines {
+		if runewidth.StringWidth(rawLine) <= width {
+			lines = append(lines, rawLine)
 			continue
 		}
-		if inEsc {
-			result.WriteRune(r)
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEsc = false
+		// Wrap long lines
+		runes := []rune(rawLine)
+		current := 0
+		for current < len(runes) {
+			end := current
+			lineWidth := 0
+			for end < len(runes) && lineWidth < width {
+				w := runewidth.RuneWidth(runes[end])
+				if lineWidth+w > width {
+					break
+				}
+				lineWidth += w
+				end++
 			}
-			continue
+			if end == current {
+				end++ // Avoid infinite loop for very wide characters
+			}
+			lines = append(lines, string(runes[current:end]))
+			current = end
 		}
-		rw := runewidth.RuneWidth(r)
-		if w+rw > maxWidth {
-			break
-		}
-		result.WriteRune(r)
-		w += rw
 	}
-	// Pad to exact width
-	for w < maxWidth {
-		result.WriteByte(' ')
-		w++
-	}
-	return result.String()
-}
-
-// sliceFromWidth returns the portion of s from startCol to endCol in display columns.
-func sliceFromWidth(s string, startCol, endCol int) string {
-	if startCol >= endCol {
-		return ""
-	}
-	w := 0
-	inEsc := false
-	started := false
-	var result strings.Builder
-	for _, r := range s {
-		if r == '\x1b' {
-			inEsc = true
-			if started {
-				result.WriteRune(r)
-			}
-			continue
-		}
-		if inEsc {
-			if started {
-				result.WriteRune(r)
-			}
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEsc = false
-			}
-			continue
-		}
-		rw := runewidth.RuneWidth(r)
-		if w+rw > startCol && !started {
-			started = true
-		}
-		if started {
-			if w >= endCol {
-				break
-			}
-			result.WriteRune(r)
-		}
-		w += rw
-	}
-	return result.String()
+	return lines
 }
 
 // viewCreateMode renders the create session form
@@ -3138,7 +1956,7 @@ func (m Model) viewCreateMode() string {
 			}
 			b.WriteString("\n")
 		}
-		b.WriteString(helpStyle.Render("  ↑↓: select  Enter/Tab: confirm"))
+		b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm"))
 	} else if len(m.repositories) == 0 {
 		b.WriteString(helpStyle.Render("  No repositories registered. Use 'ccvalet repo add' to add one."))
 	} else if m.focusIndex == 1 {
@@ -3184,7 +2002,7 @@ func (m Model) viewCreateMode() string {
 			}
 			b.WriteString("\n")
 		}
-		b.WriteString(helpStyle.Render("  ↑↓: select  Enter/Tab: confirm  Ctrl+W: new worktree"))
+		b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm  Ctrl+W: new worktree"))
 	} else if m.focusIndex == 2 && m.repoInput.Value() == "" {
 		b.WriteString(helpStyle.Render("  Select repository first"))
 	} else if m.focusIndex == 2 {
@@ -3226,7 +2044,7 @@ func (m Model) viewCreateMode() string {
 			b.WriteString(helpStyle.Render(fmt.Sprintf("  ... and %d more", len(m.filteredBranches)-10)))
 			b.WriteString("\n")
 		}
-		b.WriteString(helpStyle.Render("  ↑↓: select  Enter/Tab: confirm"))
+		b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm"))
 		b.WriteString("\n")
 	} else if m.focusIndex == 3 {
 		if m.newBranchMode {
@@ -3277,7 +2095,7 @@ func (m Model) viewCreateMode() string {
 				b.WriteString(helpStyle.Render(fmt.Sprintf("  ... and %d more", len(m.filteredBaseBranches)-10)))
 				b.WriteString("\n")
 			}
-			b.WriteString(helpStyle.Render("  ↑↓: select  Enter/Tab: confirm"))
+			b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm"))
 			b.WriteString("\n")
 		} else if m.focusIndex == baseBranchFieldIdx {
 			b.WriteString(helpStyle.Render("  Base branch for new branch creation"))
@@ -3318,7 +2136,7 @@ func (m Model) viewCreateMode() string {
 			b.WriteString(helpStyle.Render(fmt.Sprintf("  ... and %d more", len(m.filteredPrompts)-5)))
 			b.WriteString("\n")
 		}
-		b.WriteString(helpStyle.Render("  ↑↓: select  Enter/Tab: confirm"))
+		b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm"))
 		b.WriteString("\n")
 	} else if m.focusIndex == promptFieldIdx && len(m.prompts) == 0 {
 		b.WriteString(helpStyle.Render("  No prompts available. Add files to ~/.ccvalet/prompts/"))

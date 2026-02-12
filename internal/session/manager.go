@@ -1,22 +1,15 @@
 package session
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/google/uuid"
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/notify"
@@ -25,7 +18,6 @@ import (
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/transcript"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
-	"golang.org/x/term"
 )
 
 // debugEnabled controls debug logging output
@@ -44,12 +36,11 @@ type Manager struct {
 	notifier    *notify.Notifier
 	promptMgr   *prompt.Manager
 	configMgr   *config.Manager
-	tmuxClient  *tmux.Client // tmux client (nil in legacy/non-tmux mode)
+	tmuxClient  *tmux.Client // tmux client for session management
 	mu          sync.RWMutex
 }
 
 // SetTmuxClient sets the tmux client for tmux-based session management.
-// When set, sessions are started in tmux windows instead of PTY directly.
 func (m *Manager) SetTmuxClient(tc *tmux.Client) {
 	m.tmuxClient = tc
 }
@@ -414,184 +405,10 @@ func isProcessRunning(s *Session) bool {
 		return false
 	}
 	// tmux mode: process is running if we have a tmux window name
-	if s.TmuxWindowName != "" {
-		return true
-	}
-	// Legacy mode: check PTY
-	return s.PTY != nil
+	return s.TmuxWindowName != ""
 }
 
-// Attach attaches to a session and runs interactively
-func (m *Manager) Attach(id string) error {
-	m.mu.Lock()
-	session, ok := m.sessions[id]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("session %s not found", id)
-	}
-
-	// Start the process if not running
-	if !isProcessRunning(session) {
-		if err := m.startSession(session); err != nil {
-			m.mu.Unlock()
-			return err
-		}
-	}
-	m.mu.Unlock()
-
-	// Run interactive session
-	return m.runInteractive(session)
-}
-
-// AttachToConn attaches a session to a network connection
-func (m *Manager) AttachToConn(id string, conn io.ReadWriter) error {
-	m.mu.Lock()
-	session, ok := m.sessions[id]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("session %s not found", id)
-	}
-
-	if !isProcessRunning(session) {
-		m.mu.Unlock()
-		return fmt.Errorf("session %s is not running", id)
-	}
-
-	// Get references to session resources
-	screenBuffer := session.ScreenBuffer
-	broadcaster := session.Broadcaster
-	ptyFile := session.PTY
-	cmd := session.Cmd
-	m.mu.Unlock()
-
-	// Subscribe to broadcaster for new output
-	if broadcaster == nil {
-		debugLog("[ATTACH] broadcaster is nil!")
-		return fmt.Errorf("broadcaster is nil")
-	}
-	outputCh := broadcaster.Subscribe()
-	debugLog("[ATTACH] subscribed to broadcaster")
-	defer broadcaster.Unsubscribe(outputCh)
-
-	// Send screen buffer to restore the current screen state
-	if screenBuffer != nil {
-		bufferData := screenBuffer.Bytes()
-		debugLog("[ATTACH] screenBuffer size: %d bytes", len(bufferData))
-		if len(bufferData) > 0 {
-			conn.Write(bufferData)
-		}
-	}
-
-	done := make(chan struct{}, 2)
-
-	// Resize command markers
-	resizePrefix := []byte("\x00\x00RESIZE:")
-	resizeSuffix := []byte("\x00\x00")
-
-	// Read from conn and write to PTY (input), handling resize commands
-	go func() {
-		buf := make([]byte, 4096)
-		var pending []byte
-
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				done <- struct{}{}
-				return
-			}
-
-			data := buf[:n]
-			if len(pending) > 0 {
-				data = append(pending, data...)
-				pending = nil
-			}
-
-			// Process data, looking for resize commands
-			for len(data) > 0 {
-				// Check for resize command prefix
-				if idx := bytes.Index(data, resizePrefix); idx >= 0 {
-					// Write any data before the resize command
-					if idx > 0 {
-						ptyFile.Write(data[:idx])
-					}
-
-					// Find the end of the resize command
-					cmdStart := idx + len(resizePrefix)
-					remaining := data[cmdStart:]
-					if endIdx := bytes.Index(remaining, resizeSuffix); endIdx >= 0 {
-						// Parse resize command: cols:rows
-						cmdData := string(remaining[:endIdx])
-						if cols, rows, ok := parseResizeCmd(cmdData); ok {
-							pty.Setsize(ptyFile, &pty.Winsize{
-								Cols: uint16(cols),
-								Rows: uint16(rows),
-							})
-							// Record resize time to prevent false thinking detection
-							m.mu.Lock()
-							if sess, ok := m.sessions[id]; ok {
-								sess.LastResizeTime = time.Now()
-							}
-							m.mu.Unlock()
-							// Send SIGWINCH to trigger TUI redraw
-							if cmd != nil && cmd.Process != nil {
-								cmd.Process.Signal(syscall.SIGWINCH)
-							}
-						}
-						data = remaining[endIdx+len(resizeSuffix):]
-					} else {
-						// Incomplete resize command, save for next read
-						pending = data[idx:]
-						data = nil
-					}
-				} else {
-					// Check if data ends with partial prefix
-					partialMatch := false
-					for i := 1; i < len(resizePrefix) && i <= len(data); i++ {
-						if bytes.HasSuffix(data, resizePrefix[:i]) {
-							pending = data[len(data)-i:]
-							ptyFile.Write(data[:len(data)-i])
-							partialMatch = true
-							break
-						}
-					}
-					if !partialMatch {
-						ptyFile.Write(data)
-					}
-					data = nil
-				}
-			}
-		}
-	}()
-
-	// Read from broadcaster and write to conn (output)
-	go func() {
-		for data := range outputCh {
-			if _, err := conn.Write(data); err != nil {
-				break
-			}
-		}
-		done <- struct{}{}
-	}()
-
-	<-done
-	return nil
-}
-
-// parseResizeCmd parses "cols:rows" format
-func parseResizeCmd(cmd string) (cols, rows int, ok bool) {
-	parts := bytes.Split([]byte(cmd), []byte(":"))
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	c, err1 := strconv.Atoi(string(parts[0]))
-	r, err2 := strconv.Atoi(string(parts[1]))
-	if err1 != nil || err2 != nil {
-		return 0, 0, false
-	}
-	return c, r, true
-}
-
-// startSession starts a session's process (tmux window or PTY).
+// startSession starts a session's process in a tmux window.
 func (m *Manager) startSession(session *Session) error {
 	// Try to detect tmux session if not already connected
 	// (may trigger recovery which sets session to Running)
@@ -602,15 +419,12 @@ func (m *Manager) startSession(session *Session) error {
 		return nil
 	}
 
-	if m.tmuxClient != nil {
-		return m.startSessionTmux(session)
-	}
-	return m.startSessionPTY(session)
+	return m.startSessionTmux(session)
 }
 
 // startSessionTmux starts a session in a tmux window.
 func (m *Manager) startSessionTmux(session *Session) error {
-	// Branch checkout handling (same as PTY mode)
+	// Branch checkout handling
 	if session.Branch != "" && session.WorkDir != "" && !session.IsNewWorktree {
 		currentBranch, err := worktree.GetCurrentBranch(session.WorkDir)
 		if err != nil {
@@ -870,284 +684,6 @@ func (m *Manager) injectPromptTmux(session *Session, promptName string, vars pro
 	debugLog("[PROMPT] Tmux injection complete for '%s'", promptName)
 }
 
-// startSessionPTY starts a session's PTY process (legacy mode).
-func (m *Manager) startSessionPTY(session *Session) error {
-	// Branch checkout handling (v3 design)
-	if session.Branch != "" && session.WorkDir != "" && !session.IsNewWorktree {
-		// Get current branch
-		currentBranch, err := worktree.GetCurrentBranch(session.WorkDir)
-		if err != nil {
-			debugLog("[SESSION] Failed to get current branch: %v", err)
-			// Continue anyway - might not be a git repo
-		} else if currentBranch != session.Branch {
-			if session.ClaudeSessionStarted {
-				// 既に一度起動済み: セッション内でブランチが変更された
-				// チェックアウトせず、現在のブランチ情報でセッションを更新
-				debugLog("[SESSION] Branch changed externally: %s -> %s (skipping checkout, using current branch)",
-					session.Branch, currentBranch)
-				session.Branch = currentBranch
-				session.NewBranch = false
-				m.store.Save(session)
-			} else {
-				// 初回起動: 従来通りチェックアウトを実行
-				hasChanges, err := worktree.HasUncommittedChanges(session.WorkDir)
-				if err != nil {
-					return fmt.Errorf("failed to check uncommitted changes: %w", err)
-				}
-				if hasChanges {
-					return fmt.Errorf("cannot checkout branch %s: uncommitted changes exist in %s", session.Branch, session.WorkDir)
-				}
-
-				if session.NewBranch {
-					// Create and checkout a new branch
-					debugLog("[SESSION] Creating and checking out new branch %s from %s in %s", session.Branch, session.BaseBranch, session.WorkDir)
-					if err := worktree.CreateAndCheckoutBranch(session.WorkDir, session.Branch, session.BaseBranch); err != nil {
-						return fmt.Errorf("failed to create and checkout branch: %w", err)
-					}
-				} else {
-					// Checkout existing branch
-					debugLog("[SESSION] Checking out branch %s in %s", session.Branch, session.WorkDir)
-					if err := worktree.CheckoutBranch(session.WorkDir, session.Branch); err != nil {
-						return fmt.Errorf("failed to checkout branch: %w", err)
-					}
-				}
-			}
-		}
-	}
-
-	// Set trust state in Claude settings to skip trust confirmation dialog
-	if err := ensureClaudeTrustState(session.WorkDir); err != nil {
-		debugLog("[TRUST] Warning: failed to set trust state: %v", err)
-		// Continue anyway - trust confirmation will appear but session can still work
-	}
-
-	// Create command: <shell> -ic "claude [--session-id|--resume <uuid>]"
-	shell := m.configMgr.GetShell()
-	claudeCmd := "claude"
-
-	if session.ClaudeSessionID != "" {
-		if session.ClaudeSessionStarted {
-			// Resume existing Claude session
-			claudeCmd = fmt.Sprintf("claude --resume %s", session.ClaudeSessionID)
-			debugLog("[SESSION] Resuming Claude session: %s", session.ClaudeSessionID)
-		} else {
-			// First start: create new session with specific ID
-			claudeCmd = fmt.Sprintf("claude --session-id %s", session.ClaudeSessionID)
-			debugLog("[SESSION] Starting new Claude session with ID: %s", session.ClaudeSessionID)
-			session.ClaudeSessionStarted = true
-		}
-	}
-
-	c := exec.Command(shell, "-ic", claudeCmd)
-	c.Dir = session.WorkDir
-	c.Env = m.buildEnv()
-
-	// Get terminal size
-	cols, rows := 80, 24
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		w, h, err := term.GetSize(int(os.Stdin.Fd()))
-		if err == nil {
-			cols, rows = w, h
-		}
-	}
-
-	// Start with PTY
-	ptmx, err := pty.StartWithSize(c, &pty.Winsize{
-		Cols: uint16(cols),
-		Rows: uint16(rows),
-	})
-	if err != nil {
-		return err
-	}
-
-	session.PTY = ptmx
-	session.Cmd = c
-	session.Status = StatusRunning
-	session.LastOutputTime = time.Now()
-	session.StartedAt = time.Now()
-
-	// Initialize screen buffer (256KB) and broadcaster
-	session.ScreenBuffer = NewScreenBuffer(256 * 1024)
-	session.Broadcaster = NewBroadcaster()
-
-	// Start goroutine to capture PTY output
-	go m.captureOutput(session)
-
-	// Start goroutine for idle stability detection
-	go m.checkIdleStability(session)
-
-	return nil
-}
-
-// captureOutput reads from PTY and broadcasts to listeners and buffer
-func (m *Manager) captureOutput(session *Session) {
-	buf := make([]byte, 4096)
-	detector := status.NewDetector()
-
-	for {
-		n, err := session.PTY.Read(buf)
-		if err != nil {
-			// Session ended - clean up resources
-			m.mu.Lock()
-			session.Status = StatusStopped
-			// Update LastActiveAt for persistence
-			if !session.LastOutputTime.IsZero() {
-				session.LastActiveAt = session.LastOutputTime
-			} else {
-				session.LastActiveAt = time.Now()
-			}
-			if session.PTY != nil {
-				session.PTY.Close()
-				session.PTY = nil
-			}
-			session.Cmd = nil
-			session.ScreenBuffer = nil
-			// Close broadcaster to notify all listeners
-			if session.Broadcaster != nil {
-				session.Broadcaster.Close()
-				session.Broadcaster = nil
-			}
-			sessionToSave := session
-			m.mu.Unlock()
-			// Persist LastActiveAt
-			m.store.Save(sessionToSave)
-			return
-		}
-		if n > 0 {
-			data := make([]byte, n)
-			copy(data, buf[:n])
-
-			// 前回の出力からの経過時間を取得（idle安定性検出用）
-			m.mu.Lock()
-			timeSinceLastOutput := time.Since(session.LastOutputTime)
-			// 出力を受信した時刻を更新
-			session.LastOutputTime = time.Now()
-			m.mu.Unlock()
-
-			// Write to screen buffer first
-			if session.ScreenBuffer != nil {
-				session.ScreenBuffer.Write(data)
-			}
-
-			// Detect status from recent buffer content (last 4KB)
-			// detector.go filters and uses only last 30 content lines
-			if session.ScreenBuffer != nil {
-				recentContent := session.ScreenBuffer.LastN(4096)
-				if detected := detector.Detect(string(recentContent)); detected != "" {
-					// Trust確認を検出した場合、ステータスをconfirmに更新
-					if detected == status.StatusTrust {
-						m.mu.Lock()
-						oldStatus := session.Status
-						session.Status = StatusConfirm
-						if !session.TrustHandled {
-							session.TrustHandled = true
-							sessionName := session.Name
-							m.mu.Unlock()
-							debugLog("[TRUST] Trust dialog detected for session %s - manual intervention required", sessionName)
-							// TODO: デスクトップ通知を送信
-						} else {
-							m.mu.Unlock()
-						}
-						// ステータス変更をログ出力
-						if oldStatus != StatusConfirm {
-							debugLog("[STATUS] Session %s: %s -> %s", session.Name, oldStatus, StatusConfirm)
-						}
-						// Broadcast to all listeners (Trust画面もクライアントに送信)
-						if session.Broadcaster != nil {
-							session.Broadcaster.Broadcast(data)
-						}
-						continue
-					}
-
-					newStatus := convertStatus(detected)
-
-					// 出力安定性ベースのステータス検出
-					// permission: 即時反映
-					// thinking: idleからの遷移は出力安定後のみ（リサイズ時の誤検出防止）
-					// idle: 出力が一定時間安定している場合のみ反映
-					// error: 起動直後は無視
-					const stabilityTime = 1 * time.Second
-					const startupGracePeriod = 5 * time.Second // 起動直後のエラー誤検出防止
-					m.mu.Lock()
-					oldStatus := session.Status
-					timeSinceStart := time.Since(session.StartedAt)
-
-					// 起動直後はエラー検出を無視（誤検出防止）
-					if newStatus == StatusError && timeSinceStart < startupGracePeriod {
-						// 起動直後のエラーは無視 - runningを維持
-						newStatus = StatusRunning
-					}
-
-					// thinking検出時はリサイズ直後かチェック（idleからの遷移時のみ）
-					// リサイズ時の一時的な再描画でthinkingと誤検出されることを防止
-					const resizeGracePeriod = 500 * time.Millisecond
-					if newStatus == StatusThinking && oldStatus == StatusIdle {
-						timeSinceResize := time.Since(session.LastResizeTime)
-						if timeSinceResize < resizeGracePeriod {
-							// リサイズ直後 - idleを維持
-							newStatus = StatusIdle
-						}
-					}
-
-					// idle検出時は出力安定性をチェック
-					if newStatus == StatusIdle {
-						if timeSinceLastOutput < stabilityTime {
-							// まだ出力が安定していない - 現在のステータスを維持
-							// ただし、初回起動時（ステータスがrunning）の場合はidleに遷移可能
-							if oldStatus != StatusRunning {
-								newStatus = oldStatus
-							}
-						}
-					}
-
-					session.Status = newStatus
-					sessionName := session.Name
-					sessionID := session.ID
-					promptName := session.PromptName
-					promptArgs := session.PromptArgs
-					promptInjected := session.PromptInjected
-					ptyFile := session.PTY
-					repository := session.Repository
-					branch := session.Branch
-					baseBranch := session.BaseBranch
-					workDir := session.WorkDir
-					m.mu.Unlock()
-
-					// Send notifications on status change
-					if oldStatus != newStatus {
-						m.handleStatusChange(sessionID, sessionName, oldStatus, newStatus)
-					}
-
-					// Inject prompt when idle and not yet injected
-					if newStatus == StatusIdle && !promptInjected && promptName != "" && ptyFile != nil {
-						// Mark as injected immediately to prevent duplicate
-						m.mu.Lock()
-						session.PromptInjected = true
-						m.mu.Unlock()
-
-						debugLog("[PROMPT] Triggering prompt injection for session %s, prompt=%s", sessionID, promptName)
-
-						// Run injection in separate goroutine to avoid blocking capture loop
-						go m.injectPrompt(session, promptName, prompt.Variables{
-							Args:       promptArgs,
-							Branch:     branch,
-							Repository: repository,
-							Session:    sessionName,
-							WorkDir:    workDir,
-							BaseBranch: baseBranch,
-						})
-					}
-				}
-			}
-
-			// Broadcast to all listeners
-			if session.Broadcaster != nil {
-				session.Broadcaster.Broadcast(data)
-			}
-		}
-	}
-}
-
 // convertStatus converts status.DetectedStatus to session.Status
 func convertStatus(detected status.DetectedStatus) Status {
 	switch detected {
@@ -1161,90 +697,6 @@ func convertStatus(detected status.DetectedStatus) Status {
 		return StatusError
 	default:
 		return StatusRunning
-	}
-}
-
-// checkIdleStability periodically checks if the session should transition to idle
-// This handles the case where PTY output stops completely (true idle state)
-func (m *Manager) checkIdleStability(session *Session) {
-	detector := status.NewDetector()
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	const idleStabilityTime = 3 * time.Second
-
-	for range ticker.C {
-		m.mu.Lock()
-		// セッションが停止していたら終了
-		if session.Status == StatusStopped || session.PTY == nil {
-			m.mu.Unlock()
-			return
-		}
-
-		// 既にidleなら何もしない
-		if session.Status == StatusIdle {
-			m.mu.Unlock()
-			continue
-		}
-
-		// 出力が安定しているかチェック
-		timeSinceLastOutput := time.Since(session.LastOutputTime)
-		if timeSinceLastOutput < idleStabilityTime {
-			m.mu.Unlock()
-			continue
-		}
-
-		// バッファからidleパターンをチェック
-		screenBuffer := session.ScreenBuffer
-		if screenBuffer == nil {
-			m.mu.Unlock()
-			continue
-		}
-		recentContent := screenBuffer.LastN(4096)
-		m.mu.Unlock()
-
-		detected := detector.Detect(string(recentContent))
-		// 出力が安定していて、thinking/permission/error/trustが検出されない → idleに遷移
-		shouldTransitionToIdle := detected == status.StatusIdle || detected == ""
-		if shouldTransitionToIdle {
-			m.mu.Lock()
-			oldStatus := session.Status
-			session.Status = StatusIdle
-			sessionID := session.ID
-			sessionName := session.Name
-			promptName := session.PromptName
-			promptArgs := session.PromptArgs
-			promptInjected := session.PromptInjected
-			ptyFile := session.PTY
-			repository := session.Repository
-			branch := session.Branch
-			baseBranch := session.BaseBranch
-			workDir := session.WorkDir
-			m.mu.Unlock()
-
-			// 通知を送信
-			if oldStatus != StatusIdle {
-				m.handleStatusChange(sessionID, sessionName, oldStatus, StatusIdle)
-			}
-
-			// プロンプト注入（未注入の場合）
-			if !promptInjected && promptName != "" && ptyFile != nil {
-				m.mu.Lock()
-				session.PromptInjected = true
-				m.mu.Unlock()
-
-				debugLog("[PROMPT] Triggering prompt injection (stability check) for session %s, prompt=%s", sessionID, promptName)
-
-				go m.injectPrompt(session, promptName, prompt.Variables{
-					Args:       promptArgs,
-					Branch:     branch,
-					Repository: repository,
-					Session:    sessionName,
-					WorkDir:    workDir,
-					BaseBranch: baseBranch,
-				})
-			}
-		}
 	}
 }
 
@@ -1269,154 +721,6 @@ func (m *Manager) handleStatusChange(sessionID, sessionName string, oldStatus, n
 	}
 }
 
-// injectPrompt injects a prompt template into the session's PTY
-// This should be called in a separate goroutine to avoid blocking the capture loop
-func (m *Manager) injectPrompt(session *Session, promptName string, vars prompt.Variables) {
-	debugLog("[PROMPT] Starting injection, promptName=%s, args=%s", promptName, vars.Args)
-
-	// Get expanded prompt
-	expandedPrompt, err := m.promptMgr.GetExpanded(promptName, vars)
-	if err != nil {
-		debugLog("[PROMPT] Failed to expand prompt template '%s': %v", promptName, err)
-		return
-	}
-
-	debugLog("[PROMPT] Expanded prompt (%d chars): %s", len(expandedPrompt), expandedPrompt[:min(100, len(expandedPrompt))])
-
-	// Wait for Claude Code to be fully ready for input
-	// Initial idle detection can happen before the UI is fully rendered
-	time.Sleep(1 * time.Second)
-
-	// Get PTY file with lock
-	m.mu.RLock()
-	ptyFile := session.PTY
-	m.mu.RUnlock()
-
-	if ptyFile == nil {
-		debugLog("[PROMPT] PTY is nil, cannot inject prompt")
-		return
-	}
-
-	debugLog("[PROMPT] Writing prompt to PTY...")
-
-	// Write the prompt to PTY character by character with small delays
-	// This simulates typing and ensures Claude Code receives the input properly
-	for _, r := range expandedPrompt {
-		_, err = ptyFile.Write([]byte(string(r)))
-		if err != nil {
-			debugLog("[PROMPT] Failed to write prompt to PTY: %v", err)
-			return
-		}
-		time.Sleep(5 * time.Millisecond) // Small delay between characters
-	}
-
-	// Wait a bit before sending Enter
-	time.Sleep(200 * time.Millisecond)
-
-	// Send Enter to submit the prompt
-	debugLog("[PROMPT] Sending Enter...")
-	ptyFile.Write([]byte("\r"))
-
-	debugLog("[PROMPT] Injection complete for '%s'", promptName)
-}
-
-// buildEnv builds environment variables for the session
-func (m *Manager) buildEnv() []string {
-	env := os.Environ()
-	envMap := make(map[string]bool)
-	for _, e := range env {
-		for i := 0; i < len(e); i++ {
-			if e[i] == '=' {
-				envMap[e[:i]] = true
-				break
-			}
-		}
-	}
-
-	// Ensure TERM is set
-	if !envMap["TERM"] {
-		env = append(env, "TERM=xterm-256color")
-	}
-	if !envMap["COLORTERM"] {
-		env = append(env, "COLORTERM=truecolor")
-	}
-	if !envMap["FORCE_COLOR"] {
-		env = append(env, "FORCE_COLOR=1")
-	}
-
-	// Remove problematic variables
-	removeVars := map[string]bool{
-		"TMUX": true, "TMUX_PANE": true, "STY": true,
-		"WINDOW": true, "WINDOWID": true, "TERMCAP": true,
-		"COLUMNS": true, "LINES": true, "CI": true,
-	}
-
-	result := make([]string, 0, len(env))
-	for _, e := range env {
-		varName := ""
-		for i := 0; i < len(e); i++ {
-			if e[i] == '=' {
-				varName = e[:i]
-				break
-			}
-		}
-		if !removeVars[varName] {
-			result = append(result, e)
-		}
-	}
-
-	return result
-}
-
-// runInteractive runs an interactive session
-func (m *Manager) runInteractive(session *Session) error {
-	// Handle PTY size
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGWINCH)
-	go func() {
-		for range ch {
-			if err := pty.InheritSize(os.Stdin, session.PTY); err != nil {
-				debugLog("error resizing pty: %s", err)
-			}
-		}
-	}()
-	ch <- syscall.SIGWINCH
-	defer func() { signal.Stop(ch); close(ch) }()
-
-	// Set stdin in raw mode
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
-
-	// Copy stdin to PTY
-	go func() {
-		buf := make([]byte, 256)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if n > 0 {
-				session.PTY.Write(buf[:n])
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// Copy PTY to stdout
-	_, _ = io.Copy(os.Stdout, session.PTY)
-
-	// Session ended
-	m.mu.Lock()
-	session.Status = StatusStopped
-	session.PTY = nil
-	session.Cmd = nil
-	m.mu.Unlock()
-
-	return nil
-}
-
 // Kill terminates a session
 func (m *Manager) Kill(id string) error {
 	m.mu.Lock()
@@ -1434,13 +738,6 @@ func (m *Manager) Kill(id string) error {
 		session.TmuxWindowName = ""
 	}
 
-	if session.Cmd != nil && session.Cmd.Process != nil {
-		session.Cmd.Process.Kill()
-	}
-	if session.PTY != nil {
-		session.PTY.Close()
-	}
-
 	session.Status = StatusStopped
 	// Update LastActiveAt for persistence
 	if !session.LastOutputTime.IsZero() {
@@ -1448,8 +745,6 @@ func (m *Manager) Kill(id string) error {
 	} else {
 		session.LastActiveAt = time.Now()
 	}
-	session.PTY = nil
-	session.Cmd = nil
 
 	m.mu.Unlock()
 	// Persist LastActiveAt
@@ -1474,14 +769,6 @@ func (m *Manager) Delete(id string) error {
 		m.tmuxClient.KillWindow(windowTarget)
 	}
 
-	// Kill if running
-	if session.Cmd != nil && session.Cmd.Process != nil {
-		session.Cmd.Process.Kill()
-	}
-	if session.PTY != nil {
-		session.PTY.Close()
-	}
-
 	// Remove from store
 	if err := m.store.Delete(id); err != nil {
 		return err
@@ -1489,94 +776,6 @@ func (m *Manager) Delete(id string) error {
 
 	delete(m.sessions, id)
 	return nil
-}
-
-// WriteToSession writes data to a session's PTY (e.g., user prompt input).
-func (m *Manager) WriteToSession(id string, data []byte) error {
-	m.mu.RLock()
-	session, ok := m.sessions[id]
-	if !ok {
-		m.mu.RUnlock()
-		return fmt.Errorf("session %s not found", id)
-	}
-
-	if !isProcessRunning(session) {
-		m.mu.RUnlock()
-		return fmt.Errorf("session %s is not running", id)
-	}
-
-	ptyFile := session.PTY
-	m.mu.RUnlock()
-
-	if ptyFile == nil {
-		return fmt.Errorf("session %s has no PTY", id)
-	}
-
-	_, err := ptyFile.Write(data)
-	return err
-}
-
-// ResizePTY resizes a session's PTY to the given dimensions.
-func (m *Manager) ResizePTY(id string, cols, rows int) error {
-	m.mu.RLock()
-	session, ok := m.sessions[id]
-	if !ok {
-		m.mu.RUnlock()
-		return fmt.Errorf("session %s not found", id)
-	}
-
-	if !isProcessRunning(session) {
-		m.mu.RUnlock()
-		return fmt.Errorf("session %s is not running", id)
-	}
-
-	ptyFile := session.PTY
-	m.mu.RUnlock()
-
-	if ptyFile == nil {
-		return fmt.Errorf("session %s has no PTY", id)
-	}
-
-	return pty.Setsize(ptyFile, &pty.Winsize{
-		Cols: uint16(cols),
-		Rows: uint16(rows),
-	})
-}
-
-// SubscribeOutput subscribes to a session's PTY output (read-only, no input).
-// It sends the current screen buffer contents, then streams new output via the writer.
-// The done channel is closed when the caller should stop (e.g., session ended).
-// Returns the broadcaster channel and a cleanup function.
-func (m *Manager) SubscribeOutput(id string) (screenData []byte, outputCh chan []byte, cleanup func(), err error) {
-	m.mu.RLock()
-	session, ok := m.sessions[id]
-	if !ok {
-		m.mu.RUnlock()
-		return nil, nil, nil, fmt.Errorf("session %s not found", id)
-	}
-
-	broadcaster := session.Broadcaster
-	screenBuffer := session.ScreenBuffer
-	m.mu.RUnlock()
-
-	// Get current screen buffer content
-	if screenBuffer != nil {
-		screenData = screenBuffer.Bytes()
-	}
-
-	// Subscribe to broadcaster for new output
-	if broadcaster != nil {
-		outputCh = broadcaster.Subscribe()
-		cleanup = func() {
-			broadcaster.Unsubscribe(outputCh)
-		}
-	} else {
-		// No broadcaster (session not running) - return nil channel
-		outputCh = nil
-		cleanup = func() {}
-	}
-
-	return screenData, outputCh, cleanup, nil
 }
 
 // ClaudeSettings represents the structure of ~/.claude/settings.local.json

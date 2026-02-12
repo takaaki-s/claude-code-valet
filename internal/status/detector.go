@@ -155,8 +155,16 @@ func (d *Detector) Detect(text string) DetectedStatus {
 	// - idle: use lastFewLines (2 lines) because prompt line may be followed by "? for shortcuts"
 	for _, p := range d.patterns {
 		if p.Status == StatusIdle {
-			// Idle detection: check last few lines (prompt may be followed by hint text)
-			// Skip if thinking pattern is present (thinking takes priority)
+			// まず最終行でidle検出を試みる（最優先）
+			// 最終行にプロンプトがあればidle確定（上の行に"esc to interrupt"が残っていても）
+			for _, pattern := range p.Patterns {
+				if strings.Contains(lastContentLine, pattern) {
+					debugLog("Detected %s (pattern: %q in last content line)", p.Status, pattern)
+					return p.Status
+				}
+			}
+			// 最終行にプロンプトがない場合、lastFewLinesでチェック
+			// ただし "esc to interrupt" がある場合はthinkingと判定させるためスキップ
 			if strings.Contains(lastFewLines, "esc to interrupt") {
 				continue
 			}
