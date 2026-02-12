@@ -80,7 +80,11 @@ func (m *Manager) recoverTmuxSessionsLocked() {
 			continue
 		}
 
-		target := tmux.WindowTarget(session.TmuxWindowName, 0)
+		// Use pane ID if available (stable across join-pane reordering)
+		target := session.TmuxPaneID
+		if target == "" {
+			target = tmux.WindowTarget(session.TmuxWindowName, 0)
+		}
 
 		// Check if pane is dead — keep TmuxWindowName (window alive via remain-on-exit)
 		if m.tmuxClient.IsPaneDead(target) {
@@ -485,8 +489,12 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	if session.TmuxWindowName != "" {
 		existingTarget := tmux.SessionName + ":" + session.TmuxWindowName
 		if _, err := m.tmuxClient.PaneCount(existingTarget); err == nil {
-			// Window exists → RespawnPane on pane 0 to revive CC in place
-			target := tmux.WindowTarget(session.TmuxWindowName, 0)
+			// Window exists → RespawnPane on CC pane to revive it in place
+			// Use pane ID (stable) instead of pane index (changes when TUI joins via join-pane)
+			target := session.TmuxPaneID
+			if target == "" {
+				target = tmux.WindowTarget(session.TmuxWindowName, 0)
+			}
 			if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
 				session.Status = StatusRunning
 				session.LastOutputTime = time.Now()
@@ -513,6 +521,11 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	target := tmux.WindowTarget(windowName, 0)
 	m.tmuxClient.TagManagedPane(target)
 
+	// Record CC pane's unique ID for capture-pane (survives pane reordering by join-pane)
+	if paneID, err := m.tmuxClient.GetPaneID(target); err == nil {
+		session.TmuxPaneID = paneID
+	}
+
 	session.TmuxWindowName = windowName
 	session.Status = StatusRunning
 	session.LastOutputTime = time.Now()
@@ -533,7 +546,12 @@ func (m *Manager) captureOutputTmux(session *Session) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	target := tmux.WindowTarget(session.TmuxWindowName, 0)
+	// Use pane ID (%N) if available; falls back to window.pane index.
+	// Pane IDs are stable even when join-pane reorders pane indices.
+	target := session.TmuxPaneID
+	if target == "" {
+		target = tmux.WindowTarget(session.TmuxWindowName, 0)
+	}
 	consecutiveErrors := 0
 
 	for range ticker.C {
@@ -731,8 +749,13 @@ func (m *Manager) Kill(id string) error {
 		return fmt.Errorf("session %s not found", id)
 	}
 
-	// Kill tmux window if exists
-	if m.tmuxClient != nil && session.TmuxWindowName != "" {
+	// Kill CC pane (not the whole window) to avoid destroying TUI if it's joined
+	if m.tmuxClient != nil && session.TmuxPaneID != "" {
+		m.tmuxClient.KillPane(session.TmuxPaneID)
+		session.TmuxPaneID = ""
+		session.TmuxWindowName = ""
+	} else if m.tmuxClient != nil && session.TmuxWindowName != "" {
+		// Fallback: no pane ID, kill the whole window
 		windowTarget := tmux.SessionName + ":" + session.TmuxWindowName
 		m.tmuxClient.KillWindow(windowTarget)
 		session.TmuxWindowName = ""
@@ -763,8 +786,11 @@ func (m *Manager) Delete(id string) error {
 		return fmt.Errorf("session %s not found", id)
 	}
 
-	// Kill tmux window if exists
-	if m.tmuxClient != nil && session.TmuxWindowName != "" {
+	// Kill CC pane (not the whole window) to avoid destroying TUI if it's joined
+	if m.tmuxClient != nil && session.TmuxPaneID != "" {
+		m.tmuxClient.KillPane(session.TmuxPaneID)
+	} else if m.tmuxClient != nil && session.TmuxWindowName != "" {
+		// Fallback: no pane ID, kill the whole window
 		windowTarget := tmux.SessionName + ":" + session.TmuxWindowName
 		m.tmuxClient.KillWindow(windowTarget)
 	}

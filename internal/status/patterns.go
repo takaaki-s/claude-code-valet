@@ -55,7 +55,9 @@ func DefaultPatterns() []Pattern {
 			},
 		},
 		// Thinking/busy - Claude Code activity indicators
-		// Spinner text patterns indicate thinking state
+		// Note: Active spinner characters (Dingbats asterisks U+2731-U+273F, except ✻)
+		// are detected by containsActiveSpinner() in detector.go, not by these string patterns.
+		// The patterns below catch spinner text and "esc to interrupt" in lastFewLines.
 		{
 			Status: StatusThinking,
 			Patterns: []string{
@@ -68,7 +70,9 @@ func DefaultPatterns() []Pattern {
 				"Loading…",        // Spinner text
 				"Reasoning…",      // Spinner text
 				"Analyzing…",      // Spinner text
-				"✻",               // Spinner character
+				"Mustering…",      // Spinner text
+				"Cogitating…",     // Spinner text
+				"Crunching…",      // Spinner text
 			},
 		},
 		// Error detection

@@ -428,3 +428,13 @@ func (c *Client) GetPaneID(target string) (string, error) {
 func (c *Client) ZoomPane(target string) error {
 	return c.runSilent("resize-pane", "-Z", "-t", target)
 }
+
+// KillPane kills a specific pane. If it's the last pane in the window, the window is also destroyed.
+func (c *Client) KillPane(target string) error {
+	return c.runSilent("kill-pane", "-t", target)
+}
+
+// GetPaneWindowName returns the window name that contains the given pane.
+func (c *Client) GetPaneWindowName(paneID string) (string, error) {
+	return c.run("display-message", "-t", paneID, "-p", "#{window_name}")
+}

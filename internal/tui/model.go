@@ -205,6 +205,7 @@ type Model struct {
 	tmuxClient           *tmux.Client // tmux client (nil in legacy mode)
 	tuiPaneID            string       // TUIペインの固有ID (例: "%42")
 	currentSessionWindow string       // TUIが現在いるセッションwindow名 ("" = UIウィンドウ)
+	switchSeq            int          // カーソル移動デバウンス用シーケンス番号
 }
 
 // NewModel creates a new TUI model
@@ -381,6 +382,32 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+// cursorSettledMsg is sent after a debounce delay when the cursor stops moving.
+type cursorSettledMsg struct {
+	seq int
+}
+
+func cursorSettledCmd(seq int) tea.Cmd {
+	return tea.Tick(150*time.Millisecond, func(t time.Time) tea.Msg {
+		return cursorSettledMsg{seq: seq}
+	})
+}
+
+// evacuateTUIIfNeeded checks if TUI is in the given session window and evacuates it.
+// Queries tmux directly to avoid stale state issues with m.currentSessionWindow.
+func (m *Model) evacuateTUIIfNeeded(sessionWindowName string) {
+	if m.tmuxClient == nil || m.tuiPaneID == "" || sessionWindowName == "" {
+		return
+	}
+	windowName, err := m.tmuxClient.GetPaneWindowName(m.tuiPaneID)
+	if err != nil || windowName != sessionWindowName {
+		return
+	}
+	m.tmuxClient.BreakPane(m.tuiPaneID, true, tmux.UIWindowName)
+	m.currentSessionWindow = ""
+	m.tmuxClient.UnsetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW")
+}
+
 // switchToSession moves the TUI sidebar to the given session's tmux window.
 // Each session has its own tmux window; the TUI pane floats between them via join-pane.
 func (m *Model) switchToSession(sessionID string) {
@@ -448,15 +475,11 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.confirmDelete {
 			switch msg.String() {
 			case "y", "Y", "enter":
-				// If TUI is in the session's window being deleted, evacuate to UI window first
-				if m.tmuxClient != nil && m.tuiPaneID != "" {
-					for _, s := range m.sessions {
-						if s.ID == m.deleteTargetID && s.TmuxWindowName != "" && m.currentSessionWindow == s.TmuxWindowName {
-							m.tmuxClient.BreakPane(m.tuiPaneID, true, tmux.UIWindowName)
-							m.currentSessionWindow = ""
-							m.tmuxClient.UnsetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW")
-							break
-						}
+				// TUIが対象セッションのウィンドウにいる場合、先にUIウィンドウに退避
+				for _, s := range m.sessions {
+					if s.ID == m.deleteTargetID {
+						m.evacuateTUIIfNeeded(s.TmuxWindowName)
+						break
 					}
 				}
 				if err := m.client.Delete(m.deleteTargetID); err != nil {
@@ -469,7 +492,7 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursor >= len(newPageSessions) && m.cursor > 0 {
 					m.cursor--
 				}
-				return m, m.fetchSessions
+				return m, tea.Batch(tea.ClearScreen, m.fetchSessions)
 			case "n", "N", "esc":
 				m.confirmDelete = false
 				m.deleteTargetID = ""
@@ -495,16 +518,19 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor > 0 {
 				m.cursor--
 			}
-			return m, nil
+			m.switchSeq++
+			return m, cursorSettledCmd(m.switchSeq)
 
 		case key.Matches(msg, m.keys.Down):
 			pageSessions := m.getPageSessions()
 			if m.cursor < len(pageSessions)-1 {
 				m.cursor++
 			}
-			return m, nil
+			m.switchSeq++
+			return m, cursorSettledCmd(m.switchSeq)
 
 		case key.Matches(msg, m.keys.Enter):
+			m.switchSeq++ // デバウンス中のswitchをキャンセル
 			pageSessions := m.getPageSessions()
 			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 				sess := pageSessions[m.cursor]
@@ -539,6 +565,10 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.currentSessionWindow = ""
 					}
 					m.switchToSession(sess.ID)
+					// セッション切り替え後、右ペイン（ワークスペース）にフォーカスを移動
+					if m.currentSessionWindow != "" {
+						m.tmuxClient.SelectPaneRight()
+					}
 					return m, m.fetchSessions
 				}
 			}
@@ -570,10 +600,13 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pageSessions := m.getPageSessions()
 			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 				sess := pageSessions[m.cursor]
+				// TUIが対象セッションのウィンドウにいる場合、先にUIウィンドウに退避
+				// tmuxに直接問い合わせることで、m.currentSessionWindowの状態ズレを回避
+				m.evacuateTUIIfNeeded(sess.TmuxWindowName)
 				if err := m.client.Kill(sess.ID); err != nil {
 					m.err = err
 				}
-				return m, m.fetchSessions
+				return m, tea.Batch(tea.ClearScreen, m.fetchSessions)
 			}
 
 		case key.Matches(msg, m.keys.Delete):
@@ -636,6 +669,17 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case cursorSettledMsg:
+		if msg.seq != m.switchSeq {
+			return m, nil
+		}
+		pageSessions := m.getPageSessions()
+		if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
+			sess := pageSessions[m.cursor]
+			m.switchToSession(sess.ID)
+		}
+		return m, nil
+
 	case errMsg:
 		m.err = msg
 
@@ -670,7 +714,8 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.tmuxClient != nil && m.tuiPaneID != "" {
 				m.tmuxClient.ZoomPane(m.tuiPaneID)
 			}
-			return m, nil
+			// ClearScreenでzoom解除後のペインリサイズに合わせて再描画
+			return m, tea.ClearScreen
 
 		case "ctrl+b":
 			// Toggle new branch mode (available for both existing and new worktree)
@@ -1585,14 +1630,14 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 	if sess.Status == session.StatusError && sess.ErrorMessage != "" {
 		errMsg := truncateString(sess.ErrorMessage, width-4)
 		if selected {
-			errLine := "  -- " + errMsg
+			errLine := "  └─ " + errMsg
 			errPadding := width - lipgloss.Width(errLine)
 			if errPadding > 0 {
 				errLine += strings.Repeat(" ", errPadding)
 			}
 			b.WriteString(selectedItemStyle.Render(errLine))
 		} else {
-			b.WriteString("  -- " + lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
+			b.WriteString("  └─ " + lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
 		}
 		b.WriteString("\n")
 	} else {
@@ -1610,11 +1655,11 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 			details = append(details, workDir)
 		}
 		if len(details) > 0 {
-			detailStr := strings.Join(details, " | ")
-			// Use | instead of tree chars if we have last messages to show
-			lineChar := "--"
+			detailStr := strings.Join(details, " │ ")
+			// Use ├─ if we have last messages to show, └─ if this is the last line
+			lineChar := "└─"
 			if sess.LastUserMessage != "" || sess.LastAssistantMessage != "" {
-				lineChar = "|-"
+				lineChar = "├─"
 			}
 			detailStr = truncateString(detailStr, width-6)
 			if selected {
@@ -1632,13 +1677,13 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 
 		// Show last user message (line 3)
 		if sess.LastUserMessage != "" {
-			// Determine line prefix
-			linePrefix := "--"
+			// Determine line prefix: ├─ if assistant message follows, └─ if last line
+			linePrefix := "└─"
 			if sess.LastAssistantMessage != "" {
-				linePrefix = "|-"
+				linePrefix = "├─"
 			}
 
-			prefix := "  " + linePrefix + " U: "
+			prefix := "  " + linePrefix + " 👤 "
 			prefixWidth := lipgloss.Width(prefix)
 			msgWidth := width - prefixWidth
 			if msgWidth < 10 {
@@ -1654,14 +1699,14 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 				}
 				b.WriteString(selectedItemStyle.Render(msgLine))
 			} else {
-				b.WriteString("  " + linePrefix + " " + helpStyle.Render("U: "+msgStr))
+				b.WriteString("  " + linePrefix + " " + helpStyle.Render("👤 "+msgStr))
 			}
 			b.WriteString("\n")
 		}
 
 		// Show last assistant message (line 4)
 		if sess.LastAssistantMessage != "" {
-			prefix := "  -- A: "
+			prefix := "  └─ 🤖 "
 			prefixWidth := lipgloss.Width(prefix)
 			msgWidth := width - prefixWidth
 			if msgWidth < 10 {
@@ -1677,7 +1722,7 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 				}
 				b.WriteString(selectedItemStyle.Render(msgLine))
 			} else {
-				b.WriteString("  -- " + helpStyle.Render("A: "+msgStr))
+				b.WriteString("  └─ " + helpStyle.Render("🤖 "+msgStr))
 			}
 			b.WriteString("\n")
 		}
@@ -1848,23 +1893,23 @@ func buildStatusSummary(sessions []session.Info) string {
 func getStatusDisplay(status session.Status) (icon, label string, style lipgloss.Style) {
 	switch status {
 	case session.StatusThinking:
-		return "*", "THINKING", thinkingStyle
+		return "⚡", "THINKING", thinkingStyle
 	case session.StatusPermission:
 		return "?", "PERMISSION", permissionStyle
 	case session.StatusRunning:
-		return ">", "RUNNING", runningStyle
+		return "▶", "RUNNING", runningStyle
 	case session.StatusCreating:
 		return "+", "CREATING", creatingStyle
 	case session.StatusQueued:
-		return ".", "QUEUED", queuedStyle
+		return "…", "QUEUED", queuedStyle
 	case session.StatusIdle:
-		return "o", "IDLE", idleStyle
+		return "○", "IDLE", idleStyle
 	case session.StatusStopped:
-		return "#", "STOPPED", stoppedStyle
+		return "■", "STOPPED", stoppedStyle
 	case session.StatusConfirm:
-		return "!", "CONFIRM", confirmStyle
+		return "⚠", "CONFIRM", confirmStyle
 	case session.StatusError:
-		return "x", "ERROR", errorStatusStyle
+		return "✗", "ERROR", errorStatusStyle
 	default:
 		return "?", "UNKNOWN", stoppedStyle
 	}

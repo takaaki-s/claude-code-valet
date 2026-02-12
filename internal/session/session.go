@@ -51,6 +51,7 @@ type Session struct {
 
 	// tmux integration
 	TmuxWindowName string `json:"tmux_window_name,omitempty"` // tmux window name for this session
+	TmuxPaneID     string `json:"tmux_pane_id,omitempty"`     // CC pane ID (e.g., "%42") for capture-pane
 
 	// Runtime fields (not persisted)
 	PromptInjected bool      `json:"-"` // プロンプト注入済みか

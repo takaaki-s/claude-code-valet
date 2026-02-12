@@ -43,6 +43,18 @@ func debugLog(format string, args ...interface{}) {
 	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
+// containsActiveSpinner checks if text contains any active spinner character used by Claude Code.
+// Claude Code rotates through Unicode Dingbats asterisks (U+2731-U+273F) as spinner icons.
+// ✻ (U+273B) is excluded because it's the completed/summary form (e.g., "✻ Crunched for 2m 12s").
+func containsActiveSpinner(text string) bool {
+	for _, r := range text {
+		if r >= 0x2731 && r <= 0x273F && r != 0x273B {
+			return true
+		}
+	}
+	return false
+}
+
 // Detector detects session status from PTY output
 type Detector struct {
 	patterns []Pattern
@@ -150,13 +162,25 @@ func (d *Detector) Detect(text string) DetectedStatus {
 
 	// Check patterns in priority order: permission > thinking > error > idle
 	// - permission, trust: use recentLines (30 lines)
-	// - thinking: use lastFewLines (2 lines) to avoid stale spinner messages
+	// - thinking: use recentLines (30 lines) for active spinner ✶, lastFewLines (2 lines) for other patterns
 	// - error: use lastFewLines (2 lines) to avoid false positives from code output
-	// - idle: use lastFewLines (2 lines) because prompt line may be followed by "? for shortcuts"
+	// - idle: use lastFewLines (2 lines), but suppress if active thinking (✶) in recentLines
+	//
+	// Active spinner detection:
+	//   Claude Code rotates through Dingbats asterisks (U+2731-U+273F) as spinner icons.
+	//   ✻ (U+273B) is excluded — it's the completed summary form (e.g., "✻ Crunched for 2m 12s").
+	//   containsActiveSpinner() checks for any char in the range except ✻.
+	activeThinking := containsActiveSpinner(recentLines) || strings.Contains(recentLines, "esc to interrupt")
+
 	for _, p := range d.patterns {
 		if p.Status == StatusIdle {
-			// まず最終行でidle検出を試みる（最優先）
-			// 最終行にプロンプトがあればidle確定（上の行に"esc to interrupt"が残っていても）
+			// Claude Code always shows ❯ prompt at the bottom of the UI,
+			// even during thinking. Suppress idle if active thinking is detected.
+			if activeThinking {
+				debugLog("Skipping idle detection: active thinking (spinner/esc) in recent lines")
+				continue
+			}
+			// まず最終行でidle検出を試みる
 			for _, pattern := range p.Patterns {
 				if strings.Contains(lastContentLine, pattern) {
 					debugLog("Detected %s (pattern: %q in last content line)", p.Status, pattern)
@@ -164,10 +188,6 @@ func (d *Detector) Detect(text string) DetectedStatus {
 				}
 			}
 			// 最終行にプロンプトがない場合、lastFewLinesでチェック
-			// ただし "esc to interrupt" がある場合はthinkingと判定させるためスキップ
-			if strings.Contains(lastFewLines, "esc to interrupt") {
-				continue
-			}
 			for _, pattern := range p.Patterns {
 				if strings.Contains(lastFewLines, pattern) {
 					debugLog("Detected %s (pattern: %q in last few lines)", p.Status, pattern)
@@ -178,13 +198,18 @@ func (d *Detector) Detect(text string) DetectedStatus {
 		}
 
 		if p.Status == StatusThinking {
-			// Thinking detection: use lastFewLines (last 2 lines) only
-			// This prevents false positives from old spinner messages in the buffer
+			// Check lastFewLines first (standard spinner text, "esc to interrupt")
 			for _, pattern := range p.Patterns {
 				if strings.Contains(lastFewLines, pattern) {
 					debugLog("Detected %s (pattern: %q in last 2 lines)", p.Status, pattern)
 					return p.Status
 				}
+			}
+			// Also check recentLines for active spinner (Dingbats asterisks U+2731-U+273F, except ✻)
+			// ❯ prompt at bottom pushes spinner out of lastFewLines, but it's still in recentLines.
+			if containsActiveSpinner(recentLines) {
+				debugLog("Detected %s (active spinner in recent lines)", p.Status)
+				return p.Status
 			}
 			continue
 		}
@@ -211,6 +236,15 @@ func (d *Detector) Detect(text string) DetectedStatus {
 		}
 
 		// Other statuses (permission, trust): check recent lines (30 lines)
+		// Skip if idle prompt is present — Claude may discuss permissions/trust
+		// in its output while waiting for input (e.g., "approved", "permit" in text)
+		if p.Status == StatusPermission {
+			hasIdlePrompt := strings.Contains(lastFewLines, "❯") || strings.Contains(lastFewLines, "> ")
+			if hasIdlePrompt {
+				debugLog("Skipping permission detection: idle prompt found")
+				continue
+			}
+		}
 		for _, pattern := range p.Patterns {
 			if strings.Contains(recentLines, pattern) {
 				debugLog("Detected %s (pattern: %q)", p.Status, pattern)
