@@ -206,6 +206,9 @@ type Model struct {
 	tuiPaneID            string       // TUIペインの固有ID (例: "%42")
 	currentSessionWindow string       // TUIが現在いるセッションwindow名 ("" = UIウィンドウ)
 	switchSeq            int          // カーソル移動デバウンス用シーケンス番号
+
+	// Focus after create
+	focusSessionID string // 作成後にフォーカスするセッションID
 }
 
 // NewModel creates a new TUI model
@@ -664,7 +667,19 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionsMsg:
 		m.sessions = msg
 		m.err = nil
-		if m.cursor >= len(m.sessions) && m.cursor > 0 {
+		// 作成直後のセッションにフォーカス＋右ペイン切り替え
+		if m.focusSessionID != "" {
+			itemsPerPage := m.getItemsPerPage()
+			for i, s := range m.sessions {
+				if s.ID == m.focusSessionID {
+					m.currentPage = i / itemsPerPage
+					m.cursor = i % itemsPerPage
+					m.switchToSession(s.ID)
+					break
+				}
+			}
+			m.focusSessionID = ""
+		} else if m.cursor >= len(m.sessions) && m.cursor > 0 {
 			m.cursor = len(m.sessions) - 1
 		}
 		return m, nil
@@ -1372,7 +1387,7 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 		worktreeName := m.worktreeInput.Value()
 
 		// Use async session creation (worktree creation happens in background)
-		_, err := m.client.NewWithOptions(daemon.NewOptions{
+		info, err := m.client.NewWithOptions(daemon.NewOptions{
 			Name:          name,
 			Start:         true,
 			Async:         true, // Returns immediately with creating status
@@ -1388,6 +1403,7 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 		if err != nil {
 			m.err = err
 		} else {
+			m.focusSessionID = info.ID
 			// 成功時に使用したリポジトリを記憶
 			if m.stateMgr != nil {
 				m.stateMgr.SetLastUsedRepository(repoName)
@@ -1407,7 +1423,7 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 			baseBranch = m.baseBranchInput.Value()
 		}
 
-		_, err := m.client.NewWithOptions(daemon.NewOptions{
+		info, err := m.client.NewWithOptions(daemon.NewOptions{
 			Name:          name,
 			WorkDir:       selectedWt.Path,
 			Start:         true,
@@ -1422,6 +1438,7 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 		if err != nil {
 			m.err = err
 		} else {
+			m.focusSessionID = info.ID
 			// 成功時に使用したリポジトリを記憶
 			if m.stateMgr != nil {
 				m.stateMgr.SetLastUsedRepository(repoName)
