@@ -209,6 +209,13 @@ type Model struct {
 
 	// Focus after create
 	focusSessionID string // 作成後にフォーカスするセッションID
+
+	// Reswitch after delete/kill
+	needsReswitch bool // 削除/Kill後にカーソル位置のセッションに再接続
+
+	// Processing indicator
+	processingMsg    string // 処理中メッセージ（空でない時はオーバーレイ表示）
+	waitingForResize bool   // WindowSizeMsg到着を待っている（JoinPane後のリサイズ完了待ち）
 }
 
 // NewModel creates a new TUI model
@@ -370,6 +377,13 @@ type sessionsMsg []session.Info
 type errMsg error
 type tickMsg time.Time
 
+// createCompleteMsg is sent when async session creation finishes
+type createCompleteMsg struct {
+	sessionID string
+	sessions  []session.Info
+	err       error
+}
+
 // Commands
 func (m *Model) fetchSessions() tea.Msg {
 	sessions, err := m.client.List()
@@ -393,6 +407,16 @@ type cursorSettledMsg struct {
 func cursorSettledCmd(seq int) tea.Cmd {
 	return tea.Tick(150*time.Millisecond, func(t time.Time) tea.Msg {
 		return cursorSettledMsg{seq: seq}
+	})
+}
+
+// resizeSettledMsg is sent after a delay to allow WindowSizeMsg to arrive
+// after tmux pane operations (ZoomPane, JoinPane).
+type resizeSettledMsg struct{}
+
+func resizeSettledCmd() tea.Cmd {
+	return tea.Tick(150*time.Millisecond, func(t time.Time) tea.Msg {
+		return resizeSettledMsg{}
 	})
 }
 
@@ -460,6 +484,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if msg, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width = msg.Width
 		m.height = msg.Height
+		// JoinPane/ZoomPane後のリサイズ完了を検知
+		// WindowSizeMsgが届いた = ペインサイズが確定した → processingMsgをクリアして再描画
+		if m.waitingForResize {
+			m.waitingForResize = false
+			m.processingMsg = ""
+			return m, tea.ClearScreen
+		}
+	}
+
+	// 処理中はキー入力を無視し、完了メッセージのみ処理
+	if m.processingMsg != "" {
+		switch msg.(type) {
+		case tea.KeyMsg:
+			return m, nil
+		}
+	}
+
+	// モードをまたぐメッセージはルーティング前に処理
+	switch msg := msg.(type) {
+	case createCompleteMsg:
+		if msg.err != nil {
+			m.processingMsg = ""
+			m.err = msg.err
+			// エラー時はModeCreateに留まる
+			return m, nil
+		}
+		m.mode = ModeList
+		m.err = nil
+		// ZoomPaneはここでは呼ばない。sessionsMsg内でJoinPaneと一緒に実行する。
+		// こうすることで、ZoomPane(unzoom)+JoinPaneが同一Updateサイクルで実行され、
+		// 最後のWindowSizeMsgが最終的なペインサイズを反映する。
+		m.focusSessionID = msg.sessionID
+		return m, tea.Batch(m.fetchSessions, tickCmd())
 	}
 
 	// Mode-specific handling
@@ -478,24 +535,62 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.confirmDelete {
 			switch msg.String() {
 			case "y", "Y", "enter":
-				// TUIが対象セッションのウィンドウにいる場合、先にUIウィンドウに退避
-				for _, s := range m.sessions {
-					if s.ID == m.deleteTargetID {
-						m.evacuateTUIIfNeeded(s.TmuxWindowName)
+				m.processingMsg = "Deleting..."
+				m.confirmDelete = false
+				m.needsReswitch = true
+
+				// Cmd用に必要な値をキャプチャ
+				deleteID := m.deleteTargetID
+				m.deleteTargetID = ""
+				m.deleteTargetName = ""
+
+				// 次セッションのwindow名を事前取得（Cmd内でJoinPaneに使う）
+				pageSessions := m.getPageSessions()
+				var nextWindowName, deletedWindowName string
+				for i, s := range pageSessions {
+					if s.ID == deleteID {
+						deletedWindowName = s.TmuxWindowName
+						var nextIdx int
+						if i+1 < len(pageSessions) {
+							nextIdx = i + 1
+						} else if i > 0 {
+							nextIdx = i - 1
+						} else {
+							break
+						}
+						nextWindowName = pageSessions[nextIdx].TmuxWindowName
 						break
 					}
 				}
-				if err := m.client.Delete(m.deleteTargetID); err != nil {
-					m.err = err
+
+				tmuxClient := m.tmuxClient
+				tuiPaneID := m.tuiPaneID
+				client := m.client
+
+				return m, func() tea.Msg {
+					// 次セッションに先に切り替え（画面崩れ回避）
+					if tmuxClient != nil && tuiPaneID != "" && nextWindowName != "" {
+						target := tmux.WindowTarget(nextWindowName, 0)
+						tmuxClient.JoinPane(tuiPaneID, target, true, 25, true, true)
+					}
+					// フォールバック: TUIがまだ削除対象のウィンドウにいればUIウィンドウに退避
+					if tmuxClient != nil && tuiPaneID != "" && deletedWindowName != "" {
+						wn, err := tmuxClient.GetPaneWindowName(tuiPaneID)
+						if err == nil && wn == deletedWindowName {
+							tmuxClient.BreakPane(tuiPaneID, true, tmux.UIWindowName)
+						}
+					}
+					// 削除RPC
+					if err := client.Delete(deleteID); err != nil {
+						return errMsg(fmt.Errorf("delete failed: %w", err))
+					}
+					// セッション一覧取得
+					sessions, err := client.List()
+					if err != nil {
+						return errMsg(err)
+					}
+					return sessionsMsg(sessions)
 				}
-				m.confirmDelete = false
-				m.deleteTargetID = ""
-				m.deleteTargetName = ""
-				newPageSessions := m.getPageSessions()
-				if m.cursor >= len(newPageSessions) && m.cursor > 0 {
-					m.cursor--
-				}
-				return m, tea.Batch(tea.ClearScreen, m.fetchSessions)
 			case "n", "N", "esc":
 				m.confirmDelete = false
 				m.deleteTargetID = ""
@@ -603,13 +698,45 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pageSessions := m.getPageSessions()
 			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 				sess := pageSessions[m.cursor]
-				// TUIが対象セッションのウィンドウにいる場合、先にUIウィンドウに退避
-				// tmuxに直接問い合わせることで、m.currentSessionWindowの状態ズレを回避
-				m.evacuateTUIIfNeeded(sess.TmuxWindowName)
-				if err := m.client.Kill(sess.ID); err != nil {
-					m.err = err
+				m.processingMsg = "Stopping..."
+				m.needsReswitch = true
+
+				// Cmd用に値をキャプチャ
+				killID := sess.ID
+				killedWindowName := sess.TmuxWindowName
+				var nextWindowName string
+				if m.cursor+1 < len(pageSessions) {
+					nextWindowName = pageSessions[m.cursor+1].TmuxWindowName
+				} else if m.cursor > 0 {
+					nextWindowName = pageSessions[m.cursor-1].TmuxWindowName
 				}
-				return m, tea.Batch(tea.ClearScreen, m.fetchSessions)
+
+				tmuxClient := m.tmuxClient
+				tuiPaneID := m.tuiPaneID
+				client := m.client
+
+				return m, func() tea.Msg {
+					// 次セッションに先に切り替え
+					if tmuxClient != nil && tuiPaneID != "" && nextWindowName != "" {
+						target := tmux.WindowTarget(nextWindowName, 0)
+						tmuxClient.JoinPane(tuiPaneID, target, true, 25, true, true)
+					}
+					// フォールバック: UIウィンドウに退避
+					if tmuxClient != nil && tuiPaneID != "" && killedWindowName != "" {
+						wn, err := tmuxClient.GetPaneWindowName(tuiPaneID)
+						if err == nil && wn == killedWindowName {
+							tmuxClient.BreakPane(tuiPaneID, true, tmux.UIWindowName)
+						}
+					}
+					if err := client.Kill(killID); err != nil {
+						return errMsg(fmt.Errorf("kill failed: %w", err))
+					}
+					sessions, err := client.List()
+					if err != nil {
+						return errMsg(err)
+					}
+					return sessionsMsg(sessions)
+				}
 			}
 
 		case key.Matches(msg, m.keys.Delete):
@@ -669,6 +796,11 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		// 作成直後のセッションにフォーカス＋右ペイン切り替え
 		if m.focusSessionID != "" {
+			// ZoomPane(unzoom) + switchToSession(JoinPane) を同一Updateサイクルで実行
+			// → 最後のSIGWINCH/WindowSizeMsgが最終的なペインサイズを反映
+			if m.tmuxClient != nil && m.tuiPaneID != "" {
+				m.tmuxClient.ZoomPane(m.tuiPaneID)
+			}
 			itemsPerPage := m.getItemsPerPage()
 			for i, s := range m.sessions {
 				if s.ID == m.focusSessionID {
@@ -679,8 +811,38 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.focusSessionID = ""
-		} else if m.cursor >= len(m.sessions) && m.cursor > 0 {
+			// processingMsgは保持: WindowSizeMsgの到着を待つ
+			// WindowSizeMsg到着時にprocessingMsgをクリア＋ClearScreen
+			// resizeSettledCmdはフォールバック（SIGWINCHが来ない場合のタイムアウト）
+			m.waitingForResize = true
+			return m, resizeSettledCmd()
+		}
+		if m.cursor >= len(m.sessions) && m.cursor > 0 {
 			m.cursor = len(m.sessions) - 1
+		}
+		// 削除/Kill後にカーソル位置のセッションに再接続
+		if m.needsReswitch {
+			m.needsReswitch = false
+			// Cmd内でtmux操作済みのため、currentSessionWindowをリセット
+			// switchToSessionが正しく再接続できるようにする
+			m.currentSessionWindow = ""
+			pageSessions := m.getPageSessions()
+			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
+				m.switchToSession(pageSessions[m.cursor].ID)
+			}
+			// processingMsgは保持: WindowSizeMsgの到着を待つ
+			m.waitingForResize = true
+			return m, resizeSettledCmd()
+		}
+		m.processingMsg = ""
+		return m, nil
+
+	case resizeSettledMsg:
+		// フォールバック: WindowSizeMsgが来なかった場合（ペインサイズ変更なし）
+		if m.waitingForResize {
+			m.waitingForResize = false
+			m.processingMsg = ""
+			return m, tea.ClearScreen
 		}
 		return m, nil
 
@@ -696,6 +858,7 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case errMsg:
+		m.processingMsg = ""
 		m.err = msg
 
 	case tickMsg:
@@ -1380,17 +1543,21 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if m.isNewWorktree {
-		// 新規worktree作成モード
-		baseBranch := m.baseBranchInput.Value()
-		// worktree名はworktreeフィールドの入力値を使用（空の場合はブランチ名がデフォルト）
-		worktreeName := m.worktreeInput.Value()
+	// RPC部分を非同期Cmdに移して処理中インジケーターを表示
+	m.processingMsg = "Creating..."
 
-		// Use async session creation (worktree creation happens in background)
-		info, err := m.client.NewWithOptions(daemon.NewOptions{
+	// Cmd用に値をキャプチャ
+	client := m.client
+	stateMgr := m.stateMgr
+
+	var opts daemon.NewOptions
+	if m.isNewWorktree {
+		baseBranch := m.baseBranchInput.Value()
+		worktreeName := m.worktreeInput.Value()
+		opts = daemon.NewOptions{
 			Name:          name,
 			Start:         true,
-			Async:         true, // Returns immediately with creating status
+			Async:         true,
 			Repository:    repoName,
 			Branch:        branch,
 			BaseBranch:    baseBranch,
@@ -1399,21 +1566,11 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 			WorktreeName:  worktreeName,
 			PromptName:    promptName,
 			PromptArgs:    promptArgs,
-		})
-		if err != nil {
-			m.err = err
-		} else {
-			m.focusSessionID = info.ID
-			// 成功時に使用したリポジトリを記憶
-			if m.stateMgr != nil {
-				m.stateMgr.SetLastUsedRepository(repoName)
-				_ = m.stateMgr.Save()
-			}
 		}
 	} else {
-		// 既存worktree使用モード
 		selectedWt := m.getSelectedWorktree()
 		if selectedWt == nil {
+			m.processingMsg = ""
 			m.err = fmt.Errorf("worktree is required")
 			return m, nil
 		}
@@ -1422,8 +1579,7 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 		if m.newBranchMode {
 			baseBranch = m.baseBranchInput.Value()
 		}
-
-		info, err := m.client.NewWithOptions(daemon.NewOptions{
+		opts = daemon.NewOptions{
 			Name:          name,
 			WorkDir:       selectedWt.Path,
 			Start:         true,
@@ -1434,50 +1590,56 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 			IsNewWorktree: false,
 			PromptName:    promptName,
 			PromptArgs:    promptArgs,
-		})
-		if err != nil {
-			m.err = err
-		} else {
-			m.focusSessionID = info.ID
-			// 成功時に使用したリポジトリを記憶
-			if m.stateMgr != nil {
-				m.stateMgr.SetLastUsedRepository(repoName)
-				_ = m.stateMgr.Save()
-			}
 		}
 	}
 
-	// エラー発生時は ModeCreate を維持してエラーを表示
-	if m.err != nil {
-		return m, nil
+	return m, func() tea.Msg {
+		info, err := client.NewWithOptions(opts)
+		if err != nil {
+			return createCompleteMsg{err: err}
+		}
+		// 成功時に使用したリポジトリを記憶
+		if stateMgr != nil {
+			stateMgr.SetLastUsedRepository(repoName)
+			_ = stateMgr.Save()
+		}
+		sessions, listErr := client.List()
+		if listErr != nil {
+			return createCompleteMsg{sessionID: info.ID, err: listErr}
+		}
+		return createCompleteMsg{sessionID: info.ID, sessions: sessions}
 	}
-
-	m.mode = ModeList
-	// tmuxモード: zoom解除
-	if m.tmuxClient != nil && m.tuiPaneID != "" {
-		m.tmuxClient.ZoomPane(m.tuiPaneID)
-	}
-	return m, tea.Batch(m.fetchSessions, tickCmd())
 }
 
 // View renders the UI
 func (m Model) View() string {
+	// 処理中インジケーター
+	if m.processingMsg != "" {
+		return m.renderProcessingView()
+	}
+
 	if m.mode == ModeCreate {
 		return m.viewCreateMode()
 	}
 
 	boxWidth := m.width - 2
-	if boxWidth < 60 {
-		boxWidth = 60
+	if boxWidth < 20 {
+		boxWidth = 20
 	}
 	boxHeight := m.height - 3
-	if boxHeight < 10 {
-		boxHeight = 10
+	if boxHeight < 5 {
+		boxHeight = 5
 	}
 	boxStyle := createBoxStyle(boxWidth, boxHeight)
 	box := boxStyle.Render(m.renderListContent(boxWidth - 4))
 	helpLine := m.renderHelpLine()
 	return box + "\n" + helpLine
+}
+
+// renderProcessingView renders a processing indicator.
+// サイズ非依存: ZoomPane/JoinPane後のWindowSizeMsg到着前でも正しく表示される
+func (m Model) renderProcessingView() string {
+	return "\n  ⟳ " + m.processingMsg
 }
 
 // renderListContent renders the session list content

@@ -556,7 +556,8 @@ func (m *Manager) captureOutputTmux(session *Session) {
 
 	for range ticker.C {
 		m.mu.RLock()
-		if session.Status == StatusStopped {
+		_, exists := m.sessions[session.ID]
+		if !exists || session.Status == StatusStopped {
 			m.mu.RUnlock()
 			return
 		}
@@ -574,6 +575,12 @@ func (m *Manager) captureOutputTmux(session *Session) {
 		// Check if pane process has exited
 		if m.tmuxClient.IsPaneDead(target) {
 			m.mu.Lock()
+			// セッションが削除済みの場合はsaveせず終了
+			if _, exists := m.sessions[session.ID]; !exists {
+				m.mu.Unlock()
+				debugLog("[TMUX] Session %s pane died but session already deleted, skipping save", sessionName)
+				return
+			}
 			session.Status = StatusStopped
 			session.LastActiveAt = time.Now()
 			// Keep TmuxWindowName: window survives (remain-on-exit), only CC pane is dead.
@@ -592,6 +599,11 @@ func (m *Manager) captureOutputTmux(session *Session) {
 			// (e.g., user quit ccvalet and the tmux session was destroyed)
 			if consecutiveErrors >= 3 {
 				m.mu.Lock()
+				if _, exists := m.sessions[session.ID]; !exists {
+					m.mu.Unlock()
+					debugLog("[TMUX] Session %s capture failed but session already deleted, skipping save", sessionName)
+					return
+				}
 				session.Status = StatusStopped
 				session.LastActiveAt = time.Now()
 				session.TmuxWindowName = ""
