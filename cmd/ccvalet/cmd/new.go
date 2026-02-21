@@ -42,6 +42,7 @@ For interactive session creation, use 'ccvalet ui' (TUI).`,
 
 		// オプションフラグの取得
 		name, _ := cmd.Flags().GetString("name")
+		hostID, _ := cmd.Flags().GetString("host")
 		newWorktree, _ := cmd.Flags().GetBool("new-worktree")
 		newBranch, _ := cmd.Flags().GetBool("new-branch")
 		baseBranch, _ := cmd.Flags().GetString("base")
@@ -49,6 +50,8 @@ For interactive session creation, use 'ccvalet ui' (TUI).`,
 		noStart, _ := cmd.Flags().GetBool("no-start")
 		promptName, _ := cmd.Flags().GetString("prompt")
 		promptArgs, _ := cmd.Flags().GetString("args")
+
+		isRemote := hostID != "" && hostID != "local"
 
 		// バリデーション: リポジトリは必須
 		if repoName == "" {
@@ -70,36 +73,45 @@ For interactive session creation, use 'ccvalet ui' (TUI).`,
 			return fmt.Errorf("--workdir and --new-worktree cannot be used together")
 		}
 
-		configMgr, err := config.NewManager(getConfigDir())
-		if err != nil {
-			return fmt.Errorf("failed to initialize config: %w", err)
-		}
-
-		// バリデーション: リポジトリが登録されているか確認
-		if configMgr.GetRepository(repoName) == nil {
-			return fmt.Errorf("repository '%s' not found. Register it first with: ccvalet repo add <path>", repoName)
-		}
-
 		var actualWorktreeName string
 
-		// 新規worktreeモードの場合
-		if newWorktree {
-			wtMgr := worktree.NewManager(configMgr)
-
-			fmt.Printf("Creating worktree for %s/%s...\n", repoName, branch)
-			wt, wtName, err := wtMgr.CreateWithOptions(worktree.CreateOptions{
-				RepoName:     repoName,
-				Branch:       branch,
-				NewBranch:    newBranch,
-				BaseBranch:   baseBranch,
-				WorktreeName: worktreeName,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to create worktree: %w", err)
+		if isRemote {
+			// リモートホストの場合: リポジトリ検証とworktree作成はslave側に委譲
+			if newWorktree && workDir == "" {
+				// worktree作成はdaemon(slave)側で行うので、workDirは空のままでOK
+				fmt.Printf("Creating session on host '%s' (worktree will be created on remote)...\n", hostID)
 			}
-			fmt.Printf("Created worktree at: %s\n", wt.Path)
-			workDir = wt.Path
-			actualWorktreeName = wtName
+		} else {
+			// ローカルの場合: 従来通りの処理
+			configMgr, err := config.NewManager(getConfigDir())
+			if err != nil {
+				return fmt.Errorf("failed to initialize config: %w", err)
+			}
+
+			// バリデーション: リポジトリが登録されているか確認
+			if configMgr.GetRepository(repoName) == nil {
+				return fmt.Errorf("repository '%s' not found. Register it first with: ccvalet repo add <path>", repoName)
+			}
+
+			// 新規worktreeモードの場合
+			if newWorktree {
+				wtMgr := worktree.NewManager(configMgr)
+
+				fmt.Printf("Creating worktree for %s/%s...\n", repoName, branch)
+				wt, wtName, err := wtMgr.CreateWithOptions(worktree.CreateOptions{
+					RepoName:     repoName,
+					Branch:       branch,
+					NewBranch:    newBranch,
+					BaseBranch:   baseBranch,
+					WorktreeName: worktreeName,
+				})
+				if err != nil {
+					return fmt.Errorf("failed to create worktree: %w", err)
+				}
+				fmt.Printf("Created worktree at: %s\n", wt.Path)
+				workDir = wt.Path
+				actualWorktreeName = wtName
+			}
 		}
 
 		client := daemon.NewClient(getSocketPath())
@@ -115,6 +127,7 @@ For interactive session creation, use 'ccvalet ui' (TUI).`,
 			NewBranch:     newBranch,
 			IsNewWorktree: newWorktree,
 			WorktreeName:  actualWorktreeName,
+			HostID:        hostID,
 		})
 		if err != nil {
 			return err
@@ -150,6 +163,9 @@ func init() {
 	newCmd.Flags().Bool("new-branch", false, "Create a new branch (error if exists)")
 	newCmd.Flags().String("base", "", "Base branch for new branch (e.g., main, develop)")
 	newCmd.Flags().StringP("worktree", "w", "", "Worktree name (default: branch name)")
+
+	// ホスト指定
+	newCmd.Flags().StringP("host", "H", "", "Target host (default: local)")
 
 	// オプション
 	newCmd.Flags().StringP("name", "n", "", "Session name (default: repo/branch)")

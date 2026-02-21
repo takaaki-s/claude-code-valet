@@ -49,6 +49,9 @@ type Session struct {
 	ClaudeSessionID      string `json:"claude_session_id,omitempty"`
 	ClaudeSessionStarted bool   `json:"claude_session_started,omitempty"` // CCセッションが一度でも起動されたか
 
+	// ホスト情報（マルチホスト対応）
+	HostID string `json:"host_id,omitempty"` // ホスト識別子 ("local", "ec2", "docker-dev" 等)
+
 	// tmux integration
 	TmuxWindowName string `json:"tmux_window_name,omitempty"` // tmux window name for this session
 	TmuxPaneID     string `json:"tmux_pane_id,omitempty"`     // CC pane ID (e.g., "%42") for capture-pane
@@ -74,6 +77,7 @@ type Info struct {
 	ErrorMessage     string `json:"error_message,omitempty"`
 	ClaudeSessionID  string `json:"claude_session_id,omitempty"` // Claude Code session ID for transcript lookup
 	TmuxWindowName   string `json:"tmux_window_name,omitempty"` // tmux window name
+	HostID           string `json:"host_id,omitempty"`          // ホスト識別子
 
 	// Last messages from transcript
 	LastUserMessage      string `json:"last_user_message,omitempty"`      // Last user message content (truncated)
@@ -96,5 +100,6 @@ func (s *Session) ToInfo() Info {
 		ErrorMessage:    s.ErrorMessage,
 		ClaudeSessionID: s.ClaudeSessionID,
 		TmuxWindowName:  s.TmuxWindowName,
+		HostID:          s.HostID,
 	}
 }

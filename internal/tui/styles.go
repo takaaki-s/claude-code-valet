@@ -78,11 +78,16 @@ var (
 				Foreground(secondaryColor)
 )
 
-// createBoxStyle creates a box style with specified width and height
-func createBoxStyle(width, height int) lipgloss.Style {
+// createBoxStyle creates a box style with specified width and height.
+// When focused is false, the border color is dimmed to indicate the pane is inactive.
+func createBoxStyle(width, height int, focused bool) lipgloss.Style {
+	borderColor := boxBorderColor
+	if !focused {
+		borderColor = dimColor
+	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(boxBorderColor).
+		BorderForeground(borderColor).
 		Width(width).
 		Height(height)
 }

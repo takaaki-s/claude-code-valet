@@ -22,7 +22,7 @@ var killCmd = &cobra.Command{
 			return err
 		}
 
-		if err := client.Kill(sessionID); err != nil {
+		if err := client.Kill(sessionID, ""); err != nil {
 			return err
 		}
 		fmt.Printf("Killed session: %s\n", sessionName)
@@ -46,7 +46,7 @@ var deleteCmd = &cobra.Command{
 			return err
 		}
 
-		if err := client.Delete(sessionID); err != nil {
+		if err := client.Delete(sessionID, ""); err != nil {
 			return err
 		}
 		fmt.Printf("Deleted session: %s\n", sessionName)

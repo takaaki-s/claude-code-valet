@@ -191,7 +191,8 @@ ccvalet completion fish | source
 ├── sessions/        # セッションデータ
 ├── worktrees/       # 自動作成された worktree
 ├── prompts/         # プロンプトテンプレート
-└── daemon.sock      # デーモンソケット
+└── run/
+    └── daemon.sock  # デーモンソケット
 ```
 
 ### 設定例 (`~/.ccvalet/config.yaml`)
@@ -311,6 +312,106 @@ ${args}
 - `queued`: キュー待機中
 - `stopped`: 停止済み
 - `error`: エラー
+
+## リモートホスト（EC2 / Docker）
+
+ローカルの Mac だけでなく、EC2 インスタンスや Docker コンテナ上の CC セッションも統合管理できます。
+
+### アーキテクチャ
+
+Mac 上の Master デーモンが、リモートの Slave デーモンと SSH トンネル（または Docker volume mount）経由で通信します。Slave は通常の `ccvalet daemon` と同一バイナリです。
+
+### EC2 セットアップ
+
+**1. EC2 に ccvalet と tmux をインストール（初回のみ）**
+
+```bash
+# EC2 にログイン
+ssh my-ec2-instance
+
+# ccvalet インストール
+go install github.com/takaaki-s/claude-code-valet/cmd/ccvalet@latest
+
+# tmux インストール（未インストールの場合）
+sudo apt install -y tmux  # Ubuntu/Debian
+```
+
+**2. Mac の config.yaml にホスト設定を追加**
+
+```yaml
+hosts:
+  - id: ec2
+    type: ssh
+    host: my-ec2-instance
+    ssh_opts:          # SSH接続の最適化（推奨）
+      - "-o"
+      - "ControlMaster=auto"
+      - "-o"
+      - "ControlPath=~/.ssh/sockets/%r@%h-%p"
+      - "-o"
+      - "ControlPersist=600"
+```
+
+**3. Master 起動で自動接続**
+
+```bash
+ccvalet daemon start  # Slave 自動起動 + トンネル確立
+ccvalet ui            # TUI でローカル + EC2 を統合管理
+```
+
+Master 起動時に SSH 経由で EC2 の Slave デーモンを自動起動します。ccvalet が未インストールの場合はエラーメッセージが表示されます。
+
+### Docker セットアップ
+
+**1. コンテナに ccvalet と tmux を含める**
+
+```dockerfile
+# Dockerfile に追加
+RUN apt-get update && apt-get install -y tmux
+RUN go install github.com/takaaki-s/claude-code-valet/cmd/ccvalet@latest
+```
+
+**2. ソケット共有用 volume mount を設定してコンテナを起動**
+
+ローカル側のソケットパスは `/tmp/ccvalet-tunnels/{hostID}/daemon.sock` に自動計算されます（SSH と同じ規約）。volume mount はこのディレクトリとコンテナ内のソケットディレクトリを対応させます。
+
+```bash
+# root ユーザーの場合
+docker run -v /tmp/ccvalet-tunnels/docker-dev:/root/.ccvalet/run my-image
+
+# non-root ユーザー（app）の場合
+docker run -v /tmp/ccvalet-tunnels/docker-dev:/home/app/.ccvalet/run my-image
+
+# socket_path をオーバーライドする場合
+docker run -v /tmp/ccvalet-tunnels/docker-dev:/var/run/ccvalet my-image
+```
+
+**3. Mac の config.yaml にホスト設定を追加**
+
+```yaml
+hosts:
+  # 基本設定（デフォルトソケットパス: ~/.ccvalet/run/daemon.sock）
+  - id: docker-dev
+    type: docker
+    container: my-container
+
+  # socket_path オーバーライド（コンテナ内パスを指定）
+  - id: docker-ci
+    type: docker
+    container: ci-runner
+    socket_path: /var/run/ccvalet/daemon.sock
+```
+
+`socket_path` はコンテナ内（リモート側）のソケットパスを指定します。省略時は `~/.ccvalet/run/daemon.sock` が使用されます。
+
+**4. Master 起動**
+
+```bash
+ccvalet daemon start  # docker exec で Slave 自動起動
+ccvalet ui
+```
+
+> **注意**: コンテナを再作成（`docker rm`）すると ccvalet が消えます。Dockerfile に含めるか、バイナリを volume mount で永続化してください。
 
 ## デバッグ
 

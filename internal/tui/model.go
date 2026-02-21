@@ -14,8 +14,8 @@ import (
 	"github.com/mattn/go-runewidth"
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/daemon"
+	"github.com/takaaki-s/claude-code-valet/internal/host"
 	"github.com/takaaki-s/claude-code-valet/internal/prompt"
-	"github.com/takaaki-s/claude-code-valet/internal/repository"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
@@ -28,6 +28,11 @@ const (
 	ModeList Mode = iota
 	ModeCreate
 )
+
+// maxTUIWidth is the maximum width (columns) for the TUI pane.
+// When the terminal is maximized, the TUI pane is resized to this width
+// so the display pane gets the extra space.
+const maxTUIWidth = 50
 
 // KeyMap defines key bindings
 type KeyMap struct {
@@ -152,6 +157,14 @@ type Model struct {
 	nameInput  textinput.Model
 	focusIndex int // フォーカス中のフィールドインデックス
 
+	// ホスト選択
+	selectedHostID     string             // 選択中のホストID（デフォルト: "local"）
+	hosts              []daemon.HostInfo  // ホスト一覧
+	hostInput          textinput.Model
+	filteredHosts      []daemon.HostInfo  // フィルタリングされたホスト
+	hostSelectedIndex  int                // 選択中のホストインデックス
+	hostDropdownOpen   bool               // ホストドロップダウンが開いているか
+
 	// リポジトリ選択
 	repoInput         textinput.Model
 	configMgr         *config.Manager
@@ -198,14 +211,19 @@ type Model struct {
 
 	// Delete confirmation
 	confirmDelete    bool   // 削除確認中かどうか
-	deleteTargetID   string // 削除対象のセッションID
-	deleteTargetName string // 削除対象のセッション名（表示用）
+	deleteTargetID     string // 削除対象のセッションID
+	deleteTargetName   string // 削除対象のセッション名（表示用）
+	deleteTargetHostID string // 削除対象のホストID
+
+	// Focus tracking (for visual focus indicator)
+	focused bool // true when TUI pane has focus (changes border/title color)
 
 	// tmux integration
-	tmuxClient           *tmux.Client // tmux client (nil in legacy mode)
-	tuiPaneID            string       // TUIペインの固有ID (例: "%42")
-	currentSessionWindow string       // TUIが現在いるセッションwindow名 ("" = UIウィンドウ)
-	switchSeq            int          // カーソル移動デバウンス用シーケンス番号
+	tmuxClient       *tmux.Client // outer tmux client (-L ccvalet-mgr, nil in legacy mode)
+	tuiPaneID        string       // TUIペインの固有ID (例: "%42") in outer tmux
+	displayPaneID    string       // 右ペインの固有ID (セッション表示用) in outer tmux
+	currentSessionID string       // 現在右ペインに表示中のセッションID
+	switchSeq        int          // カーソル移動デバウンス用シーケンス番号
 
 	// Focus after create
 	focusSessionID string // 作成後にフォーカスするセッションID
@@ -215,11 +233,16 @@ type Model struct {
 
 	// Processing indicator
 	processingMsg    string // 処理中メッセージ（空でない時はオーバーレイ表示）
-	waitingForResize bool   // WindowSizeMsg到着を待っている（JoinPane後のリサイズ完了待ち）
+	waitingForResize bool   // WindowSizeMsg到着を待っている（ZoomPane後のリサイズ完了待ち）
 }
 
 // NewModel creates a new TUI model
 func NewModel(client *daemon.Client) Model {
+	// Host input
+	hostInput := textinput.New()
+	hostInput.Placeholder = "target host"
+	hostInput.CharLimit = 50
+
 	// Name input
 	nameInput := textinput.New()
 	nameInput.Placeholder = "session name (optional)"
@@ -275,8 +298,28 @@ func NewModel(client *daemon.Client) Model {
 	}
 	keys := NewKeyMap(keybindings)
 
+	// ホスト一覧をdaemon経由で取得
+	var hosts []daemon.HostInfo
+	if hostInfos, err := client.ListHosts(); err == nil {
+		hosts = hostInfos
+	}
+	// ホストが1つ以下（localのみ）の場合はhostsを空にしてフィールドを非表示にする
+	if len(hosts) <= 1 {
+		hosts = nil
+	}
+
+	// リポジトリ一覧をdaemon経由で取得
 	var repos []config.RepositoryConfig
-	if configMgr != nil {
+	if repoInfos, err := client.ListRepos("local"); err == nil {
+		for _, r := range repoInfos {
+			repos = append(repos, config.RepositoryConfig{
+				Name:       r.Name,
+				Path:       r.Path,
+				BaseBranch: r.BaseBranch,
+			})
+		}
+	} else if configMgr != nil {
+		// フォールバック: daemon経由で取得できない場合はconfigMgrから直接読む
 		repos = configMgr.GetRepositories()
 	}
 
@@ -300,6 +343,11 @@ func NewModel(client *daemon.Client) Model {
 		client:            client,
 		keys:              keys,
 		mode:              ModeList,
+		focused:           true,
+		selectedHostID:    "local",
+		hosts:             hosts,
+		hostInput:         hostInput,
+		filteredHosts:     hosts,
 		nameInput:         nameInput,
 		repoInput:         repoInput,
 		worktreeInput:     worktreeInput,
@@ -318,13 +366,15 @@ func NewModel(client *daemon.Client) Model {
 }
 
 // NewModelWithTmux creates a new TUI model with tmux integration.
-// In tmux mode, the TUI pane moves between session windows as a floating sidebar.
-func NewModelWithTmux(client *daemon.Client, tc *tmux.Client, tuiPaneID string) Model {
+// The outer tmux (-L ccvalet-mgr) has a fixed 2-pane layout:
+// left pane (TUI) + right pane (session display via RespawnPane).
+func NewModelWithTmux(client *daemon.Client, tc *tmux.Client, tuiPaneID, displayPaneID string) Model {
 	m := NewModel(client)
 	m.tmuxClient = tc
 	m.tuiPaneID = tuiPaneID
-	// Restore which session window TUI was in (for reattach)
-	m.currentSessionWindow = tc.GetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW")
+	m.displayPaneID = displayPaneID
+	// Restore which session was displayed (for reattach)
+	m.currentSessionID = tc.GetEnvironment(tmux.SessionName, "CCVALET_CURRENT_SESSION")
 	return m
 }
 
@@ -411,7 +461,7 @@ func cursorSettledCmd(seq int) tea.Cmd {
 }
 
 // resizeSettledMsg is sent after a delay to allow WindowSizeMsg to arrive
-// after tmux pane operations (ZoomPane, JoinPane).
+// after tmux pane operations (ZoomPane).
 type resizeSettledMsg struct{}
 
 func resizeSettledCmd() tea.Cmd {
@@ -420,25 +470,17 @@ func resizeSettledCmd() tea.Cmd {
 	})
 }
 
-// evacuateTUIIfNeeded checks if TUI is in the given session window and evacuates it.
-// Queries tmux directly to avoid stale state issues with m.currentSessionWindow.
-func (m *Model) evacuateTUIIfNeeded(sessionWindowName string) {
-	if m.tmuxClient == nil || m.tuiPaneID == "" || sessionWindowName == "" {
-		return
-	}
-	windowName, err := m.tmuxClient.GetPaneWindowName(m.tuiPaneID)
-	if err != nil || windowName != sessionWindowName {
-		return
-	}
-	m.tmuxClient.BreakPane(m.tuiPaneID, true, tmux.UIWindowName)
-	m.currentSessionWindow = ""
-	m.tmuxClient.UnsetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW")
-}
-
-// switchToSession moves the TUI sidebar to the given session's tmux window.
-// Each session has its own tmux window; the TUI pane floats between them via join-pane.
+// switchToSession displays the given session in the right pane via RespawnPane.
+// For local sessions, attaches to the inner tmux session (-L ccvalet).
+// For remote sessions, runs SSH attach command.
+// Only attaches to sessions that are actively running; stopped sessions are skipped.
 func (m *Model) switchToSession(sessionID string) {
-	if m.tmuxClient == nil || m.tuiPaneID == "" || sessionID == "" {
+	if m.tmuxClient == nil || m.displayPaneID == "" || sessionID == "" {
+		return
+	}
+
+	// Already displaying this session
+	if m.currentSessionID == sessionID {
 		return
 	}
 
@@ -454,20 +496,58 @@ func (m *Model) switchToSession(sessionID string) {
 		return
 	}
 
-	// Already in this session's window
-	if m.currentSessionWindow == sess.TmuxWindowName {
+	// Only attach to sessions that are actively running.
+	// Stopped/error sessions may not have an inner tmux session alive.
+	if !isSessionAlive(sess.Status) {
 		return
 	}
 
-	// join-pane: move TUI to session window as left sidebar (25%)
-	target := tmux.WindowTarget(sess.TmuxWindowName, 0)
-	if err := m.tmuxClient.JoinPane(m.tuiPaneID, target, true, 25, true, true); err != nil {
-		// Join failed — window might not exist
+	// Remote session: use SSH attach command
+	if sess.HostID != "" && sess.HostID != "local" {
+		m.switchToRemoteSession(sess)
 		return
 	}
 
-	m.currentSessionWindow = sess.TmuxWindowName
-	m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_WINDOW", sess.TmuxWindowName)
+	// Local: respawn right pane with inner tmux attach
+	attachCmd := fmt.Sprintf("tmux -L %s attach -t %s", tmux.SocketName, sess.TmuxWindowName)
+	m.tmuxClient.RespawnPane(m.displayPaneID, attachCmd)
+
+	m.currentSessionID = sessionID
+	m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_SESSION", sessionID)
+}
+
+// isSessionAlive returns true if the session status indicates an active process.
+func isSessionAlive(status session.Status) bool {
+	switch status {
+	case session.StatusRunning, session.StatusThinking, session.StatusIdle,
+		session.StatusPermission, session.StatusConfirm, session.StatusCreating:
+		return true
+	}
+	return false
+}
+
+// switchToRemoteSession displays a remote session in the right pane via RespawnPane.
+func (m *Model) switchToRemoteSession(sess *session.Info) {
+	if m.configMgr == nil {
+		return
+	}
+
+	hostConfig := m.configMgr.GetHost(sess.HostID)
+	if hostConfig == nil {
+		return
+	}
+
+	// Ensure a background ControlMaster SSH connection exists for this host.
+	// This is separate from the tmux pane process, so RespawnPane won't kill it.
+	// Subsequent SSH connections (slaves) reuse the master for near-instant connection.
+	host.EnsureSSHMaster(*hostConfig)
+
+	// Generate SSH attach command string (slave connection via ControlMaster)
+	attachCmd := host.AttachCommandString(*hostConfig, sess.TmuxWindowName)
+	m.tmuxClient.RespawnPane(m.displayPaneID, attachCmd)
+
+	m.currentSessionID = sess.ID
+	m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_SESSION", sess.ID)
 }
 
 // Init initializes the model
@@ -484,13 +564,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if msg, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width = msg.Width
 		m.height = msg.Height
-		// JoinPane/ZoomPane後のリサイズ完了を検知
+		// Cap TUI pane width: resize via tmux so the display pane gets the extra space.
+		// Skip when in ModeCreate (ZoomPane makes TUI fullscreen for the form).
+		if m.mode != ModeCreate && m.width > maxTUIWidth && m.tmuxClient != nil && m.tuiPaneID != "" && m.displayPaneID != "" {
+			m.tmuxClient.ResizePaneWidth(m.tuiPaneID, maxTUIWidth)
+		}
+		// ZoomPane後のリサイズ完了を検知
 		// WindowSizeMsgが届いた = ペインサイズが確定した → processingMsgをクリアして再描画
 		if m.waitingForResize {
 			m.waitingForResize = false
 			m.processingMsg = ""
 			return m, tea.ClearScreen
 		}
+	}
+
+	// Handle focus events (from tmux focus-events + tea.WithReportFocus)
+	if _, ok := msg.(tea.FocusMsg); ok {
+		m.focused = true
+		return m, nil
+	}
+	if _, ok := msg.(tea.BlurMsg); ok {
+		m.focused = false
+		return m, nil
 	}
 
 	// 処理中はキー入力を無視し、完了メッセージのみ処理
@@ -539,52 +634,18 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmDelete = false
 				m.needsReswitch = true
 
-				// Cmd用に必要な値をキャプチャ
 				deleteID := m.deleteTargetID
+				deleteHostID := m.deleteTargetHostID
 				m.deleteTargetID = ""
 				m.deleteTargetName = ""
+				m.deleteTargetHostID = ""
 
-				// 次セッションのwindow名を事前取得（Cmd内でJoinPaneに使う）
-				pageSessions := m.getPageSessions()
-				var nextWindowName, deletedWindowName string
-				for i, s := range pageSessions {
-					if s.ID == deleteID {
-						deletedWindowName = s.TmuxWindowName
-						var nextIdx int
-						if i+1 < len(pageSessions) {
-							nextIdx = i + 1
-						} else if i > 0 {
-							nextIdx = i - 1
-						} else {
-							break
-						}
-						nextWindowName = pageSessions[nextIdx].TmuxWindowName
-						break
-					}
-				}
-
-				tmuxClient := m.tmuxClient
-				tuiPaneID := m.tuiPaneID
 				client := m.client
 
 				return m, func() tea.Msg {
-					// 次セッションに先に切り替え（画面崩れ回避）
-					if tmuxClient != nil && tuiPaneID != "" && nextWindowName != "" {
-						target := tmux.WindowTarget(nextWindowName, 0)
-						tmuxClient.JoinPane(tuiPaneID, target, true, 25, true, true)
-					}
-					// フォールバック: TUIがまだ削除対象のウィンドウにいればUIウィンドウに退避
-					if tmuxClient != nil && tuiPaneID != "" && deletedWindowName != "" {
-						wn, err := tmuxClient.GetPaneWindowName(tuiPaneID)
-						if err == nil && wn == deletedWindowName {
-							tmuxClient.BreakPane(tuiPaneID, true, tmux.UIWindowName)
-						}
-					}
-					// 削除RPC
-					if err := client.Delete(deleteID); err != nil {
+					if err := client.Delete(deleteID, deleteHostID); err != nil {
 						return errMsg(fmt.Errorf("delete failed: %w", err))
 					}
-					// セッション一覧取得
 					sessions, err := client.List()
 					if err != nil {
 						return errMsg(err)
@@ -595,15 +656,15 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmDelete = false
 				m.deleteTargetID = ""
 				m.deleteTargetName = ""
+				m.deleteTargetHostID = ""
 				return m, nil
 			}
 			return m, nil
 		}
 
-		// Tab key: in tmux sidebar mode, move focus to the right workspace pane
-		if msg.String() == "tab" && m.tmuxClient != nil && m.currentSessionWindow != "" {
-			// Select the pane to the right of TUI (the workspace)
-			m.tmuxClient.SelectPaneRight()
+		// Tab key: move focus to the right display pane
+		if msg.String() == "tab" && m.tmuxClient != nil && m.displayPaneID != "" && m.currentSessionID != "" {
+			m.tmuxClient.SelectPane(m.displayPaneID)
 			return m, nil
 		}
 
@@ -641,31 +702,31 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 
-				// tmux sidebar mode: start session and move TUI to session window
+				// tmux mode: start session and display in right pane
 				if m.tmuxClient != nil {
 					needsStart := sess.Status == session.StatusStopped || sess.Status == session.StatusError
 					if needsStart {
-						if err := m.client.Start(sess.ID); err != nil {
+						if err := m.client.Start(sess.ID, sess.HostID); err != nil {
 							m.err = err
 							return m, nil
 						}
-						// Update local session data immediately (daemon has already created the tmux window)
+						// Update local session data immediately
 						for i := range m.sessions {
 							if m.sessions[i].ID == sess.ID {
 								if m.sessions[i].TmuxWindowName == "" {
-									m.sessions[i].TmuxWindowName = tmux.WindowName(sess.ID)
+									m.sessions[i].TmuxWindowName = tmux.InnerSessionName(sess.ID)
 								}
 								m.sessions[i].Status = session.StatusRunning
 								break
 							}
 						}
-						// Force switchToSession to run (clear current window tracking)
-						m.currentSessionWindow = ""
+						// Force switchToSession to run
+						m.currentSessionID = ""
 					}
 					m.switchToSession(sess.ID)
-					// セッション切り替え後、右ペイン（ワークスペース）にフォーカスを移動
-					if m.currentSessionWindow != "" {
-						m.tmuxClient.SelectPaneRight()
+					// Focus right pane (session display)
+					if m.displayPaneID != "" {
+						m.tmuxClient.SelectPane(m.displayPaneID)
 					}
 					return m, m.fetchSessions
 				}
@@ -678,6 +739,7 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.tmuxClient != nil && m.tuiPaneID != "" {
 				m.tmuxClient.ZoomPane(m.tuiPaneID)
 			}
+			m.hostInput.Reset()
 			m.nameInput.Reset()
 			m.worktreeInput.Reset()
 			m.worktreeNameInput.Reset()
@@ -689,9 +751,18 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.newBranchMode = true  // デフォルトは新規ブランチ作成
 			m.worktrees = nil
 			m.filteredWorktrees = nil
+			m.selectedHostID = "local"
+			m.hostSelectedIndex = 0
+			m.filteredHosts = m.hosts
 			m.focusIndex = 0
 			m.closeAllDropdowns()
-			m.nameInput.Focus()
+			if m.hasHostField() {
+				m.hostInput.Focus()
+			} else {
+				m.nameInput.Focus()
+			}
+			// ホスト変更でリポジトリが変わった可能性があるのでリロード
+			m.loadRepositories()
 			return m, textinput.Blink
 
 		case key.Matches(msg, m.keys.Kill):
@@ -701,34 +772,12 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.processingMsg = "Stopping..."
 				m.needsReswitch = true
 
-				// Cmd用に値をキャプチャ
 				killID := sess.ID
-				killedWindowName := sess.TmuxWindowName
-				var nextWindowName string
-				if m.cursor+1 < len(pageSessions) {
-					nextWindowName = pageSessions[m.cursor+1].TmuxWindowName
-				} else if m.cursor > 0 {
-					nextWindowName = pageSessions[m.cursor-1].TmuxWindowName
-				}
-
-				tmuxClient := m.tmuxClient
-				tuiPaneID := m.tuiPaneID
+				killHostID := sess.HostID
 				client := m.client
 
 				return m, func() tea.Msg {
-					// 次セッションに先に切り替え
-					if tmuxClient != nil && tuiPaneID != "" && nextWindowName != "" {
-						target := tmux.WindowTarget(nextWindowName, 0)
-						tmuxClient.JoinPane(tuiPaneID, target, true, 25, true, true)
-					}
-					// フォールバック: UIウィンドウに退避
-					if tmuxClient != nil && tuiPaneID != "" && killedWindowName != "" {
-						wn, err := tmuxClient.GetPaneWindowName(tuiPaneID)
-						if err == nil && wn == killedWindowName {
-							tmuxClient.BreakPane(tuiPaneID, true, tmux.UIWindowName)
-						}
-					}
-					if err := client.Kill(killID); err != nil {
+					if err := client.Kill(killID, killHostID); err != nil {
 						return errMsg(fmt.Errorf("kill failed: %w", err))
 					}
 					sessions, err := client.List()
@@ -747,6 +796,7 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmDelete = true
 				m.deleteTargetID = sess.ID
 				m.deleteTargetName = sess.Name
+				m.deleteTargetHostID = sess.HostID
 				return m, nil
 			}
 
@@ -756,7 +806,7 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 				sess := pageSessions[m.cursor]
 				if sess.Status == session.StatusQueued {
-					if err := m.client.Delete(sess.ID); err != nil {
+					if err := m.client.Delete(sess.ID, sess.HostID); err != nil {
 						m.err = err
 					}
 					newPageSessions := m.getPageSessions()
@@ -796,8 +846,7 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		// 作成直後のセッションにフォーカス＋右ペイン切り替え
 		if m.focusSessionID != "" {
-			// ZoomPane(unzoom) + switchToSession(JoinPane) を同一Updateサイクルで実行
-			// → 最後のSIGWINCH/WindowSizeMsgが最終的なペインサイズを反映
+			// ZoomPane(unzoom) でTUIペインをフルスクリーンから復帰
 			if m.tmuxClient != nil && m.tuiPaneID != "" {
 				m.tmuxClient.ZoomPane(m.tuiPaneID)
 			}
@@ -806,14 +855,12 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if s.ID == m.focusSessionID {
 					m.currentPage = i / itemsPerPage
 					m.cursor = i % itemsPerPage
+					m.currentSessionID = "" // 強制リセットで switchToSession を実行
 					m.switchToSession(s.ID)
 					break
 				}
 			}
 			m.focusSessionID = ""
-			// processingMsgは保持: WindowSizeMsgの到着を待つ
-			// WindowSizeMsg到着時にprocessingMsgをクリア＋ClearScreen
-			// resizeSettledCmdはフォールバック（SIGWINCHが来ない場合のタイムアウト）
 			m.waitingForResize = true
 			return m, resizeSettledCmd()
 		}
@@ -823,16 +870,18 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 削除/Kill後にカーソル位置のセッションに再接続
 		if m.needsReswitch {
 			m.needsReswitch = false
-			// Cmd内でtmux操作済みのため、currentSessionWindowをリセット
-			// switchToSessionが正しく再接続できるようにする
-			m.currentSessionWindow = ""
+			m.currentSessionID = "" // 強制リセット
 			pageSessions := m.getPageSessions()
 			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 				m.switchToSession(pageSessions[m.cursor].ID)
+			} else {
+				// セッションがなくなった場合はplaceholderに戻す
+				if m.tmuxClient != nil && m.displayPaneID != "" {
+					m.tmuxClient.RespawnPane(m.displayPaneID, tmux.PlaceholderCmd)
+				}
 			}
-			// processingMsgは保持: WindowSizeMsgの到着を待つ
-			m.waitingForResize = true
-			return m, resizeSettledCmd()
+			m.processingMsg = ""
+			return m, nil
 		}
 		m.processingMsg = ""
 		return m, nil
@@ -872,15 +921,10 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	// Calculate field count based on mode
-	// フィールド構成:
-	// - 0: name
-	// - 1: repo
-	// - 2: worktree
-	// - 3: branch
-	// 既存worktree: name(0), repo(1), worktree(2), branch(3), prompt(4), args(5) = 6
-	// 新規worktree + 既存ブランチ: name(0), repo(1), worktree(2), branch(3), wtname(4), prompt(5), args(6) = 7
-	// 新規worktree + 新規ブランチ: name(0), repo(1), worktree(2), branch(3), base(4), wtname(5), prompt(6), args(7) = 8
+	// フィールド構成（hostフィールドはhosts > 1の場合のみ表示）:
+	// [host], name, repo, worktree, branch, [base], prompt, [args]
 	fieldCount := m.getFieldCount()
+	offset := m.getHostFieldOffset()
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -930,13 +974,16 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "tab":
 			// ドロップダウンが開いている場合は選択を確定（必須フィールドのみ）
-			if m.focusIndex == 1 && m.repoDropdownOpen {
+			if m.hasHostField() && m.focusIndex == 0 && m.hostDropdownOpen {
+				m.selectCurrentHost()
+			}
+			if m.focusIndex == offset+1 && m.repoDropdownOpen {
 				m.selectCurrentRepo()
 			}
-			if m.focusIndex == 2 && m.worktreeDropdownOpen {
+			if m.focusIndex == offset+2 && m.worktreeDropdownOpen {
 				m.selectCurrentWorktree()
 			}
-			if m.focusIndex == 3 && m.branchDropdownOpen {
+			if m.focusIndex == offset+3 && m.branchDropdownOpen {
 				m.selectCurrentBranch()
 			}
 			if m.focusIndex == m.getBaseBranchFieldIndex() && m.baseBranchDropdownOpen {
@@ -951,15 +998,19 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "down":
 			// ドロップダウンが開いている場合は候補を移動
-			if m.focusIndex == 1 && m.repoDropdownOpen && len(m.filteredRepos) > 0 {
+			if m.hasHostField() && m.focusIndex == 0 && m.hostDropdownOpen && len(m.filteredHosts) > 0 {
+				m.hostSelectedIndex = (m.hostSelectedIndex + 1) % len(m.filteredHosts)
+				return m, nil
+			}
+			if m.focusIndex == offset+1 && m.repoDropdownOpen && len(m.filteredRepos) > 0 {
 				m.repoSelectedIndex = (m.repoSelectedIndex + 1) % len(m.filteredRepos)
 				return m, nil
 			}
-			if m.focusIndex == 2 && m.worktreeDropdownOpen && len(m.filteredWorktrees) > 0 {
+			if m.focusIndex == offset+2 && m.worktreeDropdownOpen && len(m.filteredWorktrees) > 0 {
 				m.worktreeSelectedIndex = (m.worktreeSelectedIndex + 1) % len(m.filteredWorktrees)
 				return m, nil
 			}
-			if m.focusIndex == 3 && m.branchDropdownOpen && len(m.filteredBranches) > 0 {
+			if m.focusIndex == offset+3 && m.branchDropdownOpen && len(m.filteredBranches) > 0 {
 				m.branchSelectedIndex = (m.branchSelectedIndex + 1) % len(m.filteredBranches)
 				return m, nil
 			}
@@ -986,15 +1037,19 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "up":
 			// ドロップダウンが開いている場合は候補を移動
-			if m.focusIndex == 1 && m.repoDropdownOpen && len(m.filteredRepos) > 0 {
+			if m.hasHostField() && m.focusIndex == 0 && m.hostDropdownOpen && len(m.filteredHosts) > 0 {
+				m.hostSelectedIndex = (m.hostSelectedIndex - 1 + len(m.filteredHosts)) % len(m.filteredHosts)
+				return m, nil
+			}
+			if m.focusIndex == offset+1 && m.repoDropdownOpen && len(m.filteredRepos) > 0 {
 				m.repoSelectedIndex = (m.repoSelectedIndex - 1 + len(m.filteredRepos)) % len(m.filteredRepos)
 				return m, nil
 			}
-			if m.focusIndex == 2 && m.worktreeDropdownOpen && len(m.filteredWorktrees) > 0 {
+			if m.focusIndex == offset+2 && m.worktreeDropdownOpen && len(m.filteredWorktrees) > 0 {
 				m.worktreeSelectedIndex = (m.worktreeSelectedIndex - 1 + len(m.filteredWorktrees)) % len(m.filteredWorktrees)
 				return m, nil
 			}
-			if m.focusIndex == 3 && m.branchDropdownOpen && len(m.filteredBranches) > 0 {
+			if m.focusIndex == offset+3 && m.branchDropdownOpen && len(m.filteredBranches) > 0 {
 				m.branchSelectedIndex = (m.branchSelectedIndex - 1 + len(m.filteredBranches)) % len(m.filteredBranches)
 				return m, nil
 			}
@@ -1014,17 +1069,22 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			// ドロップダウンが開いている場合は選択を確定
-			if m.focusIndex == 1 && m.repoDropdownOpen {
+			if m.hasHostField() && m.focusIndex == 0 && m.hostDropdownOpen {
+				m.selectCurrentHost()
+				m.hostDropdownOpen = false
+				return m, nil
+			}
+			if m.focusIndex == offset+1 && m.repoDropdownOpen {
 				m.selectCurrentRepo()
 				m.repoDropdownOpen = false
 				return m, nil
 			}
-			if m.focusIndex == 2 && m.worktreeDropdownOpen {
+			if m.focusIndex == offset+2 && m.worktreeDropdownOpen {
 				m.selectCurrentWorktree()
 				m.worktreeDropdownOpen = false
 				return m, nil
 			}
-			if m.focusIndex == 3 && m.branchDropdownOpen {
+			if m.focusIndex == offset+3 && m.branchDropdownOpen {
 				m.selectCurrentBranch()
 				m.branchDropdownOpen = false
 				return m, nil
@@ -1049,44 +1109,43 @@ func (m Model) updateCreateMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// hasHostField returns true when host selection field should be shown
+func (m *Model) hasHostField() bool {
+	return len(m.hosts) > 1
+}
+
+// getHostFieldOffset returns the field index offset caused by the host field
+func (m *Model) getHostFieldOffset() int {
+	if m.hasHostField() {
+		return 1
+	}
+	return 0
+}
+
 // getFieldCount returns the number of fields based on current mode
 func (m *Model) getFieldCount() int {
+	offset := m.getHostFieldOffset()
 	// argsはpromptが指定されている場合のみ表示
 	hasArgs := m.promptInput.Value() != ""
 
-	if !m.isNewWorktree {
-		if m.newBranchMode {
-			// 既存worktree + 新規ブランチ: name(0), repo(1), worktree(2), branch(3), base(4), prompt(5), [args(6)]
-			if hasArgs {
-				return 7
-			}
-			return 6
-		}
-		// 既存worktree + 既存ブランチ: name(0), repo(1), worktree(2), branch(3), prompt(4), [args(5)]
-		if hasArgs {
-			return 6
-		}
-		return 5
-	}
 	if m.newBranchMode {
-		// 新規worktree + 新規ブランチ: name(0), repo(1), worktree(2), branch(3), base(4), prompt(5), [args(6)]
-		// worktree名はworktreeフィールドに統合
+		// 新規ブランチ: [host], name, repo, worktree, branch, base, prompt, [args]
 		if hasArgs {
-			return 7
+			return offset + 7
 		}
-		return 6
+		return offset + 6
 	}
-	// 新規worktree + 既存ブランチ: name(0), repo(1), worktree(2), branch(3), prompt(4), [args(5)]
+	// 既存ブランチ: [host], name, repo, worktree, branch, prompt, [args]
 	if hasArgs {
-		return 6
+		return offset + 6
 	}
-	return 5
+	return offset + 5
 }
 
 // getBaseBranchFieldIndex returns the index of base branch field (only valid for new branch mode)
 func (m *Model) getBaseBranchFieldIndex() int {
 	if m.newBranchMode {
-		return 4 // 新規ブランチモード時はbase branchは常にindex 4
+		return m.getHostFieldOffset() + 4 // [host], name, repo, worktree, branch, base
 	}
 	return -1 // not applicable
 }
@@ -1099,6 +1158,7 @@ func (m *Model) getWorktreeNameFieldIndex() int {
 
 // updateInputFocus updates input focus based on current mode and focusIndex
 func (m *Model) updateInputFocus() {
+	m.hostInput.Blur()
 	m.nameInput.Blur()
 	m.repoInput.Blur()
 	m.worktreeInput.Blur()
@@ -1107,41 +1167,41 @@ func (m *Model) updateInputFocus() {
 	m.promptInput.Blur()
 	m.argsInput.Blur()
 
+	offset := m.getHostFieldOffset()
 	promptFieldIdx := m.getPromptFieldIndex()
 	baseBranchFieldIdx := m.getBaseBranchFieldIndex()
 	hasArgs := m.promptInput.Value() != ""
 	argsFieldIdx := promptFieldIdx + 1
 
-	switch m.focusIndex {
-	case 0:
+	fi := m.focusIndex
+	if m.hasHostField() && fi == 0 {
+		m.hostInput.Focus()
+		m.filterHosts()
+	} else if fi == offset+0 {
 		m.nameInput.Focus()
-	case 1:
+	} else if fi == offset+1 {
 		m.repoInput.Focus()
 		m.filterRepositories()
-	case 2:
+	} else if fi == offset+2 {
 		m.worktreeInput.Focus()
-		// 新規worktreeモードではドロップダウンを開かない（テキスト入力）
 		if !m.isNewWorktree {
 			m.filterWorktrees()
 		}
-	case 3:
+	} else if fi == offset+3 {
 		m.branchInput.Focus()
 		m.filterBranches()
-	default:
-		// 動的フィールド
-		if m.focusIndex == baseBranchFieldIdx {
-			m.baseBranchInput.Focus()
-			m.filterBaseBranches()
-		} else if m.focusIndex == promptFieldIdx {
-			m.promptInput.Focus()
-			m.filterPrompts()
-		} else if hasArgs && m.focusIndex == argsFieldIdx {
-			m.argsInput.Focus()
-		}
+	} else if fi == baseBranchFieldIdx && baseBranchFieldIdx >= 0 {
+		m.baseBranchInput.Focus()
+		m.filterBaseBranches()
+	} else if fi == promptFieldIdx {
+		m.promptInput.Focus()
+		m.filterPrompts()
+	} else if hasArgs && fi == argsFieldIdx {
+		m.argsInput.Focus()
 	}
 
 	// フォーカスがpromptでない場合はドロップダウンを閉じる
-	if m.focusIndex != promptFieldIdx {
+	if fi != promptFieldIdx {
 		m.promptDropdownOpen = false
 	}
 }
@@ -1150,50 +1210,53 @@ func (m *Model) updateInputFocus() {
 func (m *Model) updateFocusedInput(msg tea.Msg) tea.Cmd {
 	var cmd tea.Cmd
 
+	offset := m.getHostFieldOffset()
 	promptFieldIdx := m.getPromptFieldIndex()
 	baseBranchFieldIdx := m.getBaseBranchFieldIndex()
 	hasArgs := m.promptInput.Value() != ""
 	argsFieldIdx := promptFieldIdx + 1
 
-	switch m.focusIndex {
-	case 0:
+	fi := m.focusIndex
+	if m.hasHostField() && fi == 0 {
+		oldHost := m.hostInput.Value()
+		m.hostInput, cmd = m.hostInput.Update(msg)
+		if oldHost != m.hostInput.Value() {
+			m.filterHosts()
+		}
+	} else if fi == offset+0 {
 		m.nameInput, cmd = m.nameInput.Update(msg)
-	case 1:
+	} else if fi == offset+1 {
 		oldRepo := m.repoInput.Value()
 		m.repoInput, cmd = m.repoInput.Update(msg)
 		if oldRepo != m.repoInput.Value() {
 			m.filterRepositories()
 		}
-	case 2:
+	} else if fi == offset+2 {
 		oldWorktree := m.worktreeInput.Value()
 		m.worktreeInput, cmd = m.worktreeInput.Update(msg)
-		// 既存worktreeモードでのみフィルタリング
 		if !m.isNewWorktree && oldWorktree != m.worktreeInput.Value() {
 			m.filterWorktrees()
 		}
-	case 3:
+	} else if fi == offset+3 {
 		oldBranch := m.branchInput.Value()
 		m.branchInput, cmd = m.branchInput.Update(msg)
 		if oldBranch != m.branchInput.Value() {
 			m.filterBranches()
 		}
-	default:
-		// 動的フィールド
-		if m.focusIndex == baseBranchFieldIdx {
-			oldBaseBranch := m.baseBranchInput.Value()
-			m.baseBranchInput, cmd = m.baseBranchInput.Update(msg)
-			if oldBaseBranch != m.baseBranchInput.Value() {
-				m.filterBaseBranches()
-			}
-		} else if m.focusIndex == promptFieldIdx {
-			oldPrompt := m.promptInput.Value()
-			m.promptInput, cmd = m.promptInput.Update(msg)
-			if oldPrompt != m.promptInput.Value() {
-				m.filterPrompts()
-			}
-		} else if hasArgs && m.focusIndex == argsFieldIdx {
-			m.argsInput, cmd = m.argsInput.Update(msg)
+	} else if fi == baseBranchFieldIdx && baseBranchFieldIdx >= 0 {
+		oldBaseBranch := m.baseBranchInput.Value()
+		m.baseBranchInput, cmd = m.baseBranchInput.Update(msg)
+		if oldBaseBranch != m.baseBranchInput.Value() {
+			m.filterBaseBranches()
 		}
+	} else if fi == promptFieldIdx {
+		oldPrompt := m.promptInput.Value()
+		m.promptInput, cmd = m.promptInput.Update(msg)
+		if oldPrompt != m.promptInput.Value() {
+			m.filterPrompts()
+		}
+	} else if hasArgs && fi == argsFieldIdx {
+		m.argsInput, cmd = m.argsInput.Update(msg)
 	}
 
 	return cmd
@@ -1231,7 +1294,75 @@ func (m *Model) filterRepositories() {
 	m.repoDropdownOpen = len(m.filteredRepos) > 0
 }
 
-// selectCurrentRepo は現在選択中のリポジトリを確定
+// filterHosts は入力値でホストをフィルタリング
+func (m *Model) filterHosts() {
+	query := strings.ToLower(m.hostInput.Value())
+	if query == "" {
+		m.filteredHosts = m.hosts
+	} else {
+		m.filteredHosts = make([]daemon.HostInfo, 0)
+		for _, h := range m.hosts {
+			if strings.Contains(strings.ToLower(h.ID), query) {
+				m.filteredHosts = append(m.filteredHosts, h)
+			}
+		}
+	}
+	// 候補があればドロップダウンを開く
+	if len(m.filteredHosts) > 0 {
+		m.hostDropdownOpen = true
+		m.hostSelectedIndex = 0
+	} else {
+		m.hostDropdownOpen = false
+	}
+}
+
+// selectCurrentHost は現在選択中のホストを確定し、下流フィールドをリセットする
+func (m *Model) selectCurrentHost() {
+	if len(m.filteredHosts) > 0 && m.hostSelectedIndex < len(m.filteredHosts) {
+		selected := m.filteredHosts[m.hostSelectedIndex]
+		m.hostInput.SetValue(selected.ID)
+		m.hostDropdownOpen = false
+		m.selectedHostID = selected.ID
+		// ホスト変更時に下流フィールドをリセット
+		m.repoInput.Reset()
+		m.worktreeInput.Reset()
+		m.branchInput.Reset()
+		m.baseBranchInput.Reset()
+		m.repositories = nil
+		m.filteredRepos = nil
+		m.worktrees = nil
+		m.filteredWorktrees = nil
+		m.branches = nil
+		m.filteredBranches = nil
+		m.allBranches = nil
+		// 新しいホストのリポジトリ一覧を取得
+		m.loadRepositories()
+	}
+}
+
+// loadRepositories は選択中のホストのリポジトリ一覧をdaemon経由で取得する
+func (m *Model) loadRepositories() {
+	repoInfos, err := m.client.ListRepos(m.selectedHostID)
+	if err != nil {
+		m.repositories = nil
+		m.filteredRepos = nil
+		return
+	}
+
+	repos := make([]config.RepositoryConfig, 0, len(repoInfos))
+	for _, r := range repoInfos {
+		repos = append(repos, config.RepositoryConfig{
+			Name:       r.Name,
+			Path:       r.Path,
+			BaseBranch: r.BaseBranch,
+		})
+	}
+
+	m.repositories = repos
+	m.filteredRepos = repos
+	m.repoSelectedIndex = 0
+}
+
 func (m *Model) selectCurrentRepo() {
 	if len(m.filteredRepos) > 0 && m.repoSelectedIndex < len(m.filteredRepos) {
 		selected := m.filteredRepos[m.repoSelectedIndex]
@@ -1250,15 +1381,14 @@ func (m *Model) selectCurrentRepo() {
 // loadBranches は選択中のリポジトリのローカルブランチ一覧を取得（既存ブランチモード用）
 func (m *Model) loadBranches() {
 	repoName := m.repoInput.Value()
-	if repoName == "" || m.configMgr == nil {
+	if repoName == "" {
 		m.branches = nil
 		m.filteredBranches = nil
 		return
 	}
 
-	registry := repository.NewRegistry(m.configMgr)
-	// 既存ブランチモード用：ローカルブランチのみ取得
-	branches, err := registry.GetLocalBranches(repoName)
+	// daemon経由でブランチ一覧を取得（ローカル・リモート両対応）
+	branches, err := m.client.ListBranches(m.selectedHostID, repoName, false)
 	if err != nil {
 		m.branches = nil
 		m.filteredBranches = nil
@@ -1344,6 +1474,7 @@ func (m *Model) selectCurrentBaseBranch() {
 
 // closeAllDropdowns は全てのドロップダウンを閉じる
 func (m *Model) closeAllDropdowns() {
+	m.hostDropdownOpen = false
 	m.repoDropdownOpen = false
 	m.worktreeDropdownOpen = false
 	m.branchDropdownOpen = false
@@ -1354,18 +1485,30 @@ func (m *Model) closeAllDropdowns() {
 // loadWorktrees は選択中のリポジトリのworktree一覧を取得
 func (m *Model) loadWorktrees() {
 	repoName := m.repoInput.Value()
-	if repoName == "" || m.configMgr == nil {
+	if repoName == "" {
 		m.worktrees = nil
 		m.filteredWorktrees = nil
 		return
 	}
 
-	wtMgr := worktree.NewManager(m.configMgr)
-	wts, err := wtMgr.List(repoName)
+	// daemon経由でworktree一覧を取得（ローカル・リモート両対応）
+	wtInfos, err := m.client.ListWorktrees(m.selectedHostID, repoName)
 	if err != nil {
 		m.worktrees = nil
 		m.filteredWorktrees = nil
 		return
+	}
+
+	wts := make([]worktree.Worktree, 0, len(wtInfos))
+	for _, info := range wtInfos {
+		wts = append(wts, worktree.Worktree{
+			Path:       info.Path,
+			Branch:     info.Branch,
+			RepoName:   info.RepoName,
+			IsMain:     info.IsMain,
+			IsManaged:  info.IsManaged,
+			IsDetached: info.IsDetached,
+		})
 	}
 
 	m.worktrees = wts
@@ -1449,13 +1592,13 @@ func formatWorktreeDisplay(wt *worktree.Worktree) string {
 
 // getPromptFieldIndex はプロンプトフィールドのインデックスを返す
 func (m *Model) getPromptFieldIndex() int {
-	// worktree名はworktreeフィールドに統合されたので、フィールド構成が簡略化
+	offset := m.getHostFieldOffset()
 	if m.newBranchMode {
-		// 新規ブランチモード: name(0), repo(1), worktree(2), branch(3), base(4), prompt(5)
-		return 5
+		// 新規ブランチモード: [host], name, repo, worktree, branch, base, prompt
+		return offset + 5
 	}
-	// 既存ブランチモード: name(0), repo(1), worktree(2), branch(3), prompt(4)
-	return 4
+	// 既存ブランチモード: [host], name, repo, worktree, branch, prompt
+	return offset + 4
 }
 
 // filterPrompts は入力値でプロンプトをフィルタリング
@@ -1489,14 +1632,14 @@ func (m *Model) selectCurrentPrompt() {
 // loadAllBranches は選択中のリポジトリの全ブランチ一覧を取得（ローカル＋リモート）
 func (m *Model) loadAllBranches() {
 	repoName := m.repoInput.Value()
-	if repoName == "" || m.configMgr == nil {
+	if repoName == "" {
 		m.allBranches = nil
 		m.filteredBaseBranches = nil
 		return
 	}
 
-	registry := repository.NewRegistry(m.configMgr)
-	branches, err := registry.GetBranches(repoName)
+	// daemon経由でブランチ一覧を取得（ローカル+リモート、ローカル・リモートホスト両対応）
+	branches, err := m.client.ListBranches(m.selectedHostID, repoName, true)
 	if err != nil {
 		m.allBranches = nil
 		m.filteredBaseBranches = nil
@@ -1566,6 +1709,7 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 			WorktreeName:  worktreeName,
 			PromptName:    promptName,
 			PromptArgs:    promptArgs,
+			HostID:        m.selectedHostID,
 		}
 	} else {
 		selectedWt := m.getSelectedWorktree()
@@ -1590,6 +1734,7 @@ func (m Model) handleCreateSubmit() (tea.Model, tea.Cmd) {
 			IsNewWorktree: false,
 			PromptName:    promptName,
 			PromptArgs:    promptArgs,
+			HostID:        m.selectedHostID,
 		}
 	}
 
@@ -1630,7 +1775,7 @@ func (m Model) View() string {
 	if boxHeight < 5 {
 		boxHeight = 5
 	}
-	boxStyle := createBoxStyle(boxWidth, boxHeight)
+	boxStyle := createBoxStyle(boxWidth, boxHeight, m.focused)
 	box := boxStyle.Render(m.renderListContent(boxWidth - 4))
 	helpLine := m.renderHelpLine()
 	return box + "\n" + helpLine
@@ -1647,7 +1792,11 @@ func (m Model) renderListContent(contentWidth int) string {
 	var content strings.Builder
 
 	// Header line: title + current time
-	title := titleStyle.Render("ccvalet")
+	ts := titleStyle
+	if !m.focused {
+		ts = ts.Foreground(secondaryColor)
+	}
+	title := ts.Render("ccvalet")
 	currentTime := time.Now().Format("15:04:05")
 	timeDisplay := fmt.Sprintf("[ %s ]", currentTime)
 
@@ -1755,159 +1904,143 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 	}
 	timeStr := timeAgo(lastActiveTime)
 
-	// Build name with branch: "name (branch)"
-	nameWithBranch := sess.Name
-	if sess.Branch != "" {
-		nameWithBranch += " (" + sess.Branch + ")"
-	}
-
-	// Fixed width columns from right:
-	// - Last Active: 10 chars
-	// - Status label: 12 chars
-	// - Status icon: 2 chars
-	// - Remaining: name with branch
-	statusColWidth := 12
-	timeColWidth := 10
-
-	// Calculate available width for name
-	cursorWidth := 2 // "> " or "  "
-	availableForName := width - cursorWidth - 2 - statusColWidth - 1 - timeColWidth
-
-	// Truncate name if needed
-	if len(nameWithBranch) > availableForName {
-		nameWithBranch = truncateString(nameWithBranch, availableForName)
-	}
-
-	// Pad name to fill available space
-	namePadded := nameWithBranch + strings.Repeat(" ", availableForName-len(nameWithBranch))
-
-	// Format status and time columns
-	statusCol := fmt.Sprintf("%s %-10s", statusIcon, statusLabel)
-	timeCol := fmt.Sprintf("%10s", timeStr)
+	// --- Line 1: cursor + session name ---
+	availableForName := width - 2 // cursor(2)
+	name := truncateString(sess.Name, availableForName)
 
 	if selected {
-		// Selected: highlight with background
-		cursor := "> "
-		line := cursor + namePadded + statusCol + " " + timeCol
-		// Pad to full width
-		if lipgloss.Width(line) < width {
-			line += strings.Repeat(" ", width-lipgloss.Width(line))
-		}
-		b.WriteString(selectedItemStyle.Render(line))
+		b.WriteString(selectedItemStyle.Render(padLine("> "+name, width)))
 	} else {
-		// Not selected: use styled text
-		cursor := "  "
-		b.WriteString(cursor)
-		b.WriteString(sessionNameStyle.Render(namePadded))
-		b.WriteString(statusStyle.Render(statusCol))
-		b.WriteString(" ")
-		b.WriteString(timeStyle.Render(timeCol))
+		b.WriteString("  ")
+		b.WriteString(sessionNameStyle.Render(name))
 	}
 	b.WriteString("\n")
 
-	// Show error message on second line if error status
+	// --- Line 2: status (icon + label) + metadata ---
+	// Error: show error message instead of metadata
 	if sess.Status == session.StatusError && sess.ErrorMessage != "" {
-		errMsg := truncateString(sess.ErrorMessage, width-4)
+		statusStr := statusIcon + " " + statusLabel
+		errMsg := truncateString(sess.ErrorMessage, width-6-runewidth.StringWidth(statusStr)-1)
+		line2Content := statusStr + " " + errMsg
 		if selected {
-			errLine := "  └─ " + errMsg
-			errPadding := width - lipgloss.Width(errLine)
-			if errPadding > 0 {
-				errLine += strings.Repeat(" ", errPadding)
-			}
-			b.WriteString(selectedItemStyle.Render(errLine))
+			b.WriteString(selectedItemStyle.Render(padLine("  "+line2Content, width)))
 		} else {
-			b.WriteString("  └─ " + lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
+			b.WriteString("  ")
+			b.WriteString(statusStyle.Render(statusStr))
+			b.WriteString(" ")
+			b.WriteString(lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
 		}
 		b.WriteString("\n")
-	} else {
-		// Show repository and work directory on second line
-		var details []string
-		if sess.Repository != "" {
-			details = append(details, sess.Repository)
+		// Time on last line
+		if selected {
+			b.WriteString(selectedItemStyle.Render(padLine("  └─ "+timeStr, width)))
+		} else {
+			b.WriteString("  └─ " + timeStyle.Render(timeStr))
 		}
-		if sess.WorkDir != "" {
-			// Shorten home directory to ~
-			workDir := sess.WorkDir
-			if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(workDir, home) {
-				workDir = "~" + workDir[len(home):]
-			}
-			details = append(details, workDir)
-		}
-		if len(details) > 0 {
-			detailStr := strings.Join(details, " │ ")
-			// Use ├─ if we have last messages to show, └─ if this is the last line
-			lineChar := "└─"
-			if sess.LastUserMessage != "" || sess.LastAssistantMessage != "" {
-				lineChar = "├─"
-			}
-			detailStr = truncateString(detailStr, width-6)
-			if selected {
-				detailLine := "  " + lineChar + " " + detailStr
-				detailPadding := width - lipgloss.Width(detailLine)
-				if detailPadding > 0 {
-					detailLine += strings.Repeat(" ", detailPadding)
-				}
-				b.WriteString(selectedItemStyle.Render(detailLine))
-			} else {
-				b.WriteString("  " + lineChar + " " + helpStyle.Render(detailStr))
-			}
-			b.WriteString("\n")
-		}
-
-		// Show last user message (line 3)
-		if sess.LastUserMessage != "" {
-			// Determine line prefix: ├─ if assistant message follows, └─ if last line
-			linePrefix := "└─"
-			if sess.LastAssistantMessage != "" {
-				linePrefix = "├─"
-			}
-
-			prefix := "  " + linePrefix + " 👤 "
-			prefixWidth := lipgloss.Width(prefix)
-			msgWidth := width - prefixWidth
-			if msgWidth < 10 {
-				msgWidth = 10
-			}
-			msgStr := truncateString(sess.LastUserMessage, msgWidth)
-
-			if selected {
-				msgLine := prefix + msgStr
-				msgPadding := width - lipgloss.Width(msgLine)
-				if msgPadding > 0 {
-					msgLine += strings.Repeat(" ", msgPadding)
-				}
-				b.WriteString(selectedItemStyle.Render(msgLine))
-			} else {
-				b.WriteString("  " + linePrefix + " " + helpStyle.Render("👤 "+msgStr))
-			}
-			b.WriteString("\n")
-		}
-
-		// Show last assistant message (line 4)
-		if sess.LastAssistantMessage != "" {
-			prefix := "  └─ 🤖 "
-			prefixWidth := lipgloss.Width(prefix)
-			msgWidth := width - prefixWidth
-			if msgWidth < 10 {
-				msgWidth = 10
-			}
-			msgStr := truncateStringFromEnd(sess.LastAssistantMessage, msgWidth)
-
-			if selected {
-				msgLine := prefix + msgStr
-				msgPadding := width - lipgloss.Width(msgLine)
-				if msgPadding > 0 {
-					msgLine += strings.Repeat(" ", msgPadding)
-				}
-				b.WriteString(selectedItemStyle.Render(msgLine))
-			} else {
-				b.WriteString("  └─ " + helpStyle.Render("🤖 "+msgStr))
-			}
-			b.WriteString("\n")
-		}
+		b.WriteString("\n")
+		return b.String()
 	}
 
+	// Build metadata: [host] repo (branch) — fallback to workDir
+	var metaParts []string
+	if sess.HostID != "" && sess.HostID != "local" {
+		metaParts = append(metaParts, "["+sess.HostID+"]")
+	}
+	if sess.Repository != "" {
+		metaParts = append(metaParts, sess.Repository)
+	} else if sess.WorkDir != "" {
+		workDir := sess.WorkDir
+		if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(workDir, home) {
+			workDir = "~" + workDir[len(home):]
+		}
+		metaParts = append(metaParts, workDir)
+	}
+	if sess.Branch != "" {
+		metaParts = append(metaParts, "("+sess.Branch+")")
+	}
+
+	statusStr := statusIcon + " " + statusLabel
+	statusWidth := runewidth.StringWidth(statusStr)
+	metaStr := strings.Join(metaParts, " ")
+	indent := "  ├─ "
+	indentWidth := 5
+
+	// Truncate metadata if needed
+	availableForMeta := width - indentWidth - statusWidth - 1
+	if availableForMeta > 0 && runewidth.StringWidth(metaStr) > availableForMeta {
+		metaStr = truncateString(metaStr, availableForMeta)
+	}
+
+	if selected {
+		line2 := indent + statusStr
+		if metaStr != "" {
+			line2 += " " + metaStr
+		}
+		b.WriteString(selectedItemStyle.Render(padLine(line2, width)))
+	} else {
+		b.WriteString(indent)
+		b.WriteString(statusStyle.Render(statusStr))
+		if metaStr != "" {
+			b.WriteString(" ")
+			b.WriteString(helpStyle.Render(metaStr))
+		}
+	}
+	b.WriteString("\n")
+
+	// --- Line 3: last user message ---
+	if sess.LastUserMessage != "" {
+		prefix := "  ├─ 👤 "
+		pWidth := lipgloss.Width(prefix)
+		msgWidth := width - pWidth
+		if msgWidth < 10 {
+			msgWidth = 10
+		}
+		msgStr := truncateString(sess.LastUserMessage, msgWidth)
+
+		if selected {
+			b.WriteString(selectedItemStyle.Render(padLine(prefix+msgStr, width)))
+		} else {
+			b.WriteString("  ├─ " + helpStyle.Render("👤 "+msgStr))
+		}
+		b.WriteString("\n")
+	}
+
+	// --- Line 4: last assistant message ---
+	if sess.LastAssistantMessage != "" {
+		prefix := "  ├─ 🤖 "
+		pWidth := lipgloss.Width(prefix)
+		msgWidth := width - pWidth
+		if msgWidth < 10 {
+			msgWidth = 10
+		}
+		msgStr := truncateStringFromEnd(sess.LastAssistantMessage, msgWidth)
+
+		if selected {
+			b.WriteString(selectedItemStyle.Render(padLine(prefix+msgStr, width)))
+		} else {
+			b.WriteString("  ├─ " + helpStyle.Render("🤖 "+msgStr))
+		}
+		b.WriteString("\n")
+	}
+
+	// --- Last line: time ---
+	if selected {
+		b.WriteString(selectedItemStyle.Render(padLine("  └─ "+timeStr, width)))
+	} else {
+		b.WriteString("  └─ " + timeStyle.Render(timeStr))
+	}
+	b.WriteString("\n")
+
 	return b.String()
+}
+
+// padLine pads a string to the specified width with spaces.
+func padLine(s string, width int) string {
+	w := lipgloss.Width(s)
+	if w < width {
+		return s + strings.Repeat(" ", width-w)
+	}
+	return s
 }
 
 // truncateString truncates a string to fit within maxWidth display width from the beginning
@@ -2132,6 +2265,81 @@ func wrapText(text string, width int) []string {
 	return lines
 }
 
+// getInUseStyle returns a style for the "in use" indicator based on session status.
+func getInUseStyle(status session.Status) lipgloss.Style {
+	switch status {
+	case session.StatusThinking, session.StatusPermission, session.StatusConfirm:
+		return lipgloss.NewStyle().Foreground(warningColor)
+	case session.StatusRunning, session.StatusCreating:
+		return lipgloss.NewStyle().Foreground(secondaryColor)
+	default:
+		return lipgloss.NewStyle().Foreground(dimColor)
+	}
+}
+
+// buildWorktreeSessionMap builds a map from worktree path to session info
+// for the currently selected repository and host.
+func (m Model) buildWorktreeSessionMap() map[string]session.Info {
+	repo := m.repoInput.Value()
+	hostID := m.selectedHostID
+	if hostID == "" {
+		hostID = "local"
+	}
+
+	result := make(map[string]session.Info)
+	for _, sess := range m.sessions {
+		sessHost := sess.HostID
+		if sessHost == "" {
+			sessHost = "local"
+		}
+		if sess.Repository == repo && sessHost == hostID && sess.WorkDir != "" {
+			if _, exists := result[sess.WorkDir]; !exists {
+				result[sess.WorkDir] = sess
+			}
+		}
+	}
+	return result
+}
+
+// buildBranchSessionMap builds a map from branch name to session info
+// for the currently selected repository and host.
+func (m Model) buildBranchSessionMap() map[string]session.Info {
+	repo := m.repoInput.Value()
+	hostID := m.selectedHostID
+	if hostID == "" {
+		hostID = "local"
+	}
+
+	result := make(map[string]session.Info)
+	for _, sess := range m.sessions {
+		sessHost := sess.HostID
+		if sessHost == "" {
+			sessHost = "local"
+		}
+		if sess.Repository == repo && sessHost == hostID && sess.Branch != "" {
+			if _, exists := result[sess.Branch]; !exists {
+				result[sess.Branch] = sess
+			}
+		}
+	}
+	return result
+}
+
+// formatInUseIndicator returns a formatted "in use" indicator string.
+// Format: [status: session-name], truncated to maxWidth.
+func formatInUseIndicator(sess session.Info, maxWidth int) string {
+	statusStr := string(sess.Status)
+	name := sess.Name
+	// "[" + status + ": " + name + "]"
+	overhead := len(statusStr) + 4 // "[", ": ", "]"
+	availableForName := maxWidth - overhead
+	if availableForName < 3 {
+		return fmt.Sprintf("[%s]", statusStr)
+	}
+	name = truncateString(name, availableForName)
+	return fmt.Sprintf("[%s: %s]", statusStr, name)
+}
+
 // viewCreateMode renders the create session form
 func (m Model) viewCreateMode() string {
 	var b strings.Builder
@@ -2149,9 +2357,46 @@ func (m Model) viewCreateMode() string {
 	// Form fields
 	labelStyle := lipgloss.NewStyle().Width(15).Foreground(secondaryColor)
 	focusedLabelStyle := lipgloss.NewStyle().Width(15).Foreground(primaryColor).Bold(true)
+	disabledLabelStyle := lipgloss.NewStyle().Width(15).Foreground(lipgloss.Color("8"))
+	offset := m.getHostFieldOffset()
+
+	// Host field (only when multiple hosts)
+	if m.hasHostField() {
+		if m.focusIndex == 0 {
+			b.WriteString(focusedLabelStyle.Render("Host:"))
+		} else {
+			b.WriteString(labelStyle.Render("Host:"))
+		}
+		b.WriteString(m.hostInput.View())
+		b.WriteString("\n")
+
+		// Show host dropdown or help
+		if m.hostDropdownOpen && len(m.filteredHosts) > 0 {
+			for i, h := range m.filteredHosts {
+				prefix := "  "
+				label := h.ID
+				if !h.Connected {
+					label += " (disconnected)"
+				}
+				if i == m.hostSelectedIndex {
+					prefix = "> "
+					b.WriteString(lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(prefix + label))
+				} else if !h.Connected {
+					b.WriteString(disabledLabelStyle.Render(prefix + label))
+				} else {
+					b.WriteString(helpStyle.Render(prefix + label))
+				}
+				b.WriteString("\n")
+			}
+			b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm"))
+		} else if m.focusIndex == 0 {
+			b.WriteString(helpStyle.Render("  Type to search hosts..."))
+		}
+		b.WriteString("\n\n")
+	}
 
 	// Session name field (always shown)
-	if m.focusIndex == 0 {
+	if m.focusIndex == offset+0 {
 		b.WriteString(focusedLabelStyle.Render("Session Name:"))
 	} else {
 		b.WriteString(labelStyle.Render("Session Name:"))
@@ -2160,7 +2405,7 @@ func (m Model) viewCreateMode() string {
 	b.WriteString("\n\n")
 
 	// Repository field
-	if m.focusIndex == 1 {
+	if m.focusIndex == offset+1 {
 		b.WriteString(focusedLabelStyle.Render("Repository:"))
 	} else {
 		b.WriteString(labelStyle.Render("Repository:"))
@@ -2183,13 +2428,13 @@ func (m Model) viewCreateMode() string {
 		b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm"))
 	} else if len(m.repositories) == 0 {
 		b.WriteString(helpStyle.Render("  No repositories registered. Use 'ccvalet repo add' to add one."))
-	} else if m.focusIndex == 1 {
+	} else if m.focusIndex == offset+1 {
 		b.WriteString(helpStyle.Render("  Type to search repositories..."))
 	}
 	b.WriteString("\n\n")
 
 	// Worktree field
-	if m.focusIndex == 2 {
+	if m.focusIndex == offset+2 {
 		if m.isNewWorktree {
 			b.WriteString(focusedLabelStyle.Render("Worktree Name:"))
 		} else {
@@ -2210,26 +2455,36 @@ func (m Model) viewCreateMode() string {
 		// 新規worktreeモード: テキスト入力のみ
 		b.WriteString(lipgloss.NewStyle().Foreground(primaryColor).Render("  [New Worktree Mode]"))
 		b.WriteString("\n")
-		if m.focusIndex == 2 {
+		if m.focusIndex == offset+2 {
 			b.WriteString(helpStyle.Render("  Worktree directory name (optional, defaults to branch)"))
 		}
 	} else if m.worktreeDropdownOpen && len(m.filteredWorktrees) > 0 {
 		// 既存worktree一覧
+		wtSessionMap := m.buildWorktreeSessionMap()
 		for i, wt := range m.filteredWorktrees {
 			prefix := "  "
 			label := formatWorktreeDisplay(&wt)
+
+			// "in use" インジケーター
+			inUseRendered := ""
+			if sess, ok := wtSessionMap[wt.Path]; ok {
+				inUseRendered = " " + getInUseStyle(sess.Status).Render(formatInUseIndicator(sess, 25))
+			}
+
 			if i == m.worktreeSelectedIndex {
 				prefix = "> "
 				b.WriteString(lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(prefix + label))
+				b.WriteString(inUseRendered)
 			} else {
 				b.WriteString(helpStyle.Render(prefix + label))
+				b.WriteString(inUseRendered)
 			}
 			b.WriteString("\n")
 		}
 		b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm  Ctrl+W: new worktree"))
-	} else if m.focusIndex == 2 && m.repoInput.Value() == "" {
+	} else if m.focusIndex == offset+2 && m.repoInput.Value() == "" {
 		b.WriteString(helpStyle.Render("  Select repository first"))
-	} else if m.focusIndex == 2 {
+	} else if m.focusIndex == offset+2 {
 		b.WriteString(helpStyle.Render("  Type to search or select worktree..."))
 	}
 	b.WriteString("\n\n")
@@ -2239,7 +2494,7 @@ func (m Model) viewCreateMode() string {
 	if !m.isNewWorktree {
 		branchLabel = "Checkout:"
 	}
-	if m.focusIndex == 3 {
+	if m.focusIndex == offset+3 {
 		b.WriteString(focusedLabelStyle.Render(branchLabel))
 	} else {
 		b.WriteString(labelStyle.Render(branchLabel))
@@ -2249,6 +2504,7 @@ func (m Model) viewCreateMode() string {
 
 	// Show branch dropdown or help
 	if m.branchDropdownOpen && len(m.filteredBranches) > 0 {
+		branchSessionMap := m.buildBranchSessionMap()
 		displayCount := len(m.filteredBranches)
 		if displayCount > 10 {
 			displayCount = 10
@@ -2256,11 +2512,20 @@ func (m Model) viewCreateMode() string {
 		for i := 0; i < displayCount; i++ {
 			branch := m.filteredBranches[i]
 			prefix := "  "
+
+			// "in use" インジケーター
+			inUseRendered := ""
+			if sess, ok := branchSessionMap[branch]; ok {
+				inUseRendered = " " + getInUseStyle(sess.Status).Render(formatInUseIndicator(sess, 25))
+			}
+
 			if i == m.branchSelectedIndex {
 				prefix = "> "
 				b.WriteString(lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render(prefix + branch))
+				b.WriteString(inUseRendered)
 			} else {
 				b.WriteString(helpStyle.Render(prefix + branch))
+				b.WriteString(inUseRendered)
 			}
 			b.WriteString("\n")
 		}
@@ -2270,7 +2535,7 @@ func (m Model) viewCreateMode() string {
 		}
 		b.WriteString(helpStyle.Render("  up/down: select  Enter/Tab: confirm"))
 		b.WriteString("\n")
-	} else if m.focusIndex == 3 {
+	} else if m.focusIndex == offset+3 {
 		if m.newBranchMode {
 			b.WriteString(helpStyle.Render("  New branch name (Ctrl+B to toggle mode)"))
 		} else {

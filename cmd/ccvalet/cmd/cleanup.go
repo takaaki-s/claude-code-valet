@@ -101,7 +101,7 @@ If --worktree flag is specified, also deletes the associated git worktrees.`,
 			}
 
 			// Delete session
-			if err := client.Delete(s.ID); err != nil {
+			if err := client.Delete(s.ID, ""); err != nil {
 				fmt.Printf("Warning: failed to delete session %s: %v\n", s.Name, err)
 			} else {
 				fmt.Printf("Deleted session: %s (%s)\n", s.Name, s.ID[:8])

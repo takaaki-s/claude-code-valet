@@ -5,10 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/takaaki-s/claude-code-valet/internal/daemon"
 )
+
+var socketPathFlag string
 
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
@@ -41,7 +44,11 @@ var daemonStartCmd = &cobra.Command{
 
 		// Start daemon in background
 		exe, _ := os.Executable()
-		daemonCmd := exec.Command(exe, "daemon")
+		daemonArgs := []string{"daemon"}
+		if socketPathFlag != "" {
+			daemonArgs = append(daemonArgs, "--socket", socketPathFlag)
+		}
+		daemonCmd := exec.Command(exe, daemonArgs...)
 		daemonCmd.Env = os.Environ() // Inherit environment variables
 		daemonCmd.Stdout = nil
 		daemonCmd.Stderr = nil
@@ -83,6 +90,14 @@ var daemonStopCmd = &cobra.Command{
 		if err := client.Stop(); err != nil {
 			return err
 		}
+		// Wait for daemon to actually exit (handleStop calls os.Exit in a goroutine)
+		for i := 0; i < 30; i++ {
+			if !client.IsRunning() {
+				fmt.Println("Daemon stopped")
+				return nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 		fmt.Println("Daemon stopped")
 		return nil
 	},
@@ -93,9 +108,15 @@ func init() {
 	daemonCmd.AddCommand(daemonStartCmd)
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
+
+	// --socket フラグ: Slaveモードでカスタムソケットパスを指定
+	daemonCmd.PersistentFlags().StringVar(&socketPathFlag, "socket", "", "custom socket path (for slave mode)")
 }
 
 func getSocketPath() string {
+	if socketPathFlag != "" {
+		return socketPathFlag
+	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".ccvalet", "daemon.sock")
+	return filepath.Join(home, ".ccvalet", "run", "daemon.sock")
 }

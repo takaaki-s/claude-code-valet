@@ -67,58 +67,86 @@ func (m *Manager) recoverTmuxSessionsLocked() {
 
 	for _, session := range m.sessions {
 		if session.TmuxWindowName == "" {
+			// Fix stale sessions: active status but no tmux session (from prior recovery bug)
+			if session.Status != StatusStopped && session.Status != StatusError && session.Status != StatusQueued && session.Status != StatusCreating {
+				session.Status = StatusStopped
+				m.store.Save(session)
+				debugLog("[RECOVER] Session %s has active status but no tmux session, marked stopped", session.Name)
+			}
 			continue
 		}
 
-		// Check if the tmux window still exists
-		windowTarget := tmux.SessionName + ":" + session.TmuxWindowName
-		if _, err := m.tmuxClient.PaneCount(windowTarget); err != nil {
-			// Window doesn't exist anymore
+		// Check if the inner tmux session still exists
+		if !m.tmuxClient.HasSession(session.TmuxWindowName) {
 			session.TmuxWindowName = ""
+			session.Status = StatusStopped
 			m.store.Save(session)
-			debugLog("[RECOVER] Session %s tmux window gone, cleared TmuxWindowName", session.Name)
+			debugLog("[RECOVER] Session %s inner tmux session gone, marked stopped", session.Name)
 			continue
 		}
 
-		// Use pane ID if available (stable across join-pane reordering)
+		// Use pane ID if available, otherwise get from tmux (avoids base-index issues)
 		target := session.TmuxPaneID
 		if target == "" {
-			target = tmux.WindowTarget(session.TmuxWindowName, 0)
+			if id, err := m.tmuxClient.GetPaneID(session.TmuxWindowName); err == nil {
+				target = id
+			} else {
+				target = session.TmuxWindowName + ":0.0"
+			}
 		}
 
-		// Check if pane is dead — keep TmuxWindowName (window alive via remain-on-exit)
+		// Check if pane is dead — keep TmuxWindowName (session alive via remain-on-exit)
 		if m.tmuxClient.IsPaneDead(target) {
 			session.Status = StatusStopped
 			m.store.Save(session)
-			debugLog("[RECOVER] Session %s tmux pane dead, kept TmuxWindowName (window preserved)", session.Name)
+			debugLog("[RECOVER] Session %s tmux pane dead, kept TmuxWindowName (session preserved)", session.Name)
 			continue
 		}
 
-		// Window exists and pane is alive - resume monitoring
+		// Session exists and pane is alive - resume monitoring
 		session.Status = StatusRunning
 		session.LastOutputTime = time.Now()
 		m.store.Save(session)
-		debugLog("[RECOVER] Session %s has live tmux window, resuming monitoring", session.Name)
+		debugLog("[RECOVER] Session %s has live inner tmux session, resuming monitoring", session.Name)
 
 		go m.captureOutputTmux(session)
 	}
 }
 
-// ensureTmuxClient lazily initializes the tmux client if the ccvalet tmux session exists.
-// This handles the case where the daemon starts before the TUI creates the tmux session.
+// ensureTmuxClient lazily initializes the inner tmux client (-L ccvalet).
+// Each CC session creates its own tmux session, so no shared session is needed.
 func (m *Manager) ensureTmuxClient() {
 	if m.tmuxClient != nil {
 		return
 	}
-	tc, err := tmux.NewClient()
+	tc, err := tmux.NewClient() // Uses SocketName = "ccvalet"
 	if err != nil {
 		return
 	}
-	if tc.HasSession(tmux.SessionName) {
-		m.tmuxClient = tc
-		debugLog("[TMUX] tmux client lazily initialized (session: %s)", tmux.SessionName)
-		m.recoverTmuxSessionsLocked()
+	m.tmuxClient = tc
+	debugLog("[TMUX] Inner tmux client initialized (socket: %s)", tmux.SocketName)
+	// Don't call configureInnerTmux here — the inner tmux server may not exist yet.
+	// Configuration is applied in startSessionTmux after the first session is created.
+	m.recoverTmuxSessionsLocked()
+}
+
+// configureInnerTmux applies ccvalet-specific settings to the inner tmux server.
+// User's ~/.tmux.conf is automatically loaded by tmux on server startup.
+// Only ccvalet-specific settings (remain-on-exit, pane-died hook) are added here.
+// Must only be called after the inner tmux server is confirmed to exist (i.e., after
+// a session has been created).
+// This is called every time a session is started (not just once) because the inner
+// tmux server may have exited and restarted between sessions. The overhead is minimal.
+func (m *Manager) configureInnerTmux() {
+	if m.tmuxClient == nil {
+		return
 	}
+	if err := m.tmuxClient.SetOption("remain-on-exit", "on", true); err != nil {
+		debugLog("[TMUX] Inner tmux server not ready: %v", err)
+		return
+	}
+	m.tmuxClient.SetupAutoCleanDeadPanes()
+	debugLog("[TMUX] Inner tmux server configured (remain-on-exit, pane-died hook)")
 }
 
 // NewManager creates a new session manager
@@ -481,57 +509,68 @@ func (m *Manager) startSessionTmux(session *Session) error {
 
 	// Build shell command with environment setup
 	// Unset TMUX/TMUX_PANE to prevent nested tmux detection
-	shellCmd := fmt.Sprintf("env -u TMUX -u TMUX_PANE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic '%s'",
+	shellCmd := fmt.Sprintf("env -u TMUX -u TMUX_PANE -u CLAUDECODE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic '%s'",
 		shell, claudeCmd)
 
-	// Try to revive CC in existing window (preserves user panes)
-	windowName := tmux.WindowName(session.ID)
-	if session.TmuxWindowName != "" {
-		existingTarget := tmux.SessionName + ":" + session.TmuxWindowName
-		if _, err := m.tmuxClient.PaneCount(existingTarget); err == nil {
-			// Window exists → RespawnPane on CC pane to revive it in place
-			// Use pane ID (stable) instead of pane index (changes when TUI joins via join-pane)
-			target := session.TmuxPaneID
-			if target == "" {
-				target = tmux.WindowTarget(session.TmuxWindowName, 0)
-			}
-			if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
-				session.Status = StatusRunning
-				session.LastOutputTime = time.Now()
-				session.StartedAt = time.Now()
-				m.store.Save(session)
-				debugLog("[TMUX] Session %s CC revived via RespawnPane (layout preserved)", session.Name)
-				go m.captureOutputTmux(session)
-				return nil
+	innerSessionName := tmux.InnerSessionName(session.ID)
+
+	// Try to revive CC in existing inner tmux session (preserves user panes)
+	if session.TmuxWindowName != "" && m.tmuxClient.HasSession(session.TmuxWindowName) {
+		target := session.TmuxPaneID
+		if target == "" {
+			// Fallback: get pane ID from session (avoids base-index issues with ":0.0")
+			if id, err := m.tmuxClient.GetPaneID(session.TmuxWindowName); err == nil {
+				target = id
+			} else {
+				target = session.TmuxWindowName + ":0.0"
 			}
 		}
-		// Fall through: window gone or respawn failed → create new
+		if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
+			session.Status = StatusRunning
+			session.LastOutputTime = time.Now()
+			session.StartedAt = time.Now()
+			m.store.Save(session)
+			debugLog("[TMUX] Session %s CC revived via RespawnPane in inner session", session.Name)
+			go m.captureOutputTmux(session)
+			return nil
+		}
+		// Fall through: session gone or respawn failed → create new
 		session.TmuxWindowName = ""
 	}
 
-	// Kill existing window with the same name if it exists (stale from daemon restart)
-	existingWindowTarget := tmux.SessionName + ":" + windowName
-	m.tmuxClient.KillWindow(existingWindowTarget) // ignore error (window might not exist)
+	// Kill existing inner session with the same name if it exists (stale from daemon restart)
+	m.tmuxClient.KillSession(innerSessionName) // ignore error (session might not exist)
 
-	if err := m.tmuxClient.NewWindowInDir(tmux.SessionName, windowName, session.WorkDir, shellCmd, true); err != nil {
-		return fmt.Errorf("failed to create tmux window: %w", err)
+	// Create a new inner tmux session (-L ccvalet) for this CC session
+	if err := m.tmuxClient.NewSessionWithCmdInDir(innerSessionName, 200, 50, session.WorkDir, shellCmd); err != nil {
+		return fmt.Errorf("failed to create inner tmux session: %w", err)
 	}
 
-	// Tag CC pane so pane-died hook preserves it (user-added panes auto-close)
-	target := tmux.WindowTarget(windowName, 0)
-	m.tmuxClient.TagManagedPane(target)
-
-	// Record CC pane's unique ID for capture-pane (survives pane reordering by join-pane)
-	if paneID, err := m.tmuxClient.GetPaneID(target); err == nil {
-		session.TmuxPaneID = paneID
+	// Get the pane's unique ID (%N) — reliable regardless of base-index/pane-base-index.
+	// User's ~/.tmux.conf may set base-index=1, making ":0.0" targets invalid.
+	paneID, err := m.tmuxClient.GetPaneID(innerSessionName)
+	if err != nil {
+		debugLog("[TMUX] GetPaneID failed for %s: %v", innerSessionName, err)
+		paneID = ""
 	}
 
-	session.TmuxWindowName = windowName
+	// Tag CC pane FIRST — must happen before pane-died hook is active,
+	// otherwise a quick process exit triggers kill-pane on the untagged pane.
+	if paneID != "" {
+		m.tmuxClient.TagManagedPane(paneID)
+	}
+
+	// Then apply server config (remain-on-exit + pane-died hook)
+	m.configureInnerTmux()
+
+	session.TmuxPaneID = paneID
+
+	session.TmuxWindowName = innerSessionName // Reuse field for inner session name
 	session.Status = StatusRunning
 	session.LastOutputTime = time.Now()
 	session.StartedAt = time.Now()
 
-	// Persist tmux window name
+	// Persist inner session name
 	m.store.Save(session)
 
 	// Start status detection via capture-pane polling
@@ -581,6 +620,39 @@ func (m *Manager) captureOutputTmux(session *Session) {
 				debugLog("[TMUX] Session %s pane died but session already deleted, skipping save", sessionName)
 				return
 			}
+
+			// claude --resume が即座に失敗した場合（起動後10秒以内）、
+			// 新しいセッションIDでプレーンな claude を自動リスタートする
+			if session.ClaudeSessionStarted && time.Since(session.StartedAt) < 10*time.Second {
+				debugLog("[TMUX] Session %s pane died quickly (resume likely failed), retrying with fresh claude", session.Name)
+				newSessionID := uuid.New().String()
+				session.ClaudeSessionStarted = false
+				session.ClaudeSessionID = newSessionID
+				m.mu.Unlock()
+				m.store.Save(session)
+
+				shell := m.configMgr.GetShell()
+				shellCmd := fmt.Sprintf("env -u TMUX -u TMUX_PANE -u CLAUDECODE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic 'claude --session-id %s'",
+					shell, newSessionID)
+				if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
+					m.mu.Lock()
+					session.Status = StatusRunning
+					session.ClaudeSessionStarted = true
+					session.StartedAt = time.Now()
+					session.LastOutputTime = time.Now()
+					m.mu.Unlock()
+					m.store.Save(session)
+					debugLog("[TMUX] Session %s restarted with fresh claude (session-id: %s)", session.Name, newSessionID)
+					continue
+				}
+				debugLog("[TMUX] Session %s respawn failed after quick death", session.Name)
+				m.mu.Lock()
+				if _, exists := m.sessions[session.ID]; !exists {
+					m.mu.Unlock()
+					return
+				}
+			}
+
 			session.Status = StatusStopped
 			session.LastActiveAt = time.Now()
 			// Keep TmuxWindowName: window survives (remain-on-exit), only CC pane is dead.
@@ -688,6 +760,7 @@ func (m *Manager) injectPromptTmux(session *Session, promptName string, vars pro
 
 	m.mu.RLock()
 	windowName := session.TmuxWindowName
+	paneID := session.TmuxPaneID
 	m.mu.RUnlock()
 
 	if windowName == "" {
@@ -695,7 +768,10 @@ func (m *Manager) injectPromptTmux(session *Session, promptName string, vars pro
 		return
 	}
 
-	target := tmux.WindowTarget(windowName, 0)
+	target := paneID
+	if target == "" {
+		target = windowName + ":0.0"
+	}
 
 	// Send prompt text via send-keys (literal mode)
 	if err := m.tmuxClient.SendKeysLiteral(target, expandedPrompt); err != nil {
@@ -761,15 +837,14 @@ func (m *Manager) Kill(id string) error {
 		return fmt.Errorf("session %s not found", id)
 	}
 
-	// Kill CC pane (not the whole window) to avoid destroying TUI if it's joined
+	// Kill CC pane in the inner tmux session
 	if m.tmuxClient != nil && session.TmuxPaneID != "" {
 		m.tmuxClient.KillPane(session.TmuxPaneID)
 		session.TmuxPaneID = ""
 		session.TmuxWindowName = ""
 	} else if m.tmuxClient != nil && session.TmuxWindowName != "" {
-		// Fallback: no pane ID, kill the whole window
-		windowTarget := tmux.SessionName + ":" + session.TmuxWindowName
-		m.tmuxClient.KillWindow(windowTarget)
+		// Fallback: no pane ID, kill the inner tmux session
+		m.tmuxClient.KillSession(session.TmuxWindowName)
 		session.TmuxWindowName = ""
 	}
 
@@ -798,13 +873,9 @@ func (m *Manager) Delete(id string) error {
 		return fmt.Errorf("session %s not found", id)
 	}
 
-	// Kill CC pane (not the whole window) to avoid destroying TUI if it's joined
-	if m.tmuxClient != nil && session.TmuxPaneID != "" {
-		m.tmuxClient.KillPane(session.TmuxPaneID)
-	} else if m.tmuxClient != nil && session.TmuxWindowName != "" {
-		// Fallback: no pane ID, kill the whole window
-		windowTarget := tmux.SessionName + ":" + session.TmuxWindowName
-		m.tmuxClient.KillWindow(windowTarget)
+	// Kill the inner tmux session entirely
+	if m.tmuxClient != nil && session.TmuxWindowName != "" {
+		m.tmuxClient.KillSession(session.TmuxWindowName)
 	}
 
 	// Remove from store

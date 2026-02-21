@@ -71,5 +71,9 @@ func (s *Store) LoadAll() ([]*Session, error) {
 // Delete removes a session file
 func (s *Store) Delete(id string) error {
 	path := filepath.Join(s.dataDir, id+".json")
-	return os.Remove(path)
+	err := os.Remove(path)
+	if err != nil && os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }

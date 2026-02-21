@@ -7,10 +7,13 @@ import (
 )
 
 const (
-	// SocketName is the dedicated tmux socket name for ccvalet
+	// SocketName is the dedicated tmux socket name for ccvalet (inner tmux for CC sessions)
 	SocketName = "ccvalet"
 
-	// SessionName is the tmux session name
+	// MgrSocketName is the tmux socket name for the outer layout manager
+	MgrSocketName = "ccvalet-mgr"
+
+	// SessionName is the tmux session name (used for the outer tmux session)
 	SessionName = "ccvalet"
 
 	// UIWindowName is the name of the window that contains the TUI + display pane
@@ -18,6 +21,9 @@ const (
 
 	// WindowPrefix is prepended to session IDs for tmux window names
 	WindowPrefix = "sess-"
+
+	// SessionPrefix is prepended to session IDs for inner tmux session names
+	SessionPrefix = "sess-"
 
 	// PlaceholderCmd is the command run in the placeholder right pane
 	PlaceholderCmd = "tail -f /dev/null"
@@ -29,17 +35,36 @@ const (
 
 // Client wraps tmux CLI commands, always using the dedicated socket.
 type Client struct {
-	tmuxPath string
+	tmuxPath   string
+	socketName string
+	configFile string // optional: "-f <path>" passed to tmux (empty = use default ~/.tmux.conf)
 }
 
-// NewClient creates a new tmux client.
+// NewClientWithSocket creates a new tmux client with a specific socket name.
 // Returns error if tmux is not found.
-func NewClient() (*Client, error) {
+func NewClientWithSocket(socketName string) (*Client, error) {
 	path, err := exec.LookPath("tmux")
 	if err != nil {
 		return nil, fmt.Errorf("tmux not found: %w", err)
 	}
-	return &Client{tmuxPath: path}, nil
+	return &Client{tmuxPath: path, socketName: socketName}, nil
+}
+
+// NewClient creates a new tmux client using the default SocketName.
+// Returns error if tmux is not found.
+func NewClient() (*Client, error) {
+	return NewClientWithSocket(SocketName)
+}
+
+// NewMgrClient creates a tmux client for the outer layout manager socket.
+// Uses -f /dev/null to prevent loading user's ~/.tmux.conf, ensuring
+// user key bindings (e.g., Shift+Arrow) pass through to the inner tmux.
+func NewMgrClient() (*Client, error) {
+	path, err := exec.LookPath("tmux")
+	if err != nil {
+		return nil, fmt.Errorf("tmux not found: %w", err)
+	}
+	return &Client{tmuxPath: path, socketName: MgrSocketName, configFile: "/dev/null"}, nil
 }
 
 // HasTmux returns true if tmux is available on the system.
@@ -48,10 +73,18 @@ func HasTmux() bool {
 	return err == nil
 }
 
+// baseArgs returns the common tmux arguments (socket, config file).
+func (c *Client) baseArgs() []string {
+	args := []string{"-L", c.socketName}
+	if c.configFile != "" {
+		args = append(args, "-f", c.configFile)
+	}
+	return args
+}
+
 // run executes a tmux command with the dedicated socket.
 func (c *Client) run(args ...string) (string, error) {
-	fullArgs := append([]string{"-L", SocketName}, args...)
-	cmd := exec.Command(c.tmuxPath, fullArgs...)
+	cmd := exec.Command(c.tmuxPath, append(c.baseArgs(), args...)...)
 	out, err := cmd.CombinedOutput()
 	output := strings.TrimSpace(string(out))
 	if err != nil && output != "" {
@@ -90,6 +123,18 @@ func (c *Client) NewSessionWithCmd(name string, width, height int, windowName, s
 	return c.runSilent(args...)
 }
 
+// NewSessionWithCmdInDir creates a new detached tmux session with a starting directory and command.
+func (c *Client) NewSessionWithCmdInDir(name string, width, height int, dir, shellCmd string) error {
+	args := []string{"new-session", "-s", name, "-x", fmt.Sprintf("%d", width), "-y", fmt.Sprintf("%d", height), "-d"}
+	if dir != "" {
+		args = append(args, "-c", dir)
+	}
+	if shellCmd != "" {
+		args = append(args, shellCmd)
+	}
+	return c.runSilent(args...)
+}
+
 // KillSession kills a tmux session.
 func (c *Client) KillSession(name string) error {
 	return c.runSilent("kill-session", "-t", name)
@@ -103,8 +148,7 @@ func (c *Client) HasSession(name string) bool {
 
 // AttachSession attaches to an existing session (replaces current terminal).
 func (c *Client) AttachSession(name string) error {
-	fullArgs := []string{"-L", SocketName, "attach-session", "-t", name}
-	cmd := exec.Command(c.tmuxPath, fullArgs...)
+	cmd := exec.Command(c.tmuxPath, append(c.baseArgs(), "attach-session", "-t", name)...)
 	cmd.Stdin = nil // will be set by caller
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -114,8 +158,7 @@ func (c *Client) AttachSession(name string) error {
 // AttachCmd returns an exec.Cmd for attaching to a session.
 // The caller is responsible for setting Stdin/Stdout/Stderr and calling Run().
 func (c *Client) AttachCmd(name string) *exec.Cmd {
-	fullArgs := []string{"-L", SocketName, "attach-session", "-t", name}
-	return exec.Command(c.tmuxPath, fullArgs...)
+	return exec.Command(c.tmuxPath, append(c.baseArgs(), "attach-session", "-t", name)...)
 }
 
 // --- Window management ---
@@ -364,6 +407,7 @@ func (c *Client) TagManagedPane(target string) error {
 
 // BindKey binds a key without prefix requirement.
 // cmdArgs are the tmux command and its arguments (e.g., "select-pane", "-L").
+
 func (c *Client) BindKey(key string, cmdArgs ...string) error {
 	args := append([]string{"bind-key", "-n", key}, cmdArgs...)
 	return c.runSilent(args...)
@@ -390,6 +434,16 @@ func WindowName(sessionID string) string {
 	return WindowPrefix + sessionID
 }
 
+// InnerSessionName returns the inner tmux session name for a CC session ID.
+func InnerSessionName(sessionID string) string {
+	return SessionPrefix + sessionID
+}
+
+// GetSocketName returns the socket name used by this client.
+func (c *Client) GetSocketName() string {
+	return c.socketName
+}
+
 // WindowTarget returns the full target for a window pane.
 // e.g., "ccvalet:sess-abc123.0"
 func WindowTarget(windowName string, pane int) string {
@@ -413,6 +467,18 @@ func (c *Client) PaneCount(target string) (int, error) {
 	return len(strings.Split(out, "\n")), nil
 }
 
+// ListPaneIDs returns all pane IDs (e.g., ["%0", "%1"]) in a window/session target.
+func (c *Client) ListPaneIDs(target string) ([]string, error) {
+	out, err := c.run("list-panes", "-t", target, "-F", "#{pane_id}")
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
 // IsPaneDead checks if a pane's process has exited.
 func (c *Client) IsPaneDead(target string) bool {
 	out, _ := c.run("display-message", "-t", target, "-p", "#{pane_dead}")
@@ -422,6 +488,11 @@ func (c *Client) IsPaneDead(target string) bool {
 // GetPaneID returns the unique pane ID (e.g., "%42") for a target.
 func (c *Client) GetPaneID(target string) (string, error) {
 	return c.run("display-message", "-t", target, "-p", "#{pane_id}")
+}
+
+// ResizePaneWidth sets the width of a pane to the specified number of columns.
+func (c *Client) ResizePaneWidth(target string, width int) error {
+	return c.runSilent("resize-pane", "-t", target, "-x", fmt.Sprintf("%d", width))
 }
 
 // ZoomPane toggles the zoom state of a pane (resize-pane -Z).

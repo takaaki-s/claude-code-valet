@@ -48,11 +48,22 @@ type KeybindingsConfig struct {
 	Detach []string `mapstructure:"detach,omitempty"`
 }
 
+// HostConfig はリモートホストの設定を表す
+type HostConfig struct {
+	ID         string   `mapstructure:"id"`                    // ホスト識別子 (例: "ec2", "docker-dev")
+	Type       string   `mapstructure:"type"`                  // "ssh" or "docker"
+	Host       string   `mapstructure:"host,omitempty"`        // SSH接続先 (例: "ec2-host")
+	SSHOpts    []string `mapstructure:"ssh_opts,omitempty"`    // 追加SSHオプション
+	Container  string   `mapstructure:"container,omitempty"`   // Dockerコンテナ名/ID
+	SocketPath string   `mapstructure:"socket_path,omitempty"` // リモート側ソケットパス (デフォルト: ~/.ccvalet/run/daemon.sock)
+}
+
 // Config はアプリケーション全体の設定を表す
 type Config struct {
 	Parallel     ParallelConfig     `mapstructure:"parallel"`
 	Repositories []RepositoryConfig `mapstructure:"repositories"`
 	Keybindings  KeybindingsConfig  `mapstructure:"keybindings,omitempty"` // キーバインド設定
+	Hosts        []HostConfig       `mapstructure:"hosts,omitempty"`       // リモートホスト設定
 }
 
 // Manager は設定ファイルの読み書きを管理する
@@ -248,6 +259,30 @@ func (m *Manager) GetMaxParallel() int {
 		return 3 // デフォルト値
 	}
 	return m.config.Parallel.MaxParallel
+}
+
+// GetHosts はリモートホスト一覧を返す
+func (m *Manager) GetHosts() []HostConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	hosts := make([]HostConfig, len(m.config.Hosts))
+	copy(hosts, m.config.Hosts)
+	return hosts
+}
+
+// GetHost は指定したIDのホストを返す
+func (m *Manager) GetHost(id string) *HostConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, h := range m.config.Hosts {
+		if h.ID == id {
+			hc := h
+			return &hc
+		}
+	}
+	return nil
 }
 
 // GetShell はClaude Code起動時のシェルを返す

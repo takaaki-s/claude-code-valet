@@ -14,8 +14,11 @@ import (
 	"time"
 
 	"github.com/takaaki-s/claude-code-valet/internal/config"
+	"github.com/takaaki-s/claude-code-valet/internal/host"
+	"github.com/takaaki-s/claude-code-valet/internal/repository"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
+	"github.com/takaaki-s/claude-code-valet/internal/tunnel"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
 )
 
@@ -45,12 +48,14 @@ func debugLog(format string, args ...interface{}) {
 
 // Server is the daemon server
 type Server struct {
-	socketPath string
-	manager    *session.Manager
-	configMgr  *config.Manager
-	stateMgr   *config.StateManager
-	listener   net.Listener
-	createMu   sync.Mutex // セッション作成の排他制御用
+	socketPath    string
+	manager       *session.Manager
+	configMgr     *config.Manager
+	stateMgr      *config.StateManager
+	listener      net.Listener
+	createMu      sync.Mutex         // セッション作成の排他制御用
+	hostRegistry  *host.Registry     // マルチホスト管理
+	tunnelMgr     *tunnel.Manager    // SSHトンネル管理
 }
 
 // Message types
@@ -91,12 +96,22 @@ func NewServer(socketPath, dataDir, configDir string) (*Server, error) {
 		}
 	}
 
-	return &Server{
+	s := &Server{
 		socketPath: socketPath,
 		manager:    mgr,
 		configMgr:  configMgr,
 		stateMgr:   stateMgr,
-	}, nil
+	}
+
+	// マルチホスト対応の初期化
+	hosts := configMgr.GetHosts()
+	if len(hosts) > 0 {
+		s.tunnelMgr = tunnel.NewManager()
+		s.hostRegistry = host.NewRegistry(hosts)
+		s.initRemoteSlaves()
+	}
+
+	return s, nil
 }
 
 // Start starts the daemon server
@@ -141,6 +156,11 @@ func (s *Server) Start() error {
 
 // Stop stops the daemon server
 func (s *Server) Stop() {
+	// トンネルをクリーンアップ
+	if s.tunnelMgr != nil {
+		s.tunnelMgr.CloseAll()
+	}
+
 	if s.listener != nil {
 		s.listener.Close()
 		s.listener = nil
@@ -180,6 +200,14 @@ func (s *Server) handleRequest(req *Request) Response {
 		return s.handleDelete(req.Data)
 	case "stop":
 		return s.handleStop()
+	case "list-hosts":
+		return s.handleListHosts()
+	case "list-repos":
+		return s.handleListRepos(req.Data)
+	case "list-branches":
+		return s.handleListBranches(req.Data)
+	case "list-worktrees":
+		return s.handleListWorktrees(req.Data)
 	default:
 		return Response{Success: false, Error: fmt.Sprintf("unknown action: %s", req.Action)}
 	}
@@ -198,12 +226,18 @@ type NewRequest struct {
 	NewBranch     bool   `json:"new_branch,omitempty"`     // 新規ブランチを作成するか
 	IsNewWorktree bool   `json:"is_new_worktree,omitempty"` // 新規worktreeを作成するか
 	WorktreeName  string `json:"worktree_name,omitempty"`  // worktree名（ディレクトリ名）
+	HostID        string `json:"host_id,omitempty"`        // 対象ホスト（空="local"）
 }
 
 func (s *Server) handleNew(data json.RawMessage) Response {
 	var req NewRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		return Response{Success: false, Error: err.Error()}
+	}
+
+	// リモートホスト宛の場合、該当slaveに転送
+	if req.HostID != "" && req.HostID != "local" {
+		return s.forwardToSlave(req.HostID, Request{Action: "new", Data: data})
 	}
 
 	// 設定を再読み込み（CLI で repo add された場合に対応）
@@ -422,8 +456,54 @@ func (s *Server) handleList() Response {
 	// Try to start queued sessions if there's room
 	s.tryStartQueued()
 
-	sessions := s.manager.List()
-	data, _ := json.Marshal(sessions)
+	// ローカルセッション一覧を取得
+	localSessions := s.manager.List()
+	for i := range localSessions {
+		if localSessions[i].HostID == "" {
+			localSessions[i].HostID = "local"
+		}
+	}
+
+	// リモートホストがない場合はローカルのみ返す
+	if s.hostRegistry == nil {
+		data, _ := json.Marshal(localSessions)
+		return Response{Success: true, Data: data}
+	}
+
+	// リモートセッション一覧を並列取得して統合
+	allSessions := localSessions
+	remotes := s.hostRegistry.Remotes()
+
+	if len(remotes) > 0 {
+		type remoteResult struct {
+			sessions []session.Info
+			err      error
+			hostID   string
+		}
+
+		results := make(chan remoteResult, len(remotes))
+		for _, h := range remotes {
+			go func(rh *host.Host) {
+				if rh.Client == nil {
+					results <- remoteResult{hostID: rh.ID, err: fmt.Errorf("not connected")}
+					return
+				}
+				sessions, err := rh.Client.ListWithHostID()
+				results <- remoteResult{sessions: sessions, err: err, hostID: rh.ID}
+			}(h)
+		}
+
+		for range remotes {
+			result := <-results
+			if result.err != nil {
+				debugLog("[REMOTE] Failed to list from %s: %v", result.hostID, result.err)
+				continue
+			}
+			allSessions = append(allSessions, result.sessions...)
+		}
+	}
+
+	data, _ := json.Marshal(allSessions)
 	return Response{Success: true, Data: data}
 }
 
@@ -525,13 +605,19 @@ func (s *Server) startQueuedSession(sessionID string) {
 }
 
 type IDRequest struct {
-	ID string `json:"id"`
+	ID     string `json:"id"`
+	HostID string `json:"host_id,omitempty"` // 対象ホスト（空="local"）
 }
 
 func (s *Server) handleStart(data json.RawMessage) Response {
 	var req IDRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		return Response{Success: false, Error: err.Error()}
+	}
+
+	// リモートホスト宛の場合、該当slaveに転送
+	if req.HostID != "" && req.HostID != "local" {
+		return s.forwardToSlave(req.HostID, Request{Action: "start", Data: data})
 	}
 
 	if err := s.manager.StartBackground(req.ID); err != nil {
@@ -547,6 +633,11 @@ func (s *Server) handleKill(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 
+	// リモートホスト宛の場合、該当slaveに転送
+	if req.HostID != "" && req.HostID != "local" {
+		return s.forwardToSlave(req.HostID, Request{Action: "kill", Data: data})
+	}
+
 	if err := s.manager.Kill(req.ID); err != nil {
 		return Response{Success: false, Error: err.Error()}
 	}
@@ -558,6 +649,11 @@ func (s *Server) handleDelete(data json.RawMessage) Response {
 	var req IDRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		return Response{Success: false, Error: err.Error()}
+	}
+
+	// リモートホスト宛の場合、該当slaveに転送
+	if req.HostID != "" && req.HostID != "local" {
+		return s.forwardToSlave(req.HostID, Request{Action: "delete", Data: data})
 	}
 
 	if err := s.manager.Delete(req.ID); err != nil {
@@ -577,4 +673,221 @@ func (s *Server) handleStop() Response {
 		os.Exit(0)
 	}()
 	return Response{Success: true}
+}
+
+// --- マルチホスト対応 ---
+
+// initRemoteSlaves はリモートホストのSlaveデーモンを起動し、トンネルを確立し、daemon clientを設定する
+func (s *Server) initRemoteSlaves() {
+	if s.hostRegistry == nil || s.tunnelMgr == nil {
+		return
+	}
+
+	for _, h := range s.hostRegistry.Remotes() {
+		// Step 1: Slaveデーモンを自動起動（冪等: 既に起動済みなら何もしない）
+		if err := host.StartSlave(h.Config); err != nil {
+			debugLog("[REMOTE] Failed to start slave on %s: %v", h.ID, err)
+			continue
+		}
+		debugLog("[REMOTE] Slave started on %s", h.ID)
+
+		// Step 2: SSHトンネル/Docker接続を確立
+		localSocket, err := s.tunnelMgr.Open(h.Config)
+		if err != nil {
+			debugLog("[REMOTE] Failed to open tunnel to %s: %v", h.ID, err)
+			continue
+		}
+
+		// Step 3: RemoteClientを作成して登録
+		client := NewRemoteClient(localSocket, h.ID)
+		s.hostRegistry.SetClient(h.ID, client)
+		debugLog("[REMOTE] Connected to slave %s via %s", h.ID, localSocket)
+	}
+}
+
+// forwardToSlave はリクエストをリモートslaveに転送する
+func (s *Server) forwardToSlave(hostID string, req Request) Response {
+	if s.hostRegistry == nil {
+		return Response{Success: false, Error: "host registry not initialized"}
+	}
+
+	h, ok := s.hostRegistry.Get(hostID)
+	if !ok {
+		return Response{Success: false, Error: fmt.Sprintf("unknown host: %s", hostID)}
+	}
+
+	if h.Client == nil {
+		return Response{Success: false, Error: fmt.Sprintf("host %s not connected", hostID)}
+	}
+
+	// SlaveClientインターフェースから*Clientにキャスト
+	client, ok := h.Client.(*Client)
+	if !ok {
+		return Response{Success: false, Error: fmt.Sprintf("host %s has incompatible client type", hostID)}
+	}
+
+	// host_idをリクエストデータから除去してスレーブに転送する
+	// スレーブがhost_idを見て再度forwardしようとするのを防ぐ
+	if req.Data != nil {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(req.Data, &m); err == nil {
+			delete(m, "host_id")
+			req.Data, _ = json.Marshal(m)
+		}
+	}
+
+	resp, err := client.send(req)
+	if err != nil {
+		return Response{Success: false, Error: fmt.Sprintf("failed to forward to %s: %v", hostID, err)}
+	}
+
+	return *resp
+}
+
+// --- ホスト・リポジトリ情報クエリ ---
+
+// HostInfo はホスト情報を表す
+type HostInfo struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Connected bool   `json:"connected"`
+}
+
+// RepositoryInfo はリポジトリ情報を表す
+type RepositoryInfo struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	BaseBranch string `json:"base_branch,omitempty"`
+}
+
+// WorktreeInfo はworktree情報を表す
+type WorktreeInfo struct {
+	Path       string `json:"path"`
+	Branch     string `json:"branch"`
+	RepoName   string `json:"repo_name"`
+	IsMain     bool   `json:"is_main"`
+	IsManaged  bool   `json:"is_managed"`
+	IsDetached bool   `json:"is_detached"`
+}
+
+// ListReposRequest はリポジトリ一覧取得リクエスト
+type ListReposRequest struct {
+	HostID string `json:"host_id,omitempty"`
+}
+
+// ListBranchesRequest はブランチ一覧取得リクエスト
+type ListBranchesRequest struct {
+	HostID     string `json:"host_id,omitempty"`
+	Repository string `json:"repository"`
+	All        bool   `json:"all,omitempty"` // true=ローカル+リモート
+}
+
+// ListWorktreesRequest はworktree一覧取得リクエスト
+type ListWorktreesRequest struct {
+	HostID     string `json:"host_id,omitempty"`
+	Repository string `json:"repository"`
+}
+
+func (s *Server) handleListHosts() Response {
+	hosts := []HostInfo{
+		{ID: "local", Type: "local", Connected: true},
+	}
+
+	if s.hostRegistry != nil {
+		for _, h := range s.hostRegistry.Remotes() {
+			connected := h.Client != nil && h.Client.IsRunning()
+			hosts = append(hosts, HostInfo{
+				ID:        h.ID,
+				Type:      h.Type,
+				Connected: connected,
+			})
+		}
+	}
+
+	data, _ := json.Marshal(hosts)
+	return Response{Success: true, Data: data}
+}
+
+func (s *Server) handleListRepos(data json.RawMessage) Response {
+	var req ListReposRequest
+	if data != nil {
+		if err := json.Unmarshal(data, &req); err != nil {
+			return Response{Success: false, Error: err.Error()}
+		}
+	}
+
+	if req.HostID != "" && req.HostID != "local" {
+		return s.forwardToSlave(req.HostID, Request{Action: "list-repos", Data: data})
+	}
+
+	repos := s.configMgr.GetRepositories()
+	infos := make([]RepositoryInfo, 0, len(repos))
+	for _, r := range repos {
+		infos = append(infos, RepositoryInfo{
+			Name:       r.Name,
+			Path:       r.Path,
+			BaseBranch: r.BaseBranch,
+		})
+	}
+
+	respData, _ := json.Marshal(infos)
+	return Response{Success: true, Data: respData}
+}
+
+func (s *Server) handleListBranches(data json.RawMessage) Response {
+	var req ListBranchesRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+
+	if req.HostID != "" && req.HostID != "local" {
+		return s.forwardToSlave(req.HostID, Request{Action: "list-branches", Data: data})
+	}
+
+	registry := repository.NewRegistry(s.configMgr)
+	var branches []string
+	var err error
+	if req.All {
+		branches, err = registry.GetBranches(req.Repository)
+	} else {
+		branches, err = registry.GetLocalBranches(req.Repository)
+	}
+	if err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+
+	respData, _ := json.Marshal(branches)
+	return Response{Success: true, Data: respData}
+}
+
+func (s *Server) handleListWorktrees(data json.RawMessage) Response {
+	var req ListWorktreesRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+
+	if req.HostID != "" && req.HostID != "local" {
+		return s.forwardToSlave(req.HostID, Request{Action: "list-worktrees", Data: data})
+	}
+
+	wtMgr := worktree.NewManager(s.configMgr)
+	wts, err := wtMgr.List(req.Repository)
+	if err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+
+	infos := make([]WorktreeInfo, 0, len(wts))
+	for _, wt := range wts {
+		infos = append(infos, WorktreeInfo{
+			Path:       wt.Path,
+			Branch:     wt.Branch,
+			RepoName:   wt.RepoName,
+			IsMain:     wt.IsMain,
+			IsManaged:  wt.IsManaged,
+			IsDetached: wt.IsDetached,
+		})
+	}
+
+	respData, _ := json.Marshal(infos)
+	return Response{Success: true, Data: respData}
 }
