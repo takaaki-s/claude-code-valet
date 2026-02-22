@@ -509,3 +509,31 @@ func (c *Client) KillPane(target string) error {
 func (c *Client) GetPaneWindowName(paneID string) (string, error) {
 	return c.run("display-message", "-t", paneID, "-p", "#{window_name}")
 }
+
+// --- Popup ---
+
+// DisplayPopupOptions configures a tmux display-popup.
+type DisplayPopupOptions struct {
+	Width  string // e.g., "80%"
+	Height string // e.g., "80%"
+	Cmd    string // command to run inside the popup
+	Title  string // popup title (tmux 3.3+)
+}
+
+// DisplayPopup opens a tmux popup that runs a command and closes when it exits.
+func (c *Client) DisplayPopup(opts DisplayPopupOptions) error {
+	args := []string{"display-popup", "-E"}
+	if opts.Width != "" {
+		args = append(args, "-w", opts.Width)
+	}
+	if opts.Height != "" {
+		args = append(args, "-h", opts.Height)
+	}
+	if opts.Title != "" {
+		args = append(args, "-T", opts.Title)
+	}
+	if opts.Cmd != "" {
+		args = append(args, opts.Cmd)
+	}
+	return c.runSilent(args...)
+}
