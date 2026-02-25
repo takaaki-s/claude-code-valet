@@ -139,7 +139,6 @@ type Model struct {
 	width        int
 	height       int
 	err          error
-	showHelp     bool
 	keys         KeyMap      // キーバインド設定
 
 	// Config manager (used for remote session attach)
@@ -153,6 +152,12 @@ type Model struct {
 	deleteTargetID     string // 削除対象のセッションID
 	deleteTargetName   string // 削除対象のセッション名（表示用）
 	deleteTargetHostID string // 削除対象のホストID
+
+	// Kill confirmation
+	confirmKill      bool   // Kill確認中かどうか
+	killTargetID     string // Kill対象のセッションID
+	killTargetName   string // Kill対象のセッション名（表示用）
+	killTargetHostID string // Kill対象のホストID
 
 	// Focus tracking (for visual focus indicator)
 	focused bool // true when TUI pane has focus (changes border/title color)
@@ -300,7 +305,7 @@ func resizeSettledCmd() tea.Cmd {
 // switchToSession displays the given session in the right pane via RespawnPane.
 // For local sessions, attaches to the inner tmux session (-L ccvalet).
 // For remote sessions, runs SSH attach command.
-// Only attaches to sessions that are actively running; stopped sessions are skipped.
+// For stopped/error sessions, shows a placeholder with session info.
 func (m *Model) switchToSession(sessionID string) {
 	if m.tmuxClient == nil || m.displayPaneID == "" || sessionID == "" {
 		return
@@ -319,19 +324,40 @@ func (m *Model) switchToSession(sessionID string) {
 			break
 		}
 	}
-	if sess == nil || sess.TmuxWindowName == "" {
+	if sess == nil {
 		return
 	}
 
-	// Only attach to sessions that are actively running.
-	// Stopped/error sessions may not have an inner tmux session alive.
+	// Stopped/error sessions: show placeholder in right pane (no TmuxWindowName needed)
 	if !isSessionAlive(sess.Status) {
+		var placeholderCmd string
+		if sess.ErrorMessage != "" {
+			placeholderCmd = fmt.Sprintf(
+				"printf '\\n  Session: %s\\n  Status:  %s\\n\\n  Error:\\n%s\\n'; tail -f /dev/null",
+				sess.Name, sess.Status, sess.ErrorMessage,
+			)
+		} else {
+			placeholderCmd = fmt.Sprintf(
+				"printf '\\n  Session: %s\\n  Status:  %s\\n\\n  Press Enter to restart\\n'; tail -f /dev/null",
+				sess.Name, sess.Status,
+			)
+		}
+		m.tmuxClient.RespawnPane(m.displayPaneID, placeholderCmd)
+		m.currentSessionID = sessionID
+		m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_SESSION", sessionID)
+		m.tmuxClient.SetPaneOption(m.displayPaneID, "@session_name", sess.Name)
+		return
+	}
+
+	// Running sessions require TmuxWindowName for inner tmux attach
+	if sess.TmuxWindowName == "" {
 		return
 	}
 
 	// Remote session: use SSH attach command
 	if sess.HostID != "" && sess.HostID != "local" {
 		m.switchToRemoteSession(sess)
+		m.tmuxClient.SetPaneOption(m.displayPaneID, "@session_name", sess.Name)
 		return
 	}
 
@@ -341,6 +367,7 @@ func (m *Model) switchToSession(sessionID string) {
 
 	m.currentSessionID = sessionID
 	m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_SESSION", sessionID)
+	m.tmuxClient.SetPaneOption(m.displayPaneID, "@session_name", sess.Name)
 }
 
 // isSessionAlive returns true if the session status indicates an active process.
@@ -464,9 +491,39 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Tab key: move focus to the right display pane
-		if msg.String() == "tab" && m.tmuxClient != nil && m.displayPaneID != "" && m.currentSessionID != "" {
-			m.tmuxClient.SelectPane(m.displayPaneID)
+		// Kill確認モード中の処理
+		if m.confirmKill {
+			switch msg.String() {
+			case "y", "Y", "enter":
+				m.processingMsg = "Stopping..."
+				m.confirmKill = false
+				m.needsReswitch = true
+
+				killID := m.killTargetID
+				killHostID := m.killTargetHostID
+				m.killTargetID = ""
+				m.killTargetName = ""
+				m.killTargetHostID = ""
+
+				client := m.client
+
+				return m, func() tea.Msg {
+					if err := client.Kill(killID, killHostID); err != nil {
+						return errMsg(fmt.Errorf("kill failed: %w", err))
+					}
+					sessions, err := client.List()
+					if err != nil {
+						return errMsg(err)
+					}
+					return sessionsMsg(sessions)
+				}
+			case "n", "N", "esc":
+				m.confirmKill = false
+				m.killTargetID = ""
+				m.killTargetName = ""
+				m.killTargetHostID = ""
+				return m, nil
+			}
 			return m, nil
 		}
 
@@ -551,23 +608,12 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pageSessions := m.getPageSessions()
 			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 				sess := pageSessions[m.cursor]
-				m.processingMsg = "Stopping..."
-				m.needsReswitch = true
-
-				killID := sess.ID
-				killHostID := sess.HostID
-				client := m.client
-
-				return m, func() tea.Msg {
-					if err := client.Kill(killID, killHostID); err != nil {
-						return errMsg(fmt.Errorf("kill failed: %w", err))
-					}
-					sessions, err := client.List()
-					if err != nil {
-						return errMsg(err)
-					}
-					return sessionsMsg(sessions)
-				}
+				// 確認モードに入る
+				m.confirmKill = true
+				m.killTargetID = sess.ID
+				m.killTargetName = sess.Name
+				m.killTargetHostID = sess.HostID
+				return m, nil
 			}
 
 		case key.Matches(msg, m.keys.Delete):
@@ -605,7 +651,16 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.fetchSessions
 
 		case key.Matches(msg, m.keys.Help):
-			m.showHelp = !m.showHelp
+			if m.tmuxClient != nil {
+				selfBin, _ := os.Executable()
+				m.tmuxClient.DisplayPopup(tmux.DisplayPopupOptions{
+					Width:  "60%",
+					Height: "60%",
+					Cmd:    fmt.Sprintf("'%s' help-popup", selfBin),
+					Title:  " Shortcuts ",
+				})
+			}
+			return m, nil
 
 		case key.Matches(msg, m.keys.PrevPage):
 			if m.currentPage > 0 {
@@ -817,15 +872,17 @@ func (m Model) renderListContent(contentWidth int) string {
 
 // renderHelpLine renders the help line at the bottom
 func (m Model) renderHelpLine() string {
-	if m.confirmDelete {
-		confirmMsg := fmt.Sprintf(" Delete session '%s'? [y/Enter] yes  [n/Esc] no", m.deleteTargetName)
+	if m.confirmKill {
+		name := truncateString(m.killTargetName, 20)
+		confirmMsg := fmt.Sprintf(" Kill '%s'? y:yes n:no", name)
 		return lipgloss.NewStyle().Foreground(warningColor).Bold(true).Render(confirmMsg)
 	}
-
-	if m.showHelp {
-		return helpStyle.Render(" [up/k] up [down/j] down [left/h] prev [right/l] next [enter] attach [n] new [s] kill [d] delete [q] quit")
+	if m.confirmDelete {
+		name := truncateString(m.deleteTargetName, 20)
+		confirmMsg := fmt.Sprintf(" Delete '%s'? y:yes n:no", name)
+		return lipgloss.NewStyle().Foreground(warningColor).Bold(true).Render(confirmMsg)
 	}
-	return helpStyle.Render(" [n] new [s] kill [d] del [enter] attach [<>] page [q] quit [?] help")
+	return helpStyle.Render(" ? help")
 }
 
 // renderSession renders a single session in 1-line format with optional output preview

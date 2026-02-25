@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 )
@@ -103,6 +104,7 @@ func (c *Client) NewWithOptions(opts NewOptions) (*session.Info, error) {
 		IsNewWorktree: opts.IsNewWorktree,
 		WorktreeName:  opts.WorktreeName,
 		HostID:        opts.HostID,
+		SSHAuthSock:   os.Getenv("SSH_AUTH_SOCK"),
 	})
 
 	resp, err := c.send(Request{Action: "new", Data: data})
@@ -248,6 +250,23 @@ func (c *Client) ListBranches(hostID, repo string, all bool) ([]string, error) {
 		return nil, err
 	}
 	return branches, nil
+}
+
+// FetchRepo はリポジトリのgit fetch originを実行する
+func (c *Client) FetchRepo(hostID, repo string) error {
+	data, _ := json.Marshal(FetchRepoRequest{
+		HostID:      hostID,
+		Repository:  repo,
+		SSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
+	})
+	resp, err := c.send(Request{Action: "fetch-repo", Data: data})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return errors.New(resp.Error)
+	}
+	return nil
 }
 
 // ListWorktrees はworktree一覧を取得する

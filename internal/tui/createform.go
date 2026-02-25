@@ -29,6 +29,7 @@ type CreateFormModel struct {
 
 	// Processing state
 	processingMsg string
+	fetchingMsg   string // fetch中の表示メッセージ
 
 	// Config managers
 	configMgr *config.Manager
@@ -89,6 +90,11 @@ type CreateFormModel struct {
 type createFormCompleteMsg struct {
 	sessionID string
 	err       error
+}
+
+// fetchRepoCompleteMsg is sent when git fetch completes.
+type fetchRepoCompleteMsg struct {
+	err error
 }
 
 // NewCreateFormModel creates a new CreateFormModel with all inputs initialized.
@@ -239,9 +245,52 @@ func (m CreateFormModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// While fetching, ignore key input; only handle fetch completion
+	if m.fetchingMsg != "" {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			return m, nil
+		case fetchRepoCompleteMsg:
+			m.fetchingMsg = ""
+			if msg.err != nil {
+				m.err = fmt.Errorf("fetch failed: %v", msg.err)
+			} else {
+				m.err = nil
+				// Reload branches after successful fetch
+				m.branches = nil
+				m.allBranches = nil
+				m.loadBranches()
+				m.loadAllBranches()
+				m.filterBranches()
+				m.filterBaseBranches()
+			}
+			return m, nil
+		default:
+			_ = msg
+		}
+		return m, nil
+	}
+
 	// Handle create completion message
 	if msg, ok := msg.(createFormCompleteMsg); ok {
 		return m.handleCreateComplete(msg)
+	}
+
+	// Handle fetch completion message
+	if msg, ok := msg.(fetchRepoCompleteMsg); ok {
+		m.fetchingMsg = ""
+		if msg.err != nil {
+			m.err = fmt.Errorf("fetch failed: %v", msg.err)
+		} else {
+			m.err = nil
+			m.branches = nil
+			m.allBranches = nil
+			m.loadBranches()
+			m.loadAllBranches()
+			m.filterBranches()
+			m.filterBaseBranches()
+		}
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -280,6 +329,22 @@ func (m CreateFormModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.filterWorktrees()
 			}
 			return m, nil
+
+		case "ctrl+r":
+			// Fetch latest branches from remote
+			repoName := m.repoInput.Value()
+			if repoName == "" {
+				m.err = fmt.Errorf("select a repository first")
+				return m, nil
+			}
+			m.fetchingMsg = "Fetching..."
+			m.err = nil
+			client := m.client
+			hostID := m.selectedHostID
+			return m, func() tea.Msg {
+				err := client.FetchRepo(hostID, repoName)
+				return fetchRepoCompleteMsg{err: err}
+			}
 
 		case "tab":
 			// Confirm dropdown selection for required fields
@@ -418,6 +483,11 @@ func (m CreateFormModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // View implements tea.Model.
 func (m CreateFormModel) View() string {
+	// Fetching indicator
+	if m.fetchingMsg != "" {
+		return "\n  " + m.fetchingMsg
+	}
+
 	// Processing indicator
 	if m.processingMsg != "" {
 		return "\n  " + m.processingMsg
@@ -730,7 +800,7 @@ func (m CreateFormModel) View() string {
 	b.WriteString("\n")
 
 	// Help footer
-	b.WriteString(helpStyle.Render("Tab: next  Ctrl+W: toggle new worktree  Ctrl+B: toggle new branch  Enter: create  Esc: cancel"))
+	b.WriteString(helpStyle.Render("Tab: next  Ctrl+R: refresh branches  Ctrl+W: new worktree  Ctrl+B: new branch  Enter: create  Esc: cancel"))
 
 	return b.String()
 }

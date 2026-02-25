@@ -97,14 +97,24 @@ func (m *Manager) OpenSSH(hostConfig config.HostConfig) (string, error) {
 	// - ControlMaster=no: トンネル専用の長寿命接続のためControlMasterを使わない
 	// - ExitOnForwardFailure=no: ssh_configのLocalForward/RemoteForwardが
 	//   ポート競合で失敗してもSSHを中断させない（トンネル用-Lは別途waitForSocketで検証）
+	// - -A: SSHエージェント転送を有効化（リモートでgit fetch等に必要）
 	// 注: ClearAllForwardings=yesはコマンドラインの-Lも消すため使えない
 	args := make([]string, 0, len(hostConfig.SSHOpts)+10)
-	args = append(args, "-o", "ControlMaster=no", "-o", "ExitOnForwardFailure=no")
+	args = append(args, "-A", "-o", "ControlMaster=no", "-o", "ExitOnForwardFailure=no")
 	args = append(args, hostConfig.SSHOpts...)
+	// リモートでSSHエージェントソケットの安定シンボリックリンクを作成し、
+	// slaveデーモンがgit fetch等で利用できるようにする。
+	// -N（コマンド無し）の代わりに、symlink作成後にsleepで待機する。
+	agentSymlink := "~/.ccvalet/ssh-agent.sock"
+	remoteCmd := fmt.Sprintf(
+		"mkdir -p ~/.ccvalet && test -n \"$SSH_AUTH_SOCK\" && ln -sf \"$SSH_AUTH_SOCK\" %s; "+
+			"while sleep 3600; do :; done",
+		agentSymlink,
+	)
 	args = append(args,
 		"-L", localSocket+":"+remoteSocket,
-		"-N",    // リモートコマンドを実行しない
 		hostConfig.Host,
+		remoteCmd,
 	)
 
 	cmd := exec.Command("ssh", args...)

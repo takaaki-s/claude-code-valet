@@ -7,8 +7,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -206,6 +208,8 @@ func (s *Server) handleRequest(req *Request) Response {
 		return s.handleListRepos(req.Data)
 	case "list-branches":
 		return s.handleListBranches(req.Data)
+	case "fetch-repo":
+		return s.handleFetchRepo(req.Data)
 	case "list-worktrees":
 		return s.handleListWorktrees(req.Data)
 	default:
@@ -227,6 +231,7 @@ type NewRequest struct {
 	IsNewWorktree bool   `json:"is_new_worktree,omitempty"` // 新規worktreeを作成するか
 	WorktreeName  string `json:"worktree_name,omitempty"`  // worktree名（ディレクトリ名）
 	HostID        string `json:"host_id,omitempty"`        // 対象ホスト（空="local"）
+	SSHAuthSock   string `json:"ssh_auth_sock,omitempty"`  // SSH_AUTH_SOCK（git操作用）
 }
 
 func (s *Server) handleNew(data json.RawMessage) Response {
@@ -237,7 +242,11 @@ func (s *Server) handleNew(data json.RawMessage) Response {
 
 	// リモートホスト宛の場合、該当slaveに転送
 	if req.HostID != "" && req.HostID != "local" {
-		return s.forwardToSlave(req.HostID, Request{Action: "new", Data: data})
+		// Clear SSH_AUTH_SOCK: local socket path doesn't exist on remote host.
+		// The slave uses its own SSH_AUTH_SOCK from the SSH tunnel.
+		req.SSHAuthSock = ""
+		forwardData, _ := json.Marshal(req)
+		return s.forwardToSlave(req.HostID, Request{Action: "new", Data: forwardData})
 	}
 
 	// 設定を再読み込み（CLI で repo add された場合に対応）
@@ -381,14 +390,11 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 			NewBranch:    req.NewBranch,
 			BaseBranch:   req.BaseBranch,
 			WorktreeName: req.WorktreeName,
+			SSHAuthSock:  req.SSHAuthSock,
 		})
 		if err != nil {
 			debugLog("[ASYNC] Failed to create worktree: %v", err)
 			s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("worktree creation failed: %v", err))
-			// ロールバック：worktree作成に失敗したセッションを削除して再作成可能にする
-			if delErr := s.manager.Delete(sessionID); delErr != nil {
-				debugLog("[ASYNC] Failed to delete session on rollback: %v", delErr)
-			}
 			return
 		}
 		// WorktreeNameを更新
@@ -405,14 +411,11 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 				NewBranch:    req.NewBranch,
 				BaseBranch:   req.BaseBranch,
 				WorktreeName: req.WorktreeName,
+				SSHAuthSock:  req.SSHAuthSock,
 			})
 			if err != nil {
 				debugLog("[ASYNC] Failed to create worktree: %v", err)
 				s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("worktree creation failed: %v", err))
-				// ロールバック：worktree作成に失敗したセッションを削除して再作成可能にする
-				if delErr := s.manager.Delete(sessionID); delErr != nil {
-					debugLog("[ASYNC] Failed to delete session on rollback: %v", delErr)
-				}
 				return
 			}
 			// WorktreeNameを更新
@@ -426,10 +429,6 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 	if err := s.manager.SetWorkDir(sessionID, workDir); err != nil {
 		debugLog("[ASYNC] Failed to set WorkDir: %v", err)
 		s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("failed to set WorkDir: %v", err))
-		// ロールバック：WorkDir設定に失敗したセッションを削除して再作成可能にする
-		if delErr := s.manager.Delete(sessionID); delErr != nil {
-			debugLog("[ASYNC] Failed to delete session on rollback: %v", delErr)
-		}
 		return
 	}
 
@@ -832,6 +831,72 @@ func (s *Server) handleListRepos(data json.RawMessage) Response {
 
 	respData, _ := json.Marshal(infos)
 	return Response{Success: true, Data: respData}
+}
+
+// FetchRepoRequest はリポジトリのgit fetchリクエスト
+type FetchRepoRequest struct {
+	HostID      string `json:"host_id,omitempty"`
+	Repository  string `json:"repository"`
+	SSHAuthSock string `json:"ssh_auth_sock,omitempty"`
+}
+
+func (s *Server) handleFetchRepo(data json.RawMessage) Response {
+	var req FetchRepoRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+
+	if req.HostID != "" && req.HostID != "local" {
+		// Clear SSH_AUTH_SOCK before forwarding: the client's local socket path
+		// doesn't exist on the remote host. The slave will use its own SSH_AUTH_SOCK
+		// (inherited from the SSH tunnel with ForwardAgent).
+		req.SSHAuthSock = ""
+		forwardData, _ := json.Marshal(req)
+		return s.forwardToSlave(req.HostID, Request{Action: "fetch-repo", Data: forwardData})
+	}
+
+	repo := s.configMgr.GetRepository(req.Repository)
+	if repo == nil {
+		return Response{Success: false, Error: fmt.Sprintf("repository '%s' not found", req.Repository)}
+	}
+
+	fetchCmd := exec.Command("git", "-C", repo.Path, "fetch", "origin")
+	// SSH_AUTH_SOCK の優先順位:
+	// 1. リクエストで指定された値
+	// 2. トンネル経由のForwardAgent安定シンボリックリンク (~/.ccvalet/ssh-agent.sock)
+	// 3. デーモン自身の環境変数
+	sshSock := req.SSHAuthSock
+	if sshSock == "" {
+		home, _ := os.UserHomeDir()
+		stableAgent := filepath.Join(home, ".ccvalet", "ssh-agent.sock")
+		if target, err := os.Readlink(stableAgent); err == nil && target != "" {
+			if _, err := os.Stat(stableAgent); err == nil {
+				sshSock = stableAgent
+			}
+		}
+	}
+	if sshSock != "" {
+		fetchCmd.Env = replaceEnv(os.Environ(), "SSH_AUTH_SOCK", sshSock)
+	}
+	debugLog("[FETCH] repo=%s ssh_auth_sock=%q (req=%q, daemon=%q)",
+		req.Repository, sshSock, req.SSHAuthSock, os.Getenv("SSH_AUTH_SOCK"))
+	if output, err := fetchCmd.CombinedOutput(); err != nil {
+		return Response{Success: false, Error: fmt.Sprintf("git fetch failed: %s: %v", strings.TrimSpace(string(output)), err)}
+	}
+
+	return Response{Success: true}
+}
+
+// replaceEnv replaces or appends an environment variable in the given env slice.
+func replaceEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
 
 func (s *Server) handleListBranches(data json.RawMessage) Response {

@@ -215,7 +215,7 @@ keybindings:
   down: [down, j]
   attach: [enter]
   new: ["n"]
-  kill: [s, x]
+  kill: [x]
   delete: [d]
   cancel: [c]
   refresh: [r]
@@ -230,7 +230,8 @@ keybindings:
   submit: [enter]
   cancel_form: [esc]
   # アタッチ中
-  detach: [ctrl+]]  # デフォルト: ctrl+]（ctrl+^, ctrl+\, ctrl+g も使用可）
+  detach: [ctrl+]]  # デフォルト: ctrl+]
+                     # サポートキー: ctrl+^, ctrl+], ctrl+\, ctrl+g
 ```
 
 ## プロンプトテンプレート
@@ -292,7 +293,17 @@ ${args}
 | `Enter` | セッション作成 |
 | `Esc` | キャンセル |
 
-アタッチ中は `Ctrl+]` でデタッチして TUI に戻ります。
+アタッチ中は `Ctrl+]`（デフォルト）でデタッチして TUI に戻ります。
+`config.yaml` の `keybindings.detach` で変更可能です。
+
+サポートされるデタッチキー:
+
+| キー | 説明 |
+|------|------|
+| `ctrl+]` | デフォルト |
+| `ctrl+^` | Ctrl+Shift+6 |
+| `ctrl+\` | Ctrl+バックスラッシュ |
+| `ctrl+g` | Ctrl+G |
 
 ## 並列管理
 

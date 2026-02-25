@@ -57,6 +57,7 @@ type CreateOptions struct {
 	NewBranch    bool   // 新しいブランチを作成するか
 	BaseBranch   string // 新規ブランチ作成時のベースブランチ
 	WorktreeName string // worktree名（省略時はブランチ名から自動生成）
+	SSHAuthSock  string // SSH_AUTH_SOCK（git fetch用、空の場合は環境変数を継承）
 }
 
 // CreateWithOptions は新しいworktreeを作成する（v2 API）
@@ -87,11 +88,24 @@ func (m *Manager) CreateWithOptions(opts CreateOptions) (*Worktree, string, erro
 	// worktreeパスを決定
 	worktreePath := m.getWorktreePathByName(opts.RepoName, worktreeName)
 
-	// 新規ブランチ作成時はgit fetchを実行
+	// 新規ブランチ作成時はgit fetchを試行（失敗しても続行）
 	if opts.NewBranch {
 		fetchCmd := exec.Command("git", "-C", repo.Path, "fetch", "origin")
+		sshSock := opts.SSHAuthSock
+		if sshSock == "" {
+			home, _ := os.UserHomeDir()
+			stableAgent := filepath.Join(home, ".ccvalet", "ssh-agent.sock")
+			if target, err := os.Readlink(stableAgent); err == nil && target != "" {
+				if _, err := os.Stat(stableAgent); err == nil {
+					sshSock = stableAgent
+				}
+			}
+		}
+		if sshSock != "" {
+			fetchCmd.Env = replaceEnv(os.Environ(), "SSH_AUTH_SOCK", sshSock)
+		}
 		if output, err := fetchCmd.CombinedOutput(); err != nil {
-			return nil, "", fmt.Errorf("failed to fetch origin: %s: %w", string(output), err)
+			debugLog("[WORKTREE] git fetch origin failed (continuing): %s: %v", string(output), err)
 		}
 	}
 
@@ -653,4 +667,16 @@ func FetchRemoteBranch(workDir, branch string) error {
 		return fmt.Errorf("failed to fetch branch %s: %s", branch, string(output))
 	}
 	return nil
+}
+
+// replaceEnv replaces or appends an environment variable in the given env slice.
+func replaceEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }

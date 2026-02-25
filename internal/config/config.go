@@ -1,12 +1,30 @@
 package config
 
 import (
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/spf13/viper"
 )
+
+// supportedDetachKeys はサポートされるdetachキーの一覧
+var supportedDetachKeys = []string{"ctrl+^", "ctrl+]", "ctrl+\\", "ctrl+g"}
+
+// ValidateDetachKey はdetachキーがサポートされているか検証する
+// サポート外の場合はサポートキー一覧を含むerrorを返す
+func ValidateDetachKey(key string) error {
+	for _, k := range supportedDetachKeys {
+		if key == k {
+			return nil
+		}
+	}
+	return fmt.Errorf("unsupported detach key %q: supported keys are %s",
+		key, strings.Join(supportedDetachKeys, ", "))
+}
 
 // RepositoryConfig はリポジトリの設定を表す
 type RepositoryConfig struct {
@@ -302,7 +320,7 @@ func DefaultKeybindings() KeybindingsConfig {
 		Down:    []string{"down", "j"},
 		Attach:  []string{"enter"},
 		New:     []string{"n"},
-		Kill:    []string{"s", "x"},
+		Kill:    []string{"x"},
 		Delete:  []string{"d"},
 		Cancel:  []string{"c"},
 		Refresh: []string{"r"},
@@ -385,6 +403,21 @@ func (m *Manager) GetKeybindings() KeybindingsConfig {
 	}
 	if len(cfg.Detach) == 0 {
 		cfg.Detach = defaults.Detach
+	} else {
+		// サポート外のキーをフィルタ
+		var valid []string
+		for _, k := range cfg.Detach {
+			if err := ValidateDetachKey(k); err != nil {
+				log.Printf("WARNING: %v", err)
+			} else {
+				valid = append(valid, k)
+			}
+		}
+		if len(valid) == 0 {
+			cfg.Detach = defaults.Detach
+		} else {
+			cfg.Detach = valid
+		}
 	}
 
 	return cfg
@@ -480,4 +513,33 @@ func formatKeyHint(key string) string {
 	default:
 		return "Ctrl+]"
 	}
+}
+
+// formatKeyForTmux はキー文字列をtmuxのbind-key形式に変換する
+func formatKeyForTmux(key string) string {
+	switch key {
+	case "ctrl+^":
+		return "C-^"
+	case "ctrl+]":
+		return "C-]"
+	case "ctrl+\\":
+		return "C-\\"
+	case "ctrl+g":
+		return "C-g"
+	default:
+		return "C-]"
+	}
+}
+
+// GetDetachKeyTmux はデタッチキーのtmux bind-key形式文字列を返す
+func (m *Manager) GetDetachKeyTmux() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	detachKeys := m.config.Keybindings.Detach
+	if len(detachKeys) == 0 {
+		detachKeys = DefaultKeybindings().Detach
+	}
+
+	return formatKeyForTmux(detachKeys[0])
 }

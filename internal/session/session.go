@@ -60,6 +60,7 @@ type Session struct {
 	PromptInjected bool      `json:"-"` // プロンプト注入済みか
 	LastOutputTime time.Time `json:"-"` // 最後にPTY出力を受信した時刻（idle安定性検出用）
 	StartedAt      time.Time `json:"-"` // プロセス起動時刻（起動直後のエラー誤検出防止用）
+	SSHAuthSock    string    `json:"-"` // SSH_AUTH_SOCK（git操作用、永続化しない）
 }
 
 // Info returns session information for display
