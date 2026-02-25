@@ -420,6 +420,9 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 			}
 			// WorktreeNameを更新
 			s.manager.SetWorktreeName(sessionID, worktreeName)
+		} else {
+			// 既存worktreeが見つかった場合もworktree名を設定
+			s.manager.SetWorktreeName(sessionID, filepath.Base(wt.Path))
 		}
 	}
 	workDir = wt.Path

@@ -222,11 +222,15 @@ func (m *Model) getItemsPerPage() int {
 	// Subtract header lines (title, stats, separator, footer)
 	// Header: 3 lines, Footer: 2 lines (page info + help)
 	availableLines := m.height - 8
-	if availableLines < 3 {
-		availableLines = 3
+	if availableLines < 4 {
+		availableLines = 4
 	}
-	// Each session takes 1 line (2 if error)
-	return availableLines
+	// Each session takes ~4 lines (name + status + meta + time)
+	items := availableLines / 4
+	if items < 1 {
+		items = 1
+	}
+	return items
 }
 
 // getTotalPages calculates the total number of pages
@@ -914,31 +918,6 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 	}
 	b.WriteString("\n")
 
-	// --- Line 2: status (icon + label) + metadata ---
-	// Error: show error message instead of metadata
-	if sess.Status == session.StatusError && sess.ErrorMessage != "" {
-		statusStr := statusIcon + " " + statusLabel
-		errMsg := truncateString(sess.ErrorMessage, width-6-runewidth.StringWidth(statusStr)-1)
-		line2Content := statusStr + " " + errMsg
-		if selected {
-			b.WriteString(selectedItemStyle.Render(padLine("  "+line2Content, width)))
-		} else {
-			b.WriteString("  ")
-			b.WriteString(statusStyle.Render(statusStr))
-			b.WriteString(" ")
-			b.WriteString(lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
-		}
-		b.WriteString("\n")
-		// Time on last line
-		if selected {
-			b.WriteString(selectedItemStyle.Render(padLine("  └─ "+timeStr, width)))
-		} else {
-			b.WriteString("  └─ " + timeStyle.Render(timeStr))
-		}
-		b.WriteString("\n")
-		return b.String()
-	}
-
 	// Build metadata: [host] repo (branch) — fallback to workDir
 	var metaParts []string
 	if sess.HostID != "" && sess.HostID != "local" {
@@ -958,32 +937,76 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 	}
 
 	statusStr := statusIcon + " " + statusLabel
-	statusWidth := runewidth.StringWidth(statusStr)
 	metaStr := strings.Join(metaParts, " ")
 	indent := "  ├─ "
 	indentWidth := 5
 
 	// Truncate metadata if needed
-	availableForMeta := width - indentWidth - statusWidth - 1
+	availableForMeta := width - indentWidth
 	if availableForMeta > 0 && runewidth.StringWidth(metaStr) > availableForMeta {
 		metaStr = truncateString(metaStr, availableForMeta)
 	}
 
+	// --- Line 2: status (icon + label) ---
 	if selected {
-		line2 := indent + statusStr
-		if metaStr != "" {
-			line2 += " " + metaStr
-		}
-		b.WriteString(selectedItemStyle.Render(padLine(line2, width)))
+		b.WriteString(selectedItemStyle.Render(padLine(indent+statusStr, width)))
 	} else {
 		b.WriteString(indent)
 		b.WriteString(statusStyle.Render(statusStr))
-		if metaStr != "" {
-			b.WriteString(" ")
-			b.WriteString(helpStyle.Render(metaStr))
-		}
 	}
 	b.WriteString("\n")
+
+	// Error: show metadata + error message, then return early
+	if sess.Status == session.StatusError && sess.ErrorMessage != "" {
+		if metaStr != "" {
+			if selected {
+				b.WriteString(selectedItemStyle.Render(padLine(indent+metaStr, width)))
+			} else {
+				b.WriteString(indent)
+				b.WriteString(helpStyle.Render(metaStr))
+			}
+			b.WriteString("\n")
+		}
+		errMsg := truncateString(sess.ErrorMessage, width-indentWidth)
+		if selected {
+			b.WriteString(selectedItemStyle.Render(padLine(indent+errMsg, width)))
+		} else {
+			b.WriteString(indent)
+			b.WriteString(lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
+		}
+		b.WriteString("\n")
+		// Time on last line
+		if selected {
+			b.WriteString(selectedItemStyle.Render(padLine("  └─ "+timeStr, width)))
+		} else {
+			b.WriteString("  └─ " + timeStyle.Render(timeStr))
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	// --- Line 3: metadata ([host] repo (branch)) ---
+	if metaStr != "" {
+		if selected {
+			b.WriteString(selectedItemStyle.Render(padLine(indent+metaStr, width)))
+		} else {
+			b.WriteString(indent)
+			b.WriteString(helpStyle.Render(metaStr))
+		}
+		b.WriteString("\n")
+	}
+
+	// --- Line 4: worktree name ---
+	if sess.WorktreeName != "" {
+		wtDisplay := "📁 " + sess.WorktreeName
+		if selected {
+			b.WriteString(selectedItemStyle.Render(padLine(indent+wtDisplay, width)))
+		} else {
+			b.WriteString(indent)
+			b.WriteString(helpStyle.Render(wtDisplay))
+		}
+		b.WriteString("\n")
+	}
 
 	// --- Line 3: last user message ---
 	if sess.LastUserMessage != "" {
