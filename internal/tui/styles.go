@@ -53,9 +53,6 @@ var (
 	creatingStyle = lipgloss.NewStyle().
 			Foreground(primaryColor)
 
-	queuedStyle = lipgloss.NewStyle().
-			Foreground(secondaryColor)
-
 	idleStyle = lipgloss.NewStyle().
 			Foreground(successColor)
 
@@ -73,9 +70,6 @@ var (
 	// Box border style
 	boxBorderColor = primaryColor
 
-	// Queue section header
-	queueHeaderStyle = lipgloss.NewStyle().
-				Foreground(secondaryColor)
 )
 
 // createBoxStyle creates a box style with specified width and height.

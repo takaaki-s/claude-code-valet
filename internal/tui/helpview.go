@@ -62,7 +62,6 @@ func (m HelpModel) View() string {
 	writeBinding(&b, keyStyle, descStyle, k.New)
 	writeBinding(&b, keyStyle, descStyle, k.Kill)
 	writeBinding(&b, keyStyle, descStyle, k.Delete)
-	writeBinding(&b, keyStyle, descStyle, k.Cancel)
 	writeBinding(&b, keyStyle, descStyle, k.Refresh)
 	b.WriteString("\n")
 

@@ -34,11 +34,6 @@ type RepositoryConfig struct {
 	Setup      []string `mapstructure:"setup,omitempty"`
 }
 
-// ParallelConfig は並列管理の設定を表す
-type ParallelConfig struct {
-	MaxParallel int `mapstructure:"max_parallel"`
-}
-
 // KeybindingsConfig はキーバインド設定を表す
 type KeybindingsConfig struct {
 	// セッション一覧画面
@@ -48,7 +43,6 @@ type KeybindingsConfig struct {
 	New     []string `mapstructure:"new,omitempty"`
 	Kill    []string `mapstructure:"kill,omitempty"`
 	Delete  []string `mapstructure:"delete,omitempty"`
-	Cancel  []string `mapstructure:"cancel,omitempty"`
 	Refresh []string `mapstructure:"refresh,omitempty"`
 	Resume  []string `mapstructure:"resume,omitempty"`
 	Quit    []string `mapstructure:"quit,omitempty"`
@@ -78,7 +72,6 @@ type HostConfig struct {
 
 // Config はアプリケーション全体の設定を表す
 type Config struct {
-	Parallel     ParallelConfig     `mapstructure:"parallel"`
 	Repositories []RepositoryConfig `mapstructure:"repositories"`
 	Keybindings  KeybindingsConfig  `mapstructure:"keybindings,omitempty"` // キーバインド設定
 	Hosts        []HostConfig       `mapstructure:"hosts,omitempty"`       // リモートホスト設定
@@ -124,9 +117,6 @@ func NewManager(dataDir string) (*Manager, error) {
 // defaultConfig はデフォルト設定を返す
 func defaultConfig() *Config {
 	return &Config{
-		Parallel: ParallelConfig{
-			MaxParallel: 3, // デフォルト並列数
-		},
 		Repositories: []RepositoryConfig{},
 	}
 }
@@ -173,7 +163,6 @@ func (m *Manager) Save() error {
 	defer m.mu.Unlock()
 
 	// viperのSetは構造体のmapstructureタグを無視するため、明示的にキーを設定
-	m.v.Set("parallel.max_parallel", m.config.Parallel.MaxParallel)
 	m.v.Set("repositories", m.config.Repositories)
 
 	return m.v.WriteConfigAs(m.filePath)
@@ -269,16 +258,6 @@ func (m *Manager) GetWorktreeDir() string {
 	return filepath.Join(home, ".ccvalet", "worktrees")
 }
 
-// GetMaxParallel は最大並列数を返す
-func (m *Manager) GetMaxParallel() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.config.Parallel.MaxParallel <= 0 {
-		return 3 // デフォルト値
-	}
-	return m.config.Parallel.MaxParallel
-}
-
 // GetHosts はリモートホスト一覧を返す
 func (m *Manager) GetHosts() []HostConfig {
 	m.mu.RLock()
@@ -322,7 +301,6 @@ func DefaultKeybindings() KeybindingsConfig {
 		New:     []string{"n"},
 		Kill:    []string{"x"},
 		Delete:  []string{"d"},
-		Cancel:  []string{"c"},
 		Refresh: []string{"r"},
 		Resume:  []string{"R"},
 		Quit:    []string{"q", "ctrl+c"},
@@ -367,9 +345,6 @@ func (m *Manager) GetKeybindings() KeybindingsConfig {
 	}
 	if len(cfg.Delete) == 0 {
 		cfg.Delete = defaults.Delete
-	}
-	if len(cfg.Cancel) == 0 {
-		cfg.Cancel = defaults.Cancel
 	}
 	if len(cfg.Refresh) == 0 {
 		cfg.Refresh = defaults.Refresh

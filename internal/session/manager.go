@@ -68,7 +68,7 @@ func (m *Manager) recoverTmuxSessionsLocked() {
 	for _, session := range m.sessions {
 		if session.TmuxWindowName == "" {
 			// Fix stale sessions: active status but no tmux session (from prior recovery bug)
-			if session.Status != StatusStopped && session.Status != StatusError && session.Status != StatusQueued && session.Status != StatusCreating {
+			if session.Status != StatusStopped && session.Status != StatusError && session.Status != StatusCreating {
 				session.Status = StatusStopped
 				m.store.Save(session)
 				debugLog("[RECOVER] Session %s has active status but no tmux session, marked stopped", session.Name)
@@ -340,6 +340,7 @@ func (m *Manager) SetStatusWithError(id string, status Status, errMsg string) {
 	if session, ok := m.sessions[id]; ok {
 		session.Status = status
 		session.ErrorMessage = errMsg
+		m.store.Save(session)
 	}
 }
 
@@ -378,8 +379,7 @@ func (m *Manager) SetWorktreeName(id string, worktreeName string) {
 }
 
 // CountActive returns the number of active sessions (creating, running, thinking, permission)
-// These are the sessions that count against the parallel limit
-// Excludes: stopped, idle, queued, error
+// Excludes: stopped, idle, error
 func (m *Manager) CountActive() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -392,25 +392,6 @@ func (m *Manager) CountActive() int {
 		}
 	}
 	return count
-}
-
-// GetNextQueued returns the oldest queued session (FIFO)
-func (m *Manager) GetNextQueued() (*Session, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var oldest *Session
-	for _, s := range m.sessions {
-		if s.Status == StatusQueued {
-			if oldest == nil || s.CreatedAt.Before(oldest.CreatedAt) {
-				oldest = s
-			}
-		}
-	}
-	if oldest != nil {
-		return oldest, true
-	}
-	return nil, false
 }
 
 // StartBackground starts a session in the background

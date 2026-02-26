@@ -8,7 +8,6 @@ import (
 type Status string
 
 const (
-	StatusQueued     Status = "queued"     // キュー待機中
 	StatusCreating   Status = "creating"   // worktree作成中/CC起動中
 	StatusStopped    Status = "stopped"    // プロセス停止
 	StatusRunning    Status = "running"    // 実行中（詳細不明）

@@ -266,20 +266,8 @@ func (s *Server) handleNew(data json.RawMessage) Response {
 		return s.handleNewAsync(req)
 	}
 
-	// 同期モード - 排他制御と並列数チェック
+	// 同期モード - 排他制御
 	s.createMu.Lock()
-
-	// Check if we should queue this session
-	shouldQueue := false
-	if s.configMgr != nil && req.Start {
-		maxParallel := s.configMgr.GetMaxParallel()
-		activeCount := s.manager.CountActive()
-		if activeCount >= maxParallel {
-			shouldQueue = true
-			debugLog("[QUEUE] Queueing new session (active: %d, max: %d)",
-				activeCount, maxParallel)
-		}
-	}
 
 	sess, err := s.manager.CreateWithOptions(session.CreateOptions{
 		Name:          req.Name,
@@ -298,17 +286,13 @@ func (s *Server) handleNew(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 
-	if shouldQueue {
-		s.manager.SetStatus(sess.ID, session.StatusQueued)
-		s.createMu.Unlock()
-	} else {
-		s.createMu.Unlock()
+	s.createMu.Unlock()
 
-		// Start session in background if requested
-		if req.Start {
-			if err := s.manager.StartBackground(sess.ID); err != nil {
-				return Response{Success: false, Error: err.Error()}
-			}
+	// Start session in background if requested
+	if req.Start {
+		if err := s.manager.StartBackground(sess.ID); err != nil {
+			s.manager.Delete(sess.ID)
+			return Response{Success: false, Error: err.Error()}
 		}
 	}
 
@@ -318,20 +302,8 @@ func (s *Server) handleNew(data json.RawMessage) Response {
 
 // handleNewAsync handles async session creation with worktree
 func (s *Server) handleNewAsync(req NewRequest) Response {
-	// 排他制御：CountActive()とセッション作成を原子的に行う
+	// 排他制御
 	s.createMu.Lock()
-
-	// Check if we should queue this session
-	shouldQueue := false
-	if s.configMgr != nil && req.Start {
-		maxParallel := s.configMgr.GetMaxParallel()
-		activeCount := s.manager.CountActive()
-		if activeCount >= maxParallel {
-			shouldQueue = true
-			debugLog("[QUEUE] Queueing new session (active: %d, max: %d)",
-				activeCount, maxParallel)
-		}
-	}
 
 	// セッションを作成（WorkDirは後で設定、セッション名は自動生成される）
 	sess, err := s.manager.CreateWithOptions(session.CreateOptions{
@@ -351,20 +323,12 @@ func (s *Server) handleNewAsync(req NewRequest) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 
-	if shouldQueue {
-		// Set to queued status
-		s.manager.SetStatus(sess.ID, session.StatusQueued)
-	} else {
-		// Set to creating status and start immediately
-		s.manager.SetStatus(sess.ID, session.StatusCreating)
-	}
+	s.manager.SetStatus(sess.ID, session.StatusCreating)
 
 	s.createMu.Unlock()
 
 	// バックグラウンド処理はロック解放後に開始
-	if !shouldQueue {
-		go s.createSessionAsync(sess.ID, req)
-	}
+	go s.createSessionAsync(sess.ID, req)
 
 	respData, _ := json.Marshal(sess.ToInfo())
 	return Response{Success: true, Data: respData}
@@ -393,8 +357,8 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 			SSHAuthSock:  req.SSHAuthSock,
 		})
 		if err != nil {
-			debugLog("[ASYNC] Failed to create worktree: %v", err)
-			s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("worktree creation failed: %v", err))
+			debugLog("[ASYNC] Failed to create worktree, cleaning up session %s: %v", sessionID, err)
+			s.manager.Delete(sessionID)
 			return
 		}
 		// WorktreeNameを更新
@@ -414,8 +378,8 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 				SSHAuthSock:  req.SSHAuthSock,
 			})
 			if err != nil {
-				debugLog("[ASYNC] Failed to create worktree: %v", err)
-				s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("worktree creation failed: %v", err))
+				debugLog("[ASYNC] Failed to create worktree, cleaning up session %s: %v", sessionID, err)
+				s.manager.Delete(sessionID)
 				return
 			}
 			// WorktreeNameを更新
@@ -430,8 +394,8 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 
 	// WorkDirを設定（重複チェック付き）
 	if err := s.manager.SetWorkDir(sessionID, workDir); err != nil {
-		debugLog("[ASYNC] Failed to set WorkDir: %v", err)
-		s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("failed to set WorkDir: %v", err))
+		debugLog("[ASYNC] Failed to set WorkDir, cleaning up session %s: %v", sessionID, err)
+		s.manager.Delete(sessionID)
 		return
 	}
 
@@ -439,8 +403,8 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 	if req.Start {
 		debugLog("[ASYNC] Starting session %s", sessionID)
 		if err := s.manager.StartBackground(sessionID); err != nil {
-			debugLog("[ASYNC] Failed to start session: %v", err)
-			s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("failed to start session: %v", err))
+			debugLog("[ASYNC] Failed to start session, cleaning up session %s: %v", sessionID, err)
+			s.manager.Delete(sessionID)
 			return
 		}
 	}
@@ -455,9 +419,6 @@ func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
 }
 
 func (s *Server) handleList() Response {
-	// Try to start queued sessions if there's room
-	s.tryStartQueued()
-
 	// ローカルセッション一覧を取得
 	localSessions := s.manager.List()
 	for i := range localSessions {
@@ -507,103 +468,6 @@ func (s *Server) handleList() Response {
 
 	data, _ := json.Marshal(allSessions)
 	return Response{Success: true, Data: data}
-}
-
-// tryStartQueued checks if we can start a queued session and starts it
-func (s *Server) tryStartQueued() {
-	if s.configMgr == nil {
-		return
-	}
-
-	// 排他制御
-	s.createMu.Lock()
-	defer s.createMu.Unlock()
-
-	maxParallel := s.configMgr.GetMaxParallel()
-	activeCount := s.manager.CountActive()
-
-	// Start queued sessions while we have room
-	for activeCount < maxParallel {
-		queuedSession, ok := s.manager.GetNextQueued()
-		if !ok {
-			break // No more queued sessions
-		}
-
-		debugLog("[QUEUE] Starting queued session %s (active: %d, max: %d)",
-			queuedSession.ID, activeCount, maxParallel)
-
-		// Set to creating status before starting
-		s.manager.SetStatus(queuedSession.ID, session.StatusCreating)
-
-		// Start the queued session in background
-		go s.startQueuedSession(queuedSession.ID)
-
-		activeCount++ // Increment to prevent starting too many in one call
-	}
-}
-
-// startQueuedSession starts a queued session (with worktree creation if needed)
-// Note: Session status should already be set to StatusCreating by tryStartQueued
-func (s *Server) startQueuedSession(sessionID string) {
-	sess, ok := s.manager.Get(sessionID)
-	if !ok {
-		debugLog("[QUEUE] Session %s not found", sessionID)
-		return
-	}
-
-	// If session has repository/branch, handle worktree creation
-	if sess.Repository != "" && sess.Branch != "" {
-		wtMgr := worktree.NewManager(s.configMgr)
-
-		var wt *worktree.Worktree
-		var err error
-
-		if sess.IsNewWorktree {
-			// 新規worktreeを作成（setup-script実行）
-			debugLog("[QUEUE] Creating new worktree for %s/%s (IsNewWorktree=true)", sess.Repository, sess.Branch)
-			wt, _, err = wtMgr.CreateWithOptions(worktree.CreateOptions{
-				RepoName:     sess.Repository,
-				Branch:       sess.Branch,
-				NewBranch:    sess.NewBranch,
-				BaseBranch:   sess.BaseBranch,
-				WorktreeName: sess.WorktreeName,
-			})
-			if err != nil {
-				debugLog("[QUEUE] Failed to create worktree: %v", err)
-				s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("worktree creation failed: %v", err))
-				return
-			}
-		} else {
-			// 既存のworktreeを検索
-			wt, err = wtMgr.GetByBranch(sess.Repository, sess.Branch)
-			if err != nil {
-				// worktreeが存在しない場合は作成
-				debugLog("[QUEUE] Creating worktree for %s/%s (not found)", sess.Repository, sess.Branch)
-				wt, err = wtMgr.Create("", sess.Repository, sess.Branch, sess.NewBranch, sess.BaseBranch)
-				if err != nil {
-					debugLog("[QUEUE] Failed to create worktree: %v", err)
-					s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("worktree creation failed: %v", err))
-					return
-				}
-			}
-		}
-
-		// Update WorkDir（重複チェック付き）
-		if err := s.manager.SetWorkDir(sessionID, wt.Path); err != nil {
-			debugLog("[QUEUE] Failed to set WorkDir: %v", err)
-			s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("failed to set WorkDir: %v", err))
-			return
-		}
-	}
-
-	// Start the session
-	if err := s.manager.StartBackground(sessionID); err != nil {
-		debugLog("[QUEUE] Failed to start session %s: %v", sessionID, err)
-		s.manager.SetStatusWithError(sessionID, session.StatusError, fmt.Sprintf("failed to start session: %v", err))
-		return
-	}
-
-	debugLog("[QUEUE] Session %s started successfully", sessionID)
 }
 
 type IDRequest struct {
@@ -661,9 +525,6 @@ func (s *Server) handleDelete(data json.RawMessage) Response {
 	if err := s.manager.Delete(req.ID); err != nil {
 		return Response{Success: false, Error: err.Error()}
 	}
-
-	// Try to start queued sessions if a slot became available
-	s.tryStartQueued()
 
 	return Response{Success: true}
 }

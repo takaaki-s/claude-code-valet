@@ -32,7 +32,6 @@ type KeyMap struct {
 	New      key.Binding
 	Kill     key.Binding
 	Delete   key.Binding
-	Cancel   key.Binding
 	Refresh  key.Binding
 	Resume   key.Binding
 	Quit     key.Binding
@@ -75,10 +74,6 @@ func NewKeyMap(cfg config.KeybindingsConfig) KeyMap {
 		Delete: key.NewBinding(
 			key.WithKeys(cfg.Delete...),
 			key.WithHelp(strings.Join(cfg.Delete, "/"), "delete"),
-		),
-		Cancel: key.NewBinding(
-			key.WithKeys(cfg.Cancel...),
-			key.WithHelp(strings.Join(cfg.Cancel, "/"), "cancel queued"),
 		),
 		Refresh: key.NewBinding(
 			key.WithKeys(cfg.Refresh...),
@@ -556,10 +551,6 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pageSessions := m.getPageSessions()
 			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 				sess := pageSessions[m.cursor]
-				if sess.Status == session.StatusQueued {
-					m.err = fmt.Errorf("cannot attach to queued session")
-					return m, nil
-				}
 				if sess.Status == session.StatusCreating {
 					m.err = fmt.Errorf("cannot attach to creating session")
 					return m, nil
@@ -630,25 +621,6 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.deleteTargetName = sess.Name
 				m.deleteTargetHostID = sess.HostID
 				return m, nil
-			}
-
-		case key.Matches(msg, m.keys.Cancel):
-			// Cancel only works on queued sessions
-			pageSessions := m.getPageSessions()
-			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
-				sess := pageSessions[m.cursor]
-				if sess.Status == session.StatusQueued {
-					if err := m.client.Delete(sess.ID, sess.HostID); err != nil {
-						m.err = err
-					}
-					newPageSessions := m.getPageSessions()
-					if m.cursor >= len(newPageSessions) && m.cursor > 0 {
-						m.cursor--
-					}
-					return m, m.fetchSessions
-				} else {
-					m.err = fmt.Errorf("can only cancel queued sessions")
-				}
 			}
 
 		case key.Matches(msg, m.keys.Refresh):
@@ -830,14 +802,6 @@ func (m Model) renderListContent(contentWidth int) string {
 		content.WriteString("\n\n")
 	}
 
-	// Queued sessions count
-	var queuedSessions []session.Info
-	for _, sess := range m.sessions {
-		if sess.Status == session.StatusQueued {
-			queuedSessions = append(queuedSessions, sess)
-		}
-	}
-
 	// Sessions list
 	if len(m.sessions) == 0 {
 		content.WriteString("\n")
@@ -849,12 +813,6 @@ func (m Model) renderListContent(contentWidth int) string {
 			content.WriteString(m.renderSession(sess, i == m.cursor, contentWidth))
 		}
 
-		if len(queuedSessions) > 0 {
-			content.WriteString("\n")
-			queueNote := fmt.Sprintf("(%d queued)", len(queuedSessions))
-			content.WriteString(queueHeaderStyle.Render(queueNote))
-			content.WriteString("\n")
-		}
 	}
 
 	// Page info
@@ -1193,7 +1151,6 @@ type statusCounts struct {
 	running    int
 	creating   int
 	idle       int
-	queued     int
 	stopped    int
 	errorCount int
 }
@@ -1214,8 +1171,6 @@ func countStatuses(sessions []session.Info) statusCounts {
 			counts.creating++
 		case session.StatusIdle:
 			counts.idle++
-		case session.StatusQueued:
-			counts.queued++
 		case session.StatusStopped:
 			counts.stopped++
 		case session.StatusError:
@@ -1248,9 +1203,6 @@ func buildStatusSummary(sessions []session.Info) string {
 	if counts.idle > 0 {
 		parts = append(parts, idleStyle.Render(fmt.Sprintf("o%d Idle", counts.idle)))
 	}
-	if counts.queued > 0 {
-		parts = append(parts, queuedStyle.Render(fmt.Sprintf(".%d Queued", counts.queued)))
-	}
 	if counts.errorCount > 0 {
 		parts = append(parts, errorStatusStyle.Render(fmt.Sprintf("x%d Error", counts.errorCount)))
 	}
@@ -1272,8 +1224,6 @@ func getStatusDisplay(status session.Status) (icon, label string, style lipgloss
 		return "▶", "RUNNING", runningStyle
 	case session.StatusCreating:
 		return "+", "CREATING", creatingStyle
-	case session.StatusQueued:
-		return "…", "QUEUED", queuedStyle
 	case session.StatusIdle:
 		return "○", "IDLE", idleStyle
 	case session.StatusStopped:
