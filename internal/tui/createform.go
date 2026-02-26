@@ -902,6 +902,7 @@ func (m CreateFormModel) handleSubmit() (tea.Model, tea.Cmd) {
 			NewBranch:     m.newBranchMode,
 			BaseBranch:    baseBranch,
 			IsNewWorktree: false,
+			WorktreeName:  filepath.Base(selectedWt.Path),
 			PromptName:    promptName,
 			PromptArgs:    promptArgs,
 			HostID:        m.selectedHostID,
