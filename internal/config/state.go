@@ -10,7 +10,6 @@ import (
 
 // State はアプリケーションの状態を表す（設定ではない一時的な状態）
 type State struct {
-	LastUsedRepository string `yaml:"last_used_repository,omitempty"`
 }
 
 // StateManager は状態ファイルの読み書きを管理する
@@ -71,18 +70,4 @@ func (m *StateManager) Save() error {
 	}
 
 	return os.WriteFile(m.filePath, data, 0644)
-}
-
-// GetLastUsedRepository は前回使用したリポジトリ名を返す
-func (m *StateManager) GetLastUsedRepository() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.state.LastUsedRepository
-}
-
-// SetLastUsedRepository は前回使用したリポジトリ名を設定する
-func (m *StateManager) SetLastUsedRepository(name string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.state.LastUsedRepository = name
 }

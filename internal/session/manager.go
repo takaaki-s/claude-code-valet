@@ -7,13 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/notify"
-	"github.com/takaaki-s/claude-code-valet/internal/prompt"
 	"github.com/takaaki-s/claude-code-valet/internal/status"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/transcript"
@@ -31,13 +31,12 @@ func debugLog(format string, args ...interface{}) {
 
 // Manager manages multiple Claude Code sessions
 type Manager struct {
-	sessions    map[string]*Session
-	store       *Store
-	notifier    *notify.Notifier
-	promptMgr   *prompt.Manager
-	configMgr   *config.Manager
-	tmuxClient  *tmux.Client // tmux client for session management
-	mu          sync.RWMutex
+	sessions   map[string]*Session
+	store      *Store
+	notifier   *notify.Notifier
+	configMgr  *config.Manager
+	tmuxClient *tmux.Client // tmux client for session management
+	mu         sync.RWMutex
 }
 
 // SetTmuxClient sets the tmux client for tmux-based session management.
@@ -160,7 +159,6 @@ func NewManager(dataDir, configDir string, configMgr *config.Manager) (*Manager,
 		sessions:  make(map[string]*Session),
 		store:     store,
 		notifier:  notify.NewNotifier(),
-		promptMgr: prompt.NewManager(configDir),
 		configMgr: configMgr,
 	}
 
@@ -185,21 +183,8 @@ func NewManager(dataDir, configDir string, configMgr *config.Manager) (*Manager,
 
 // CreateOptions contains options for creating a new session
 type CreateOptions struct {
-	// 必須項目
-	Repository string // リポジトリ名
-	WorkDir    string // ワークディレクトリパス（リポジトリ本体/既存worktree/新規worktreeパス）
-	Branch     string // ブランチ名
-
-	// オプション
-	Name          string // セッション名（省略時: リポジトリ名/ブランチ名）
-	NewBranch     bool   // 新規ブランチを作成するか
-	BaseBranch    string // ベースブランチ（新規ブランチ時）
-	IsNewWorktree bool   // 新規worktreeを作成するか
-	WorktreeName  string // worktree名（新規worktree時、省略時はブランチ名）
-
-	// プロンプト
-	PromptName string
-	PromptArgs string
+	WorkDir string // ワークディレクトリパス
+	Name    string // セッション名（省略時: ディレクトリのbasename）
 }
 
 // CreateWithOptions creates a new session with full options
@@ -207,40 +192,24 @@ func (m *Manager) CreateWithOptions(opts CreateOptions) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// 必須フィールドのバリデーション
-	if opts.Repository == "" {
-		return nil, fmt.Errorf("repository is required")
-	}
-	if opts.Branch == "" {
-		return nil, fmt.Errorf("branch is required")
+	// WorkDirは必須
+	if opts.WorkDir == "" {
+		return nil, fmt.Errorf("work directory is required")
 	}
 
-	// 重複ディレクトリチェック（WorkDirが指定されている場合）
-	if opts.WorkDir != "" {
-		for _, s := range m.sessions {
-			if s.WorkDir == opts.WorkDir {
-				return nil, fmt.Errorf("session already exists for directory: %s (session: %s)", opts.WorkDir, s.Name)
-			}
-		}
-	}
-
-	// 重複ブランチチェック（Repository + Branch の組み合わせ）
-	// 同じリポジトリの同じブランチで複数のセッションを作成することを防止
-	if opts.Repository != "" && opts.Branch != "" {
-		for _, s := range m.sessions {
-			if s.Repository == opts.Repository && s.Branch == opts.Branch {
-				return nil, fmt.Errorf("session already exists for %s/%s (session: %s)",
-					opts.Repository, opts.Branch, s.Name)
-			}
+	// 重複ディレクトリチェック
+	for _, s := range m.sessions {
+		if s.WorkDir == opts.WorkDir {
+			return nil, fmt.Errorf("session already exists for directory: %s (session: %s)", opts.WorkDir, s.Name)
 		}
 	}
 
 	id := uuid.New().String() // Full UUID for Claude Code --session-id compatibility
 
-	// セッション名の決定（デフォルト: リポジトリ名/ブランチ名）
+	// セッション名の決定（デフォルト: ディレクトリのbasename）
 	name := opts.Name
 	if name == "" {
-		name = fmt.Sprintf("%s/%s", opts.Repository, opts.Branch)
+		name = filepath.Base(opts.WorkDir)
 	}
 
 	// セッション名の一意性チェック
@@ -259,14 +228,6 @@ func (m *Manager) CreateWithOptions(opts CreateOptions) (*Session, error) {
 		WorkDir:         opts.WorkDir,
 		CreatedAt:       time.Now(),
 		Status:          StatusStopped,
-		Repository:      opts.Repository,
-		Branch:          opts.Branch,
-		BaseBranch:      opts.BaseBranch,
-		NewBranch:       opts.NewBranch,
-		IsNewWorktree:   opts.IsNewWorktree,
-		WorktreeName:    opts.WorktreeName,
-		PromptName:      opts.PromptName,
-		PromptArgs:      opts.PromptArgs,
 		ClaudeSessionID: claudeSessionID,
 	}
 
@@ -367,17 +328,6 @@ func (m *Manager) SetWorkDir(id string, workDir string) error {
 	return nil
 }
 
-// SetWorktreeName updates the worktree name of a session
-func (m *Manager) SetWorktreeName(id string, worktreeName string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if session, ok := m.sessions[id]; ok {
-		session.WorktreeName = worktreeName
-		// Persist the change
-		m.store.Save(session)
-	}
-}
-
 // CountActive returns the number of active sessions (creating, running, thinking, permission)
 // Excludes: stopped, idle, error
 func (m *Manager) CountActive() int {
@@ -437,38 +387,6 @@ func (m *Manager) startSession(session *Session) error {
 
 // startSessionTmux starts a session in a tmux window.
 func (m *Manager) startSessionTmux(session *Session) error {
-	// Branch checkout handling
-	if session.Branch != "" && session.WorkDir != "" && !session.IsNewWorktree {
-		currentBranch, err := worktree.GetCurrentBranch(session.WorkDir)
-		if err != nil {
-			debugLog("[SESSION] Failed to get current branch: %v", err)
-		} else if currentBranch != session.Branch {
-			if session.ClaudeSessionStarted {
-				debugLog("[SESSION] Branch changed externally: %s -> %s", session.Branch, currentBranch)
-				session.Branch = currentBranch
-				session.NewBranch = false
-				m.store.Save(session)
-			} else {
-				hasChanges, err := worktree.HasUncommittedChanges(session.WorkDir)
-				if err != nil {
-					return fmt.Errorf("failed to check uncommitted changes: %w", err)
-				}
-				if hasChanges {
-					return fmt.Errorf("cannot checkout branch %s: uncommitted changes exist in %s", session.Branch, session.WorkDir)
-				}
-				if session.NewBranch {
-					if err := worktree.CreateAndCheckoutBranch(session.WorkDir, session.Branch, session.BaseBranch); err != nil {
-						return fmt.Errorf("failed to create and checkout branch: %w", err)
-					}
-				} else {
-					if err := worktree.CheckoutBranch(session.WorkDir, session.Branch); err != nil {
-						return fmt.Errorf("failed to checkout branch: %w", err)
-					}
-				}
-			}
-		}
-	}
-
 	// Set trust state
 	if err := ensureClaudeTrustState(session.WorkDir); err != nil {
 		debugLog("[TRUST] Warning: failed to set trust state: %v", err)
@@ -560,7 +478,7 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	return nil
 }
 
-// captureOutputTmux polls tmux capture-pane for status detection.
+// captureOutputTmux polls tmux capture-pane for status detection and CWD/branch tracking.
 func (m *Manager) captureOutputTmux(session *Session) {
 	detector := status.NewDetector()
 	ticker := time.NewTicker(1 * time.Second)
@@ -573,6 +491,7 @@ func (m *Manager) captureOutputTmux(session *Session) {
 		target = tmux.WindowTarget(session.TmuxWindowName, 0)
 	}
 	consecutiveErrors := 0
+	lastTrackedPath := ""
 
 	for range ticker.C {
 		m.mu.RLock()
@@ -583,13 +502,6 @@ func (m *Manager) captureOutputTmux(session *Session) {
 		}
 		sessionID := session.ID
 		sessionName := session.Name
-		promptName := session.PromptName
-		promptArgs := session.PromptArgs
-		promptInjected := session.PromptInjected
-		repository := session.Repository
-		branch := session.Branch
-		baseBranch := session.BaseBranch
-		workDir := session.WorkDir
 		m.mu.RUnlock()
 
 		// Check if pane process has exited
@@ -642,6 +554,32 @@ func (m *Manager) captureOutputTmux(session *Session) {
 			m.store.Save(session)
 			debugLog("[TMUX] Session %s pane died, marked as stopped (window preserved)", sessionName)
 			return
+		}
+
+		// Track current working directory and git branch
+		if currentPath, err := m.tmuxClient.GetPaneCurrentPath(target); err == nil {
+			currentPath = strings.TrimSpace(currentPath)
+			if currentPath != "" {
+				m.mu.Lock()
+				session.CurrentWorkDir = currentPath
+				m.mu.Unlock()
+
+				// Always check git branch (git rev-parse is lightweight, <5ms)
+				// Branch can change without CWD changing (e.g. git checkout)
+				if branch, err := worktree.GetCurrentBranch(currentPath); err == nil {
+					m.mu.Lock()
+					session.CurrentBranch = branch
+					session.IsGitRepo = true
+					m.mu.Unlock()
+				} else if currentPath != lastTrackedPath {
+					// Only clear git info when entering a non-git directory
+					m.mu.Lock()
+					session.CurrentBranch = ""
+					session.IsGitRepo = false
+					m.mu.Unlock()
+				}
+				lastTrackedPath = currentPath
+			}
 		}
 
 		// Capture pane content for status detection
@@ -706,69 +644,7 @@ func (m *Manager) captureOutputTmux(session *Session) {
 		if oldStatus != newStatus {
 			m.handleStatusChange(sessionID, sessionName, oldStatus, newStatus)
 		}
-
-		// Inject prompt when idle and not yet injected
-		if newStatus == StatusIdle && !promptInjected && promptName != "" {
-			m.mu.Lock()
-			session.PromptInjected = true
-			m.mu.Unlock()
-
-			debugLog("[PROMPT] Triggering tmux prompt injection for session %s", sessionID)
-			go m.injectPromptTmux(session, promptName, prompt.Variables{
-				Args:       promptArgs,
-				Branch:     branch,
-				Repository: repository,
-				Session:    sessionName,
-				WorkDir:    workDir,
-				BaseBranch: baseBranch,
-			})
-		}
 	}
-}
-
-// injectPromptTmux injects a prompt into the session via tmux send-keys.
-func (m *Manager) injectPromptTmux(session *Session, promptName string, vars prompt.Variables) {
-	expandedPrompt, err := m.promptMgr.GetExpanded(promptName, vars)
-	if err != nil {
-		debugLog("[PROMPT] Failed to expand prompt template '%s': %v", promptName, err)
-		return
-	}
-
-	debugLog("[PROMPT] Expanded prompt (%d chars)", len(expandedPrompt))
-
-	// Wait for Claude Code to be fully ready
-	time.Sleep(1 * time.Second)
-
-	m.mu.RLock()
-	windowName := session.TmuxWindowName
-	paneID := session.TmuxPaneID
-	m.mu.RUnlock()
-
-	if windowName == "" {
-		debugLog("[PROMPT] No tmux window, cannot inject prompt")
-		return
-	}
-
-	target := paneID
-	if target == "" {
-		target = windowName + ":0.0"
-	}
-
-	// Send prompt text via send-keys (literal mode)
-	if err := m.tmuxClient.SendKeysLiteral(target, expandedPrompt); err != nil {
-		debugLog("[PROMPT] Failed to send prompt via tmux: %v", err)
-		return
-	}
-
-	time.Sleep(200 * time.Millisecond)
-
-	// Send Enter
-	if err := m.tmuxClient.SendKeys(target, "Enter"); err != nil {
-		debugLog("[PROMPT] Failed to send Enter via tmux: %v", err)
-		return
-	}
-
-	debugLog("[PROMPT] Tmux injection complete for '%s'", promptName)
 }
 
 // convertStatus converts status.DetectedStatus to session.Status

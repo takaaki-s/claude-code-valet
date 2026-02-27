@@ -510,6 +510,11 @@ func (c *Client) GetPaneWindowName(paneID string) (string, error) {
 	return c.run("display-message", "-t", paneID, "-p", "#{window_name}")
 }
 
+// GetPaneCurrentPath returns the current working directory of the given pane.
+func (c *Client) GetPaneCurrentPath(target string) (string, error) {
+	return c.run("display-message", "-t", target, "-p", "#{pane_current_path}")
+}
+
 // --- Popup ---
 
 // DisplayPopupOptions configures a tmux display-popup.

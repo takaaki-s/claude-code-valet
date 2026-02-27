@@ -64,19 +64,10 @@ func (c *Client) send(req Request) (*Response, error) {
 
 // NewOptions contains options for creating a new session
 type NewOptions struct {
-	Name          string
-	WorkDir       string
-	Start         bool
-	Async         bool // If true, returns immediately with creating status
-	PromptName    string
-	PromptArgs    string
-	Repository    string
-	Branch        string
-	BaseBranch    string
-	NewBranch     bool   // If true, creates a new branch
-	IsNewWorktree bool   // If true, creates a new worktree
-	WorktreeName  string // Worktree name (directory name)
-	HostID        string // Target host (empty = "local")
+	Name    string
+	WorkDir string
+	Start   bool
+	HostID  string // Target host (empty = "local")
 }
 
 // New creates a new session
@@ -91,20 +82,11 @@ func (c *Client) New(name, workDir string, start bool) (*session.Info, error) {
 // NewWithOptions creates a new session with full options
 func (c *Client) NewWithOptions(opts NewOptions) (*session.Info, error) {
 	data, _ := json.Marshal(NewRequest{
-		Name:          opts.Name,
-		WorkDir:       opts.WorkDir,
-		Start:         opts.Start,
-		Async:         opts.Async,
-		PromptName:    opts.PromptName,
-		PromptArgs:    opts.PromptArgs,
-		Repository:    opts.Repository,
-		Branch:        opts.Branch,
-		BaseBranch:    opts.BaseBranch,
-		NewBranch:     opts.NewBranch,
-		IsNewWorktree: opts.IsNewWorktree,
-		WorktreeName:  opts.WorktreeName,
-		HostID:        opts.HostID,
-		SSHAuthSock:   os.Getenv("SSH_AUTH_SOCK"),
+		Name:        opts.Name,
+		WorkDir:     opts.WorkDir,
+		Start:       opts.Start,
+		HostID:      opts.HostID,
+		SSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
 	})
 
 	resp, err := c.send(Request{Action: "new", Data: data})
@@ -217,72 +199,3 @@ func (c *Client) ListHosts() ([]HostInfo, error) {
 	}
 	return hosts, nil
 }
-
-// ListRepos はリポジトリ一覧を取得する
-func (c *Client) ListRepos(hostID string) ([]RepositoryInfo, error) {
-	data, _ := json.Marshal(ListReposRequest{HostID: hostID})
-	resp, err := c.send(Request{Action: "list-repos", Data: data})
-	if err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, errors.New(resp.Error)
-	}
-	var repos []RepositoryInfo
-	if err := json.Unmarshal(resp.Data, &repos); err != nil {
-		return nil, err
-	}
-	return repos, nil
-}
-
-// ListBranches はブランチ一覧を取得する
-func (c *Client) ListBranches(hostID, repo string, all bool) ([]string, error) {
-	data, _ := json.Marshal(ListBranchesRequest{HostID: hostID, Repository: repo, All: all})
-	resp, err := c.send(Request{Action: "list-branches", Data: data})
-	if err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, errors.New(resp.Error)
-	}
-	var branches []string
-	if err := json.Unmarshal(resp.Data, &branches); err != nil {
-		return nil, err
-	}
-	return branches, nil
-}
-
-// FetchRepo はリポジトリのgit fetch originを実行する
-func (c *Client) FetchRepo(hostID, repo string) error {
-	data, _ := json.Marshal(FetchRepoRequest{
-		HostID:      hostID,
-		Repository:  repo,
-		SSHAuthSock: os.Getenv("SSH_AUTH_SOCK"),
-	})
-	resp, err := c.send(Request{Action: "fetch-repo", Data: data})
-	if err != nil {
-		return err
-	}
-	if !resp.Success {
-		return errors.New(resp.Error)
-	}
-	return nil
-}
-
-// ListWorktrees はworktree一覧を取得する
-func (c *Client) ListWorktrees(hostID, repo string) ([]WorktreeInfo, error) {
-	data, _ := json.Marshal(ListWorktreesRequest{HostID: hostID, Repository: repo})
-	resp, err := c.send(Request{Action: "list-worktrees", Data: data})
-	if err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, errors.New(resp.Error)
-	}
-	var wts []WorktreeInfo
-	if err := json.Unmarshal(resp.Data, &wts); err != nil {
-		return nil, err
-	}
-	return wts, nil
-}
-

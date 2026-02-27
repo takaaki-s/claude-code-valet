@@ -26,14 +26,6 @@ func ValidateDetachKey(key string) error {
 		key, strings.Join(supportedDetachKeys, ", "))
 }
 
-// RepositoryConfig はリポジトリの設定を表す
-type RepositoryConfig struct {
-	Path       string   `mapstructure:"path"`
-	Name       string   `mapstructure:"name"`
-	BaseBranch string   `mapstructure:"basebranch,omitempty"`
-	Setup      []string `mapstructure:"setup,omitempty"`
-}
-
 // KeybindingsConfig はキーバインド設定を表す
 type KeybindingsConfig struct {
 	// セッション一覧画面
@@ -73,9 +65,8 @@ type HostConfig struct {
 
 // Config はアプリケーション全体の設定を表す
 type Config struct {
-	Repositories []RepositoryConfig `mapstructure:"repositories"`
-	Keybindings  KeybindingsConfig  `mapstructure:"keybindings,omitempty"` // キーバインド設定
-	Hosts        []HostConfig       `mapstructure:"hosts,omitempty"`       // リモートホスト設定
+	Keybindings KeybindingsConfig `mapstructure:"keybindings,omitempty"` // キーバインド設定
+	Hosts       []HostConfig      `mapstructure:"hosts,omitempty"`       // リモートホスト設定
 }
 
 // Manager は設定ファイルの読み書きを管理する
@@ -117,9 +108,7 @@ func NewManager(dataDir string) (*Manager, error) {
 
 // defaultConfig はデフォルト設定を返す
 func defaultConfig() *Config {
-	return &Config{
-		Repositories: []RepositoryConfig{},
-	}
+	return &Config{}
 }
 
 // load は設定ファイルを読み込む
@@ -163,9 +152,6 @@ func (m *Manager) Save() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// viperのSetは構造体のmapstructureタグを無視するため、明示的にキーを設定
-	m.v.Set("repositories", m.config.Repositories)
-
 	return m.v.WriteConfigAs(m.filePath)
 }
 
@@ -174,89 +160,8 @@ func (m *Manager) Get() *Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// コピーを返す
 	cfg := *m.config
-	repos := make([]RepositoryConfig, len(m.config.Repositories))
-	copy(repos, m.config.Repositories)
-	cfg.Repositories = repos
 	return &cfg
-}
-
-// GetRepositories はリポジトリ一覧を返す
-func (m *Manager) GetRepositories() []RepositoryConfig {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	repos := make([]RepositoryConfig, len(m.config.Repositories))
-	copy(repos, m.config.Repositories)
-	return repos
-}
-
-// GetRepository は指定した名前のリポジトリを返す
-func (m *Manager) GetRepository(name string) *RepositoryConfig {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, repo := range m.config.Repositories {
-		if repo.Name == name {
-			r := repo
-			return &r
-		}
-	}
-	return nil
-}
-
-// AddRepository はリポジトリを追加する
-func (m *Manager) AddRepository(repo RepositoryConfig) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// 重複チェック
-	for _, r := range m.config.Repositories {
-		if r.Name == repo.Name {
-			return ErrRepositoryExists
-		}
-	}
-
-	m.config.Repositories = append(m.config.Repositories, repo)
-	return nil
-}
-
-// RemoveRepository はリポジトリを削除する
-func (m *Manager) RemoveRepository(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for i, repo := range m.config.Repositories {
-		if repo.Name == name {
-			m.config.Repositories = append(
-				m.config.Repositories[:i],
-				m.config.Repositories[i+1:]...,
-			)
-			return nil
-		}
-	}
-	return ErrRepositoryNotFound
-}
-
-// UpdateRepository はリポジトリを更新する
-func (m *Manager) UpdateRepository(name string, repo RepositoryConfig) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for i, r := range m.config.Repositories {
-		if r.Name == name {
-			m.config.Repositories[i] = repo
-			return nil
-		}
-	}
-	return ErrRepositoryNotFound
-}
-
-// GetWorktreeDir はworktreeの配置ディレクトリを返す
-func (m *Manager) GetWorktreeDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".ccvalet", "worktrees")
 }
 
 // GetHosts はリモートホスト一覧を返す

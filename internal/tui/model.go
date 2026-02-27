@@ -17,7 +17,6 @@ import (
 	"github.com/takaaki-s/claude-code-valet/internal/host"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
-	"github.com/takaaki-s/claude-code-valet/internal/worktree"
 )
 
 // maxTUIWidth is the maximum width (columns) for the TUI pane.
@@ -292,13 +291,13 @@ func (m *Model) getDisplaySessions() []session.Info {
 }
 
 // matchesSearch returns true if the session matches the search query
-// across any of the target fields (Name, Repository, Branch, WorktreeName).
+// across any of the target fields (Name, WorkDir, CurrentWorkDir, CurrentBranch).
 func matchesSearch(sess session.Info, query string) bool {
 	fields := []string{
 		sess.Name,
-		sess.Repository,
-		sess.Branch,
-		sess.WorktreeName,
+		sess.WorkDir,
+		sess.CurrentWorkDir,
+		sess.CurrentBranch,
 	}
 	for _, field := range fields {
 		if field != "" && strings.Contains(strings.ToLower(field), query) {
@@ -1040,22 +1039,24 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 	}
 	b.WriteString("\n")
 
-	// Build metadata: [host] repo (branch) — fallback to workDir
+	// Build metadata: [host] workdir (branch)
 	var metaParts []string
 	if sess.HostID != "" && sess.HostID != "local" {
 		metaParts = append(metaParts, "["+sess.HostID+"]")
 	}
-	if sess.Repository != "" {
-		metaParts = append(metaParts, sess.Repository)
-	} else if sess.WorkDir != "" {
-		workDir := sess.WorkDir
-		if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(workDir, home) {
-			workDir = "~" + workDir[len(home):]
-		}
-		metaParts = append(metaParts, workDir)
+	// Use CurrentWorkDir if available, fall back to WorkDir
+	displayDir := sess.CurrentWorkDir
+	if displayDir == "" {
+		displayDir = sess.WorkDir
 	}
-	if sess.Branch != "" {
-		metaParts = append(metaParts, "("+sess.Branch+")")
+	if displayDir != "" {
+		if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(displayDir, home) {
+			displayDir = "~" + displayDir[len(home):]
+		}
+		metaParts = append(metaParts, displayDir)
+	}
+	if sess.CurrentBranch != "" {
+		metaParts = append(metaParts, "("+sess.CurrentBranch+")")
 	}
 
 	statusStr := statusIcon + " " + statusLabel
@@ -1114,18 +1115,6 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 		} else {
 			b.WriteString(indent)
 			b.WriteString(helpStyle.Render(metaStr))
-		}
-		b.WriteString("\n")
-	}
-
-	// --- Line 4: worktree name ---
-	if sess.WorktreeName != "" {
-		wtDisplay := "📁 " + sess.WorktreeName
-		if selected {
-			b.WriteString(selectedItemStyle.Render(padLine(indent+wtDisplay, width)))
-		} else {
-			b.WriteString(indent)
-			b.WriteString(helpStyle.Render(wtDisplay))
 		}
 		b.WriteString("\n")
 	}
@@ -1237,18 +1226,6 @@ func truncateFromEndToWidth(s string, maxWidth int) string {
 		width += w
 	}
 	return string(runes[startIdx:])
-}
-
-// formatWorktreeDisplay はworktreeの表示形式を返す
-// リポジトリ本体: [main] /path/to/repo
-// 通常のworktree: worktree_name (branch)
-func formatWorktreeDisplay(wt *worktree.Worktree) string {
-	if wt.IsMain {
-		return fmt.Sprintf("[main] %s", wt.Path)
-	}
-	// worktree名はパスの最後のディレクトリ名
-	wtName := filepath.Base(wt.Path)
-	return fmt.Sprintf("%s (%s)", wtName, wt.Branch)
 }
 
 // getInUseStyle returns a style for the "in use" indicator based on session status.

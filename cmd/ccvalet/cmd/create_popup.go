@@ -5,7 +5,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
-	"github.com/takaaki-s/claude-code-valet/internal/daemon"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/tui"
 )
@@ -24,12 +23,7 @@ var createPopupCmd = &cobra.Command{
 			}
 		}
 
-		client := daemon.NewClient(getSocketPath())
-
-		// セッション一覧を取得（"in use" 表示に必要）
-		sessions, _ := client.List()
-
-		model := tui.NewCreateFormModel(client, sessions)
+		model := tui.NewCreateFormModel(getSocketPath())
 		p := tea.NewProgram(model, tea.WithAltScreen())
 		_, err := p.Run()
 		return err

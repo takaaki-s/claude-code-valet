@@ -8,7 +8,7 @@ import (
 type Status string
 
 const (
-	StatusCreating   Status = "creating"   // worktree作成中/CC起動中
+	StatusCreating   Status = "creating"   // CC起動中
 	StatusStopped    Status = "stopped"    // プロセス停止
 	StatusRunning    Status = "running"    // 実行中（詳細不明）
 	StatusIdle       Status = "idle"       // 入力待ち
@@ -32,18 +32,6 @@ type Session struct {
 	// エラー情報
 	ErrorMessage string `json:"error_message,omitempty"` // エラー時のメッセージ
 
-	// Worktree関連
-	Repository    string `json:"repository,omitempty"`      // リポジトリ名
-	Branch        string `json:"branch,omitempty"`          // ブランチ名
-	BaseBranch    string `json:"base_branch,omitempty"`     // ベースブランチ名
-	NewBranch     bool   `json:"new_branch,omitempty"`      // 新規ブランチを作成するか
-	IsNewWorktree bool   `json:"is_new_worktree,omitempty"` // 新規worktreeを作成するか
-	WorktreeName  string `json:"worktree_name,omitempty"`   // worktree名（ディレクトリ名）
-
-	// プロンプト関連
-	PromptName string `json:"prompt_name,omitempty"` // プロンプトテンプレート名
-	PromptArgs string `json:"prompt_args,omitempty"` // プロンプト引数
-
 	// Claude Code セッションID（復元用）
 	ClaudeSessionID      string `json:"claude_session_id,omitempty"`
 	ClaudeSessionStarted bool   `json:"claude_session_started,omitempty"` // CCセッションが一度でも起動されたか
@@ -56,28 +44,32 @@ type Session struct {
 	TmuxPaneID     string `json:"tmux_pane_id,omitempty"`     // CC pane ID (e.g., "%42") for capture-pane
 
 	// Runtime fields (not persisted)
-	PromptInjected bool      `json:"-"` // プロンプト注入済みか
 	LastOutputTime time.Time `json:"-"` // 最後にPTY出力を受信した時刻（idle安定性検出用）
 	StartedAt      time.Time `json:"-"` // プロセス起動時刻（起動直後のエラー誤検出防止用）
 	SSHAuthSock    string    `json:"-"` // SSH_AUTH_SOCK（git操作用、永続化しない）
+
+	// Tracked runtime fields (not persisted, updated by daemon polling)
+	CurrentWorkDir string `json:"-"` // 現在のワークディレクトリ（tmux pane_current_path）
+	CurrentBranch  string `json:"-"` // 現在のgitブランチ
+	IsGitRepo      bool   `json:"-"` // CurrentWorkDirがgitリポジトリ内か
 }
 
 // Info returns session information for display
 type Info struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	WorkDir       string    `json:"work_dir"`
-	Status        Status    `json:"status"`
-	CreatedAt     time.Time `json:"created_at"`
-	LastActiveAt  time.Time `json:"last_active_at,omitempty"`
-	Repository    string    `json:"repository,omitempty"`
-	Branch        string    `json:"branch,omitempty"`
-	IsNewWorktree    bool   `json:"is_new_worktree,omitempty"`
-	WorktreeName     string `json:"worktree_name,omitempty"`
-	ErrorMessage     string `json:"error_message,omitempty"`
-	ClaudeSessionID  string `json:"claude_session_id,omitempty"` // Claude Code session ID for transcript lookup
-	TmuxWindowName   string `json:"tmux_window_name,omitempty"` // tmux window name
-	HostID           string `json:"host_id,omitempty"`          // ホスト識別子
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	WorkDir         string    `json:"work_dir"`
+	Status          Status    `json:"status"`
+	CreatedAt       time.Time `json:"created_at"`
+	LastActiveAt    time.Time `json:"last_active_at,omitempty"`
+	ErrorMessage    string    `json:"error_message,omitempty"`
+	ClaudeSessionID string    `json:"claude_session_id,omitempty"` // Claude Code session ID for transcript lookup
+	TmuxWindowName  string    `json:"tmux_window_name,omitempty"` // tmux window name
+	HostID          string    `json:"host_id,omitempty"`          // ホスト識別子
+
+	// Tracked fields (dynamic, from daemon polling)
+	CurrentWorkDir string `json:"current_work_dir,omitempty"` // 現在のワークディレクトリ
+	CurrentBranch  string `json:"current_branch,omitempty"`   // 現在のgitブランチ
 
 	// Last messages from transcript
 	LastUserMessage      string `json:"last_user_message,omitempty"`      // Last user message content (truncated)
@@ -93,13 +85,11 @@ func (s *Session) ToInfo() Info {
 		Status:          s.Status,
 		CreatedAt:       s.CreatedAt,
 		LastActiveAt:    s.LastActiveAt,
-		Repository:      s.Repository,
-		Branch:          s.Branch,
-		IsNewWorktree:   s.IsNewWorktree,
-		WorktreeName:    s.WorktreeName,
 		ErrorMessage:    s.ErrorMessage,
 		ClaudeSessionID: s.ClaudeSessionID,
 		TmuxWindowName:  s.TmuxWindowName,
 		HostID:          s.HostID,
+		CurrentWorkDir:  s.CurrentWorkDir,
+		CurrentBranch:   s.CurrentBranch,
 	}
 }

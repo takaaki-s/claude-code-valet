@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -17,11 +16,9 @@ import (
 
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/host"
-	"github.com/takaaki-s/claude-code-valet/internal/repository"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/tunnel"
-	"github.com/takaaki-s/claude-code-valet/internal/worktree"
 )
 
 // debugEnabled controls debug logging output
@@ -50,14 +47,14 @@ func debugLog(format string, args ...interface{}) {
 
 // Server is the daemon server
 type Server struct {
-	socketPath    string
-	manager       *session.Manager
-	configMgr     *config.Manager
-	stateMgr      *config.StateManager
-	listener      net.Listener
-	createMu      sync.Mutex         // セッション作成の排他制御用
-	hostRegistry  *host.Registry     // マルチホスト管理
-	tunnelMgr     *tunnel.Manager    // SSHトンネル管理
+	socketPath   string
+	manager      *session.Manager
+	configMgr    *config.Manager
+	stateMgr     *config.StateManager
+	listener     net.Listener
+	createMu     sync.Mutex      // セッション作成の排他制御用
+	hostRegistry *host.Registry  // マルチホスト管理
+	tunnelMgr    *tunnel.Manager // SSHトンネル管理
 }
 
 // Message types
@@ -204,34 +201,17 @@ func (s *Server) handleRequest(req *Request) Response {
 		return s.handleStop()
 	case "list-hosts":
 		return s.handleListHosts()
-	case "list-repos":
-		return s.handleListRepos(req.Data)
-	case "list-branches":
-		return s.handleListBranches(req.Data)
-	case "fetch-repo":
-		return s.handleFetchRepo(req.Data)
-	case "list-worktrees":
-		return s.handleListWorktrees(req.Data)
 	default:
 		return Response{Success: false, Error: fmt.Sprintf("unknown action: %s", req.Action)}
 	}
 }
 
 type NewRequest struct {
-	Name          string `json:"name"`
-	WorkDir       string `json:"work_dir"`
-	Start         bool   `json:"start"`
-	Async         bool   `json:"async,omitempty"`          // trueの場合、creating状態で即座に返す
-	PromptName    string `json:"prompt_name,omitempty"`
-	PromptArgs    string `json:"prompt_args,omitempty"`
-	Repository    string `json:"repository,omitempty"`
-	Branch        string `json:"branch,omitempty"`
-	BaseBranch    string `json:"base_branch,omitempty"`
-	NewBranch     bool   `json:"new_branch,omitempty"`     // 新規ブランチを作成するか
-	IsNewWorktree bool   `json:"is_new_worktree,omitempty"` // 新規worktreeを作成するか
-	WorktreeName  string `json:"worktree_name,omitempty"`  // worktree名（ディレクトリ名）
-	HostID        string `json:"host_id,omitempty"`        // 対象ホスト（空="local"）
-	SSHAuthSock   string `json:"ssh_auth_sock,omitempty"`  // SSH_AUTH_SOCK（git操作用）
+	Name        string `json:"name"`
+	WorkDir     string `json:"work_dir"`
+	Start       bool   `json:"start"`
+	HostID      string `json:"host_id,omitempty"`       // 対象ホスト（空="local"）
+	SSHAuthSock string `json:"ssh_auth_sock,omitempty"` // SSH_AUTH_SOCK（git操作用）
 }
 
 func (s *Server) handleNew(data json.RawMessage) Response {
@@ -249,37 +229,12 @@ func (s *Server) handleNew(data json.RawMessage) Response {
 		return s.forwardToSlave(req.HostID, Request{Action: "new", Data: forwardData})
 	}
 
-	// 設定を再読み込み（CLI で repo add された場合に対応）
-	if s.configMgr != nil {
-		_ = s.configMgr.Reload()
-	}
-
-	// リポジトリが指定されている場合は存在チェック
-	if req.Repository != "" && s.configMgr != nil {
-		if s.configMgr.GetRepository(req.Repository) == nil {
-			return Response{Success: false, Error: fmt.Sprintf("repository '%s' not found", req.Repository)}
-		}
-	}
-
-	// Asyncモード + worktreeモードの場合
-	if req.Async && req.Repository != "" && req.Branch != "" {
-		return s.handleNewAsync(req)
-	}
-
 	// 同期モード - 排他制御
 	s.createMu.Lock()
 
 	sess, err := s.manager.CreateWithOptions(session.CreateOptions{
-		Name:          req.Name,
-		WorkDir:       req.WorkDir,
-		PromptName:    req.PromptName,
-		PromptArgs:    req.PromptArgs,
-		Repository:    req.Repository,
-		Branch:        req.Branch,
-		BaseBranch:    req.BaseBranch,
-		NewBranch:     req.NewBranch,
-		IsNewWorktree: req.IsNewWorktree,
-		WorktreeName:  req.WorktreeName,
+		Name:    req.Name,
+		WorkDir: req.WorkDir,
 	})
 	if err != nil {
 		s.createMu.Unlock()
@@ -298,124 +253,6 @@ func (s *Server) handleNew(data json.RawMessage) Response {
 
 	respData, _ := json.Marshal(sess.ToInfo())
 	return Response{Success: true, Data: respData}
-}
-
-// handleNewAsync handles async session creation with worktree
-func (s *Server) handleNewAsync(req NewRequest) Response {
-	// 排他制御
-	s.createMu.Lock()
-
-	// セッションを作成（WorkDirは後で設定、セッション名は自動生成される）
-	sess, err := s.manager.CreateWithOptions(session.CreateOptions{
-		Name:          req.Name, // 空の場合は自動生成
-		WorkDir:       "",       // 後で設定
-		PromptName:    req.PromptName,
-		PromptArgs:    req.PromptArgs,
-		Repository:    req.Repository,
-		Branch:        req.Branch,
-		BaseBranch:    req.BaseBranch,
-		NewBranch:     req.NewBranch,
-		IsNewWorktree: req.IsNewWorktree,
-		WorktreeName:  req.WorktreeName,
-	})
-	if err != nil {
-		s.createMu.Unlock()
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	s.manager.SetStatus(sess.ID, session.StatusCreating)
-
-	s.createMu.Unlock()
-
-	// バックグラウンド処理はロック解放後に開始
-	go s.createSessionAsync(sess.ID, req)
-
-	respData, _ := json.Marshal(sess.ToInfo())
-	return Response{Success: true, Data: respData}
-}
-
-// createSessionAsync creates worktree and starts CC in background
-func (s *Server) createSessionAsync(sessionID string, req NewRequest) {
-	debugLog("[ASYNC] Starting async session creation for %s", sessionID)
-
-	wtMgr := worktree.NewManager(s.configMgr)
-
-	var workDir string
-	var worktreeName string
-	var wt *worktree.Worktree
-	var err error
-
-	if req.IsNewWorktree {
-		// 新規worktreeを作成（setup-script実行）
-		debugLog("[ASYNC] Creating new worktree for %s/%s (IsNewWorktree=true)", req.Repository, req.Branch)
-		wt, worktreeName, err = wtMgr.CreateWithOptions(worktree.CreateOptions{
-			RepoName:     req.Repository,
-			Branch:       req.Branch,
-			NewBranch:    req.NewBranch,
-			BaseBranch:   req.BaseBranch,
-			WorktreeName: req.WorktreeName,
-			SSHAuthSock:  req.SSHAuthSock,
-		})
-		if err != nil {
-			debugLog("[ASYNC] Failed to create worktree, cleaning up session %s: %v", sessionID, err)
-			s.manager.Delete(sessionID)
-			return
-		}
-		// WorktreeNameを更新
-		s.manager.SetWorktreeName(sessionID, worktreeName)
-	} else {
-		// 既存のworktreeを検索
-		wt, err = wtMgr.GetByBranch(req.Repository, req.Branch)
-		if err != nil {
-			// worktreeが存在しない場合は作成
-			debugLog("[ASYNC] Creating worktree for %s/%s (not found)", req.Repository, req.Branch)
-			wt, worktreeName, err = wtMgr.CreateWithOptions(worktree.CreateOptions{
-				RepoName:     req.Repository,
-				Branch:       req.Branch,
-				NewBranch:    req.NewBranch,
-				BaseBranch:   req.BaseBranch,
-				WorktreeName: req.WorktreeName,
-				SSHAuthSock:  req.SSHAuthSock,
-			})
-			if err != nil {
-				debugLog("[ASYNC] Failed to create worktree, cleaning up session %s: %v", sessionID, err)
-				s.manager.Delete(sessionID)
-				return
-			}
-			// WorktreeNameを更新
-			s.manager.SetWorktreeName(sessionID, worktreeName)
-		} else {
-			// 既存worktreeが見つかった場合もworktree名を設定
-			s.manager.SetWorktreeName(sessionID, filepath.Base(wt.Path))
-		}
-	}
-	workDir = wt.Path
-	debugLog("[ASYNC] Worktree ready at %s", workDir)
-
-	// WorkDirを設定（重複チェック付き）
-	if err := s.manager.SetWorkDir(sessionID, workDir); err != nil {
-		debugLog("[ASYNC] Failed to set WorkDir, cleaning up session %s: %v", sessionID, err)
-		s.manager.Delete(sessionID)
-		return
-	}
-
-	// セッションを起動
-	if req.Start {
-		debugLog("[ASYNC] Starting session %s", sessionID)
-		if err := s.manager.StartBackground(sessionID); err != nil {
-			debugLog("[ASYNC] Failed to start session, cleaning up session %s: %v", sessionID, err)
-			s.manager.Delete(sessionID)
-			return
-		}
-	}
-
-	// 使用したリポジトリを記憶
-	if s.stateMgr != nil {
-		s.stateMgr.SetLastUsedRepository(req.Repository)
-		_ = s.stateMgr.Save()
-	}
-
-	debugLog("[ASYNC] Session %s created successfully", sessionID)
 }
 
 func (s *Server) handleList() Response {
@@ -607,48 +444,13 @@ func (s *Server) forwardToSlave(hostID string, req Request) Response {
 	return *resp
 }
 
-// --- ホスト・リポジトリ情報クエリ ---
+// --- ホスト情報クエリ ---
 
 // HostInfo はホスト情報を表す
 type HostInfo struct {
 	ID        string `json:"id"`
 	Type      string `json:"type"`
 	Connected bool   `json:"connected"`
-}
-
-// RepositoryInfo はリポジトリ情報を表す
-type RepositoryInfo struct {
-	Name       string `json:"name"`
-	Path       string `json:"path"`
-	BaseBranch string `json:"base_branch,omitempty"`
-}
-
-// WorktreeInfo はworktree情報を表す
-type WorktreeInfo struct {
-	Path       string `json:"path"`
-	Branch     string `json:"branch"`
-	RepoName   string `json:"repo_name"`
-	IsMain     bool   `json:"is_main"`
-	IsManaged  bool   `json:"is_managed"`
-	IsDetached bool   `json:"is_detached"`
-}
-
-// ListReposRequest はリポジトリ一覧取得リクエスト
-type ListReposRequest struct {
-	HostID string `json:"host_id,omitempty"`
-}
-
-// ListBranchesRequest はブランチ一覧取得リクエスト
-type ListBranchesRequest struct {
-	HostID     string `json:"host_id,omitempty"`
-	Repository string `json:"repository"`
-	All        bool   `json:"all,omitempty"` // true=ローカル+リモート
-}
-
-// ListWorktreesRequest はworktree一覧取得リクエスト
-type ListWorktreesRequest struct {
-	HostID     string `json:"host_id,omitempty"`
-	Repository string `json:"repository"`
 }
 
 func (s *Server) handleListHosts() Response {
@@ -671,86 +473,6 @@ func (s *Server) handleListHosts() Response {
 	return Response{Success: true, Data: data}
 }
 
-func (s *Server) handleListRepos(data json.RawMessage) Response {
-	var req ListReposRequest
-	if data != nil {
-		if err := json.Unmarshal(data, &req); err != nil {
-			return Response{Success: false, Error: err.Error()}
-		}
-	}
-
-	if req.HostID != "" && req.HostID != "local" {
-		return s.forwardToSlave(req.HostID, Request{Action: "list-repos", Data: data})
-	}
-
-	repos := s.configMgr.GetRepositories()
-	infos := make([]RepositoryInfo, 0, len(repos))
-	for _, r := range repos {
-		infos = append(infos, RepositoryInfo{
-			Name:       r.Name,
-			Path:       r.Path,
-			BaseBranch: r.BaseBranch,
-		})
-	}
-
-	respData, _ := json.Marshal(infos)
-	return Response{Success: true, Data: respData}
-}
-
-// FetchRepoRequest はリポジトリのgit fetchリクエスト
-type FetchRepoRequest struct {
-	HostID      string `json:"host_id,omitempty"`
-	Repository  string `json:"repository"`
-	SSHAuthSock string `json:"ssh_auth_sock,omitempty"`
-}
-
-func (s *Server) handleFetchRepo(data json.RawMessage) Response {
-	var req FetchRepoRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	if req.HostID != "" && req.HostID != "local" {
-		// Clear SSH_AUTH_SOCK before forwarding: the client's local socket path
-		// doesn't exist on the remote host. The slave will use its own SSH_AUTH_SOCK
-		// (inherited from the SSH tunnel with ForwardAgent).
-		req.SSHAuthSock = ""
-		forwardData, _ := json.Marshal(req)
-		return s.forwardToSlave(req.HostID, Request{Action: "fetch-repo", Data: forwardData})
-	}
-
-	repo := s.configMgr.GetRepository(req.Repository)
-	if repo == nil {
-		return Response{Success: false, Error: fmt.Sprintf("repository '%s' not found", req.Repository)}
-	}
-
-	fetchCmd := exec.Command("git", "-C", repo.Path, "fetch", "origin")
-	// SSH_AUTH_SOCK の優先順位:
-	// 1. リクエストで指定された値
-	// 2. トンネル経由のForwardAgent安定シンボリックリンク (~/.ccvalet/ssh-agent.sock)
-	// 3. デーモン自身の環境変数
-	sshSock := req.SSHAuthSock
-	if sshSock == "" {
-		home, _ := os.UserHomeDir()
-		stableAgent := filepath.Join(home, ".ccvalet", "ssh-agent.sock")
-		if target, err := os.Readlink(stableAgent); err == nil && target != "" {
-			if _, err := os.Stat(stableAgent); err == nil {
-				sshSock = stableAgent
-			}
-		}
-	}
-	if sshSock != "" {
-		fetchCmd.Env = replaceEnv(os.Environ(), "SSH_AUTH_SOCK", sshSock)
-	}
-	debugLog("[FETCH] repo=%s ssh_auth_sock=%q (req=%q, daemon=%q)",
-		req.Repository, sshSock, req.SSHAuthSock, os.Getenv("SSH_AUTH_SOCK"))
-	if output, err := fetchCmd.CombinedOutput(); err != nil {
-		return Response{Success: false, Error: fmt.Sprintf("git fetch failed: %s: %v", strings.TrimSpace(string(output)), err)}
-	}
-
-	return Response{Success: true}
-}
-
 // replaceEnv replaces or appends an environment variable in the given env slice.
 func replaceEnv(env []string, key, value string) []string {
 	prefix := key + "="
@@ -761,62 +483,4 @@ func replaceEnv(env []string, key, value string) []string {
 		}
 	}
 	return append(env, prefix+value)
-}
-
-func (s *Server) handleListBranches(data json.RawMessage) Response {
-	var req ListBranchesRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	if req.HostID != "" && req.HostID != "local" {
-		return s.forwardToSlave(req.HostID, Request{Action: "list-branches", Data: data})
-	}
-
-	registry := repository.NewRegistry(s.configMgr)
-	var branches []string
-	var err error
-	if req.All {
-		branches, err = registry.GetBranches(req.Repository)
-	} else {
-		branches, err = registry.GetLocalBranches(req.Repository)
-	}
-	if err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	respData, _ := json.Marshal(branches)
-	return Response{Success: true, Data: respData}
-}
-
-func (s *Server) handleListWorktrees(data json.RawMessage) Response {
-	var req ListWorktreesRequest
-	if err := json.Unmarshal(data, &req); err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	if req.HostID != "" && req.HostID != "local" {
-		return s.forwardToSlave(req.HostID, Request{Action: "list-worktrees", Data: data})
-	}
-
-	wtMgr := worktree.NewManager(s.configMgr)
-	wts, err := wtMgr.List(req.Repository)
-	if err != nil {
-		return Response{Success: false, Error: err.Error()}
-	}
-
-	infos := make([]WorktreeInfo, 0, len(wts))
-	for _, wt := range wts {
-		infos = append(infos, WorktreeInfo{
-			Path:       wt.Path,
-			Branch:     wt.Branch,
-			RepoName:   wt.RepoName,
-			IsMain:     wt.IsMain,
-			IsManaged:  wt.IsManaged,
-			IsDetached: wt.IsDetached,
-		})
-	}
-
-	respData, _ := json.Marshal(infos)
-	return Response{Success: true, Data: respData}
 }
