@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
@@ -38,6 +39,7 @@ type KeyMap struct {
 	Help     key.Binding
 	PrevPage key.Binding
 	NextPage key.Binding
+	Search   key.Binding
 
 	// セッション作成フォーム
 	NextField      key.Binding
@@ -98,6 +100,10 @@ func NewKeyMap(cfg config.KeybindingsConfig) KeyMap {
 		NextPage: key.NewBinding(
 			key.WithKeys("right", "l"),
 			key.WithHelp("→/l", "next page"),
+		),
+		Search: key.NewBinding(
+			key.WithKeys(cfg.Search...),
+			key.WithHelp(strings.Join(cfg.Search, "/"), "search"),
 		),
 		NextField: key.NewBinding(
 			key.WithKeys(cfg.NextField...),
@@ -173,6 +179,11 @@ type Model struct {
 	// Processing indicator
 	processingMsg    string // 処理中メッセージ（空でない時はオーバーレイ表示）
 	waitingForResize bool   // WindowSizeMsg到着を待っている（ZoomPane後のリサイズ完了待ち）
+
+	// Search/Filter mode
+	searching        bool             // true when search mode is active
+	searchInput      textinput.Model  // text input for search query
+	filteredSessions []session.Info   // filtered result (nil when not searching)
 }
 
 // NewModel creates a new TUI model
@@ -191,11 +202,17 @@ func NewModel(client *daemon.Client) Model {
 	}
 	keys := NewKeyMap(keybindings)
 
+	si := textinput.New()
+	si.Placeholder = "search..."
+	si.CharLimit = 100
+	si.Width = maxTUIWidth - 10
+
 	return Model{
-		client:    client,
-		keys:      keys,
-		focused:   true,
-		configMgr: configMgr,
+		client:      client,
+		keys:        keys,
+		focused:     true,
+		configMgr:   configMgr,
+		searchInput: si,
 	}
 }
 
@@ -217,6 +234,9 @@ func (m *Model) getItemsPerPage() int {
 	// Subtract header lines (title, stats, separator, footer)
 	// Header: 3 lines, Footer: 2 lines (page info + help)
 	availableLines := m.height - 8
+	if m.searching {
+		availableLines-- // search bar takes 1 line
+	}
 	if availableLines < 4 {
 		availableLines = 4
 	}
@@ -230,11 +250,12 @@ func (m *Model) getItemsPerPage() int {
 
 // getTotalPages calculates the total number of pages
 func (m *Model) getTotalPages() int {
-	if len(m.sessions) == 0 {
+	sessions := m.getDisplaySessions()
+	if len(sessions) == 0 {
 		return 1
 	}
 	itemsPerPage := m.getItemsPerPage()
-	totalPages := (len(m.sessions) + itemsPerPage - 1) / itemsPerPage
+	totalPages := (len(sessions) + itemsPerPage - 1) / itemsPerPage
 	if totalPages < 1 {
 		totalPages = 1
 	}
@@ -243,21 +264,64 @@ func (m *Model) getTotalPages() int {
 
 // getPageSessions returns sessions for the current page
 func (m *Model) getPageSessions() []session.Info {
-	if len(m.sessions) == 0 {
+	sessions := m.getDisplaySessions()
+	if len(sessions) == 0 {
 		return nil
 	}
 	itemsPerPage := m.getItemsPerPage()
 	start := m.currentPage * itemsPerPage
 	end := start + itemsPerPage
-	if start >= len(m.sessions) {
+	if start >= len(sessions) {
 		start = 0
 		m.currentPage = 0
 		end = itemsPerPage
 	}
-	if end > len(m.sessions) {
-		end = len(m.sessions)
+	if end > len(sessions) {
+		end = len(sessions)
 	}
-	return m.sessions[start:end]
+	return sessions[start:end]
+}
+
+// getDisplaySessions returns the sessions to display:
+// filteredSessions when searching, sessions otherwise.
+func (m *Model) getDisplaySessions() []session.Info {
+	if m.searching && m.filteredSessions != nil {
+		return m.filteredSessions
+	}
+	return m.sessions
+}
+
+// matchesSearch returns true if the session matches the search query
+// across any of the target fields (Name, Repository, Branch, WorktreeName).
+func matchesSearch(sess session.Info, query string) bool {
+	fields := []string{
+		sess.Name,
+		sess.Repository,
+		sess.Branch,
+		sess.WorktreeName,
+	}
+	for _, field := range fields {
+		if field != "" && strings.Contains(strings.ToLower(field), query) {
+			return true
+		}
+	}
+	return false
+}
+
+// applySearchFilter filters m.sessions using the current search query
+// and stores the result in m.filteredSessions.
+func (m *Model) applySearchFilter() {
+	query := strings.ToLower(m.searchInput.Value())
+	if query == "" {
+		m.filteredSessions = m.sessions
+		return
+	}
+	m.filteredSessions = make([]session.Info, 0)
+	for _, sess := range m.sessions {
+		if matchesSearch(sess, query) {
+			m.filteredSessions = append(m.filteredSessions, sess)
+		}
+	}
 }
 
 // Messages
@@ -403,6 +467,46 @@ func (m *Model) switchToRemoteSession(sess *session.Info) {
 	m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_SESSION", sess.ID)
 }
 
+// handleAttach attaches to the currently selected session.
+func (m Model) handleAttach() (tea.Model, tea.Cmd) {
+	pageSessions := m.getPageSessions()
+	if len(pageSessions) == 0 || m.cursor >= len(pageSessions) {
+		return m, nil
+	}
+	sess := pageSessions[m.cursor]
+
+	if sess.Status == session.StatusCreating {
+		m.err = fmt.Errorf("cannot attach to creating session")
+		return m, nil
+	}
+
+	if m.tmuxClient != nil {
+		needsStart := sess.Status == session.StatusStopped || sess.Status == session.StatusError
+		if needsStart {
+			if err := m.client.Start(sess.ID, sess.HostID); err != nil {
+				m.err = err
+				return m, nil
+			}
+			for i := range m.sessions {
+				if m.sessions[i].ID == sess.ID {
+					if m.sessions[i].TmuxWindowName == "" {
+						m.sessions[i].TmuxWindowName = tmux.InnerSessionName(sess.ID)
+					}
+					m.sessions[i].Status = session.StatusRunning
+					break
+				}
+			}
+			m.currentSessionID = ""
+		}
+		m.switchToSession(sess.ID)
+		if m.displayPaneID != "" {
+			m.tmuxClient.SelectPane(m.displayPaneID)
+		}
+		return m, m.fetchSessions
+	}
+	return m, nil
+}
+
 // Init initializes the model
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
@@ -526,6 +630,64 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Search mode key handling
+		if m.searching {
+			switch msg.String() {
+			case "esc":
+				m.searching = false
+				m.searchInput.Reset()
+				m.filteredSessions = nil
+				m.currentPage = 0
+				m.cursor = 0
+				return m, nil
+
+			case "up":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+				m.switchSeq++
+				return m, cursorSettledCmd(m.switchSeq)
+
+			case "down":
+				pageSessions := m.getPageSessions()
+				if m.cursor < len(pageSessions)-1 {
+					m.cursor++
+				}
+				m.switchSeq++
+				return m, cursorSettledCmd(m.switchSeq)
+
+			case "enter":
+				m.switchSeq++
+				return m.handleAttach()
+
+			case "left":
+				if m.currentPage > 0 {
+					m.currentPage--
+					m.cursor = 0
+				}
+				return m, nil
+
+			case "right":
+				totalPages := m.getTotalPages()
+				if m.currentPage < totalPages-1 {
+					m.currentPage++
+					m.cursor = 0
+				}
+				return m, nil
+			}
+
+			// All other keys go to textinput
+			var cmd tea.Cmd
+			oldQuery := m.searchInput.Value()
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			if m.searchInput.Value() != oldQuery {
+				m.applySearchFilter()
+				m.currentPage = 0
+				m.cursor = 0
+			}
+			return m, cmd
+		}
+
 		// Left pane key handling
 		switch {
 		case key.Matches(msg, m.keys.Quit):
@@ -547,44 +709,17 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cursorSettledCmd(m.switchSeq)
 
 		case key.Matches(msg, m.keys.Enter):
-			m.switchSeq++ // デバウンス中のswitchをキャンセル
-			pageSessions := m.getPageSessions()
-			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
-				sess := pageSessions[m.cursor]
-				if sess.Status == session.StatusCreating {
-					m.err = fmt.Errorf("cannot attach to creating session")
-					return m, nil
-				}
+			m.switchSeq++
+			return m.handleAttach()
 
-				// tmux mode: start session and display in right pane
-				if m.tmuxClient != nil {
-					needsStart := sess.Status == session.StatusStopped || sess.Status == session.StatusError
-					if needsStart {
-						if err := m.client.Start(sess.ID, sess.HostID); err != nil {
-							m.err = err
-							return m, nil
-						}
-						// Update local session data immediately
-						for i := range m.sessions {
-							if m.sessions[i].ID == sess.ID {
-								if m.sessions[i].TmuxWindowName == "" {
-									m.sessions[i].TmuxWindowName = tmux.InnerSessionName(sess.ID)
-								}
-								m.sessions[i].Status = session.StatusRunning
-								break
-							}
-						}
-						// Force switchToSession to run
-						m.currentSessionID = ""
-					}
-					m.switchToSession(sess.ID)
-					// Focus right pane (session display)
-					if m.displayPaneID != "" {
-						m.tmuxClient.SelectPane(m.displayPaneID)
-					}
-					return m, m.fetchSessions
-				}
-			}
+		case key.Matches(msg, m.keys.Search):
+			m.searching = true
+			m.searchInput.Reset()
+			m.searchInput.Focus()
+			m.filteredSessions = m.sessions
+			m.currentPage = 0
+			m.cursor = 0
+			return m, textinput.Blink
 
 		case key.Matches(msg, m.keys.New):
 			// Open session creation form in a tmux popup
@@ -657,8 +792,19 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionsMsg:
 		m.sessions = msg
 		m.err = nil
+
+		// Re-apply search filter if active
+		if m.searching {
+			m.applySearchFilter()
+		}
+
 		// 作成直後のセッションにフォーカス＋右ペイン切り替え
 		if m.focusSessionID != "" {
+			// Clear search to show the newly created session
+			m.searching = false
+			m.searchInput.Reset()
+			m.filteredSessions = nil
+
 			itemsPerPage := m.getItemsPerPage()
 			for i, s := range m.sessions {
 				if s.ID == m.focusSessionID {
@@ -672,8 +818,9 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focusSessionID = ""
 			return m, nil
 		}
-		if m.cursor >= len(m.sessions) && m.cursor > 0 {
-			m.cursor = len(m.sessions) - 1
+		displaySessions := m.getDisplaySessions()
+		if m.cursor >= len(displaySessions) && m.cursor > 0 {
+			m.cursor = len(displaySessions) - 1
 		}
 		// 削除/Kill後にカーソル位置のセッションに再接続
 		if m.needsReswitch {
@@ -796,6 +943,15 @@ func (m Model) renderListContent(contentWidth int) string {
 	content.WriteString(strings.Repeat("-", contentWidth))
 	content.WriteString("\n")
 
+	// Search bar
+	if m.searching {
+		matchCount := len(m.getDisplaySessions())
+		content.WriteString("/")
+		content.WriteString(m.searchInput.View())
+		content.WriteString(helpStyle.Render(fmt.Sprintf(" (%d)", matchCount)))
+		content.WriteString("\n")
+	}
+
 	// Error message
 	if m.err != nil {
 		content.WriteString(lipgloss.NewStyle().Foreground(errorColor).Render(fmt.Sprintf("Error: %v", m.err)))
@@ -803,9 +959,14 @@ func (m Model) renderListContent(contentWidth int) string {
 	}
 
 	// Sessions list
-	if len(m.sessions) == 0 {
+	displaySessions := m.getDisplaySessions()
+	if len(displaySessions) == 0 {
 		content.WriteString("\n")
-		content.WriteString(helpStyle.Render("No sessions. Press 'n' to create one."))
+		if m.searching {
+			content.WriteString(helpStyle.Render("No matching sessions."))
+		} else {
+			content.WriteString(helpStyle.Render("No sessions. Press 'n' to create one."))
+		}
 		content.WriteString("\n")
 	} else {
 		pageSessions := m.getPageSessions()
@@ -844,7 +1005,10 @@ func (m Model) renderHelpLine() string {
 		confirmMsg := fmt.Sprintf(" Delete '%s'? y:yes n:no", name)
 		return lipgloss.NewStyle().Foreground(warningColor).Bold(true).Render(confirmMsg)
 	}
-	return helpStyle.Render(" ? help")
+	if m.searching {
+		return helpStyle.Render(" Esc:clear  Enter:attach  ↑↓:navigate")
+	}
+	return helpStyle.Render(" ? help  / search")
 }
 
 // renderSession renders a single session in 1-line format with optional output preview

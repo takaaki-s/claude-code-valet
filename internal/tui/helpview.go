@@ -54,6 +54,7 @@ func (m HelpModel) View() string {
 	writeBinding(&b, keyStyle, descStyle, k.Down)
 	writeBinding(&b, keyStyle, descStyle, k.PrevPage)
 	writeBinding(&b, keyStyle, descStyle, k.NextPage)
+	writeBinding(&b, keyStyle, descStyle, k.Search)
 	b.WriteString("\n")
 
 	b.WriteString(sectionStyle.Render("Actions"))
