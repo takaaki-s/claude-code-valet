@@ -36,7 +36,6 @@ type KeybindingsConfig struct {
 	Kill    []string `mapstructure:"kill,omitempty"`
 	Delete  []string `mapstructure:"delete,omitempty"`
 	Refresh []string `mapstructure:"refresh,omitempty"`
-	Resume  []string `mapstructure:"resume,omitempty"`
 	Quit    []string `mapstructure:"quit,omitempty"`
 	Help    []string `mapstructure:"help,omitempty"`
 	Search  []string `mapstructure:"search,omitempty"`
@@ -209,7 +208,6 @@ func DefaultKeybindings() KeybindingsConfig {
 		Kill:    []string{"x"},
 		Delete:  []string{"d"},
 		Refresh: []string{"r"},
-		Resume:  []string{"R"},
 		Quit:    []string{"q", "ctrl+c"},
 		Help:    []string{"?"},
 		Search:  []string{"/"},
@@ -257,9 +255,6 @@ func (m *Manager) GetKeybindings() KeybindingsConfig {
 	}
 	if len(cfg.Refresh) == 0 {
 		cfg.Refresh = defaults.Refresh
-	}
-	if len(cfg.Resume) == 0 {
-		cfg.Resume = defaults.Resume
 	}
 	if len(cfg.Quit) == 0 {
 		cfg.Quit = defaults.Quit

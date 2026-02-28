@@ -34,7 +34,6 @@ type KeyMap struct {
 	Kill     key.Binding
 	Delete   key.Binding
 	Refresh  key.Binding
-	Resume   key.Binding
 	Quit     key.Binding
 	Help     key.Binding
 	PrevPage key.Binding
@@ -81,10 +80,6 @@ func NewKeyMap(cfg config.KeybindingsConfig) KeyMap {
 		Refresh: key.NewBinding(
 			key.WithKeys(cfg.Refresh...),
 			key.WithHelp(strings.Join(cfg.Refresh, "/"), "refresh"),
-		),
-		Resume: key.NewBinding(
-			key.WithKeys(cfg.Resume...),
-			key.WithHelp(strings.Join(cfg.Resume, "/"), "resume"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys(cfg.Quit...),
