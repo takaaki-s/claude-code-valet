@@ -40,6 +40,7 @@ type KeybindingsConfig struct {
 	Quit    []string `mapstructure:"quit,omitempty"`
 	Help    []string `mapstructure:"help,omitempty"`
 	Search  []string `mapstructure:"search,omitempty"`
+	Vscode  []string `mapstructure:"vscode,omitempty"`
 
 	// セッション作成フォーム
 	NextField      []string `mapstructure:"next_field,omitempty"`
@@ -212,6 +213,7 @@ func DefaultKeybindings() KeybindingsConfig {
 		Quit:    []string{"q", "ctrl+c"},
 		Help:    []string{"?"},
 		Search:  []string{"/"},
+		Vscode:  []string{"v"},
 
 		// セッション作成フォーム
 		NextField:      []string{"tab"},
@@ -267,6 +269,9 @@ func (m *Manager) GetKeybindings() KeybindingsConfig {
 	}
 	if len(cfg.Search) == 0 {
 		cfg.Search = defaults.Search
+	}
+	if len(cfg.Vscode) == 0 {
+		cfg.Vscode = defaults.Vscode
 	}
 	if len(cfg.NextField) == 0 {
 		cfg.NextField = defaults.NextField

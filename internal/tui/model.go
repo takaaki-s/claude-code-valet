@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ type KeyMap struct {
 	PrevPage key.Binding
 	NextPage key.Binding
 	Search   key.Binding
+	Vscode   key.Binding
 
 	// セッション作成フォーム
 	NextField      key.Binding
@@ -103,6 +105,10 @@ func NewKeyMap(cfg config.KeybindingsConfig) KeyMap {
 		Search: key.NewBinding(
 			key.WithKeys(cfg.Search...),
 			key.WithHelp(strings.Join(cfg.Search, "/"), "search"),
+		),
+		Vscode: key.NewBinding(
+			key.WithKeys(cfg.Vscode...),
+			key.WithHelp(strings.Join(cfg.Vscode, "/"), "open vscode"),
 		),
 		NextField: key.NewBinding(
 			key.WithKeys(cfg.NextField...),
@@ -466,6 +472,35 @@ func (m *Model) switchToRemoteSession(sess *session.Info) {
 	m.tmuxClient.SetEnvironment(tmux.SessionName, "CCVALET_CURRENT_SESSION", sess.ID)
 }
 
+// openVSCode opens VS Code for the given session's working directory.
+// For local sessions: code <path>
+// For SSH remote sessions: code --remote ssh-remote+<host> <path>
+func (m *Model) openVSCode(sess *session.Info) {
+	workDir := sess.CurrentWorkDir
+	if workDir == "" {
+		workDir = sess.WorkDir
+	}
+	if workDir == "" {
+		return
+	}
+
+	// リモートセッション（SSH）
+	if sess.HostID != "" && sess.HostID != "local" {
+		if m.configMgr == nil {
+			return
+		}
+		hostConfig := m.configMgr.GetHost(sess.HostID)
+		if hostConfig == nil || hostConfig.Type != "ssh" {
+			return
+		}
+		exec.Command("code", "--remote", "ssh-remote+"+hostConfig.Host, workDir).Start()
+		return
+	}
+
+	// ローカルセッション
+	exec.Command("code", workDir).Start()
+}
+
 // handleAttach attaches to the currently selected session.
 func (m Model) handleAttach() (tea.Model, tea.Cmd) {
 	pageSessions := m.getPageSessions()
@@ -784,6 +819,14 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentPage < totalPages-1 {
 				m.currentPage++
 				m.cursor = 0
+			}
+			return m, nil
+
+		case key.Matches(msg, m.keys.Vscode):
+			pageSessions := m.getPageSessions()
+			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
+				sess := pageSessions[m.cursor]
+				go m.openVSCode(&sess)
 			}
 			return m, nil
 		}

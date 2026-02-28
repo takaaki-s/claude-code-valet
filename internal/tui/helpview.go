@@ -64,6 +64,7 @@ func (m HelpModel) View() string {
 	writeBinding(&b, keyStyle, descStyle, k.Kill)
 	writeBinding(&b, keyStyle, descStyle, k.Delete)
 	writeBinding(&b, keyStyle, descStyle, k.Refresh)
+	writeBinding(&b, keyStyle, descStyle, k.Vscode)
 	b.WriteString("\n")
 
 	b.WriteString(sectionStyle.Render("General"))

@@ -222,6 +222,7 @@ keybindings:
   resume: [R]
   quit: [q, ctrl+c]
   help: ["?"]
+  vscode: ["v"]
   # セッション作成フォーム
   next_field: [tab]
   prev_field: [shift+tab]
@@ -279,6 +280,7 @@ ${args}
 | `d` | セッション削除 |
 | `c` | キュー待機中のセッションをキャンセル |
 | `r` | 一覧更新 |
+| `v` | VS Codeで開く |
 | `?` | ヘルプ表示 |
 | `q` | 終了 |
 
