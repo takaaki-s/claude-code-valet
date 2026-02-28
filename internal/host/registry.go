@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/takaaki-s/claude-code-valet/internal/config"
+	"github.com/takaaki-s/claude-code-valet/internal/notify"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 )
 
@@ -11,6 +12,7 @@ import (
 type SlaveClient interface {
 	IsRunning() bool
 	ListWithHostID() ([]session.Info, error)
+	NotificationHistoryWithHostID() ([]notify.Entry, error)
 }
 
 // Host はホストとそのslave clientのペア

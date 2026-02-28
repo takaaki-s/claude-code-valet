@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"io"
 	"log"
 	"net"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/host"
+	"github.com/takaaki-s/claude-code-valet/internal/notify"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/tunnel"
@@ -203,6 +205,8 @@ func (s *Server) handleRequest(req *Request) Response {
 		return s.handleListHosts()
 	case "hook":
 		return s.handleHook(req.Data)
+	case "notification-history":
+		return s.handleNotificationHistory()
 	default:
 		return Response{Success: false, Error: fmt.Sprintf("unknown action: %s", req.Action)}
 	}
@@ -222,6 +226,63 @@ func (s *Server) handleHook(data json.RawMessage) Response {
 	}
 	s.manager.HandleHookEvent(req.SessionID, req.HookEventName, req.NotificationType)
 	return Response{Success: true}
+}
+
+func (s *Server) handleNotificationHistory() Response {
+	// ローカルの通知履歴を取得
+	localEntries := s.manager.NotificationHistory()
+	for i := range localEntries {
+		if localEntries[i].HostID == "" {
+			localEntries[i].HostID = "local"
+		}
+	}
+
+	// リモートホストがない場合はローカルのみ返す
+	if s.hostRegistry == nil {
+		data, _ := json.Marshal(localEntries)
+		return Response{Success: true, Data: data}
+	}
+
+	// リモートの通知履歴を並列取得して統合
+	allEntries := localEntries
+	remotes := s.hostRegistry.Remotes()
+
+	if len(remotes) > 0 {
+		type remoteResult struct {
+			entries []notify.Entry
+			err     error
+			hostID  string
+		}
+
+		results := make(chan remoteResult, len(remotes))
+		for _, h := range remotes {
+			go func(rh *host.Host) {
+				if rh.Client == nil {
+					results <- remoteResult{hostID: rh.ID, err: fmt.Errorf("not connected")}
+					return
+				}
+				entries, err := rh.Client.NotificationHistoryWithHostID()
+				results <- remoteResult{entries: entries, err: err, hostID: rh.ID}
+			}(h)
+		}
+
+		for range remotes {
+			result := <-results
+			if result.err != nil {
+				debugLog("[REMOTE] Failed to get notification history from %s: %v", result.hostID, result.err)
+				continue
+			}
+			allEntries = append(allEntries, result.entries...)
+		}
+	}
+
+	// Timestamp降順でソート
+	sort.Slice(allEntries, func(i, j int) bool {
+		return allEntries[i].Timestamp.After(allEntries[j].Timestamp)
+	})
+
+	data, _ := json.Marshal(allEntries)
+	return Response{Success: true, Data: data}
 }
 
 type NewRequest struct {

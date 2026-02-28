@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 
+	"github.com/takaaki-s/claude-code-valet/internal/notify"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 )
 
@@ -195,6 +196,35 @@ func (c *Client) SendHook(req HookRequest) error {
 		return errors.New(resp.Error)
 	}
 	return nil
+}
+
+// NotificationHistory は通知履歴を取得する
+func (c *Client) NotificationHistory() ([]notify.Entry, error) {
+	resp, err := c.send(Request{Action: "notification-history"})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, errors.New(resp.Error)
+	}
+
+	var entries []notify.Entry
+	if err := json.Unmarshal(resp.Data, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// NotificationHistoryWithHostID は通知履歴を取得し、各エントリにHostIDをタグ付けする
+func (c *Client) NotificationHistoryWithHostID() ([]notify.Entry, error) {
+	entries, err := c.NotificationHistory()
+	if err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		entries[i].HostID = c.hostID
+	}
+	return entries, nil
 }
 
 // ListHosts はホスト一覧を取得する

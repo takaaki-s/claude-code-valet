@@ -39,7 +39,8 @@ type KeyMap struct {
 	PrevPage key.Binding
 	NextPage key.Binding
 	Search   key.Binding
-	Vscode   key.Binding
+	Vscode        key.Binding
+	Notifications key.Binding
 
 	// セッション作成フォーム
 	NextField      key.Binding
@@ -104,6 +105,10 @@ func NewKeyMap(cfg config.KeybindingsConfig) KeyMap {
 		Vscode: key.NewBinding(
 			key.WithKeys(cfg.Vscode...),
 			key.WithHelp(strings.Join(cfg.Vscode, "/"), "open vscode"),
+		),
+		Notifications: key.NewBinding(
+			key.WithKeys(cfg.Notifications...),
+			key.WithHelp(strings.Join(cfg.Notifications, "/"), "notifications"),
 		),
 		NextField: key.NewBinding(
 			key.WithKeys(cfg.NextField...),
@@ -824,6 +829,18 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				go m.openVSCode(&sess)
 			}
 			return m, nil
+
+		case key.Matches(msg, m.keys.Notifications):
+			if m.tmuxClient != nil {
+				selfBin, _ := os.Executable()
+				m.tmuxClient.DisplayPopup(tmux.DisplayPopupOptions{
+					Width:  "70%",
+					Height: "60%",
+					Cmd:    fmt.Sprintf("'%s' notify-popup", selfBin),
+					Title:  " Notifications ",
+				})
+			}
+			return m, nil
 		}
 
 	case sessionsMsg:
@@ -907,6 +924,11 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.tmuxClient != nil {
 			if id := m.tmuxClient.GetEnvironment(tmux.SessionName, "CCVALET_CREATED_SESSION"); id != "" {
 				m.tmuxClient.UnsetEnvironment(tmux.SessionName, "CCVALET_CREATED_SESSION")
+				m.focusSessionID = id
+			}
+			// Poll for session selected from notification history popup
+			if id := m.tmuxClient.GetEnvironment(tmux.SessionName, "CCVALET_NOTIFY_SESSION"); id != "" {
+				m.tmuxClient.UnsetEnvironment(tmux.SessionName, "CCVALET_NOTIFY_SESSION")
 				m.focusSessionID = id
 			}
 		}

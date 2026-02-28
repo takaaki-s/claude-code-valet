@@ -22,6 +22,8 @@ type Notifier struct {
 	// Remote notification settings
 	remoteHost string
 	remotePort string
+	// Notification history
+	history *History
 }
 
 // NewNotifier creates a new notifier
@@ -39,6 +41,7 @@ func NewNotifier() *Notifier {
 		debounceInterval: 3 * time.Second,
 		remoteHost:       remoteHost,
 		remotePort:       remotePort,
+		history:          NewHistory(100),
 	}
 }
 
@@ -51,12 +54,33 @@ func (n *Notifier) SetEnabled(enabled bool) {
 
 // NotifyPermission sends a notification when permission is required
 func (n *Notifier) NotifyPermission(sessionID, sessionName string) {
-	n.notify(sessionID, "Permission Required", fmt.Sprintf("[%s] Claude is waiting for permission", sessionName))
+	msg := fmt.Sprintf("[%s] Claude is waiting for permission", sessionName)
+	n.history.Add(Entry{
+		SessionID:   sessionID,
+		SessionName: sessionName,
+		Type:        "permission",
+		Message:     msg,
+		Timestamp:   time.Now(),
+	})
+	n.notify(sessionID, "Permission Required", msg)
 }
 
 // NotifyTaskComplete sends a notification when a task is complete
 func (n *Notifier) NotifyTaskComplete(sessionID, sessionName string) {
-	n.notify(sessionID, "Task Complete", fmt.Sprintf("[%s] Claude has finished the task", sessionName))
+	msg := fmt.Sprintf("[%s] Claude has finished the task", sessionName)
+	n.history.Add(Entry{
+		SessionID:   sessionID,
+		SessionName: sessionName,
+		Type:        "task_complete",
+		Message:     msg,
+		Timestamp:   time.Now(),
+	})
+	n.notify(sessionID, "Task Complete", msg)
+}
+
+// NotificationHistory returns a copy of the notification history (newest first)
+func (n *Notifier) NotificationHistory() []Entry {
+	return n.history.List()
 }
 
 func (n *Notifier) notify(sessionID, title, message string) {

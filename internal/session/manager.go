@@ -641,6 +641,11 @@ func (m *Manager) HandleHookEvent(ccSessionID, eventName, notificationType strin
 	}
 }
 
+// NotificationHistory returns the notification history
+func (m *Manager) NotificationHistory() []notify.Entry {
+	return m.notifier.NotificationHistory()
+}
+
 // Kill terminates a session
 func (m *Manager) Kill(id string) error {
 	m.mu.Lock()

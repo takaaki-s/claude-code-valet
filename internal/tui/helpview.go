@@ -69,6 +69,7 @@ func (m HelpModel) View() string {
 
 	b.WriteString(sectionStyle.Render("General"))
 	b.WriteString("\n")
+	writeBinding(&b, keyStyle, descStyle, k.Notifications)
 	writeBinding(&b, keyStyle, descStyle, k.Quit)
 	writeShortcut(&b, keyStyle, descStyle, m.detachKeyHint, "return to TUI pane")
 	writeBinding(&b, keyStyle, descStyle, k.Help)
