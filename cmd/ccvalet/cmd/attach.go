@@ -5,7 +5,9 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/daemon"
+	"github.com/takaaki-s/claude-code-valet/internal/host"
 	"github.com/takaaki-s/claude-code-valet/internal/session"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 )
@@ -54,7 +56,26 @@ var attachCmd = &cobra.Command{
 			windowName = tmux.InnerSessionName(sess.ID)
 		}
 
-		// Attach to inner tmux session
+		// Remote session: SSH or Docker attach
+		if sess.HostID != "" && sess.HostID != "local" {
+			configMgr, _ := config.NewManager(getConfigDir())
+			if configMgr == nil {
+				return fmt.Errorf("config not available")
+			}
+			hostConfig := configMgr.GetHost(sess.HostID)
+			if hostConfig == nil {
+				return fmt.Errorf("host not found: %s", sess.HostID)
+			}
+
+			host.EnsureSSHMaster(*hostConfig)
+			attachExec := host.AttachCommand(*hostConfig, windowName)
+			attachExec.Stdin = os.Stdin
+			attachExec.Stdout = os.Stdout
+			attachExec.Stderr = os.Stderr
+			return attachExec.Run()
+		}
+
+		// Local session: attach to inner tmux
 		tc, err := tmux.NewClient()
 		if err != nil {
 			return fmt.Errorf("tmux not available: %w", err)
