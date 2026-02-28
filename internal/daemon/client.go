@@ -184,6 +184,19 @@ func (c *Client) Stop() error {
 	return nil
 }
 
+// SendHook sends a Claude Code hook event to the daemon
+func (c *Client) SendHook(req HookRequest) error {
+	data, _ := json.Marshal(req)
+	resp, err := c.send(Request{Action: "hook", Data: data})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return errors.New(resp.Error)
+	}
+	return nil
+}
+
 // ListHosts はホスト一覧を取得する
 func (c *Client) ListHosts() ([]HostInfo, error) {
 	resp, err := c.send(Request{Action: "list-hosts"})

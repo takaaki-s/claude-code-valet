@@ -11,11 +11,9 @@ const (
 	StatusCreating   Status = "creating"   // CC起動中
 	StatusStopped    Status = "stopped"    // プロセス停止
 	StatusRunning    Status = "running"    // 実行中（詳細不明）
-	StatusIdle       Status = "idle"       // 入力待ち
-	StatusThinking   Status = "thinking"   // 処理中
-	StatusPermission Status = "permission" // 許可待ち
-	StatusConfirm    Status = "confirm"    // Trust確認待ち
-	StatusError      Status = "error"      // エラー
+	StatusIdle       Status = "idle"       // 入力待ち（Stop hook）
+	StatusThinking   Status = "thinking"   // 処理中（UserPromptSubmit hook）
+	StatusPermission Status = "permission" // 許可待ち（Notification hook）
 )
 
 // Session represents a Claude Code session

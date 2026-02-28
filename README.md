@@ -58,17 +58,17 @@ TUI 内で `n` キーを押してセッション作成、`Enter` でアタッチ
 
 ## セッションステータス
 
-| ステータス | アイコン | 説明 |
-|-----------|---------|------|
-| `thinking` | ⚡ | 処理中（並列カウント対象） |
-| `permission` | ? | 許可待ち（並列カウント対象） |
-| `running` | ▶ | 実行中（並列カウント対象） |
-| `creating` | + | 作成中（worktree作成/CC起動中） |
-| `queued` | … | キュー待機中（並列上限に達している） |
-| `idle` | ○ | 入力待ち（カウント外） |
-| `confirm` | ⚠ | Trust確認待ち |
-| `stopped` | ■ | 停止済み |
-| `error` | ✗ | エラー |
+セッションの状態は Claude Code の [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) によりイベントドリブンで検知されます。
+
+| ステータス | アイコン | 検知方法 | 説明 |
+|-----------|---------|---------|------|
+| `thinking` | ⚡ | `UserPromptSubmit` hook | 処理中（並列カウント対象） |
+| `permission` | ? | `Notification` hook | 許可待ち（並列カウント対象） |
+| `running` | ▶ | 内部設定 | 実行中（並列カウント対象） |
+| `creating` | + | 内部設定 | 作成中（worktree作成/CC起動中） |
+| `queued` | … | 内部設定 | キュー待機中（並列上限に達している） |
+| `idle` | ○ | `Stop` hook | 入力待ち（カウント外） |
+| `stopped` | ■ | プロセス死亡検知 | 停止済み |
 
 ## CLI コマンド
 
@@ -322,7 +322,61 @@ ${args}
 - `idle`: 入力待ち
 - `queued`: キュー待機中
 - `stopped`: 停止済み
-- `error`: エラー
+
+## Claude Code Hooks 設定
+
+ccvalet はセッションの状態検知に Claude Code の hooks を使用します。以下の設定を `~/.claude/settings.json` に追加してください。
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/ccvalet hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/ccvalet hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|elicitation_dialog|idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/ccvalet hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`/absolute/path/to/ccvalet` は `ccvalet` バイナリのフルパスに置き換えてください（`which ccvalet` で確認可能）。
+
+各 hook の役割:
+
+| Hook Event | 役割 |
+|-----------|------|
+| `UserPromptSubmit` | ユーザーがプロンプトを送信 → セッションを `thinking` に |
+| `Stop` | Claude のターン終了 → セッションを `idle` に（タスク完了通知を送信） |
+| `Notification` | 権限要求等 → セッションを `permission` に（権限要求通知を送信） |
 
 ## リモートホスト（EC2 / Docker）
 

@@ -14,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 	"github.com/takaaki-s/claude-code-valet/internal/notify"
-	"github.com/takaaki-s/claude-code-valet/internal/status"
 	"github.com/takaaki-s/claude-code-valet/internal/tmux"
 	"github.com/takaaki-s/claude-code-valet/internal/transcript"
 	"github.com/takaaki-s/claude-code-valet/internal/worktree"
@@ -67,7 +66,7 @@ func (m *Manager) recoverTmuxSessionsLocked() {
 	for _, session := range m.sessions {
 		if session.TmuxWindowName == "" {
 			// Fix stale sessions: active status but no tmux session (from prior recovery bug)
-			if session.Status != StatusStopped && session.Status != StatusError && session.Status != StatusCreating {
+			if session.Status != StatusStopped && session.Status != StatusCreating {
 				session.Status = StatusStopped
 				m.store.Save(session)
 				debugLog("[RECOVER] Session %s has active status but no tmux session, marked stopped", session.Name)
@@ -168,12 +167,6 @@ func NewManager(dataDir, configDir string, configMgr *config.Manager) (*Manager,
 		return nil, err
 	}
 	for _, s := range sessions {
-		// 作成に失敗したセッション（一度も起動していない）はスキップして削除
-		if s.Status == StatusError && !s.ClaudeSessionStarted {
-			debugLog("[SESSION] Removing failed creation session: %s (%s)", s.Name, s.ID)
-			store.Delete(s.ID)
-			continue
-		}
 		s.Status = StatusStopped // All loaded sessions start as stopped
 		m.sessions[s.ID] = s
 	}
@@ -478,10 +471,10 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	return nil
 }
 
-// captureOutputTmux polls tmux capture-pane for status detection and CWD/branch tracking.
+// captureOutputTmux polls tmux for process death detection and CWD/branch tracking.
+// Status detection is handled by Claude Code hooks (see HandleHookEvent).
 func (m *Manager) captureOutputTmux(session *Session) {
-	detector := status.NewDetector()
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	// Use pane ID (%N) if available; falls back to window.pane index.
@@ -490,7 +483,6 @@ func (m *Manager) captureOutputTmux(session *Session) {
 	if target == "" {
 		target = tmux.WindowTarget(session.TmuxWindowName, 0)
 	}
-	consecutiveErrors := 0
 	lastTrackedPath := ""
 
 	for range ticker.C {
@@ -500,7 +492,6 @@ func (m *Manager) captureOutputTmux(session *Session) {
 			m.mu.RUnlock()
 			return
 		}
-		sessionID := session.ID
 		sessionName := session.Name
 		m.mu.RUnlock()
 
@@ -581,106 +572,72 @@ func (m *Manager) captureOutputTmux(session *Session) {
 				lastTrackedPath = currentPath
 			}
 		}
+	}
+}
 
-		// Capture pane content for status detection
-		content, err := m.tmuxClient.CapturePane(target, false)
-		if err != nil {
-			consecutiveErrors++
-			// After 3 consecutive failures, the tmux window/session is likely gone
-			// (e.g., user quit ccvalet and the tmux session was destroyed)
-			if consecutiveErrors >= 3 {
-				m.mu.Lock()
-				if _, exists := m.sessions[session.ID]; !exists {
-					m.mu.Unlock()
-					debugLog("[TMUX] Session %s capture failed but session already deleted, skipping save", sessionName)
-					return
-				}
-				session.Status = StatusStopped
-				session.LastActiveAt = time.Now()
-				session.TmuxWindowName = ""
-				m.mu.Unlock()
-				m.store.Save(session)
-				debugLog("[TMUX] Session %s tmux window gone (capture failed %d times), marked as stopped", sessionName, consecutiveErrors)
-				return
-			}
-			continue
+
+// FindByClaudeSessionID finds a session by its Claude Code session ID
+func (m *Manager) FindByClaudeSessionID(ccSessionID string) (*Session, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		if s.ClaudeSessionID == ccSessionID {
+			return s, true
 		}
-		consecutiveErrors = 0
+	}
+	return nil, false
+}
 
-		detected := detector.Detect(content)
-		if detected == "" {
-			continue
-		}
+// HandleHookEvent processes a Claude Code hook event and updates session status
+func (m *Manager) HandleHookEvent(ccSessionID, eventName, notificationType string) {
+	session, ok := m.FindByClaudeSessionID(ccSessionID)
+	if !ok {
+		debugLog("[HOOK] Unknown CC session ID: %s", ccSessionID)
+		return
+	}
 
-		// Trust dialog detection
-		if detected == status.StatusTrust {
-			m.mu.Lock()
-			oldStatus := session.Status
-			session.Status = StatusConfirm
-			m.mu.Unlock()
-			if oldStatus != StatusConfirm {
-				debugLog("[STATUS] Session %s: %s -> %s (tmux)", sessionName, oldStatus, StatusConfirm)
-			}
-			continue
-		}
+	m.mu.Lock()
+	oldStatus := session.Status
+	sessionID := session.ID
+	sessionName := session.Name
 
-		newStatus := convertStatus(detected)
-
-		// Apply status stability logic
-		m.mu.Lock()
-		oldStatus := session.Status
-		timeSinceStart := time.Since(session.StartedAt)
-
-		// Skip error detection during startup grace period
-		if newStatus == StatusError && timeSinceStart < 5*time.Second {
-			newStatus = StatusRunning
-		}
-
-		session.Status = newStatus
+	switch eventName {
+	case "UserPromptSubmit":
+		session.Status = StatusThinking
 		session.LastOutputTime = time.Now()
-		m.mu.Unlock()
-
-		// Handle status change notifications
-		if oldStatus != newStatus {
-			m.handleStatusChange(sessionID, sessionName, oldStatus, newStatus)
+	case "Stop":
+		session.Status = StatusIdle
+		session.LastOutputTime = time.Now()
+	case "Notification":
+		switch notificationType {
+		case "permission_prompt", "elicitation_dialog":
+			session.Status = StatusPermission
+			session.LastOutputTime = time.Now()
+		case "idle_prompt":
+			session.Status = StatusIdle
+			session.LastOutputTime = time.Now()
+		default:
+			m.mu.Unlock()
+			return
 		}
-	}
-}
-
-// convertStatus converts status.DetectedStatus to session.Status
-func convertStatus(detected status.DetectedStatus) Status {
-	switch detected {
-	case status.StatusPermission:
-		return StatusPermission
-	case status.StatusThinking:
-		return StatusThinking
-	case status.StatusIdle:
-		return StatusIdle
-	case status.StatusError:
-		return StatusError
 	default:
-		return StatusRunning
-	}
-}
-
-// handleStatusChange sends notifications based on status transitions
-func (m *Manager) handleStatusChange(sessionID, sessionName string, oldStatus, newStatus Status) {
-	// Notify on permission request (from any state)
-	if newStatus == StatusPermission {
-		m.notifier.NotifyPermission(sessionID, sessionName)
+		m.mu.Unlock()
 		return
 	}
+	m.mu.Unlock()
 
-	// Notify on task completion (thinking -> idle)
-	if oldStatus == StatusThinking && newStatus == StatusIdle {
+	// Send notifications based on hook event
+	if oldStatus != session.Status {
+		debugLog("[HOOK] Session %s: %s -> %s (hook: %s)", sessionName, oldStatus, session.Status, eventName)
+	}
+
+	switch eventName {
+	case "Stop":
 		m.notifier.NotifyTaskComplete(sessionID, sessionName)
-		return
-	}
-
-	// Notify on error
-	if newStatus == StatusError {
-		m.notifier.NotifyError(sessionID, sessionName)
-		return
+	case "Notification":
+		if notificationType == "permission_prompt" || notificationType == "elicitation_dialog" {
+			m.notifier.NotifyPermission(sessionID, sessionName)
+		}
 	}
 }
 

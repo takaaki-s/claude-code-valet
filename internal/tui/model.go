@@ -436,7 +436,7 @@ func (m *Model) switchToSession(sessionID string) {
 func isSessionAlive(status session.Status) bool {
 	switch status {
 	case session.StatusRunning, session.StatusThinking, session.StatusIdle,
-		session.StatusPermission, session.StatusConfirm, session.StatusCreating:
+		session.StatusPermission, session.StatusCreating:
 		return true
 	}
 	return false
@@ -480,7 +480,7 @@ func (m Model) handleAttach() (tea.Model, tea.Cmd) {
 	}
 
 	if m.tmuxClient != nil {
-		needsStart := sess.Status == session.StatusStopped || sess.Status == session.StatusError
+		needsStart := sess.Status == session.StatusStopped
 		if needsStart {
 			if err := m.client.Start(sess.ID, sess.HostID); err != nil {
 				m.err = err
@@ -1079,35 +1079,6 @@ func (m Model) renderSession(sess session.Info, selected bool, width int) string
 	}
 	b.WriteString("\n")
 
-	// Error: show metadata + error message, then return early
-	if sess.Status == session.StatusError && sess.ErrorMessage != "" {
-		if metaStr != "" {
-			if selected {
-				b.WriteString(selectedItemStyle.Render(padLine(indent+metaStr, width)))
-			} else {
-				b.WriteString(indent)
-				b.WriteString(helpStyle.Render(metaStr))
-			}
-			b.WriteString("\n")
-		}
-		errMsg := truncateString(sess.ErrorMessage, width-indentWidth)
-		if selected {
-			b.WriteString(selectedItemStyle.Render(padLine(indent+errMsg, width)))
-		} else {
-			b.WriteString(indent)
-			b.WriteString(lipgloss.NewStyle().Foreground(errorColor).Render(errMsg))
-		}
-		b.WriteString("\n")
-		// Time on last line
-		if selected {
-			b.WriteString(selectedItemStyle.Render(padLine("  └─ "+timeStr, width)))
-		} else {
-			b.WriteString("  └─ " + timeStyle.Render(timeStr))
-		}
-		b.WriteString("\n")
-		return b.String()
-	}
-
 	// --- Line 3: metadata ([host] repo (branch)) ---
 	if metaStr != "" {
 		if selected {
@@ -1231,7 +1202,7 @@ func truncateFromEndToWidth(s string, maxWidth int) string {
 // getInUseStyle returns a style for the "in use" indicator based on session status.
 func getInUseStyle(status session.Status) lipgloss.Style {
 	switch status {
-	case session.StatusThinking, session.StatusPermission, session.StatusConfirm:
+	case session.StatusThinking, session.StatusPermission:
 		return lipgloss.NewStyle().Foreground(warningColor)
 	case session.StatusRunning, session.StatusCreating:
 		return lipgloss.NewStyle().Foreground(secondaryColor)
@@ -1288,12 +1259,10 @@ func timeAgo(t time.Time) string {
 type statusCounts struct {
 	thinking   int
 	permission int
-	confirm    int
 	running    int
 	creating   int
 	idle       int
 	stopped    int
-	errorCount int
 }
 
 func countStatuses(sessions []session.Info) statusCounts {
@@ -1304,8 +1273,6 @@ func countStatuses(sessions []session.Info) statusCounts {
 			counts.thinking++
 		case session.StatusPermission:
 			counts.permission++
-		case session.StatusConfirm:
-			counts.confirm++
 		case session.StatusRunning:
 			counts.running++
 		case session.StatusCreating:
@@ -1314,8 +1281,6 @@ func countStatuses(sessions []session.Info) statusCounts {
 			counts.idle++
 		case session.StatusStopped:
 			counts.stopped++
-		case session.StatusError:
-			counts.errorCount++
 		}
 	}
 	return counts
@@ -1332,9 +1297,6 @@ func buildStatusSummary(sessions []session.Info) string {
 	if counts.permission > 0 {
 		parts = append(parts, permissionStyle.Render(fmt.Sprintf("?%d Permission", counts.permission)))
 	}
-	if counts.confirm > 0 {
-		parts = append(parts, confirmStyle.Render(fmt.Sprintf("!%d Confirm", counts.confirm)))
-	}
 	if counts.running > 0 {
 		parts = append(parts, runningStyle.Render(fmt.Sprintf(">%d Running", counts.running)))
 	}
@@ -1343,9 +1305,6 @@ func buildStatusSummary(sessions []session.Info) string {
 	}
 	if counts.idle > 0 {
 		parts = append(parts, idleStyle.Render(fmt.Sprintf("o%d Idle", counts.idle)))
-	}
-	if counts.errorCount > 0 {
-		parts = append(parts, errorStatusStyle.Render(fmt.Sprintf("x%d Error", counts.errorCount)))
 	}
 
 	if len(parts) == 0 {
@@ -1369,10 +1328,6 @@ func getStatusDisplay(status session.Status) (icon, label string, style lipgloss
 		return "○", "IDLE", idleStyle
 	case session.StatusStopped:
 		return "■", "STOPPED", stoppedStyle
-	case session.StatusConfirm:
-		return "⚠", "CONFIRM", confirmStyle
-	case session.StatusError:
-		return "✗", "ERROR", errorStatusStyle
 	default:
 		return "?", "UNKNOWN", stoppedStyle
 	}

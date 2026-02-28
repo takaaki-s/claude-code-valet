@@ -59,11 +59,6 @@ func (n *Notifier) NotifyTaskComplete(sessionID, sessionName string) {
 	n.notify(sessionID, "Task Complete", fmt.Sprintf("[%s] Claude has finished the task", sessionName))
 }
 
-// NotifyError sends a notification when an error occurs
-func (n *Notifier) NotifyError(sessionID, sessionName string) {
-	n.notify(sessionID, "Error", fmt.Sprintf("[%s] An error occurred", sessionName))
-}
-
 func (n *Notifier) notify(sessionID, title, message string) {
 	n.mu.Lock()
 	if !n.enabled {

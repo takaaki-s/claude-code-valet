@@ -12,8 +12,6 @@ var (
 	dimColor       = lipgloss.Color("#414868") // Dark gray
 	purpleColor    = lipgloss.Color("#bb9af7") // Purple (thinking)
 	cyanColor      = lipgloss.Color("#7dcfff") // Cyan (running)
-	yellowColor    = lipgloss.Color("#e0af68") // Yellow (confirm)
-
 	// Title style (for header inside box)
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -58,14 +56,6 @@ var (
 
 	stoppedStyle = lipgloss.NewStyle().
 			Foreground(dimColor)
-
-	confirmStyle = lipgloss.NewStyle().
-			Foreground(yellowColor).
-			Bold(true)
-
-	errorStatusStyle = lipgloss.NewStyle().
-				Foreground(errorColor).
-				Bold(true)
 
 	// Box border style
 	boxBorderColor = primaryColor

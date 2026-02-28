@@ -201,9 +201,27 @@ func (s *Server) handleRequest(req *Request) Response {
 		return s.handleStop()
 	case "list-hosts":
 		return s.handleListHosts()
+	case "hook":
+		return s.handleHook(req.Data)
 	default:
 		return Response{Success: false, Error: fmt.Sprintf("unknown action: %s", req.Action)}
 	}
+}
+
+// HookRequest represents a Claude Code hook event
+type HookRequest struct {
+	SessionID        string `json:"session_id"`
+	HookEventName    string `json:"hook_event_name"`
+	NotificationType string `json:"notification_type,omitempty"`
+}
+
+func (s *Server) handleHook(data json.RawMessage) Response {
+	var req HookRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+	s.manager.HandleHookEvent(req.SessionID, req.HookEventName, req.NotificationType)
+	return Response{Success: true}
 }
 
 type NewRequest struct {
