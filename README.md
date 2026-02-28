@@ -94,7 +94,7 @@ ccvalet new --repo myrepo --new-worktree --branch feature-x --new-branch --base 
 ccvalet list
 
 # セッションにアタッチ
-ccvalet attach <session-name>
+ccvalet session attach <session-name>
 
 # セッション終了
 ccvalet kill <session-name>
