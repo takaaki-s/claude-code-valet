@@ -1,4 +1,4 @@
-.PHONY: build install clean test lint
+.PHONY: build install clean test fmt lint
 
 VERSION := 0.1.0
 BINARY := ccvalet
@@ -15,6 +15,9 @@ clean:
 
 test:
 	go test -v ./...
+
+fmt:
+	go fmt ./...
 
 lint:
 	go vet ./...
