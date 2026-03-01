@@ -98,27 +98,29 @@ ccvalet cleanup stopped --dry-run   # 削除対象の確認
 ### ユーティリティ
 
 ```bash
-ccvalet workdir <session-name>    # セッションの作業ディレクトリパスを出力
-ccvalet edit <session-name>       # EDITOR でセッションの作業ディレクトリを開く
+ccvalet session workdir <session-name>    # セッションの作業ディレクトリパスを出力
+ccvalet session edit <session-name>       # EDITOR でセッションの作業ディレクトリを開く
 ```
+
+> **注意**: `workdir` / `edit` はローカルセッション（host種類が `local`）でのみ正しく動作します。
 
 以下のシェル関数を定義すると便利です：
 
 ```bash
 # セッションの作業ディレクトリに移動
-cc-cd() { cd "$(ccvalet workdir "$1")"; }
+cc-cd() { cd "$(ccvalet session workdir "$1")"; }
 
 # fzf でセッションを選択して作業ディレクトリに移動
 cc-cdf() {
   local session
-  session=$(ccvalet session list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
-  [[ -n "$session" ]] && cd "$(ccvalet workdir "$session")"
+  session=$(ccvalet list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
+  [[ -n "$session" ]] && cd "$(ccvalet session workdir "$session")"
 }
 
 # fzf でセッションを選択してアタッチ
 cc-attach() {
   local session
-  session=$(ccvalet session list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
+  session=$(ccvalet list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
   [[ -n "$session" ]] && ccvalet session attach "$session"
 }
 ```
