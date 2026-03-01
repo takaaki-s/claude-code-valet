@@ -170,7 +170,6 @@ keybindings:
   # セッション作成フォーム
   next_field: [tab]
   prev_field: [shift+tab]
-  toggle_branch: [ctrl+b]
   submit: [enter]
   cancel_form: [esc]
   # アタッチ中
@@ -202,7 +201,6 @@ keybindings:
 |------|------|
 | `Tab` | 次のフィールドへ移動 |
 | `Shift+Tab` | 前のフィールドへ移動 |
-| `Ctrl+B` | ブランチモード切替（新規/既存） |
 | `Enter` | セッション作成 |
 | `Esc` | キャンセル |
 
