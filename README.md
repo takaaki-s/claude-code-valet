@@ -388,6 +388,7 @@ tail -f ~/.ccvalet/debug.log
 ## 必要要件
 
 - Go 1.21+
+- tmux 3.3+
 - Claude Code CLI がインストールされていること
 
 ## ライセンス
