@@ -27,18 +27,18 @@ const maxTUIWidth = 50
 
 // KeyMap defines key bindings
 type KeyMap struct {
-	Up      key.Binding
-	Down    key.Binding
-	Enter   key.Binding
-	New      key.Binding
-	Kill     key.Binding
-	Delete   key.Binding
-	Refresh  key.Binding
-	Quit     key.Binding
-	Help     key.Binding
-	PrevPage key.Binding
-	NextPage key.Binding
-	Search   key.Binding
+	Up            key.Binding
+	Down          key.Binding
+	Enter         key.Binding
+	New           key.Binding
+	Kill          key.Binding
+	Delete        key.Binding
+	Refresh       key.Binding
+	Quit          key.Binding
+	Help          key.Binding
+	PrevPage      key.Binding
+	NextPage      key.Binding
+	Search        key.Binding
 	Vscode        key.Binding
 	Notifications key.Binding
 
@@ -139,13 +139,13 @@ func NewKeyMap(cfg config.KeybindingsConfig) KeyMap {
 
 // Model is the TUI model
 type Model struct {
-	client       *daemon.Client
-	sessions     []session.Info
-	cursor       int
-	width        int
-	height       int
-	err          error
-	keys         KeyMap      // キーバインド設定
+	client   *daemon.Client
+	sessions []session.Info
+	cursor   int
+	width    int
+	height   int
+	err      error
+	keys     KeyMap // キーバインド設定
 
 	// Config manager (used for remote session attach)
 	configMgr *config.Manager
@@ -154,7 +154,7 @@ type Model struct {
 	currentPage int // 現在のページ（0-indexed）
 
 	// Delete confirmation
-	confirmDelete    bool   // 削除確認中かどうか
+	confirmDelete      bool   // 削除確認中かどうか
 	deleteTargetID     string // 削除対象のセッションID
 	deleteTargetName   string // 削除対象のセッション名（表示用）
 	deleteTargetHostID string // 削除対象のホストID
@@ -186,9 +186,9 @@ type Model struct {
 	waitingForResize bool   // WindowSizeMsg到着を待っている（ZoomPane後のリサイズ完了待ち）
 
 	// Search/Filter mode
-	searching        bool             // true when search mode is active
-	searchInput      textinput.Model  // text input for search query
-	filteredSessions []session.Info   // filtered result (nil when not searching)
+	searching        bool            // true when search mode is active
+	searchInput      textinput.Model // text input for search query
+	filteredSessions []session.Info  // filtered result (nil when not searching)
 }
 
 // NewModel creates a new TUI model
@@ -1072,7 +1072,8 @@ func (m Model) renderHelpLine() string {
 
 // renderSession renders a single session in 1-line format with optional output preview
 // Format: >name (branch)                    STATUS    Last Active
-//         details...
+//
+//	details...
 func (m Model) renderSession(sess session.Info, selected bool, width int) string {
 	var b strings.Builder
 

@@ -108,10 +108,10 @@ func createAndAttachTmux(tc *tmux.Client, tuiInnerCmd string) error {
 	if tuiPaneID != "" {
 		tc.TagManagedPane(tuiPaneID) // TUI pane survives exit
 	}
-	tc.SetOption("status", "off", true)         // Hide tmux status bar
+	tc.SetOption("status", "off", true) // Hide tmux status bar
 	tc.SetOption("mouse", "on", true)
-	tc.SetOption("focus-events", "on", true)    // Enable focus reporting for Bubble Tea FocusMsg/BlurMsg
-	tc.SetOption("set-clipboard", "on", true)   // Enable clipboard via OSC 52 for copy-mode
+	tc.SetOption("focus-events", "on", true)      // Enable focus reporting for Bubble Tea FocusMsg/BlurMsg
+	tc.SetOption("set-clipboard", "on", true)     // Enable clipboard via OSC 52 for copy-mode
 	tc.SetOption("allow-passthrough", "on", true) // Allow OSC 52 passthrough from inner tmux
 
 	// Pane border: color and session name display
@@ -165,8 +165,8 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd string) error {
 	if sshAuthSock := os.Getenv("SSH_AUTH_SOCK"); sshAuthSock != "" {
 		tc.SetEnvironment(tmux.SessionName, "SSH_AUTH_SOCK", sshAuthSock)
 	}
-	tc.SetOption("focus-events", "on", true)    // Ensure focus reporting is enabled
-	tc.SetOption("set-clipboard", "on", true)   // Enable clipboard via OSC 52 for copy-mode
+	tc.SetOption("focus-events", "on", true)      // Ensure focus reporting is enabled
+	tc.SetOption("set-clipboard", "on", true)     // Enable clipboard via OSC 52 for copy-mode
 	tc.SetOption("allow-passthrough", "on", true) // Allow OSC 52 passthrough from inner tmux
 	tc.SetOption("pane-border-status", "top", true)
 	tc.SetOption("pane-border-format", "#{?#{@session_name}, #{@session_name} ,}", true)

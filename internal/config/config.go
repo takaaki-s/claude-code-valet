@@ -29,15 +29,15 @@ func ValidateDetachKey(key string) error {
 // KeybindingsConfig はキーバインド設定を表す
 type KeybindingsConfig struct {
 	// セッション一覧画面
-	Up      []string `mapstructure:"up,omitempty"`
-	Down    []string `mapstructure:"down,omitempty"`
-	Attach  []string `mapstructure:"attach,omitempty"`
-	New     []string `mapstructure:"new,omitempty"`
-	Kill    []string `mapstructure:"kill,omitempty"`
-	Delete  []string `mapstructure:"delete,omitempty"`
-	Refresh []string `mapstructure:"refresh,omitempty"`
-	Quit    []string `mapstructure:"quit,omitempty"`
-	Help    []string `mapstructure:"help,omitempty"`
+	Up            []string `mapstructure:"up,omitempty"`
+	Down          []string `mapstructure:"down,omitempty"`
+	Attach        []string `mapstructure:"attach,omitempty"`
+	New           []string `mapstructure:"new,omitempty"`
+	Kill          []string `mapstructure:"kill,omitempty"`
+	Delete        []string `mapstructure:"delete,omitempty"`
+	Refresh       []string `mapstructure:"refresh,omitempty"`
+	Quit          []string `mapstructure:"quit,omitempty"`
+	Help          []string `mapstructure:"help,omitempty"`
 	Search        []string `mapstructure:"search,omitempty"`
 	Vscode        []string `mapstructure:"vscode,omitempty"`
 	Notifications []string `mapstructure:"notifications,omitempty"`
@@ -202,16 +202,16 @@ func (m *Manager) GetShell() string {
 func DefaultKeybindings() KeybindingsConfig {
 	return KeybindingsConfig{
 		// セッション一覧画面
-		Up:      []string{"up", "k"},
-		Down:    []string{"down", "j"},
-		Attach:  []string{"enter"},
-		New:     []string{"n"},
-		Kill:    []string{"x"},
-		Delete:  []string{"d"},
-		Refresh: []string{"r"},
-		Quit:    []string{"q", "ctrl+c"},
-		Help:    []string{"?"},
-		Search:  []string{"/"},
+		Up:            []string{"up", "k"},
+		Down:          []string{"down", "j"},
+		Attach:        []string{"enter"},
+		New:           []string{"n"},
+		Kill:          []string{"x"},
+		Delete:        []string{"d"},
+		Refresh:       []string{"r"},
+		Quit:          []string{"q", "ctrl+c"},
+		Help:          []string{"?"},
+		Search:        []string{"/"},
 		Vscode:        []string{"v"},
 		Notifications: []string{"!"},
 

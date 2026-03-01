@@ -10,7 +10,7 @@ import (
 type Entry struct {
 	SessionID   string    `json:"session_id"`
 	SessionName string    `json:"session_name"`
-	Type        string    `json:"type"`    // "permission" | "task_complete"
+	Type        string    `json:"type"` // "permission" | "task_complete"
 	Message     string    `json:"message"`
 	Timestamp   time.Time `json:"timestamp"`
 	HostID      string    `json:"host_id"`

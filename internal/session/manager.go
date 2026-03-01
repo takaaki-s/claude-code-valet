@@ -575,7 +575,6 @@ func (m *Manager) captureOutputTmux(session *Session) {
 	}
 }
 
-
 // FindByClaudeSessionID finds a session by its Claude Code session ID
 func (m *Manager) FindByClaudeSessionID(ccSessionID string) (*Session, bool) {
 	m.mu.RLock()

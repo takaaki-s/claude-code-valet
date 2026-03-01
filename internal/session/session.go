@@ -62,8 +62,8 @@ type Info struct {
 	LastActiveAt    time.Time `json:"last_active_at,omitempty"`
 	ErrorMessage    string    `json:"error_message,omitempty"`
 	ClaudeSessionID string    `json:"claude_session_id,omitempty"` // Claude Code session ID for transcript lookup
-	TmuxWindowName  string    `json:"tmux_window_name,omitempty"` // tmux window name
-	HostID          string    `json:"host_id,omitempty"`          // ホスト識別子
+	TmuxWindowName  string    `json:"tmux_window_name,omitempty"`  // tmux window name
+	HostID          string    `json:"host_id,omitempty"`           // ホスト識別子
 
 	// Tracked fields (dynamic, from daemon polling)
 	CurrentWorkDir string `json:"current_work_dir,omitempty"` // 現在のワークディレクトリ

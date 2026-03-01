@@ -15,9 +15,9 @@ import (
 type DirPickerModel struct {
 	currentDir string   // 現在表示中のディレクトリ
 	entries    []string // 現在のディレクトリ内のサブディレクトリ名
-	filtered  []string // フィルタ後のエントリ
-	cursor    int      // カーソル位置
-	offset    int      // スクロールオフセット
+	filtered   []string // フィルタ後のエントリ
+	cursor     int      // カーソル位置
+	offset     int      // スクロールオフセット
 
 	filterInput textinput.Model // フィルタ入力
 	showHidden  bool            // 隠しディレクトリを表示するか

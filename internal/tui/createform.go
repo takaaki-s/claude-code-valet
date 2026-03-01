@@ -20,8 +20,8 @@ type formStep int
 
 const (
 	stepHost    formStep = iota // ホスト選択（複数ホスト時のみ）
-	stepWorkDir                // ワークディレクトリ選択
-	stepName                   // セッション名
+	stepWorkDir                 // ワークディレクトリ選択
+	stepName                    // セッション名
 )
 
 // CreateFormModel is a standalone Bubble Tea model for the session creation form.

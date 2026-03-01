@@ -59,7 +59,6 @@ var (
 
 	// Box border style
 	boxBorderColor = primaryColor
-
 )
 
 // createBoxStyle creates a box style with specified width and height.
