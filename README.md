@@ -2,14 +2,11 @@
 
 複数の Claude Code セッションを同時に稼働させ、一元管理するための CLI ツール。
 
-git worktree を活用した並行開発をサポートします。
-
 ## 特徴
 
 - **複数セッション管理**: 複数の Claude Code セッションをバックグラウンドで同時実行
 - **並列数制御**: 同時実行セッション数を制限し、リソースを効率的に管理
 - **TUI**: セッション一覧・状態確認・操作を対話的に行えるターミナル UI
-- **git worktree 連携**: セッションごとに独立したワークディレクトリを自動作成
 - **アタッチ/デタッチ**: セッション間を素早く切り替え（`Ctrl+]` でデタッチ）
 
 ## インストール
@@ -64,7 +61,7 @@ TUI 内で `n` キーを押してセッション作成、`Enter` でアタッチ
 | `thinking` | ⚡ | `UserPromptSubmit` hook | 処理中（並列カウント対象） |
 | `permission` | ? | `Notification` hook | 許可待ち（並列カウント対象） |
 | `running` | ▶ | 内部設定 | 実行中（並列カウント対象） |
-| `creating` | + | 内部設定 | 作成中（worktree作成/CC起動中） |
+| `creating` | + | 内部設定 | 作成中（CC起動中） |
 | `idle` | ○ | `Stop` hook | 入力待ち（カウント外） |
 | `stopped` | ■ | プロセス死亡検知 | 停止済み |
 
@@ -87,9 +84,6 @@ ccvalet new
 # セッション作成（既存ディレクトリ使用）
 ccvalet new --repo myrepo --workdir ~/repos/myrepo --branch main
 
-# セッション作成（新規 worktree 作成）
-ccvalet new --repo myrepo --new-worktree --branch feature-x --new-branch --base main
-
 # セッション一覧
 ccvalet list
 
@@ -104,7 +98,6 @@ ccvalet delete <session-name>
 
 # 停止済みセッションの一括削除
 ccvalet cleanup stopped
-ccvalet cleanup stopped --worktree  # worktree も削除
 ccvalet cleanup stopped --dry-run   # 削除対象の確認
 ```
 
@@ -116,14 +109,6 @@ ccvalet repo list                 # 一覧表示
 ccvalet repo show <name>          # 詳細表示
 ccvalet repo remove <name>        # 削除
 ccvalet repo update <name> --setup "pnpm install"  # セットアップコマンド設定
-```
-
-### worktree 管理
-
-```bash
-ccvalet worktree list <repo-name>              # worktree 一覧
-ccvalet worktree create <repo-name> <branch>   # worktree 作成
-ccvalet worktree delete <repo-name> <worktree-name>  # worktree 削除
 ```
 
 ### ユーティリティ
@@ -176,7 +161,6 @@ ccvalet completion fish | source
 ├── config.yaml      # 設定ファイル
 ├── state.yaml       # 状態ファイル（前回使用したリポジトリ等）
 ├── sessions/        # セッションデータ
-├── worktrees/       # 自動作成された worktree
 └── run/
     └── daemon.sock  # デーモンソケット
 ```
@@ -200,7 +184,6 @@ keybindings:
   # セッション作成フォーム
   next_field: [tab]
   prev_field: [shift+tab]
-  toggle_worktree: [ctrl+w]
   toggle_branch: [ctrl+b]
   submit: [enter]
   cancel_form: [esc]
@@ -233,7 +216,6 @@ keybindings:
 |------|------|
 | `Tab` | 次のフィールドへ移動 |
 | `Shift+Tab` | 前のフィールドへ移動 |
-| `Ctrl+W` | Worktree モード切替（新規/既存） |
 | `Ctrl+B` | ブランチモード切替（新規/既存） |
 | `Enter` | セッション作成 |
 | `Esc` | キャンセル |
