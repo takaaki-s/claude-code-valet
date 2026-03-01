@@ -34,19 +34,13 @@ make install  # $GOPATH/bin にインストール
 ccvalet daemon start
 ```
 
-### 2. リポジトリを登録
-
-```bash
-ccvalet repo add /path/to/your/repo
-```
-
-### 3. TUI を起動
+### 2. TUI を起動
 
 ```bash
 ccvalet ui
 ```
 
-### 4. セッションを作成・アタッチ
+### 3. セッションを作成・アタッチ
 
 TUI 内で `n` キーを押してセッション作成、`Enter` でアタッチ。
 
@@ -81,8 +75,8 @@ ccvalet daemon status  # 状態確認
 # セッション作成（TUI で対話的に作成 - 推奨）
 ccvalet new
 
-# セッション作成（既存ディレクトリ使用）
-ccvalet new --repo myrepo --workdir ~/repos/myrepo --branch main
+# セッション作成（作業ディレクトリ指定）
+ccvalet new --workdir ~/repos/myrepo
 
 # セッション一覧
 ccvalet list
@@ -99,16 +93,6 @@ ccvalet delete <session-name>
 # 停止済みセッションの一括削除
 ccvalet cleanup stopped
 ccvalet cleanup stopped --dry-run   # 削除対象の確認
-```
-
-### リポジトリ管理
-
-```bash
-ccvalet repo add <path>           # リポジトリ登録
-ccvalet repo list                 # 一覧表示
-ccvalet repo show <name>          # 詳細表示
-ccvalet repo remove <name>        # 削除
-ccvalet repo update <name> --setup "pnpm install"  # セットアップコマンド設定
 ```
 
 ### ユーティリティ
