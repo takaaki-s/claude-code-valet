@@ -46,9 +46,7 @@ type KeyMap struct {
 	// セッション作成フォーム
 	NextField      key.Binding
 	PrevField      key.Binding
-	ToggleWorktree key.Binding
-	ToggleBranch   key.Binding
-	Submit         key.Binding
+	Submit key.Binding
 	CancelForm     key.Binding
 }
 
@@ -118,14 +116,6 @@ func NewKeyMap(cfg config.KeybindingsConfig) KeyMap {
 		PrevField: key.NewBinding(
 			key.WithKeys(cfg.PrevField...),
 			key.WithHelp(strings.Join(cfg.PrevField, "/"), "prev field"),
-		),
-		ToggleWorktree: key.NewBinding(
-			key.WithKeys(cfg.ToggleWorktree...),
-			key.WithHelp(strings.Join(cfg.ToggleWorktree, "/"), "toggle worktree"),
-		),
-		ToggleBranch: key.NewBinding(
-			key.WithKeys(cfg.ToggleBranch...),
-			key.WithHelp(strings.Join(cfg.ToggleBranch, "/"), "toggle branch"),
 		),
 		Submit: key.NewBinding(
 			key.WithKeys(cfg.Submit...),

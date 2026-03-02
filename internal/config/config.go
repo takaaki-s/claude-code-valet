@@ -45,9 +45,7 @@ type KeybindingsConfig struct {
 	// セッション作成フォーム
 	NextField      []string `mapstructure:"next_field,omitempty"`
 	PrevField      []string `mapstructure:"prev_field,omitempty"`
-	ToggleWorktree []string `mapstructure:"toggle_worktree,omitempty"`
-	ToggleBranch   []string `mapstructure:"toggle_branch,omitempty"`
-	Submit         []string `mapstructure:"submit,omitempty"`
+	Submit []string `mapstructure:"submit,omitempty"`
 	CancelForm     []string `mapstructure:"cancel_form,omitempty"`
 
 	// アタッチ中のキー
@@ -218,9 +216,7 @@ func DefaultKeybindings() KeybindingsConfig {
 		// セッション作成フォーム
 		NextField:      []string{"tab"},
 		PrevField:      []string{"shift+tab"},
-		ToggleWorktree: []string{"ctrl+w"},
-		ToggleBranch:   []string{"ctrl+b"},
-		Submit:         []string{"enter"},
+		Submit: []string{"enter"},
 		CancelForm:     []string{"esc"},
 
 		// アタッチ中のキー
@@ -278,12 +274,6 @@ func (m *Manager) GetKeybindings() KeybindingsConfig {
 	}
 	if len(cfg.PrevField) == 0 {
 		cfg.PrevField = defaults.PrevField
-	}
-	if len(cfg.ToggleWorktree) == 0 {
-		cfg.ToggleWorktree = defaults.ToggleWorktree
-	}
-	if len(cfg.ToggleBranch) == 0 {
-		cfg.ToggleBranch = defaults.ToggleBranch
 	}
 	if len(cfg.Submit) == 0 {
 		cfg.Submit = defaults.Submit

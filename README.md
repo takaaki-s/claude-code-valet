@@ -7,6 +7,8 @@
 - **複数セッション管理**: 複数の Claude Code セッションをバックグラウンドで同時実行
 - **TUI**: セッション一覧・状態確認・操作を対話的に行えるターミナル UI
 - **アタッチ/デタッチ**: セッション間を素早く切り替え（`Ctrl+]` でデタッチ）
+- **リアルタイム状態追跡**: 作業ディレクトリ・ブランチ・最新メッセージをリアルタイム表示
+- **検索・ページング**: セッション名・ディレクトリ・ブランチでインクリメンタル検索
 - **デスクトップ通知**: 許可待ち・タスク完了をOS通知でお知らせ（macOS / Linux対応）
 - **リモートホスト対応**: SSH / Docker 経由でリモートのセッションも統合管理
 
@@ -74,27 +76,29 @@ ccvalet daemon status  # 状態確認
 
 ```bash
 # セッション作成（TUI で対話的に作成 - 推奨）
-ccvalet new
+ccvalet session new
 
 # セッション作成（作業ディレクトリ指定）
-ccvalet new --workdir ~/repos/myrepo
+ccvalet session new --workdir ~/repos/myrepo
 
 # セッション一覧
-ccvalet list
+ccvalet session list
 
 # セッションにアタッチ
 ccvalet session attach <session-name>
 
 # セッション終了
-ccvalet kill <session-name>
+ccvalet session kill <session-name>
 
 # セッション削除
-ccvalet delete <session-name>
+ccvalet session delete <session-name>
 
 # 停止済みセッションの一括削除
 ccvalet cleanup stopped
 ccvalet cleanup stopped --dry-run   # 削除対象の確認
 ```
+
+> **エイリアス**: `session` は `sess` でも可（例: `ccvalet sess list`）。`list` は `ls`、`delete` は `rm` でも可。
 
 ### ユーティリティ
 
@@ -114,14 +118,14 @@ cc-cd() { cd "$(ccvalet session workdir "$1")"; }
 # fzf でセッションを選択して作業ディレクトリに移動
 cc-cdf() {
   local session
-  session=$(ccvalet list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
+  session=$(ccvalet session list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
   [[ -n "$session" ]] && cd "$(ccvalet session workdir "$session")"
 }
 
 # fzf でセッションを選択してアタッチ
 cc-attach() {
   local session
-  session=$(ccvalet list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
+  session=$(ccvalet session list | tail -n +2 | fzf --height 40% --reverse | awk '{print $1}')
   [[ -n "$session" ]] && ccvalet session attach "$session"
 }
 ```
@@ -158,24 +162,26 @@ ccvalet completion fish | source
 # キーバインドのカスタマイズ（省略時はデフォルト値を使用）
 keybindings:
   # セッション一覧画面
-  up: [up, k]
-  down: [down, j]
-  attach: [enter]
+  up: ["up", "k"]
+  down: ["down", "j"]
+  attach: ["enter"]
   new: ["n"]
-  kill: [x]
-  delete: [d]
-  refresh: [r]
-  quit: [q, ctrl+c]
-  help: ["?"]
+  kill: ["x"]
+  delete: ["d"]
+  refresh: ["r"]
+  search: ["/"]
   vscode: ["v"]
+  notifications: ["!"]
+  quit: ["q", "ctrl+c"]
+  help: ["?"]
   # セッション作成フォーム
-  next_field: [tab]
-  prev_field: [shift+tab]
-  submit: [enter]
-  cancel_form: [esc]
+  next_field: ["tab"]
+  prev_field: ["shift+tab"]
+  submit: ["enter"]
+  cancel_form: ["esc"]
   # アタッチ中
-  detach: [ctrl+]]  # デフォルト: ctrl+]
-                     # サポートキー: ctrl+^, ctrl+], ctrl+\, ctrl+g
+  detach: ["ctrl+]"]  # デフォルト: ctrl+]
+                       # サポートキー: ctrl+^, ctrl+], ctrl+\, ctrl+g
 ```
 
 ## TUI キーバインド
@@ -186,6 +192,9 @@ keybindings:
 |------|------|
 | `↑/k` | 上に移動 |
 | `↓/j` | 下に移動 |
+| `←/h` | 前のページ |
+| `→/l` | 次のページ |
+| `/` | セッション検索（名前・ディレクトリ・ブランチ） |
 | `Enter` | セッションにアタッチ |
 | `n` | 新規セッション作成 |
 | `x` | セッション終了 |
