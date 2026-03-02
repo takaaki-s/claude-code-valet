@@ -24,6 +24,7 @@ import (
 // When the terminal is maximized, the TUI pane is resized to this width
 // so the display pane gets the extra space.
 const maxTUIWidth = 50
+const minTUIWidth = 30
 
 // KeyMap defines key bindings
 type KeyMap struct {
@@ -555,9 +556,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if msg, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width = msg.Width
 		m.height = msg.Height
-		// Cap TUI pane width: resize via tmux so the display pane gets the extra space.
-		if m.width > maxTUIWidth && m.tmuxClient != nil && m.tuiPaneID != "" && m.displayPaneID != "" {
-			m.tmuxClient.ResizePaneWidth(m.tuiPaneID, maxTUIWidth)
+		// TUI pane width control: cap at max, enforce minimum.
+		if m.tmuxClient != nil && m.tuiPaneID != "" && m.displayPaneID != "" {
+			if m.width > maxTUIWidth {
+				m.tmuxClient.ResizePaneWidth(m.tuiPaneID, maxTUIWidth)
+			} else if m.width < minTUIWidth {
+				m.tmuxClient.ResizePaneWidth(m.tuiPaneID, minTUIWidth)
+			}
 		}
 		// ZoomPane後のリサイズ完了を検知
 		// WindowSizeMsgが届いた = ペインサイズが確定した → processingMsgをクリアして再描画
@@ -891,6 +896,38 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.processingMsg = ""
 			return m, nil
+		}
+		// セッションが空になった場合は右ペインをplaceholderにリセット
+		// currentSessionIDが空でも右ペインに古い表示が残っている場合があるため、
+		// 初回のみRespawnPaneを実行し、以降はスキップするために"_empty"をセットする
+		if len(m.sessions) == 0 {
+			if m.currentSessionID != "_empty" {
+				m.currentSessionID = "_empty"
+				if m.tmuxClient != nil && m.displayPaneID != "" {
+					m.tmuxClient.RespawnPane(m.displayPaneID, tmux.PlaceholderCmd)
+				}
+			}
+			m.processingMsg = ""
+			return m, nil
+		}
+		// ポーリングで現在表示中のセッションが消えた場合に右ペインをリセット
+		if m.currentSessionID != "" {
+			found := false
+			for _, s := range m.sessions {
+				if s.ID == m.currentSessionID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				m.currentSessionID = ""
+				pageSessions := m.getPageSessions()
+				if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
+					m.switchToSession(pageSessions[m.cursor].ID)
+				} else if m.tmuxClient != nil && m.displayPaneID != "" {
+					m.tmuxClient.RespawnPane(m.displayPaneID, tmux.PlaceholderCmd)
+				}
+			}
 		}
 		m.processingMsg = ""
 		return m, nil
