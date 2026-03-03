@@ -3,7 +3,6 @@ package session
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,11 +20,26 @@ import (
 
 // debugEnabled controls debug logging output
 var debugEnabled = os.Getenv("CCVALET_DEBUG") == "1"
+var debugLogPath string
+
+func init() {
+	if debugEnabled {
+		home, _ := os.UserHomeDir()
+		debugLogPath = filepath.Join(home, ".ccvalet", "daemon-debug.log")
+	}
+}
 
 func debugLog(format string, args ...interface{}) {
-	if debugEnabled {
-		log.Printf(format, args...)
+	if !debugEnabled || debugLogPath == "" {
+		return
 	}
+	f, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
 // Manager manages multiple Claude Code sessions
@@ -236,30 +250,28 @@ func (m *Manager) CreateWithOptions(opts CreateOptions) (*Session, error) {
 
 // List returns all sessions sorted by creation time
 func (m *Manager) List() []Info {
+	// Phase 1: Snapshot session data under RLock (no I/O)
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	reader := transcript.NewReader()
 	infos := make([]Info, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		info := s.ToInfo()
+		infos = append(infos, s.ToInfo())
+	}
+	m.mu.RUnlock()
 
-		// Fetch last messages from transcript if Claude session exists
-		// Use larger limit here; actual truncation happens in TUI based on window width
-		if s.ClaudeSessionID != "" && s.WorkDir != "" {
-			if msgs, err := reader.GetLastMessages(s.WorkDir, s.ClaudeSessionID); err == nil && msgs != nil {
+	// Phase 2: Enrich with transcript data outside lock (slow I/O)
+	reader := transcript.NewReader()
+	for i := range infos {
+		info := &infos[i]
+		if info.ClaudeSessionID != "" && info.WorkDir != "" {
+			if msgs, err := reader.GetLastMessages(info.WorkDir, info.ClaudeSessionID); err == nil && msgs != nil {
 				if msgs.User != nil {
 					info.LastUserMessage = transcript.TruncateMessage(msgs.User.Content, 500)
 				}
 				if msgs.Assistant != nil {
-					// Use TruncateMessageFromEnd for assistant messages
-					// Important content (like questions) is often at the end
 					info.LastAssistantMessage = transcript.TruncateMessageFromEnd(msgs.Assistant.Content, 500)
 				}
 			}
 		}
-
-		infos = append(infos, info)
 	}
 
 	// Sort by CreatedAt (oldest first)
@@ -440,8 +452,8 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	// (tmux's -c flag doesn't expand ~, and RespawnPane doesn't accept -c at all)
 	// Use ; instead of && so cd failure doesn't prevent claude from starting
 	shellDir := workDirForShell(session.WorkDir)
-	shellCmd := fmt.Sprintf("cd \"%s\" 2>/dev/null; env -u TMUX -u TMUX_PANE -u CLAUDECODE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic '%s'",
-		shellDir, shell, claudeCmd)
+	shellCmd := fmt.Sprintf("cd \"%s\" 2>/dev/null; env -u TMUX -u TMUX_PANE -u CLAUDECODE CCVALET_SESSION_ID=%s TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic '%s'",
+		shellDir, session.ID, shell, claudeCmd)
 
 	innerSessionName := tmux.InnerSessionName(session.ID)
 
@@ -556,8 +568,8 @@ func (m *Manager) captureOutputTmux(session *Session) {
 
 				shell := m.configMgr.GetShell()
 				shellDir := workDirForShell(session.WorkDir)
-				shellCmd := fmt.Sprintf("cd \"%s\" 2>/dev/null; env -u TMUX -u TMUX_PANE -u CLAUDECODE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic 'claude --session-id %s'",
-					shellDir, shell, newSessionID)
+				shellCmd := fmt.Sprintf("cd \"%s\" 2>/dev/null; env -u TMUX -u TMUX_PANE -u CLAUDECODE CCVALET_SESSION_ID=%s TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic 'claude --session-id %s'",
+					shellDir, session.ID, shell, newSessionID)
 				if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
 					m.mu.Lock()
 					session.Status = StatusRunning
@@ -637,10 +649,24 @@ func (m *Manager) FindByClaudeSessionID(ccSessionID string) (*Session, bool) {
 }
 
 // HandleHookEvent processes a Claude Code hook event and updates session status
-func (m *Manager) HandleHookEvent(ccSessionID, eventName, notificationType string) {
-	session, ok := m.FindByClaudeSessionID(ccSessionID)
+func (m *Manager) HandleHookEvent(ccSessionID, ccvaletSessionID, eventName, notificationType string) {
+	var session *Session
+	var ok bool
+
+	// Try ccvalet session ID first (from CCVALET_SESSION_ID env var, most reliable)
+	if ccvaletSessionID != "" {
+		m.mu.RLock()
+		session, ok = m.sessions[ccvaletSessionID]
+		m.mu.RUnlock()
+	}
+
+	// Fall back to Claude Code session ID
 	if !ok {
-		debugLog("[HOOK] Unknown CC session ID: %s", ccSessionID)
+		session, ok = m.FindByClaudeSessionID(ccSessionID)
+	}
+
+	if !ok {
+		debugLog("[HOOK] Unknown session: ccvalet=%s cc=%s", ccvaletSessionID, ccSessionID)
 		return
 	}
 
@@ -648,6 +674,12 @@ func (m *Manager) HandleHookEvent(ccSessionID, eventName, notificationType strin
 	oldStatus := session.Status
 	sessionID := session.ID
 	sessionName := session.Name
+
+	// Update ClaudeSessionID if it changed (Claude Code may assign its own)
+	if ccSessionID != "" && session.ClaudeSessionID != ccSessionID {
+		debugLog("[HOOK] Updating ClaudeSessionID for %s: %s -> %s", sessionName, session.ClaudeSessionID, ccSessionID)
+		session.ClaudeSessionID = ccSessionID
+	}
 
 	switch eventName {
 	case "UserPromptSubmit":
@@ -674,8 +706,9 @@ func (m *Manager) HandleHookEvent(ccSessionID, eventName, notificationType strin
 	}
 	m.mu.Unlock()
 
-	// Send notifications based on hook event
+	// Persist status change and send notifications
 	if oldStatus != session.Status {
+		m.store.Save(session)
 		debugLog("[HOOK] Session %s: %s -> %s (hook: %s)", sessionName, oldStatus, session.Status, eventName)
 	}
 

@@ -215,6 +215,7 @@ func (s *Server) handleRequest(req *Request) Response {
 // HookRequest represents a Claude Code hook event
 type HookRequest struct {
 	SessionID        string `json:"session_id"`
+	CcvaletSessionID string `json:"ccvalet_session_id,omitempty"`
 	HookEventName    string `json:"hook_event_name"`
 	NotificationType string `json:"notification_type,omitempty"`
 }
@@ -224,7 +225,7 @@ func (s *Server) handleHook(data json.RawMessage) Response {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return Response{Success: false, Error: err.Error()}
 	}
-	s.manager.HandleHookEvent(req.SessionID, req.HookEventName, req.NotificationType)
+	s.manager.HandleHookEvent(req.SessionID, req.CcvaletSessionID, req.HookEventName, req.NotificationType)
 	return Response{Success: true}
 }
 
