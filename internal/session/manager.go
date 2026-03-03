@@ -410,6 +410,11 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	// Expand ~ in WorkDir for tmux -c flag and trust state check
 	expandedWorkDir := expandTilde(session.WorkDir)
 
+	// WorkDirが存在しない場合はエラー（worktree削除後などに発生しうる）
+	if info, err := os.Stat(expandedWorkDir); err != nil || !info.IsDir() {
+		return fmt.Errorf("work directory does not exist: %s (may have been deleted, e.g. git worktree removed)", session.WorkDir)
+	}
+
 	// Set trust state
 	if err := ensureClaudeTrustState(expandedWorkDir); err != nil {
 		debugLog("[TRUST] Warning: failed to set trust state: %v", err)
@@ -588,7 +593,16 @@ func (m *Manager) captureOutputTmux(session *Session) {
 			if currentPath != "" {
 				m.mu.Lock()
 				session.CurrentWorkDir = currentPath
+				// WorkDirが変わった場合は永続化更新（worktreeへのcd等に追従）
+				workDirChanged := session.WorkDir != currentPath
+				if workDirChanged {
+					session.WorkDir = currentPath
+				}
 				m.mu.Unlock()
+				if workDirChanged {
+					m.store.Save(session)
+					debugLog("[CWD] Session %s WorkDir updated to %s", sessionName, currentPath)
+				}
 
 				// Always check git branch (git rev-parse is lightweight, <5ms)
 				// Branch can change without CWD changing (e.g. git checkout)
