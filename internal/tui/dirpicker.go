@@ -6,19 +6,58 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/takaaki-s/claude-code-valet/internal/config"
+	"github.com/takaaki-s/claude-code-valet/internal/host"
 )
+
+// --- Async message types for remote SSH operations ---
+
+type remoteHomeMsg struct {
+	home string
+	err  error
+}
+
+type remoteEntriesMsg struct {
+	entries []string
+	dir     string // リクエスト元ディレクトリ（stale検出用）
+	err     error
+}
+
+type remoteDirExistsMsg struct {
+	path   string
+	exists bool
+}
+
+type spinnerTickMsg struct{}
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg{}
+	})
+}
+
+// --- History ---
+
+// HistoryEntry represents a recently used directory for quick-select.
+type HistoryEntry struct {
+	Path        string    // フルパスまたは ~/... 形式
+	DisplayPath string    // 表示用パス（~ 展開済み）
+	LastUsedAt  time.Time // 最終利用日時
+}
 
 // DirPickerModel is a directory browser component for selecting a working directory.
 type DirPickerModel struct {
 	currentDir string   // 現在表示中のディレクトリ
 	entries    []string // 現在のディレクトリ内のサブディレクトリ名
 	filtered   []string // フィルタ後のエントリ
-	cursor     int      // カーソル位置
+	cursor     int      // カーソル位置（履歴+ディレクトリの統合リスト上）
 	offset     int      // スクロールオフセット
 
 	filterInput textinput.Model // フィルタ入力
@@ -33,6 +72,15 @@ type DirPickerModel struct {
 	// Remote host support
 	hostConfig *config.HostConfig // nil = local mode
 	remoteHome string             // リモートのホームディレクトリ
+
+	// Loading state (remote)
+	loading     bool   // SSH操作実行中
+	loadingDir  string // ロード中のディレクトリ（stale検出用）
+	spinnerTick int    // スピナーフレームインデックス
+
+	// History (recently used directories)
+	historyDirs     []HistoryEntry // 履歴エントリ
+	filteredHistory []HistoryEntry // フィルタ後の履歴エントリ
 }
 
 // NewDirPickerModel creates a new directory picker starting at the given path.
@@ -69,29 +117,36 @@ func NewDirPickerModel(startDir string) DirPickerModel {
 }
 
 // SetRemoteHost switches the directory picker to browse a remote host's filesystem via SSH.
-func (m *DirPickerModel) SetRemoteHost(hc *config.HostConfig) {
+// Returns a tea.Cmd to asynchronously fetch the remote home directory.
+func (m *DirPickerModel) SetRemoteHost(hc *config.HostConfig) tea.Cmd {
 	if hc == nil || hc.Type != "ssh" {
 		m.hostConfig = nil
-		return
+		return nil
 	}
 	m.hostConfig = hc
-
-	// Get remote home directory
-	home, err := getRemoteHome(hc)
-	if err != nil || home == "" {
-		home = "/home"
-	}
-	m.remoteHome = home
-	m.currentDir = home
+	m.currentDir = "/home" // 仮のデフォルト
 	m.cursor = 0
 	m.offset = 0
-	m.loadEntries()
+	m.entries = nil
+	m.filtered = nil
+	m.loading = true
+	m.loadingDir = ""
+
+	hostConfig := *hc // クロージャ用コピー
+	return tea.Batch(
+		func() tea.Msg {
+			home, err := getRemoteHome(&hostConfig)
+			return remoteHomeMsg{home: home, err: err}
+		},
+		spinnerTickCmd(),
+	)
 }
 
 // ClearRemoteHost switches back to local directory browsing.
 func (m *DirPickerModel) ClearRemoteHost() {
 	m.hostConfig = nil
 	m.remoteHome = ""
+	m.loading = false
 	home, _ := os.UserHomeDir()
 	if home == "" {
 		home = "/"
@@ -100,6 +155,13 @@ func (m *DirPickerModel) ClearRemoteHost() {
 	m.cursor = 0
 	m.offset = 0
 	m.loadEntries()
+}
+
+// SetHistory sets the directory history entries for quick-select.
+// Entries should be pre-sorted by LastUsedAt (most recent first).
+func (m *DirPickerModel) SetHistory(entries []HistoryEntry) {
+	m.historyDirs = entries
+	m.updateFilteredHistory()
 }
 
 // IsRemote returns true if the directory picker is browsing a remote host.
@@ -122,6 +184,11 @@ func (m DirPickerModel) Init() tea.Cmd {
 	return textinput.Blink
 }
 
+// totalItems returns the total number of selectable items (history + directories).
+func (m DirPickerModel) totalItems() int {
+	return len(m.filteredHistory) + len(m.filtered)
+}
+
 // Update implements tea.Model.
 func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -130,17 +197,97 @@ func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 
+	// --- Async SSH responses ---
+
+	case remoteHomeMsg:
+		if m.hostConfig == nil {
+			return m, nil // stale
+		}
+		if msg.err != nil || msg.home == "" {
+			m.remoteHome = "/home"
+		} else {
+			m.remoteHome = msg.home
+		}
+		m.currentDir = m.remoteHome
+		m.loading = true
+		m.loadingDir = m.currentDir
+		hc := *m.hostConfig
+		dir := m.currentDir
+		showHidden := m.showHidden
+		return m, tea.Batch(
+			func() tea.Msg {
+				entries, err := listRemoteDirectories(&hc, dir, showHidden)
+				return remoteEntriesMsg{entries: entries, dir: dir, err: err}
+			},
+			spinnerTickCmd(),
+		)
+
+	case remoteEntriesMsg:
+		// stale応答を無視
+		if msg.dir != m.currentDir {
+			return m, nil
+		}
+		m.loading = false
+		if msg.err != nil {
+			m.entries = nil
+			m.filtered = nil
+			return m, nil
+		}
+		m.entries = msg.entries
+		sort.Strings(m.entries)
+		m.applyFilter()
+		return m, nil
+
+	case remoteDirExistsMsg:
+		if !msg.exists {
+			return m, nil
+		}
+		m.currentDir = msg.path
+		m.filterInput.SetValue("")
+		m.cursor = 0
+		m.offset = 0
+		return m, m.loadRemoteEntriesCmd()
+
+	case spinnerTickMsg:
+		if m.loading {
+			m.spinnerTick = (m.spinnerTick + 1) % len(spinnerFrames)
+			return m, spinnerTickCmd()
+		}
+		return m, nil
+
+	// --- Key input ---
+
 	case tea.KeyMsg:
+		// loading中はナビゲーションキーのみ許可
+		if m.loading {
+			return m, nil
+		}
+
+		historyLen := len(m.filteredHistory)
+
 		switch msg.String() {
 		case "enter":
-			// Enter a directory
-			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
-				selected := m.filtered[m.cursor]
-				m.currentDir = filepath.Join(m.currentDir, selected)
-				m.filterInput.SetValue("")
-				m.cursor = 0
-				m.offset = 0
-				m.loadEntries()
+			if m.totalItems() > 0 && m.cursor < m.totalItems() {
+				if m.cursor < historyLen {
+					// 履歴エントリ選択: 即座にそのパスを返す
+					entry := m.filteredHistory[m.cursor]
+					m.selected = true
+					m.result = entry.Path
+					return m, nil
+				}
+				// 通常ディレクトリに入る
+				dirIdx := m.cursor - historyLen
+				if dirIdx < len(m.filtered) {
+					selected := m.filtered[dirIdx]
+					m.currentDir = filepath.Join(m.currentDir, selected)
+					m.filterInput.SetValue("")
+					m.cursor = 0
+					m.offset = 0
+					if m.IsRemote() {
+						return m, m.loadRemoteEntriesCmd()
+					}
+					m.loadEntries()
+				}
 			}
 			return m, nil
 
@@ -170,6 +317,9 @@ func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 					m.currentDir = parent
 					m.cursor = 0
 					m.offset = 0
+					if m.IsRemote() {
+						return m, m.loadRemoteEntriesCmd()
+					}
 					m.loadEntries()
 				}
 				return m, nil
@@ -183,7 +333,7 @@ func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 			return m, nil
 
 		case "down":
-			if m.cursor < len(m.filtered)-1 {
+			if m.cursor < m.totalItems()-1 {
 				m.cursor++
 				m.adjustScroll()
 			}
@@ -192,6 +342,9 @@ func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 		case "ctrl+h":
 			// Toggle hidden directories
 			m.showHidden = !m.showHidden
+			if m.IsRemote() {
+				return m, m.loadRemoteEntriesCmd()
+			}
 			m.loadEntries()
 			return m, nil
 		}
@@ -215,15 +368,13 @@ func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 				} else if path == "~" && m.remoteHome != "" {
 					path = m.remoteHome
 				}
-				// リモートでディレクトリ存在チェック
-				if remoteDirExists(m.hostConfig, path) {
-					m.currentDir = path
-					m.filterInput.SetValue("")
-					m.cursor = 0
-					m.offset = 0
-					m.loadEntries()
-					return m, cmd
-				}
+				// リモートでディレクトリ存在チェック（非同期）
+				hc := *m.hostConfig
+				checkPath := path
+				return m, tea.Batch(cmd, func() tea.Msg {
+					exists := remoteDirExists(&hc, checkPath)
+					return remoteDirExistsMsg{path: checkPath, exists: exists}
+				})
 			} else {
 				// ローカル
 				if strings.HasPrefix(path, "~/") {
@@ -243,6 +394,7 @@ func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 		}
 		// Normal filtering
 		m.applyFilter()
+		m.updateFilteredHistory()
 	}
 
 	return m, cmd
@@ -277,8 +429,6 @@ func (m DirPickerModel) View() string {
 	if sepWidth < 10 {
 		sepWidth = 40
 	}
-	b.WriteString("  " + strings.Repeat("─", sepWidth))
-	b.WriteString("\n")
 
 	// Calculate visible lines
 	visibleLines := m.height - 8
@@ -287,36 +437,96 @@ func (m DirPickerModel) View() string {
 	}
 
 	dirStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#7dcfff"))
+	historyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#bb9af7"))
 	selectedStyle := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("255")).
 		Background(lipgloss.Color("#7aa2f7"))
 	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#414868"))
+	sectionStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
 
-	if len(m.filtered) == 0 {
-		b.WriteString("  " + dimStyle.Render("(empty)"))
+	// Loading state
+	if m.loading {
+		b.WriteString("  " + strings.Repeat("─", sepWidth))
+		b.WriteString("\n")
+		spinner := spinnerFrames[m.spinnerTick]
+		b.WriteString("  " + spinner + " Loading...")
 		b.WriteString("\n")
 	} else {
-		end := m.offset + visibleLines
-		if end > len(m.filtered) {
-			end = len(m.filtered)
-		}
-		for i := m.offset; i < end; i++ {
-			entry := m.filtered[i]
-			displayName := entry + "/"
+		historyLen := len(m.filteredHistory)
 
-			if i == m.cursor {
-				// Pad selected line to full width
-				padded := "▸ " + displayName
-				availWidth := m.width - 4
-				if availWidth > 0 && len(padded) < availWidth {
-					padded += strings.Repeat(" ", availWidth-len(padded))
-				}
-				b.WriteString("  " + selectedStyle.Render(padded))
-			} else {
-				b.WriteString("    " + dirStyle.Render(displayName))
-			}
+		// History section
+		if historyLen > 0 {
+			b.WriteString("  " + sectionStyle.Render("── Recently Used "+strings.Repeat("─", sepWidth-18)))
 			b.WriteString("\n")
+			for i, entry := range m.filteredHistory {
+				if i == m.cursor {
+					padded := "▸ " + entry.DisplayPath
+					availWidth := m.width - 4
+					if availWidth > 0 && len(padded) < availWidth {
+						padded += strings.Repeat(" ", availWidth-len(padded))
+					}
+					b.WriteString("  " + selectedStyle.Render(padded))
+				} else {
+					b.WriteString("    " + historyStyle.Render(entry.DisplayPath))
+				}
+				b.WriteString("\n")
+			}
+		}
+
+		// Directories section
+		b.WriteString("  " + sectionStyle.Render("── Directories "+strings.Repeat("─", sepWidth-16)))
+		b.WriteString("\n")
+
+		if len(m.filtered) == 0 {
+			b.WriteString("  " + dimStyle.Render("(empty)"))
+			b.WriteString("\n")
+		} else {
+			// スクロール計算（履歴セクションの高さを考慮）
+			// historyHeight = historyLen (entries) + 1 (header) if historyLen > 0
+			historyHeight := 0
+			if historyLen > 0 {
+				historyHeight = historyLen + 1
+			}
+			dirVisibleLines := visibleLines - historyHeight - 1 // -1 for "Directories" header
+			if dirVisibleLines < 3 {
+				dirVisibleLines = 3
+			}
+
+			// ディレクトリ部分のスクロールオフセット計算
+			dirOffset := 0
+			if m.cursor >= historyLen {
+				dirCursor := m.cursor - historyLen
+				if dirCursor >= dirOffset+dirVisibleLines {
+					dirOffset = dirCursor - dirVisibleLines + 1
+				}
+				if dirCursor < dirOffset {
+					dirOffset = dirCursor
+				}
+			}
+
+			end := dirOffset + dirVisibleLines
+			if end > len(m.filtered) {
+				end = len(m.filtered)
+			}
+			for i := dirOffset; i < end; i++ {
+				entry := m.filtered[i]
+				displayName := entry + "/"
+				globalIdx := historyLen + i
+
+				if globalIdx == m.cursor {
+					// Pad selected line to full width
+					padded := "▸ " + displayName
+					availWidth := m.width - 4
+					if availWidth > 0 && len(padded) < availWidth {
+						padded += strings.Repeat(" ", availWidth-len(padded))
+					}
+					b.WriteString("  " + selectedStyle.Render(padded))
+				} else {
+					b.WriteString("    " + dirStyle.Render(displayName))
+				}
+				b.WriteString("\n")
+			}
 		}
 	}
 
@@ -384,6 +594,28 @@ func (m *DirPickerModel) loadRemoteEntries() {
 	m.applyFilter()
 }
 
+// loadRemoteEntriesCmd returns a tea.Cmd for async remote directory listing.
+func (m *DirPickerModel) loadRemoteEntriesCmd() tea.Cmd {
+	if m.hostConfig == nil {
+		return nil
+	}
+	m.loading = true
+	m.loadingDir = m.currentDir
+	m.entries = nil
+	m.filtered = nil
+
+	hc := *m.hostConfig
+	dir := m.currentDir
+	showHidden := m.showHidden
+	return tea.Batch(
+		func() tea.Msg {
+			entries, err := listRemoteDirectories(&hc, dir, showHidden)
+			return remoteEntriesMsg{entries: entries, dir: dir, err: err}
+		},
+		spinnerTickCmd(),
+	)
+}
+
 func (m *DirPickerModel) applyFilter() {
 	query := strings.ToLower(m.filterInput.Value())
 	if query == "" || strings.HasPrefix(query, "/") || strings.HasPrefix(query, "~") {
@@ -396,10 +628,31 @@ func (m *DirPickerModel) applyFilter() {
 			}
 		}
 	}
-	if m.cursor >= len(m.filtered) {
+	if m.cursor >= m.totalItems() {
 		m.cursor = 0
 	}
 	m.offset = 0
+}
+
+func (m *DirPickerModel) updateFilteredHistory() {
+	if len(m.historyDirs) == 0 {
+		m.filteredHistory = nil
+		return
+	}
+	query := strings.ToLower(m.filterInput.Value())
+	if query == "" || strings.HasPrefix(query, "/") || strings.HasPrefix(query, "~") {
+		m.filteredHistory = m.historyDirs
+	} else {
+		m.filteredHistory = nil
+		for _, h := range m.historyDirs {
+			if strings.Contains(strings.ToLower(h.DisplayPath), query) {
+				m.filteredHistory = append(m.filteredHistory, h)
+			}
+		}
+	}
+	if m.cursor >= m.totalItems() {
+		m.cursor = 0
+	}
 }
 
 func (m *DirPickerModel) adjustScroll() {
@@ -417,10 +670,21 @@ func (m *DirPickerModel) adjustScroll() {
 
 // --- SSH remote helpers ---
 
+// sshArgs returns common SSH arguments with ControlMaster multiplexing support.
+func sshArgs(hc *config.HostConfig) []string {
+	ctrlPath := host.SSHControlPath(hc.ID)
+	args := []string{
+		"-o", "ControlMaster=no",
+		"-o", "ControlPath=" + ctrlPath,
+		"-o", "ClearAllForwardings=yes",
+	}
+	args = append(args, hc.SSHOpts...)
+	return args
+}
+
 // getRemoteHome gets the remote user's home directory via SSH.
 func getRemoteHome(hc *config.HostConfig) (string, error) {
-	args := []string{"-o", "ControlMaster=no", "-o", "ClearAllForwardings=yes"}
-	args = append(args, hc.SSHOpts...)
+	args := sshArgs(hc)
 	args = append(args, hc.Host, "echo $HOME")
 
 	cmd := exec.Command("ssh", args...)
@@ -441,8 +705,7 @@ func listRemoteDirectories(hc *config.HostConfig, remotePath string, showHidden 
 		remoteCmd = "ls -1 -a -p " + remotePath + " 2>/dev/null | grep '/$' | grep -v '^\\.\\.\\?/$' | sed 's|/$||'"
 	}
 
-	args := []string{"-o", "ControlMaster=no", "-o", "ClearAllForwardings=yes"}
-	args = append(args, hc.SSHOpts...)
+	args := sshArgs(hc)
 	args = append(args, hc.Host, remoteCmd)
 
 	cmd := exec.Command("ssh", args...)
@@ -463,8 +726,7 @@ func remoteDirExists(hc *config.HostConfig, remotePath string) bool {
 	if hc == nil {
 		return false
 	}
-	args := []string{"-o", "ControlMaster=no", "-o", "ClearAllForwardings=yes"}
-	args = append(args, hc.SSHOpts...)
+	args := sshArgs(hc)
 	args = append(args, hc.Host, "test -d "+remotePath)
 
 	cmd := exec.Command("ssh", args...)

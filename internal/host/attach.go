@@ -8,9 +8,9 @@ import (
 	"github.com/takaaki-s/claude-code-valet/internal/config"
 )
 
-// sshControlPath returns the ControlMaster socket path for a host.
+// SSHControlPath returns the ControlMaster socket path for a host.
 // Each host gets a unique socket so connections don't interfere with each other.
-func sshControlPath(hostID string) string {
+func SSHControlPath(hostID string) string {
 	return filepath.Join("/tmp", "ccvalet-ssh-ctrl-"+hostID)
 }
 
@@ -22,7 +22,7 @@ func EnsureSSHMaster(hostConfig config.HostConfig) error {
 	if hostConfig.Type != "ssh" {
 		return nil
 	}
-	ctrlPath := sshControlPath(hostConfig.ID)
+	ctrlPath := SSHControlPath(hostConfig.ID)
 
 	// Check if master is already running
 	check := exec.Command("ssh", "-o", "ControlPath="+ctrlPath, "-O", "check", hostConfig.Host)
@@ -67,7 +67,7 @@ func AttachCommandString(hostConfig config.HostConfig, tmuxTarget string) string
 	switch hostConfig.Type {
 	case "ssh":
 		remoteCmd := fmt.Sprintf("tmux -L ccvalet attach -t %s", tmuxTarget)
-		ctrlPath := sshControlPath(hostConfig.ID)
+		ctrlPath := SSHControlPath(hostConfig.ID)
 		// ControlMaster=no: スレーブ専用（マスターはEnsureSSHMasterで事前に起動済み）
 		// ControlPath: マスターのソケットを参照してSSH多重化（接続がほぼ即座になる）
 		// ClearAllForwardings=yes: ssh_configのLocalForward/RemoteForwardのポート競合を回避
@@ -86,7 +86,7 @@ func AttachCommandString(hostConfig config.HostConfig, tmuxTarget string) string
 
 func sshAttachCommand(hostConfig config.HostConfig, tmuxTarget string) *exec.Cmd {
 	remoteCmd := fmt.Sprintf("tmux -L ccvalet attach -t %s", tmuxTarget)
-	ctrlPath := sshControlPath(hostConfig.ID)
+	ctrlPath := SSHControlPath(hostConfig.ID)
 	args := make([]string, 0, len(hostConfig.SSHOpts)+9)
 	args = append(args, "-o", "ControlMaster=no",
 		"-o", "ControlPath="+ctrlPath, "-o", "ClearAllForwardings=yes")

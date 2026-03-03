@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -110,9 +112,16 @@ func NewCreateFormModel(socketPath string) CreateFormModel {
 		m.step = stepWorkDir
 	}
 
-	// Fetch existing sessions for duplicate check
+	// Fetch existing sessions for duplicate check and directory history
 	if sessions, err := client.List(); err == nil {
 		m.sessions = sessions
+		// Set directory history from session data
+		hostID := m.selectedHostID
+		if hostID == "" {
+			hostID = "local"
+		}
+		history := computeDirHistory(sessions, hostID, 5)
+		m.dirPicker.SetHistory(history)
 	}
 
 	return m
@@ -259,10 +268,20 @@ func (m CreateFormModel) updateHostStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.step = stepWorkDir
 			m.hostInput.Blur()
 			m.hostDropdownOpen = false
+
+			// ホスト変更時に履歴を再計算
+			hostID := m.selectedHostID
+			if hostID == "" {
+				hostID = "local"
+			}
+			history := computeDirHistory(m.sessions, hostID, 5)
+			m.dirPicker.SetHistory(history)
+
 			// リモートホスト選択時、ディレクトリピッカーをリモートモードに切り替え
 			if m.selectedHostID != "" && m.selectedHostID != "local" && m.configMgr != nil {
 				if hc := m.configMgr.GetHost(m.selectedHostID); hc != nil {
-					m.dirPicker.SetRemoteHost(hc)
+					cmd := m.dirPicker.SetRemoteHost(hc)
+					return m, cmd
 				}
 			} else {
 				m.dirPicker.ClearRemoteHost()
@@ -453,4 +472,64 @@ func (m *CreateFormModel) selectHost() {
 		m.hostInput.SetValue(selected.ID)
 		m.hostDropdownOpen = false
 	}
+}
+
+// computeDirHistory extracts unique WorkDir entries from sessions for the given hostID,
+// sorted by LastActiveAt (most recent first), limited to maxEntries.
+func computeDirHistory(sessions []session.Info, hostID string, maxEntries int) []HistoryEntry {
+	if hostID == "" {
+		hostID = "local"
+	}
+
+	// Deduplicate by WorkDir, keeping the most recent LastActiveAt
+	type entry struct {
+		path       string
+		lastUsedAt int64 // UnixNano for comparison
+	}
+	seen := make(map[string]entry)
+	for _, s := range sessions {
+		sHostID := s.HostID
+		if sHostID == "" {
+			sHostID = "local"
+		}
+		if sHostID != hostID || s.WorkDir == "" {
+			continue
+		}
+		existing, exists := seen[s.WorkDir]
+		ts := s.LastActiveAt.UnixNano()
+		if !exists || ts > existing.lastUsedAt {
+			seen[s.WorkDir] = entry{path: s.WorkDir, lastUsedAt: ts}
+		}
+	}
+
+	// Build history entries
+	entries := make([]HistoryEntry, 0, len(seen))
+	home, _ := os.UserHomeDir()
+	for _, e := range seen {
+		displayPath := e.path
+		// ローカルの場合: homeプレフィックスを ~ に変換
+		if hostID == "local" && home != "" && strings.HasPrefix(displayPath, home) {
+			displayPath = "~" + displayPath[len(home):]
+		}
+		// リモートの場合: WorkDir は既に ~/... 形式で保存されているのでそのまま使う
+		entries = append(entries, HistoryEntry{
+			Path:        e.path,
+			DisplayPath: displayPath,
+			LastUsedAt:  s2time(e.lastUsedAt),
+		})
+	}
+
+	// Sort by LastUsedAt descending
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].LastUsedAt.After(entries[j].LastUsedAt)
+	})
+
+	if len(entries) > maxEntries {
+		entries = entries[:maxEntries]
+	}
+	return entries
+}
+
+func s2time(nano int64) (t time.Time) {
+	return time.Unix(0, nano)
 }
