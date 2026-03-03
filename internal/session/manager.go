@@ -378,10 +378,40 @@ func (m *Manager) startSession(session *Session) error {
 	return m.startSessionTmux(session)
 }
 
+// expandTilde expands a leading ~ in a path to the current user's home directory.
+// This runs on the target machine (local or remote slave), so os.UserHomeDir()
+// returns the correct home directory for the environment where the session runs.
+func expandTilde(path string) string {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			if path == "~" {
+				return home
+			}
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
+}
+
+// workDirForShell returns a shell-safe directory expression for use in cd commands.
+// Converts ~/path to $HOME/path so the shell handles expansion (tmux's -c doesn't expand ~).
+func workDirForShell(dir string) string {
+	if dir == "~" {
+		return "$HOME"
+	}
+	if strings.HasPrefix(dir, "~/") {
+		return "$HOME/" + dir[2:]
+	}
+	return dir
+}
+
 // startSessionTmux starts a session in a tmux window.
 func (m *Manager) startSessionTmux(session *Session) error {
+	// Expand ~ in WorkDir for tmux -c flag and trust state check
+	expandedWorkDir := expandTilde(session.WorkDir)
+
 	// Set trust state
-	if err := ensureClaudeTrustState(session.WorkDir); err != nil {
+	if err := ensureClaudeTrustState(expandedWorkDir); err != nil {
 		debugLog("[TRUST] Warning: failed to set trust state: %v", err)
 	}
 
@@ -401,8 +431,12 @@ func (m *Manager) startSessionTmux(session *Session) error {
 
 	// Build shell command with environment setup
 	// Unset TMUX/TMUX_PANE to prevent nested tmux detection
-	shellCmd := fmt.Sprintf("env -u TMUX -u TMUX_PANE -u CLAUDECODE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic '%s'",
-		shell, claudeCmd)
+	// Embed cd to WorkDir so the shell expands ~ and $HOME
+	// (tmux's -c flag doesn't expand ~, and RespawnPane doesn't accept -c at all)
+	// Use ; instead of && so cd failure doesn't prevent claude from starting
+	shellDir := workDirForShell(session.WorkDir)
+	shellCmd := fmt.Sprintf("cd \"%s\" 2>/dev/null; env -u TMUX -u TMUX_PANE -u CLAUDECODE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic '%s'",
+		shellDir, shell, claudeCmd)
 
 	innerSessionName := tmux.InnerSessionName(session.ID)
 
@@ -434,7 +468,7 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	m.tmuxClient.KillSession(innerSessionName) // ignore error (session might not exist)
 
 	// Create a new inner tmux session (-L ccvalet) for this CC session
-	if err := m.tmuxClient.NewSessionWithCmdInDir(innerSessionName, 200, 50, session.WorkDir, shellCmd); err != nil {
+	if err := m.tmuxClient.NewSessionWithCmdInDir(innerSessionName, 200, 50, expandedWorkDir, shellCmd); err != nil {
 		return fmt.Errorf("failed to create inner tmux session: %w", err)
 	}
 
@@ -516,8 +550,9 @@ func (m *Manager) captureOutputTmux(session *Session) {
 				m.store.Save(session)
 
 				shell := m.configMgr.GetShell()
-				shellCmd := fmt.Sprintf("env -u TMUX -u TMUX_PANE -u CLAUDECODE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic 'claude --session-id %s'",
-					shell, newSessionID)
+				shellDir := workDirForShell(session.WorkDir)
+				shellCmd := fmt.Sprintf("cd \"%s\" 2>/dev/null; env -u TMUX -u TMUX_PANE -u CLAUDECODE TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 %s -ic 'claude --session-id %s'",
+					shellDir, shell, newSessionID)
 				if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
 					m.mu.Lock()
 					session.Status = StatusRunning

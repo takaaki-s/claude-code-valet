@@ -35,11 +35,25 @@ For interactive session creation, use 'ccvalet ui' (TUI).`,
 			}
 		}
 
-		// WorkDirの存在チェック
-		if info, err := os.Stat(workDir); err != nil {
-			return fmt.Errorf("work directory does not exist: %s", workDir)
-		} else if !info.IsDir() {
-			return fmt.Errorf("not a directory: %s", workDir)
+		// WorkDirの存在チェック（リモートホストの場合はスキップ）
+		if hostID == "" || hostID == "local" {
+			if info, err := os.Stat(workDir); err != nil {
+				return fmt.Errorf("work directory does not exist: %s", workDir)
+			} else if !info.IsDir() {
+				return fmt.Errorf("not a directory: %s", workDir)
+			}
+		}
+
+		// リモートホストの場合、ローカルのhomeプレフィックスを ~ に変換
+		// （シェルが ~/path を /Users/xxx/path に展開してしまうため）
+		if hostID != "" && hostID != "local" {
+			if home, err := os.UserHomeDir(); err == nil {
+				if workDir == home {
+					workDir = "~"
+				} else if len(workDir) > len(home) && workDir[:len(home)+1] == home+"/" {
+					workDir = "~/" + workDir[len(home)+1:]
+				}
+			}
 		}
 
 		client := daemon.NewClient(getSocketPath())

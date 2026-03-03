@@ -259,6 +259,14 @@ func (m CreateFormModel) updateHostStep(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.step = stepWorkDir
 			m.hostInput.Blur()
 			m.hostDropdownOpen = false
+			// リモートホスト選択時、ディレクトリピッカーをリモートモードに切り替え
+			if m.selectedHostID != "" && m.selectedHostID != "local" && m.configMgr != nil {
+				if hc := m.configMgr.GetHost(m.selectedHostID); hc != nil {
+					m.dirPicker.SetRemoteHost(hc)
+				}
+			} else {
+				m.dirPicker.ClearRemoteHost()
+			}
 			return m, nil
 
 		case "up":
@@ -382,13 +390,15 @@ func (m CreateFormModel) handleSubmit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Validate directory exists
-	if info, err := os.Stat(workDir); err != nil {
-		m.err = fmt.Errorf("directory does not exist: %s", workDir)
-		return m, nil
-	} else if !info.IsDir() {
-		m.err = fmt.Errorf("not a directory: %s", workDir)
-		return m, nil
+	// Validate directory exists (local only; remote is validated by the remote dir picker)
+	if m.selectedHostID == "" || m.selectedHostID == "local" {
+		if info, err := os.Stat(workDir); err != nil {
+			m.err = fmt.Errorf("directory does not exist: %s", workDir)
+			return m, nil
+		} else if !info.IsDir() {
+			m.err = fmt.Errorf("not a directory: %s", workDir)
+			return m, nil
+		}
 	}
 
 	name := strings.TrimSpace(m.nameInput.Value())

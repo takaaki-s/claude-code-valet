@@ -2,6 +2,7 @@ package tui
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/takaaki-s/claude-code-valet/internal/config"
 )
 
 // DirPickerModel is a directory browser component for selecting a working directory.
@@ -27,6 +29,10 @@ type DirPickerModel struct {
 
 	width  int
 	height int
+
+	// Remote host support
+	hostConfig *config.HostConfig // nil = local mode
+	remoteHome string             // リモートのホームディレクトリ
 }
 
 // NewDirPickerModel creates a new directory picker starting at the given path.
@@ -60,6 +66,45 @@ func NewDirPickerModel(startDir string) DirPickerModel {
 	}
 	m.loadEntries()
 	return m
+}
+
+// SetRemoteHost switches the directory picker to browse a remote host's filesystem via SSH.
+func (m *DirPickerModel) SetRemoteHost(hc *config.HostConfig) {
+	if hc == nil || hc.Type != "ssh" {
+		m.hostConfig = nil
+		return
+	}
+	m.hostConfig = hc
+
+	// Get remote home directory
+	home, err := getRemoteHome(hc)
+	if err != nil || home == "" {
+		home = "/home"
+	}
+	m.remoteHome = home
+	m.currentDir = home
+	m.cursor = 0
+	m.offset = 0
+	m.loadEntries()
+}
+
+// ClearRemoteHost switches back to local directory browsing.
+func (m *DirPickerModel) ClearRemoteHost() {
+	m.hostConfig = nil
+	m.remoteHome = ""
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		home = "/"
+	}
+	m.currentDir = home
+	m.cursor = 0
+	m.offset = 0
+	m.loadEntries()
+}
+
+// IsRemote returns true if the directory picker is browsing a remote host.
+func (m *DirPickerModel) IsRemote() bool {
+	return m.hostConfig != nil
 }
 
 // Selected returns true if a directory was selected.
@@ -102,7 +147,19 @@ func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 		case "tab", "ctrl+d":
 			// Select current directory
 			m.selected = true
-			m.result = m.currentDir
+			if m.IsRemote() {
+				// リモートの場合: homeプレフィックスを ~ に変換して返す
+				if m.remoteHome != "" && strings.HasPrefix(m.currentDir, m.remoteHome) {
+					m.result = "~" + m.currentDir[len(m.remoteHome):]
+					if m.result == "~" {
+						m.result = "~"
+					}
+				} else {
+					m.result = m.currentDir
+				}
+			} else {
+				m.result = m.currentDir
+			}
 			return m, nil
 
 		case "backspace":
@@ -151,18 +208,37 @@ func (m DirPickerModel) Update(msg tea.Msg) (DirPickerModel, tea.Cmd) {
 		if strings.HasPrefix(val, "/") || strings.HasPrefix(val, "~") {
 			// Direct path navigation
 			path := val
-			if strings.HasPrefix(path, "~/") {
-				if home, err := os.UserHomeDir(); err == nil {
-					path = filepath.Join(home, path[2:])
+			if m.IsRemote() {
+				// リモート: ~ をリモートhomeに展開
+				if strings.HasPrefix(path, "~/") && m.remoteHome != "" {
+					path = filepath.Join(m.remoteHome, path[2:])
+				} else if path == "~" && m.remoteHome != "" {
+					path = m.remoteHome
 				}
-			}
-			if info, err := os.Stat(path); err == nil && info.IsDir() {
-				m.currentDir = path
-				m.filterInput.SetValue("")
-				m.cursor = 0
-				m.offset = 0
-				m.loadEntries()
-				return m, cmd
+				// リモートでディレクトリ存在チェック
+				if remoteDirExists(m.hostConfig, path) {
+					m.currentDir = path
+					m.filterInput.SetValue("")
+					m.cursor = 0
+					m.offset = 0
+					m.loadEntries()
+					return m, cmd
+				}
+			} else {
+				// ローカル
+				if strings.HasPrefix(path, "~/") {
+					if home, err := os.UserHomeDir(); err == nil {
+						path = filepath.Join(home, path[2:])
+					}
+				}
+				if info, err := os.Stat(path); err == nil && info.IsDir() {
+					m.currentDir = path
+					m.filterInput.SetValue("")
+					m.cursor = 0
+					m.offset = 0
+					m.loadEntries()
+					return m, cmd
+				}
 			}
 		}
 		// Normal filtering
@@ -179,8 +255,15 @@ func (m DirPickerModel) View() string {
 	// Breadcrumb: current path
 	pathStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7aa2f7"))
 	displayPath := m.currentDir
-	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(displayPath, home) {
-		displayPath = "~" + displayPath[len(home):]
+	if m.IsRemote() {
+		// リモート: homeプレフィックスを ~ に変換
+		if m.remoteHome != "" && strings.HasPrefix(displayPath, m.remoteHome) {
+			displayPath = "~" + displayPath[len(m.remoteHome):]
+		}
+	} else {
+		if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(displayPath, home) {
+			displayPath = "~" + displayPath[len(home):]
+		}
 	}
 	b.WriteString(pathStyle.Render("  📂 " + displayPath))
 	b.WriteString("\n")
@@ -252,6 +335,14 @@ func (m DirPickerModel) View() string {
 // --- Internal ---
 
 func (m *DirPickerModel) loadEntries() {
+	if m.IsRemote() {
+		m.loadRemoteEntries()
+	} else {
+		m.loadLocalEntries()
+	}
+}
+
+func (m *DirPickerModel) loadLocalEntries() {
 	m.entries = nil
 	m.filtered = nil
 
@@ -271,6 +362,24 @@ func (m *DirPickerModel) loadEntries() {
 		m.entries = append(m.entries, name)
 	}
 
+	sort.Strings(m.entries)
+	m.applyFilter()
+}
+
+func (m *DirPickerModel) loadRemoteEntries() {
+	m.entries = nil
+	m.filtered = nil
+
+	if m.hostConfig == nil {
+		return
+	}
+
+	entries, err := listRemoteDirectories(m.hostConfig, m.currentDir, m.showHidden)
+	if err != nil {
+		return
+	}
+
+	m.entries = entries
 	sort.Strings(m.entries)
 	m.applyFilter()
 }
@@ -304,4 +413,60 @@ func (m *DirPickerModel) adjustScroll() {
 	if m.cursor >= m.offset+visibleLines {
 		m.offset = m.cursor - visibleLines + 1
 	}
+}
+
+// --- SSH remote helpers ---
+
+// getRemoteHome gets the remote user's home directory via SSH.
+func getRemoteHome(hc *config.HostConfig) (string, error) {
+	args := []string{"-o", "ControlMaster=no", "-o", "ClearAllForwardings=yes"}
+	args = append(args, hc.SSHOpts...)
+	args = append(args, hc.Host, "echo $HOME")
+
+	cmd := exec.Command("ssh", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// listRemoteDirectories lists subdirectories of the given path on a remote host via SSH.
+func listRemoteDirectories(hc *config.HostConfig, remotePath string, showHidden bool) ([]string, error) {
+	// Use ls to list directories (compatible with most systems)
+	remoteCmd := "ls -1 -p " + remotePath + " 2>/dev/null | grep '/$' | sed 's|/$||'"
+	if !showHidden {
+		remoteCmd = "ls -1 -p " + remotePath + " 2>/dev/null | grep '/$' | grep -v '^\\..*/$' | sed 's|/$||'"
+	} else {
+		remoteCmd = "ls -1 -a -p " + remotePath + " 2>/dev/null | grep '/$' | grep -v '^\\.\\.\\?/$' | sed 's|/$||'"
+	}
+
+	args := []string{"-o", "ControlMaster=no", "-o", "ClearAllForwardings=yes"}
+	args = append(args, hc.SSHOpts...)
+	args = append(args, hc.Host, remoteCmd)
+
+	cmd := exec.Command("ssh", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	output := strings.TrimSpace(string(out))
+	if output == "" {
+		return nil, nil
+	}
+	return strings.Split(output, "\n"), nil
+}
+
+// remoteDirExists checks if a directory exists on a remote host via SSH.
+func remoteDirExists(hc *config.HostConfig, remotePath string) bool {
+	if hc == nil {
+		return false
+	}
+	args := []string{"-o", "ControlMaster=no", "-o", "ClearAllForwardings=yes"}
+	args = append(args, hc.SSHOpts...)
+	args = append(args, hc.Host, "test -d "+remotePath)
+
+	cmd := exec.Command("ssh", args...)
+	return cmd.Run() == nil
 }
