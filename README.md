@@ -356,6 +356,7 @@ popups:
   session_filter: { width: 70, height: 70 }  # switch-session picker
   help:           { width: 60, height: 60 }
   action:         { width: 70, height: 70 }
+  confirm:        { width: 50, height: 50 }  # Kill/Delete confirmation (default: 48x10 cells)
   plugin_default: { width: 70, height: 70 }
   plugins:                                # per-plugin overrides
     # my-notifier:  { width: 40, height: 20 }

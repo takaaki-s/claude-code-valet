@@ -776,16 +776,32 @@ keybindings:
 
 func TestDefaultPopupSizes_ContainsExpectedKeys(t *testing.T) {
 	sizes := DefaultPopupSizes()
-	wantKeys := []string{"create", "session_filter", "help", "action", "plugin_default", "default"}
+	wantKeys := []string{"create", "session_filter", "help", "action", "confirm", "plugin_default", "default"}
 	for _, k := range wantKeys {
 		v, ok := sizes[k]
 		if !ok {
 			t.Errorf("DefaultPopupSizes missing key %q", k)
 			continue
 		}
-		if v.Width < 1 || v.Width > 100 || v.Height < 1 || v.Height > 100 {
-			t.Errorf("DefaultPopupSizes[%q] = %+v, want dims in [1,100]", k, v)
+		if v.Width < 1 || v.Height < 1 {
+			t.Errorf("DefaultPopupSizes[%q] = %+v, want positive dims", k, v)
 		}
+	}
+}
+
+// TestDefaultPopupSizes_ReportsTheDefaultActuallyUsed pins that the snapshot
+// reports each popup's own default rather than its percentage field: confirm
+// opens at 48x10 cells, and reporting 50/50 for it would describe a size no
+// popup ever gets. The unit differs per popup, which is why GetPopupSize — not
+// this map — is what a caller formats for tmux.
+func TestDefaultPopupSizes_ReportsTheDefaultActuallyUsed(t *testing.T) {
+	sizes := DefaultPopupSizes()
+
+	if got, want := sizes[PopupConfirm], (PopupSizeConfig{Width: 48, Height: 10}); got != want {
+		t.Errorf("DefaultPopupSizes[confirm] = %+v, want %+v (the absolute default it opens at)", got, want)
+	}
+	if got, want := sizes[PopupCreate], (PopupSizeConfig{Width: 80, Height: 80}); got != want {
+		t.Errorf("DefaultPopupSizes[create] = %+v, want %+v (percent, unchanged)", got, want)
 	}
 }
 
@@ -801,6 +817,9 @@ func TestGetPopupSize_NilReturnsDefault(t *testing.T) {
 		{"session_filter", "70%", "70%"},
 		{"help", "60%", "60%"},
 		{"action", "70%", "70%"},
+		// The confirm dialog has fixed content dimensions, so its default is
+		// absolute cells rather than a share of the client.
+		{"confirm", "48", "10"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -821,6 +840,117 @@ func TestGetPopupSize_UserOverride_UsesConfigValue(t *testing.T) {
 	gotW, gotH := m.GetPopupSize("create")
 	if gotW != "50%" || gotH != "40%" {
 		t.Errorf("GetPopupSize(create) = (%q, %q), want (50%%, 40%%)", gotW, gotH)
+	}
+}
+
+// TestCoreUserPopup_CoversCatalog guards the invariant that popupCatalog and
+// PopupsConfig stay in lock-step: every catalog popup documents a
+// `popups.<name>` YAML key, so a catalog entry with no coreUserPopup case
+// would accept that key and then silently ignore it. PopupPluginDefault is
+// exempt — it is a resolver tier, not a popup, and is read directly by
+// GetPluginPopupSize.
+func TestCoreUserPopup_CoversCatalog(t *testing.T) {
+	all := &PopupsConfig{
+		Create:        &PopupSizeConfig{Width: 11, Height: 11},
+		SessionFilter: &PopupSizeConfig{Width: 22, Height: 22},
+		Help:          &PopupSizeConfig{Width: 33, Height: 33},
+		Action:        &PopupSizeConfig{Width: 44, Height: 44},
+		Confirm:       &PopupSizeConfig{Width: 55, Height: 55},
+	}
+	// Each field carries a distinct width so the assertion catches a case
+	// wired to the wrong field, not just a missing one: mapping popups.confirm
+	// to p.Action would hand every confirm popup the action palette's size.
+	wantWidth := map[string]int{
+		PopupCreate:        11,
+		PopupSessionFilter: 22,
+		PopupHelp:          33,
+		PopupAction:        44,
+		PopupConfirm:       55,
+	}
+	for name := range popupCatalog {
+		if name == PopupPluginDefault {
+			continue
+		}
+		got := coreUserPopup(all, name)
+		if got == nil {
+			t.Errorf("coreUserPopup has no case for catalog popup %q — its popups.%s override would be silently dropped", name, name)
+			continue
+		}
+		if got.Width != wantWidth[name] {
+			t.Errorf("coreUserPopup(%q).Width = %d, want %d — the case returns another popup's field", name, got.Width, wantWidth[name])
+		}
+	}
+}
+
+// TestGetPopupSize_AbsoluteDefaultYieldsToAnyOverride pins the all-or-nothing
+// rule for a popup with an absolute default: cells and percentages cannot be
+// mixed, because "48 cells wide, 60% tall" is a shape neither the user nor the
+// catalog asked for. One configured dimension is enough to drop the pair.
+func TestGetPopupSize_AbsoluteDefaultYieldsToAnyOverride(t *testing.T) {
+	cases := []struct {
+		name         string
+		user         *PopupSizeConfig
+		wantW, wantH string
+	}{
+		{"no config at all", nil, "48", "10"},
+		{"empty struct is still no config", &PopupSizeConfig{}, "48", "10"},
+		{"both dimensions set", &PopupSizeConfig{Width: 60, Height: 40}, "60%", "40%"},
+		// Only height configured: width falls back to the percentage default,
+		// not to the 48 cells, or the popup would be 48% wide.
+		{"height only", &PopupSizeConfig{Height: 40}, "50%", "40%"},
+		{"width only", &PopupSizeConfig{Width: 60}, "60%", "50%"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := &Manager{config: &Config{Popups: PopupsConfig{Confirm: c.user}}}
+			gotW, gotH := m.GetPopupSize(PopupConfirm)
+			if gotW != c.wantW || gotH != c.wantH {
+				t.Errorf("GetPopupSize(confirm) = (%q, %q), want (%q, %q)", gotW, gotH, c.wantW, c.wantH)
+			}
+		})
+	}
+}
+
+// TestPopupFallbackPercent covers the retry size the TUI reaches for when tmux
+// refuses an absolute popup — it rejects a size larger than the client instead
+// of shrinking it, and a percentage cannot exceed the client. ok is false
+// whenever the first attempt was already a percentage, since retrying the same
+// value there is a second doomed spawn: that covers popups with no absolute
+// default and, per TestGetPopupSize_AbsoluteDefaultYieldsToAnyOverride, a
+// confirm popup the user configured a size for.
+func TestPopupFallbackPercent(t *testing.T) {
+	m := &Manager{config: &Config{}}
+
+	w, h, ok := m.PopupFallbackPercent(PopupConfirm)
+	if !ok {
+		t.Fatal("PopupFallbackPercent(confirm) ok = false, want true")
+	}
+	if w != "50%" || h != "50%" {
+		t.Errorf("PopupFallbackPercent(confirm) = (%q, %q), want (50%%, 50%%)", w, h)
+	}
+	for _, name := range []string{PopupCreate, PopupHelp, PopupAction, PopupSessionFilter, "does-not-exist"} {
+		if _, _, ok := m.PopupFallbackPercent(name); ok {
+			t.Errorf("PopupFallbackPercent(%q) ok = true, want false (not sized in cells)", name)
+		}
+	}
+}
+
+// TestPopupFallbackPercent_UserOverrideDoesNotRetry is the tier-awareness half:
+// a configured popups.confirm already opened as a percentage, so there is
+// nothing for a retry to fix — and a retry that ignored the config would
+// replace the user's size with the catalog's on the second attempt, which is
+// the size they would then see.
+func TestPopupFallbackPercent_UserOverrideDoesNotRetry(t *testing.T) {
+	for _, user := range []*PopupSizeConfig{
+		{Width: 60, Height: 40},
+		{Width: 60},
+		{Height: 40},
+	} {
+		m := &Manager{config: &Config{Popups: PopupsConfig{Confirm: user}}}
+		if w, h, ok := m.PopupFallbackPercent(PopupConfirm); ok {
+			t.Errorf("PopupFallbackPercent(confirm) with popups.confirm=%+v = (%q, %q, true), want ok=false",
+				user, w, h)
+		}
 	}
 }
 

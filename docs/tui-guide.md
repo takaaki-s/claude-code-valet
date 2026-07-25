@@ -12,19 +12,20 @@ internal/tui/
 ├─ dirpicker.go           ... Directory picker (used within createform, ~730 lines)
 ├─ helpview.go            ... Help view (for popup, ~100 lines)
 ├─ session_filter_model.go ... Switch-session picker (for popup, sahilm/fuzzy)
+├─ confirm_popup_model.go ... Kill/Delete confirmation dialog (for popup)
 └─ styles.go              ... lipgloss style definitions (Tokyo Night color scheme)
 
 cmd/jin/cmd/
 ├─ create_popup.go          ... jin create-popup (Hidden) → launches CreateFormModel
 ├─ help_popup.go            ... jin help-popup (Hidden)   → launches HelpModel
-└─ session_filter_popup.go  ... jin session-filter-popup (Hidden) → launches SessionFilterModel
+├─ session_filter_popup.go  ... jin session-filter-popup (Hidden) → launches SessionFilterModel
+└─ confirm_popup.go         ... jin confirm-popup (Hidden) → launches ConfirmPopupModel
 ```
 
 ## Model Structure
 
 `Model` in `model.go` holds the state of the session list screen:
 - Session list + cursor position + pagination
-- Confirmation dialog (Kill/Delete)
 - daemon.Client (for IPC communication)
 - tmux.Client (for popup launch and pane control)
 - Polling timer (tickMsg)
@@ -36,7 +37,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
     case tea.KeyMsg:
         // Delegates to updateListMode()
-        // Mode checks: confirmDelete/confirmKill etc.
     case tickMsg:
         // Periodic polling (daemon.Client.List())
         // Detect popup completion (via environment variables)
@@ -47,7 +47,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
     // processingMsg != "" → renderProcessingView()
-    // Normal → renderListContent() + renderHelpLine()
+    // Normal → renderListContent() + help line
 }
 ```
 
@@ -56,13 +56,13 @@ func (m Model) View() string {
 ### Main Screen (within model.go)
 
 - **Session list**: Default screen, status display + pagination
-- **Confirmation dialog**: Shows confirmation message in help line for Kill/Delete
 
 ### Popup (launched as independent process via tmux popup)
 
 - **Create form**: `CreateFormModel` in `createform.go` (WorkDir → Agent → Fleet → Worktree; Agent step is skipped when only one adapter is registered)
 - **Help**: `HelpModel` in `helpview.go` (keybind list)
 - **Switch session**: `SessionFilterModel` in `session_filter_model.go` (fuzzy session picker, see [Switch Session Popup](#switch-session-popup) below)
+- **Kill/Delete confirmation**: `ConfirmPopupModel` in `confirm_popup_model.go`. A popup rather than an in-pane dialog because a popup owns keyboard focus while open — when the action palette launched the action, focus sits on the display pane, so an in-pane prompt could not be answered without switching panes first. The parent passes the prompt in through `JIN_CONFIRM_MODE` / `JIN_CONFIRM_TARGET_ID` / `JIN_CONFIRM_TARGET_DESC` and reads the answer back from `JIN_CONFIRM_RESULT`; dismissing the popup writes nothing, so no answer means nothing happens. Clearing the handshake is the parent's job, at both ends: it wipes all four keys before writing a new prompt, and clears whatever a startup env snapshot still shows — the outer tmux server outlives the TUI process, so an answer left behind would otherwise be replayed against a different target. The write is fail-closed for the same reason: a failure at any point leaves the whole handshake empty rather than half-written, and the popup is not opened at all, since a prompt that cannot be described in full must not be shown.
 
 After popup completion, core popups return results to the parent TUI via environment variables (`JIN_CREATED_SESSION`, `JIN_FOCUS_SESSION`). `JIN_NOTIFY_SESSION` is set by `jin session focus` — invoked from external plugins such as `jind-ai-notifier` — and consumed via the same env-tick polling path. The parent TUI detects them during tickMsg polling.
 
@@ -294,7 +294,15 @@ Defaults:
 | `session_filter` | 70    | 70     | `keybindings.search`       | <!-- switch-session picker; key name kept for backward compat -->
 | `help`           | 60    | 60     | `keybindings.help`         |
 | `action`         | 70    | 70     | `keybindings.action_panel` |
+| `confirm`        | 48†   | 10†    | `keybindings.kill` / `keybindings.delete` |
 | `plugin_default` | 70    | 70     | Plugin `jin pane popup --here` fallback |
+
+† `confirm` is the one popup whose contents have fixed dimensions, so its
+default is an absolute cell count rather than a percentage — a share of a wide
+client would leave a six-line dialog swimming in empty space. Setting either
+`popups.confirm` dimension switches the whole popup back to percentages (50/50
+by default), which is also the automatic fallback on a client too small for
+48x10, since tmux rejects an oversized absolute popup instead of shrinking it.
 
 Override in `~/.config/jind-ai/config.yaml`:
 
@@ -304,6 +312,7 @@ popups:
   session_filter: { width: 80, height: 80 }
   help:           { width: 60, height: 60 }
   action:         { width: 70, height: 70 }
+  confirm:        { width: 50, height: 50 }  # percent; overrides the 48x10 cell default
   plugin_default: { width: 70, height: 70 }
   plugins:
     my-notifier:  { width: 40, height: 20 }   # override per-plugin
@@ -312,7 +321,7 @@ popups:
 Two delivery paths for the resolved size:
 
 - **Inner path** (BubbleTea → `tmuxClient.DisplayPopup`): `create`,
-  `session_filter`, `help` are opened from inside the TUI on each keypress.
+  `session_filter`, `help`, `confirm` are opened from inside the TUI on each keypress.
   Config changes take effect the next time the popup opens — no TUI restart
   needed.
 - **Outer path** (tmux `bind-key display-popup`): `action` and `session_filter`
