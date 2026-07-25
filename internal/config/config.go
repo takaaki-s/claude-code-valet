@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -128,6 +129,7 @@ type PopupsConfig struct {
 	SessionFilter *PopupSizeConfig            `mapstructure:"session_filter,omitempty"`
 	Help          *PopupSizeConfig            `mapstructure:"help,omitempty"`
 	Action        *PopupSizeConfig            `mapstructure:"action,omitempty"`
+	Confirm       *PopupSizeConfig            `mapstructure:"confirm,omitempty"`
 	PluginDefault *PopupSizeConfig            `mapstructure:"plugin_default,omitempty"`
 	Plugins       map[string]*PopupSizeConfig `mapstructure:"plugins,omitempty"`
 }
@@ -224,6 +226,7 @@ const (
 	PopupSessionFilter = "session_filter"
 	PopupHelp          = "help"
 	PopupAction        = "action"
+	PopupConfirm       = "confirm"
 	PopupPluginDefault = "plugin_default"
 )
 
@@ -233,7 +236,15 @@ const (
 // derivation the TUI used to run at popup open time.
 type popupSpec struct {
 	DefaultSize PopupSizeConfig
-	Subcmd      string
+	// DefaultCells, when non-nil, is an absolute cell count used in place of
+	// DefaultSize for a popup whose contents have fixed dimensions — a
+	// percentage of an arbitrary client would leave such a popup swimming in
+	// empty space on a wide terminal. It applies only when the user has
+	// configured no size at all; DefaultSize stays as the percentage fallback,
+	// since tmux refuses an absolute size larger than the client outright
+	// (a percentage can never exceed it). See PopupFallbackPercent.
+	DefaultCells *PopupSizeConfig
+	Subcmd       string
 }
 
 // popupCatalog owns the canonical popup metadata. Adding a new popup means
@@ -244,6 +255,23 @@ var popupCatalog = map[string]popupSpec{
 	PopupSessionFilter: {DefaultSize: PopupSizeConfig{Width: 70, Height: 70}, Subcmd: "session-filter-popup"},
 	PopupHelp:          {DefaultSize: PopupSizeConfig{Width: 60, Height: 60}, Subcmd: "help-popup"},
 	PopupAction:        {DefaultSize: PopupSizeConfig{Width: 70, Height: 70}, Subcmd: "action-popup"},
+	// The one popup with fixed content dimensions, so it is sized in cells
+	// rather than as a share of the client. tmux's -w/-h include the border
+	// it draws, leaving an inner pty of 46x8 (measured: the border costs one
+	// cell per side). The dialog draws no frame of its own and clamps its
+	// content to confirmDialogMaxInner (44) columns by at most 6 lines — the
+	// `delete_worktree` and `delete_worktree_force` dialogs — so centering
+	// that block inside 46x8 leaves exactly one cell of padding on every side
+	// at maximum content, and more for the shorter prompts. Changing either
+	// number here or that clamp without the other eats the padding.
+	//
+	// DefaultSize is the fallback percentage for a client too small to hold
+	// 48x10, which tmux would refuse rather than shrink.
+	PopupConfirm: {
+		DefaultSize:  PopupSizeConfig{Width: 50, Height: 50},
+		DefaultCells: &PopupSizeConfig{Width: 48, Height: 10},
+		Subcmd:       "confirm-popup",
+	},
 	PopupPluginDefault: {DefaultSize: PopupSizeConfig{Width: 70, Height: 70}, Subcmd: ""},
 }
 
@@ -253,16 +281,37 @@ var popupCatalog = map[string]popupSpec{
 // there's no map lookup on this path.
 var defaultUnknownPopup = PopupSizeConfig{Width: 70, Height: 70}
 
-// DefaultPopupSizes returns a snapshot of the canonical default sizes,
-// keyed by popup name. The returned map is a fresh copy — callers may
+// DefaultPopupSizes returns a snapshot of the canonical default sizes, keyed by
+// popup name. Each value is in that popup's own unit — percent of the client
+// for most, absolute cells for one whose dialog has fixed dimensions — so the
+// numbers are not comparable across popups and are not tmux-formatted.
+// GetPopupSize is authoritative for what a popup actually opens at, since it
+// also applies user config. The returned map is a fresh copy — callers may
 // mutate it freely without touching the shared catalog.
 func DefaultPopupSizes() map[string]PopupSizeConfig {
 	out := make(map[string]PopupSizeConfig, len(popupCatalog)+1)
 	for name, spec := range popupCatalog {
+		if spec.DefaultCells != nil {
+			out[name] = *spec.DefaultCells
+			continue
+		}
 		out[name] = spec.DefaultSize
 	}
 	out["default"] = defaultUnknownPopup
 	return out
+}
+
+// PopupNames returns every canonical popup name in the catalog, sorted.
+// Exported so callers outside this package can walk the catalog rather than
+// re-listing it — the popup names are the join between config, the TUI, and
+// the hidden cobra subcommands, so a second list would be one that drifts.
+func PopupNames() []string {
+	names := make([]string, 0, len(popupCatalog))
+	for name := range popupCatalog {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
 }
 
 // PopupSubcmd returns the hidden `jin` subcommand name that renders the
@@ -808,17 +857,22 @@ func (m *Manager) GetPluginPopupSize(pluginName string, manifest *PopupSizeConfi
 }
 
 // coreUserPopup returns the user-configured popup size for a canonical core
-// popup name, or nil if the name is not one of the five core popups.
+// popup name, or nil if the name is not one of the core popups. Every name in
+// popupCatalog except PopupPluginDefault (a resolver tier, not a real popup)
+// must have a case here, or its documented `popups.<name>` YAML key would be
+// silently ignored.
 func coreUserPopup(p *PopupsConfig, name string) *PopupSizeConfig {
 	switch name {
-	case "create":
+	case PopupCreate:
 		return p.Create
-	case "session_filter":
+	case PopupSessionFilter:
 		return p.SessionFilter
-	case "help":
+	case PopupHelp:
 		return p.Help
-	case "action":
+	case PopupAction:
 		return p.Action
+	case PopupConfirm:
+		return p.Confirm
 	}
 	return nil
 }
@@ -832,6 +886,21 @@ type popupTier struct {
 
 // resolvePopupSize applies the single-tier lookup used by core popups.
 func (m *Manager) resolvePopupSize(user *PopupSizeConfig, name string) (width, height string) {
+	// An absolute default is all-or-nothing against user config: mixing
+	// "48 cells wide" with a configured "60% tall" would silently produce
+	// a shape neither side asked for, so any override at all drops the
+	// whole popup back to percentages.
+	if spec, ok := popupCatalog[name]; ok && spec.DefaultCells != nil && !hasPopupOverride(user) {
+		return strconv.Itoa(spec.DefaultCells.Width), strconv.Itoa(spec.DefaultCells.Height)
+	}
+	return m.resolvePopupPercent(user, name)
+}
+
+// resolvePopupPercent is the percentage half of the core lookup: the size every
+// popup without an absolute default gets, and the size one with an absolute
+// default falls back to when tmux refuses it (see PopupFallbackPercent). Kept
+// as one function so the fallback cannot skip a tier the primary path honors.
+func (m *Manager) resolvePopupPercent(user *PopupSizeConfig, name string) (width, height string) {
 	fallback := defaultUnknownPopup
 	if spec, ok := popupCatalog[name]; ok {
 		fallback = spec.DefaultSize
@@ -861,6 +930,44 @@ func (m *Manager) resolvePluginPopupSize(perPlugin, manifest, pluginDefault *Pop
 // notation ("70%") both resolvers hand back to callers.
 func formatPopupPercent(w, h int) (width, height string) {
 	return fmt.Sprintf("%d%%", w), fmt.Sprintf("%d%%", h)
+}
+
+// hasPopupOverride reports whether the user set either dimension for a popup.
+// A single dimension counts: the absolute defaults are a matched pair, so
+// honoring one half of a user's config and one half of ours serves neither.
+func hasPopupOverride(user *PopupSizeConfig) bool {
+	return user != nil && (user.Width != 0 || user.Height != 0)
+}
+
+// PopupFallbackPercent returns the percentage size to retry with when a popup
+// sized in absolute cells fails to open. tmux rejects an absolute size taller
+// or wider than the client ("height too large") instead of shrinking it, and
+// the caller cannot know the client's dimensions; a percentage cannot exceed
+// the client, so it always opens. Without this, a client smaller than the
+// dialog turns a destructive confirmation into a keypress that appears to do
+// nothing.
+//
+// ok is false whenever the first attempt was not in cells — the popup has no
+// absolute default, or the user configured a size, which drops it back to
+// percentages (see resolvePopupSize). Retrying a percentage with the same
+// percentage costs a second doomed spawn and cannot succeed where the first
+// failed, so those callers must not retry at all.
+func (m *Manager) PopupFallbackPercent(name string) (width, height string, ok bool) {
+	spec, found := popupCatalog[name]
+	if !found || spec.DefaultCells == nil {
+		return "", "", false
+	}
+	m.mu.RLock()
+	var user *PopupSizeConfig
+	if m.config != nil {
+		user = coreUserPopup(&m.config.Popups, name)
+	}
+	m.mu.RUnlock()
+	if hasPopupOverride(user) {
+		return "", "", false
+	}
+	w, h := m.resolvePopupPercent(user, name)
+	return w, h, true
 }
 
 // pickPopupDim walks tiers in priority order, returning the first valid

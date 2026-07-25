@@ -150,20 +150,8 @@ type Model struct {
 	// changes (session list, window resize).
 	scrollOffset int
 
-	// Delete confirmation
-	confirmDelete          bool   // Whether delete confirmation is active
-	deleteTargetID         string // Session ID to delete
-	deleteTargetDesc       string // Session description to delete (for display)
-	deleteTargetIsWorktree bool   // Whether the session is in a git worktree
-	confirmWorktreeForce   bool   // Whether force-delete worktree confirmation is active
-
 	// Async delete tracking
 	deletingIDs map[string]bool // Session IDs currently being deleted
-
-	// Kill confirmation
-	confirmKill    bool   // Whether kill confirmation is active
-	killTargetID   string // Session ID to kill
-	killTargetDesc string // Session description to kill (for display)
 
 	// Focus tracking (for visual focus indicator)
 	focused bool // true when TUI pane has focus (changes border/title color)
@@ -229,8 +217,10 @@ func NewModelWithTmux(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID
 	m.innerTmuxClient = innerTC
 	m.tuiPaneID = tuiPaneID
 	m.displayPaneID = displayPaneID
+	// One tmux call covers both startup reads below.
+	env := tc.ListEnvironment(tmux.SessionName)
 	// Restore which session was displayed (for reattach)
-	m.currentSessionID = tc.GetEnvironment(tmux.SessionName, "JIN_CURRENT_SESSION")
+	m.currentSessionID = env["JIN_CURRENT_SESSION"]
 	// Point the cursor at that restored session on the first sessionsMsg so
 	// relaunching the TUI keeps the left-list selection aligned with the
 	// right pane the user was looking at.
@@ -239,6 +229,15 @@ func NewModelWithTmux(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID
 	// yet, so publish an empty value so a stale env from a prior TUI run does
 	// not confuse a popup that opens before the first sessionsMsg arrives.
 	m.writeCursorEnv()
+	// Same reason, higher stakes: the outer tmux server outlives the TUI, so a
+	// confirm answered in the last 250ms of a previous run is still sitting in
+	// its env, and our first envTick would replay it as an approval to kill or
+	// delete a session this run never asked about. Leftovers also let a
+	// hand-run `jin confirm-popup` open a prompt for a target nobody chose.
+	// Nothing useful to do with a failure here: the TUI is still being built,
+	// and a key that survives is inert until it is paired with an answer this
+	// run would have to write itself (writeConfirmRequest clears again).
+	_ = clearConfirmEnv(tc, staleConfirmKeys(env))
 	return m
 }
 
@@ -775,19 +774,30 @@ func (m Model) handleSelectSession() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// currentCursorSessionID returns the session ID under the cursor, or "" when
-// the list is empty, the cursor is out of range, or the target is in a
-// deleting state. Kept in sync with the palette / plugin dispatch so callers
-// never target a session that is transitioning away.
-func (m Model) currentCursorSessionID() string {
+// cursorSession returns the session under the cursor. The bool is false when
+// there is nothing actionable there: empty list, cursor out of range, or a
+// target already transitioning away (being deleted). Every caller that acts on
+// "the selected session" goes through this so the guards cannot drift apart.
+func (m Model) cursorSession() (session.Info, bool) {
 	ps := m.getDisplaySessions()
-	if len(ps) == 0 || m.cursor < 0 || m.cursor >= len(ps) {
+	if m.cursor < 0 || m.cursor >= len(ps) {
+		return session.Info{}, false
+	}
+	sess := ps[m.cursor]
+	if m.deletingIDs[sess.ID] {
+		return session.Info{}, false
+	}
+	return sess, true
+}
+
+// currentCursorSessionID returns the session ID under the cursor, or "" when
+// there is no actionable target (see cursorSession).
+func (m Model) currentCursorSessionID() string {
+	sess, ok := m.cursorSession()
+	if !ok {
 		return ""
 	}
-	if m.deletingIDs[ps[m.cursor].ID] {
-		return ""
-	}
-	return ps[m.cursor].ID
+	return sess.ID
 }
 
 // writeCursorEnv publishes the current cursor session ID to the outer tmux
@@ -810,7 +820,24 @@ func (m Model) openPopup(name, title string) {
 	if m.tmuxClient == nil || m.configMgr == nil {
 		return
 	}
-	_ = m.tmuxClient.DisplayPopup(m.popupDisplayOptions(name, title))
+	opts := m.popupDisplayOptions(name, title)
+	if err := m.tmuxClient.DisplayPopup(opts); err == nil {
+		return
+	}
+	// A popup sized in absolute cells is refused outright by tmux when the
+	// client is smaller than the request rather than being shrunk to fit, and
+	// the failure is invisible from here. Retry at the percentage fallback,
+	// which cannot exceed the client — otherwise a client too small for the
+	// confirm dialog would turn a destructive keypress into a no-op. The
+	// fallback reports false when this popup was not sized in cells to begin
+	// with, in which case the first attempt already used a percentage and a
+	// second identical spawn could only fail the same way.
+	w, h, ok := m.configMgr.PopupFallbackPercent(name)
+	if !ok {
+		return
+	}
+	opts.Width, opts.Height = w, h
+	_ = m.tmuxClient.DisplayPopup(opts)
 }
 
 // popupDisplayOptions resolves the tmux display-popup arguments for a
@@ -836,38 +863,285 @@ func (m Model) handleNew() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleKill enters kill-confirmation mode for the session under the cursor.
-// No-op when the list is empty or the target is already being deleted.
-func (m Model) handleKill() (tea.Model, tea.Cmd) {
-	pageSessions := m.getDisplaySessions()
-	if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
-		sess := pageSessions[m.cursor]
-		if m.deletingIDs[sess.ID] {
-			return m, nil
-		}
-		m.confirmKill = true
-		m.killTargetID = sess.ID
-		m.killTargetDesc = sess.Description
-		return m, nil
+// openConfirmPopup asks the standalone `jin confirm-popup` UI to confirm a
+// destructive action. The prompt runs in its own tmux popup rather than in
+// this pane because a popup owns keyboard focus while open — when the action
+// palette launched the action, focus sits on the display pane, so an in-pane
+// prompt could not be answered without a manual pane switch.
+//
+// No-op without an outer tmux client (legacy mode / tests), like
+// writeCursorEnv.
+func (m Model) openConfirmPopup(req confirmRequest) {
+	if m.tmuxClient == nil {
+		return
 	}
-	return m, nil
+	// A prompt this process could not describe in full must not be shown: the
+	// popup would name whichever fragment of req landed while
+	// dispatchConfirmResult acted on whatever the failed write left behind.
+	// writeConfirmRequest wipes the handshake on its way out of a failure, so
+	// the user simply sees no popup and can press the key again.
+	if err := writeConfirmRequest(m.tmuxClient, req); err != nil {
+		return
+	}
+	m.openPopup(config.PopupConfirm, " Confirm ")
 }
 
-// handleDelete enters delete-confirmation mode for the session under the
-// cursor. Worktree sessions get a follow-up sub-confirmation later in the
-// delete flow.
-func (m Model) handleDelete() (tea.Model, tea.Cmd) {
-	pageSessions := m.getDisplaySessions()
-	if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
-		sess := pageSessions[m.cursor]
-		if m.deletingIDs[sess.ID] {
-			return m, nil
+// confirmRequest is one confirm-popup invocation: which dialog to show and
+// which session it names.
+type confirmRequest struct {
+	mode       string
+	targetID   string
+	targetDesc string
+}
+
+// Outer-tmux env keys carrying the confirm handshake: the parent writes the
+// prompt, the popup writes the answer, the parent consumes all four on its
+// next envTick. Spelled once because four sites — the write, the consume, the
+// startup clear, and the `jin confirm-popup` process in cmd/jin/cmd — have to
+// agree on them exactly, and a key only one site knows about is a destructive
+// request stranded in a tmux server that outlives this process. Exported for
+// the fourth of those, which lives in another package (and another process).
+const (
+	EnvConfirmMode       = "JIN_CONFIRM_MODE"
+	EnvConfirmTargetID   = "JIN_CONFIRM_TARGET_ID"
+	EnvConfirmTargetDesc = "JIN_CONFIRM_TARGET_DESC"
+	EnvConfirmResult     = "JIN_CONFIRM_RESULT"
+)
+
+// confirmEnvKeys is the whole handshake, the unit every clear works in: a
+// leftover subset is a destructive request a later tick — or the next TUI
+// process — can pair with something else.
+var confirmEnvKeys = []string{EnvConfirmResult, EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc}
+
+// confirmEnvWriter is the minimal outer-tmux surface the confirm handshake
+// writes through. *tmux.Client satisfies it directly; tests inject a fake.
+// Same shape as cmd/jin/cmd's agentEnvSetter, for the same reason: the writes
+// are the whole observable effect of the code below.
+type confirmEnvWriter interface {
+	SetEnvironment(session, name, value string) error
+	UnsetEnvironment(session, name string) error
+}
+
+// writeConfirmRequest publishes one confirm-popup invocation to the outer tmux
+// env. These three values are the popup's whole input; the target ID is
+// written for our own benefit, since the popup never reads it but it comes
+// back alongside the answer so dispatchConfirmResult knows what to act on.
+//
+// The whole handshake — not just the previous answer — is wiped before any of
+// the new values land, and a failed write wipes it again before returning. Both
+// halves matter:
+//
+//   - A popup answered less than one envTick ago has left a result behind that
+//     this tick would otherwise pair with the target being written here,
+//     destroying a session the user answered "no" to, or never saw.
+//   - A dismissed popup (Ctrl+C) deliberately leaves its mode/target behind, so
+//     writing only some of the new values on top would splice two requests: the
+//     popup would name the new session while the answer came back carrying the
+//     old target's ID. Clearing turns any partial write into an *empty* key,
+//     and both the popup (empty mode → quiet exit) and dispatchConfirmResult
+//     (empty target → no-op) already refuse to act on it.
+//
+// A non-nil error therefore means "the env holds no request at all", which is
+// what lets openConfirmPopup answer it by simply not opening the popup.
+func writeConfirmRequest(tc confirmEnvWriter, req confirmRequest) error {
+	if err := clearConfirmEnv(tc, confirmEnvKeys); err != nil {
+		return err
+	}
+	for _, kv := range []struct{ key, value string }{
+		{EnvConfirmMode, req.mode},
+		{EnvConfirmTargetID, req.targetID},
+		{EnvConfirmTargetDesc, req.targetDesc},
+	} {
+		if err := tc.SetEnvironment(tmux.SessionName, kv.key, kv.value); err != nil {
+			_ = clearConfirmEnv(tc, confirmEnvKeys)
+			return fmt.Errorf("set %s: %w", kv.key, err)
 		}
-		m.confirmDelete = true
-		m.deleteTargetID = sess.ID
-		m.deleteTargetDesc = sess.Description
-		m.deleteTargetIsWorktree = sess.IsWorktree
-		return m, nil
+	}
+	return nil
+}
+
+// clearConfirmEnv unsets the given handshake keys, which includes a dismissed
+// prompt's leftovers. Every key is attempted even after a failure — each one
+// still set is a fragment of a destructive request that a later tick, or the
+// next TUI process, can pair with something else — and the failures are joined
+// so the caller can refuse to build on a half-cleared env.
+func clearConfirmEnv(tc confirmEnvWriter, keys []string) error {
+	var errs []error
+	for _, key := range keys {
+		if err := tc.UnsetEnvironment(tmux.SessionName, key); err != nil {
+			errs = append(errs, fmt.Errorf("unset %s: %w", key, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// staleConfirmKeys returns the handshake keys present in env, a snapshot of the
+// outer tmux env. The startup clear narrows to these rather than wiping all
+// four unconditionally: unsetting a key that was never set leaves exactly the
+// state as never touching it, so the guarantee is unchanged, while the usual
+// case — a previous run that left nothing behind — costs no tmux calls at all
+// on the path to the first frame.
+func staleConfirmKeys(env map[string]string) []string {
+	var stale []string
+	for _, key := range confirmEnvKeys {
+		if _, ok := env[key]; ok {
+			stale = append(stale, key)
+		}
+	}
+	return stale
+}
+
+// confirmAnswer is one completed confirm-popup round trip: the prompt this
+// Model wrote before opening the popup, plus what the user chose.
+type confirmAnswer struct {
+	mode     string
+	targetID string
+	result   string
+}
+
+// envRequests is what one envTick found waiting in the outer tmux env. An
+// answer is present exactly when its result is non-empty: a dismissed popup
+// writes no result, and the empty result is the "do nothing" case everywhere
+// else too.
+type envRequests struct {
+	focusSessionID string
+	answer         confirmAnswer
+}
+
+// consumeEnvRequests drains the popup→parent env handshake for one tick.
+// consume returns a key's value and unsets it on tmux, so anything read here
+// is gone whether or not the caller acts on it.
+//
+// The confirm answer is read on this pass, alongside the focus IDs, rather
+// than further into the tick: the caller's focus handling can return early
+// from Update, and an answer left in the tmux env outlives this TUI process —
+// the next one would find a destructive request it has no context for and
+// carry it out. The description is display-only, so it is consumed and dropped
+// rather than left behind to label a later prompt.
+func consumeEnvRequests(consume func(key string) string) envRequests {
+	var req envRequests
+	// Any popup that wants the parent TUI to focus a session pushes the ID
+	// here. JIN_CREATED_SESSION (create popup), JIN_NOTIFY_SESSION (external
+	// notifier plugin via jin session focus), JIN_FOCUS_SESSION
+	// (session-filter-popup) all share the same downstream (switchToSession)
+	// via focusSessionID.
+	for _, key := range []string{"JIN_CREATED_SESSION", "JIN_NOTIFY_SESSION", "JIN_FOCUS_SESSION"} {
+		if id := consume(key); id != "" {
+			req.focusSessionID = id
+		}
+	}
+	// A dismissed popup (Ctrl+C) writes no result, so the prompt keys are
+	// left alone here — nothing to act on, and clearing them is the job of
+	// the next writeConfirmRequest or of the startup clear.
+	if result := consume(EnvConfirmResult); result != "" {
+		mode := consume(EnvConfirmMode)
+		targetID := consume(EnvConfirmTargetID)
+		_ = consume(EnvConfirmTargetDesc)
+		req.answer = confirmAnswer{mode: mode, targetID: targetID, result: result}
+	}
+	return req
+}
+
+// handleEnvTick is the whole body of one envTick: it drains the popup→parent
+// handshake out of env and acts on whatever was waiting. env is the snapshot
+// the caller read from tmux and unset removes a key from the tmux server, so a
+// test can drive every branch below — including the destructive one — against a
+// synthetic env instead of a live tmux client.
+//
+// Split from the envTickMsg case for exactly that reason: the confirm answer
+// arrives here and nowhere else, so without a seam the entire feature could be
+// deleted from the Update loop with the test suite still green.
+func (m Model) handleEnvTick(env map[string]string, unset func(key string)) (tea.Model, tea.Cmd) {
+	// consume reads a JIN_* key and, if set, unsets it on tmux so the same
+	// value isn't picked up again on the next tick.
+	consume := func(key string) string {
+		v := env[key]
+		if v != "" {
+			unset(key)
+		}
+		return v
+	}
+
+	req := consumeEnvRequests(consume)
+	if req.focusSessionID != "" {
+		m.focusSessionID = req.focusSessionID
+	}
+	// The approved destructive action runs ahead of the focus fast path
+	// below, which can return early from this tick.
+	if req.answer.result != "" {
+		next, cmd := m.dispatchConfirmResult(req.answer.mode, req.answer.targetID, req.answer.result)
+		if nm, ok := next.(Model); ok {
+			m = nm
+		}
+		if cmd != nil {
+			return m, tea.Batch(envTickCmd(), cmd)
+		}
+	}
+	// Fast path: resolve now, or kick a fetch so the sessionsMsg slow path
+	// resolves on the next round-trip instead of after the next sessionTick
+	// (~2s). JIN_CREATED_WARNING / JIN_ACTION_ID stay in tmux env and surface
+	// on the next envTick.
+	if !m.resolveFocusSession() {
+		return m, tea.Batch(envTickCmd(), m.fetchSessions)
+	}
+	// Non-fatal warning from the create popup (e.g. hook not allowlisted).
+	// Read alongside JIN_CREATED_SESSION so it surfaces on the same tick.
+	if w := consume("JIN_CREATED_WARNING"); w != "" {
+		m.warning = w
+	}
+	// Poll for an action ID pushed by the action-popup, then route through
+	// dispatchAction so palette and direct-key paths share the same helpers.
+	// If the helper returns a Cmd (e.g. Refresh), merge it into the tick's
+	// Batch so tea sees a single frame.
+	if id := consume("JIN_ACTION_ID"); id != "" {
+		next, cmd := m.dispatchAction(id)
+		if nm, ok := next.(Model); ok {
+			m = nm
+		}
+		if cmd != nil {
+			return m, tea.Batch(envTickCmd(), cmd)
+		}
+	}
+	return m, envTickCmd()
+}
+
+// confirmRequestForAction resolves the confirmation a destructive action would
+// raise against the cursor session — including the worktree variant of delete,
+// which asks an extra question. The bool is false when the action is not one
+// that confirms, or there is no actionable target under the cursor.
+//
+// Split out from handleDestructiveAction (as popupDisplayOptions was from
+// openPopup) so the action→dialog mapping stays unit-testable: once the prompt
+// moved into a popup, the handler's only remaining effect is a tmux env write,
+// which a test Model cannot observe. Keeping the mapping keyed by action ID
+// also means the palette and the direct keys resolve through one table rather
+// than two that could drift.
+func (m Model) confirmRequestForAction(actionID string) (confirmRequest, bool) {
+	var mode string
+	switch actionID {
+	case action.IDKill:
+		mode = ConfirmModeKill
+	case action.IDDelete:
+		mode = ConfirmModeDelete
+	default:
+		return confirmRequest{}, false
+	}
+	sess, ok := m.cursorSession()
+	if !ok {
+		return confirmRequest{}, false
+	}
+	if mode == ConfirmModeDelete && sess.IsWorktree {
+		mode = ConfirmModeDeleteWorktree
+	}
+	return confirmRequest{mode: mode, targetID: sess.ID, targetDesc: sess.Description}, true
+}
+
+// handleDestructiveAction opens the confirmation popup for a kill / delete
+// action on the cursor session. Shared by the action palette and the direct
+// keys; a no-op when there is nothing to confirm.
+func (m Model) handleDestructiveAction(actionID string) (tea.Model, tea.Cmd) {
+	if req, ok := m.confirmRequestForAction(actionID); ok {
+		m.openConfirmPopup(req)
 	}
 	return m, nil
 }
@@ -922,10 +1196,8 @@ func (m Model) dispatchAction(id string) (tea.Model, tea.Cmd) {
 	switch id {
 	case action.IDNew:
 		return m.handleNew()
-	case action.IDKill:
-		return m.handleKill()
-	case action.IDDelete:
-		return m.handleDelete()
+	case action.IDKill, action.IDDelete:
+		return m.handleDestructiveAction(id)
 	case action.IDRefresh:
 		return m.handleRefresh()
 	case action.IDVscode:
@@ -967,6 +1239,106 @@ func (m Model) handlePluginRun(name, actionID string) (tea.Model, tea.Cmd) {
 		m.err = fmt.Errorf("plugin %s: %w", name, err)
 	}
 	return m, nil
+}
+
+// dispatchConfirmResult carries out the destructive action the user approved
+// in the confirm popup. mode and targetID come back from the tmux env this
+// Model wrote before opening the popup; result is what the popup wrote there.
+//
+// Every branch below destroys something, and the inputs are shared tmux env
+// that can go stale (an older binary's leftovers, a prompt answered after the
+// session vanished, a hand-set value). So the routing is exhaustive by
+// construction: only the listed mode/result pairs act, and everything else —
+// any "no", an unrecognized mode or result, a mismatched pair, an empty
+// target — falls through to the no-op return.
+func (m Model) dispatchConfirmResult(mode, targetID, result string) (tea.Model, tea.Cmd) {
+	if targetID == "" {
+		return m, nil
+	}
+	switch {
+	case mode == ConfirmModeKill && result == ConfirmResultYes:
+		return m.killSession(targetID)
+
+	// Session-only delete, reached from three prompts: plain delete, the
+	// worktree prompt's "keep the worktree" answer, and declining the force
+	// prompt (which falls back to leaving the dirty worktree in place).
+	case mode == ConfirmModeDelete && result == ConfirmResultYes,
+		mode == ConfirmModeDeleteWorktree && result == ConfirmResultYes,
+		mode == ConfirmModeDeleteWorktreeForce && result == ConfirmResultForceNo:
+		return m.deleteSession(targetID, false, false)
+
+	case mode == ConfirmModeDeleteWorktree && result == ConfirmResultWorktree:
+		return m.deleteSession(targetID, true, false)
+
+	case mode == ConfirmModeDeleteWorktreeForce && result == ConfirmResultForceYes:
+		return m.deleteSession(targetID, true, true)
+	}
+	return m, nil
+}
+
+// killSession issues the daemon Kill for targetID. needsReswitch makes the
+// next sessionsMsg reconnect the display pane to whatever the cursor lands on.
+func (m Model) killSession(targetID string) (tea.Model, tea.Cmd) {
+	m.processingMsg = "Stopping..."
+	m.needsReswitch = true
+	client := m.client
+	return m, func() tea.Msg {
+		if err := client.Kill(targetID); err != nil {
+			return errMsg(fmt.Errorf("kill failed: %w", err))
+		}
+		sessions, err := client.List()
+		if err != nil {
+			return errMsg(err)
+		}
+		return sessionsMsg(sessions)
+	}
+}
+
+// deleteSession greys out targetID, slides the cursor off it, and issues the
+// daemon Delete. The removeWorktree/force pair matches daemon.Client.Delete.
+//
+// The two worktree sentinels are handled here for every flag combination even
+// though only one can raise them: internal/session's PreCheckDelete returns
+// ErrWorktreeDirty only for removeWorktree && !force, and ErrNotWorktree only
+// for removeWorktree, so the other combinations reach the generic branch
+// unchanged. The dirty case is the one call that can come back asking another
+// question — worktreeDirtyMsg re-opens the popup for a force decision — and it
+// carries the description resolved before the Cmd runs, so the follow-up prompt
+// and the error text name the session the user saw.
+func (m Model) deleteSession(targetID string, removeWorktree, force bool) (tea.Model, tea.Cmd) {
+	name := m.sessionDescription(targetID)
+	m.deletingIDs[targetID] = true
+	m.skipDeletingSessions(1)
+	client := m.client
+	return m, func() tea.Msg {
+		if err := client.Delete(targetID, removeWorktree, force); err != nil {
+			if errors.Is(err, session.ErrWorktreeDirty) {
+				return worktreeDirtyMsg{sessionID: targetID, name: name}
+			}
+			if errors.Is(err, session.ErrNotWorktree) {
+				return deleteErrMsg{
+					sessionID: targetID,
+					err:       fmt.Errorf("worktree not found for session %q (already removed, or session is not in a worktree)", name),
+				}
+			}
+			return deleteErrMsg{sessionID: targetID, err: fmt.Errorf("delete failed: %w", err)}
+		}
+		sessions, err := client.List()
+		if err != nil {
+			return errMsg(err)
+		}
+		return sessionsMsg(sessions)
+	}
+}
+
+// sessionDescription returns the session's current description, falling back to
+// the ID when the list no longer holds it (deleted between the prompt and the
+// answer).
+func (m Model) sessionDescription(targetID string) string {
+	if i := slices.IndexFunc(m.sessions, func(s session.Info) bool { return s.ID == targetID }); i >= 0 {
+		return m.sessions[i].Description
+	}
+	return targetID
 }
 
 // Init initializes the model
@@ -1031,136 +1403,6 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Dismiss any transient warning on the first key press.
 		m.warning = ""
 
-		// Handle delete confirmation mode
-		if m.confirmDelete {
-			// Sub-confirmation: force delete dirty worktree
-			if m.confirmWorktreeForce {
-				switch msg.String() {
-				case "y", "Y":
-					deleteID := m.deleteTargetID
-					m.deletingIDs[deleteID] = true
-					m.resetDeleteState()
-					m.skipDeletingSessions(1)
-					client := m.client
-					return m, func() tea.Msg {
-						if err := client.Delete(deleteID, true, true); err != nil {
-							return deleteErrMsg{sessionID: deleteID, err: fmt.Errorf("delete failed: %w", err)}
-						}
-						sessions, err := client.List()
-						if err != nil {
-							return errMsg(err)
-						}
-						return sessionsMsg(sessions)
-					}
-				case "n", "N", "esc":
-					// Fall back: delete session only
-					deleteID := m.deleteTargetID
-					m.deletingIDs[deleteID] = true
-					m.resetDeleteState()
-					m.skipDeletingSessions(1)
-					client := m.client
-					return m, func() tea.Msg {
-						if err := client.Delete(deleteID, false, false); err != nil {
-							return deleteErrMsg{sessionID: deleteID, err: fmt.Errorf("delete failed: %w", err)}
-						}
-						sessions, err := client.List()
-						if err != nil {
-							return errMsg(err)
-						}
-						return sessionsMsg(sessions)
-					}
-				}
-				return m, nil
-			}
-
-			// Primary delete confirmation
-			switch msg.String() {
-			case "y", "Y", "enter":
-				deleteID := m.deleteTargetID
-				m.deletingIDs[deleteID] = true
-				m.resetDeleteState()
-				m.skipDeletingSessions(1)
-				client := m.client
-				return m, func() tea.Msg {
-					if err := client.Delete(deleteID, false, false); err != nil {
-						return deleteErrMsg{sessionID: deleteID, err: fmt.Errorf("delete failed: %w", err)}
-					}
-					sessions, err := client.List()
-					if err != nil {
-						return errMsg(err)
-					}
-					return sessionsMsg(sessions)
-				}
-			case "w", "W":
-				if !m.deleteTargetIsWorktree {
-					return m, nil // ignore if not a worktree
-				}
-				deleteID := m.deleteTargetID
-				deleteName := m.deleteTargetDesc
-				m.deletingIDs[deleteID] = true
-				m.resetDeleteState()
-				m.skipDeletingSessions(1)
-				client := m.client
-				return m, func() tea.Msg {
-					err := client.Delete(deleteID, true, false)
-					if err != nil {
-						if errors.Is(err, session.ErrWorktreeDirty) {
-							return worktreeDirtyMsg{sessionID: deleteID, name: deleteName}
-						}
-						if errors.Is(err, session.ErrNotWorktree) {
-							return deleteErrMsg{
-								sessionID: deleteID,
-								err:       fmt.Errorf("worktree not found for session %q (already removed, or session is not in a worktree)", deleteName),
-							}
-						}
-						return deleteErrMsg{sessionID: deleteID, err: fmt.Errorf("delete failed: %w", err)}
-					}
-					sessions, err := client.List()
-					if err != nil {
-						return errMsg(err)
-					}
-					return sessionsMsg(sessions)
-				}
-			case "n", "N", "esc":
-				m.resetDeleteState()
-				return m, nil
-			}
-			return m, nil
-		}
-
-		// Handle kill confirmation mode
-		if m.confirmKill {
-			switch msg.String() {
-			case "y", "Y", "enter":
-				m.processingMsg = "Stopping..."
-				m.confirmKill = false
-				m.needsReswitch = true
-
-				killID := m.killTargetID
-				m.killTargetID = ""
-				m.killTargetDesc = ""
-
-				client := m.client
-
-				return m, func() tea.Msg {
-					if err := client.Kill(killID); err != nil {
-						return errMsg(fmt.Errorf("kill failed: %w", err))
-					}
-					sessions, err := client.List()
-					if err != nil {
-						return errMsg(err)
-					}
-					return sessionsMsg(sessions)
-				}
-			case "n", "N", "esc":
-				m.confirmKill = false
-				m.killTargetID = ""
-				m.killTargetDesc = ""
-				return m, nil
-			}
-			return m, nil
-		}
-
 		// Left pane key handling
 		switch {
 		case key.Matches(msg, m.keys.Quit):
@@ -1192,10 +1434,10 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleNew()
 
 		case key.Matches(msg, m.keys.Kill):
-			return m.handleKill()
+			return m.handleDestructiveAction(action.IDKill)
 
 		case key.Matches(msg, m.keys.Delete):
-			return m.handleDelete()
+			return m.handleDestructiveAction(action.IDDelete)
 
 		case key.Matches(msg, m.keys.Refresh):
 			return m.handleRefresh()
@@ -1382,11 +1624,14 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case worktreeDirtyMsg:
 		delete(m.deletingIDs, msg.sessionID)
 		m.processingMsg = ""
-		m.confirmDelete = true
-		m.confirmWorktreeForce = true
-		m.deleteTargetID = msg.sessionID
-		m.deleteTargetDesc = msg.name
-		m.deleteTargetIsWorktree = true
+		// The daemon refused the worktree removal because it is dirty. The
+		// popup that asked the first question is already closed, so ask the
+		// force question in a fresh one.
+		m.openConfirmPopup(confirmRequest{
+			mode:       ConfirmModeDeleteWorktreeForce,
+			targetID:   msg.sessionID,
+			targetDesc: msg.name,
+		})
 
 	case deleteErrMsg:
 		delete(m.deletingIDs, msg.sessionID)
@@ -1397,56 +1642,15 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg
 
 	case envTickMsg:
-		if m.tmuxClient != nil {
-			env := m.tmuxClient.ListEnvironment(tmux.SessionName)
-			// consume reads a JIN_* key and, if set, unsets it on tmux so
-			// the same value isn't picked up again on the next tick.
-			consume := func(key string) string {
-				v := env[key]
-				if v != "" {
-					_ = m.tmuxClient.UnsetEnvironment(tmux.SessionName, key)
-				}
-				return v
-			}
-
-			// Any popup that wants the parent TUI to focus a session pushes
-			// the ID here. JIN_CREATED_SESSION (create popup), JIN_NOTIFY_SESSION
-			// (external notifier plugin via jin session focus), JIN_FOCUS_SESSION
-			// (session-filter-popup) all share the same downstream (switchToSession)
-			// via focusSessionID.
-			for _, k := range []string{"JIN_CREATED_SESSION", "JIN_NOTIFY_SESSION", "JIN_FOCUS_SESSION"} {
-				if id := consume(k); id != "" {
-					m.focusSessionID = id
-				}
-			}
-			// Fast path: resolve now, or kick a fetch so the sessionsMsg slow
-			// path resolves on the next round-trip instead of after the next
-			// sessionTick (~2s). JIN_CREATED_WARNING / JIN_ACTION_ID stay in
-			// tmux env and surface on the next envTick.
-			if !m.resolveFocusSession() {
-				return m, tea.Batch(envTickCmd(), m.fetchSessions)
-			}
-			// Non-fatal warning from the create popup (e.g. hook not
-			// allowlisted). Read alongside JIN_CREATED_SESSION so it
-			// surfaces on the same tick.
-			if w := consume("JIN_CREATED_WARNING"); w != "" {
-				m.warning = w
-			}
-			// Poll for an action ID pushed by the action-popup, then route
-			// through dispatchAction so palette and direct-key paths share
-			// the same helpers. If the helper returns a Cmd (e.g. Refresh),
-			// merge it into the tick's Batch so tea sees a single frame.
-			if id := consume("JIN_ACTION_ID"); id != "" {
-				next, cmd := m.dispatchAction(id)
-				if nm, ok := next.(Model); ok {
-					m = nm
-				}
-				if cmd != nil {
-					return m, tea.Batch(envTickCmd(), cmd)
-				}
-			}
+		// The nil guard stays here: handleEnvTick resolves a pending focus
+		// switch, which drives the outer tmux client.
+		if m.tmuxClient == nil {
+			return m, envTickCmd()
 		}
-		return m, envTickCmd()
+		return m.handleEnvTick(
+			m.tmuxClient.ListEnvironment(tmux.SessionName),
+			func(key string) { _ = m.tmuxClient.UnsetEnvironment(tmux.SessionName, key) },
+		)
 
 	case sessionTickMsg:
 		cmds := []tea.Cmd{m.fetchSessions, sessionTickCmd()}
@@ -1470,11 +1674,6 @@ func (m Model) View() string {
 		return m.renderProcessingView()
 	}
 
-	// Delete confirmation overlay
-	if m.confirmDelete {
-		return m.renderDeleteConfirm()
-	}
-
 	paneWidth := m.width
 	paneWidth = max(paneWidth, 20)
 	paneHeight := m.height - 1
@@ -1484,22 +1683,13 @@ func (m Model) View() string {
 	contentWidth = max(contentWidth, 16)
 	paneStyle := createPaneStyle(paneWidth, paneHeight, m.focused)
 	pane := paneStyle.Render(m.renderListContent(contentWidth))
-	helpLine := m.renderHelpLine()
-	return pane + "\n" + helpLine
+	return pane + "\n" + helpStyle.Render(" ? help")
 }
 
 // renderProcessingView renders a processing indicator.
 // Size-independent: renders correctly even before WindowSizeMsg arrives after ZoomPane/JoinPane
 func (m Model) renderProcessingView() string {
 	return "\n  ⟳ " + m.processingMsg
-}
-
-func (m *Model) resetDeleteState() {
-	m.confirmDelete = false
-	m.confirmWorktreeForce = false
-	m.deleteTargetID = ""
-	m.deleteTargetDesc = ""
-	m.deleteTargetIsWorktree = false
 }
 
 // skipDeletingSessions adjusts cursor to skip over sessions being deleted.
@@ -1528,58 +1718,6 @@ func (m *Model) skipDeletingSessions(dir int) {
 			}
 		}
 	}
-}
-
-// renderDeleteConfirm renders a delete confirmation dialog as a pane overlay.
-func (m Model) renderDeleteConfirm() string {
-	paneWidth := m.width
-	paneWidth = max(paneWidth, 20)
-	paneHeight := m.height - 1
-	paneHeight = max(paneHeight, 5)
-
-	contentWidth := paneWidth - 2 // horizontal padding inside pane
-	var lines []string
-
-	warnStyle := lipgloss.NewStyle().Foreground(warningColor).Bold(true)
-	dimStyle := lipgloss.NewStyle().Foreground(secondaryColor)
-	keyStyle := lipgloss.NewStyle().Foreground(primaryColor).Bold(true)
-
-	if m.confirmWorktreeForce {
-		// Force confirmation for dirty worktree
-		lines = append(lines,
-			warnStyle.Render("⚠ Worktree has uncommitted"),
-			warnStyle.Render("  changes"),
-			"",
-			keyStyle.Render("y")+dimStyle.Render(": force delete worktree"),
-			keyStyle.Render("n")+dimStyle.Render(": delete session only"),
-		)
-	} else if m.deleteTargetIsWorktree {
-		// Worktree session
-		name := truncateString(m.deleteTargetDesc, contentWidth-10)
-		lines = append(lines,
-			warnStyle.Render(fmt.Sprintf("Delete '%s'?", name)),
-			dimStyle.Render("Session is in a git worktree"),
-			"",
-			keyStyle.Render("y")+dimStyle.Render(": delete session only"),
-			keyStyle.Render("w")+dimStyle.Render(": delete session + worktree"),
-			keyStyle.Render("n")+dimStyle.Render(": cancel"),
-		)
-	} else {
-		// Normal session
-		name := truncateString(m.deleteTargetDesc, contentWidth-10)
-		lines = append(lines,
-			warnStyle.Render(fmt.Sprintf("Delete '%s'?", name)),
-			"",
-			keyStyle.Render("y")+dimStyle.Render(": delete"),
-			keyStyle.Render("n")+dimStyle.Render(": cancel"),
-		)
-	}
-
-	content := strings.Join(lines, "\n")
-	placed := lipgloss.Place(contentWidth, paneHeight, lipgloss.Center, lipgloss.Center, content)
-
-	paneStyle := createPaneStyle(paneWidth, paneHeight, m.focused)
-	return paneStyle.Render(placed)
 }
 
 // renderListContent renders the session list content.
@@ -1651,16 +1789,6 @@ func (m Model) renderListContent(contentWidth int) string {
 	}
 	content.WriteString(strings.Join(lines[start:end], "\n"))
 	return content.String()
-}
-
-// renderHelpLine renders the help line at the bottom
-func (m Model) renderHelpLine() string {
-	if m.confirmKill {
-		name := truncateString(m.killTargetDesc, 20)
-		confirmMsg := fmt.Sprintf(" Kill '%s'? y:yes n:no", name)
-		return lipgloss.NewStyle().Foreground(warningColor).Bold(true).Render(confirmMsg)
-	}
-	return helpStyle.Render(" ? help")
 }
 
 // renderSession renders a single session as a card.

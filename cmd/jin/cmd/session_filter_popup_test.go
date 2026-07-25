@@ -1,66 +1,11 @@
 package cmd
 
 import (
-	"errors"
-	"reflect"
 	"testing"
-
-	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
-// fakeEnvWriter records SetEnvironment calls issued by pushFocusSession so
-// tests can assert what tmux env writes would have occurred, without spawning
-// a real tmux server. err (when non-nil) is returned from every SetEnvironment
-// call to exercise the "non-tmux environment" swallow path (V-014).
-type fakeEnvWriter struct {
-	sets [][3]string // [session, name, value]
-	err  error
-}
-
-func (f *fakeEnvWriter) SetEnvironment(session, name, value string) error {
-	f.sets = append(f.sets, [3]string{session, name, value})
-	return f.err
-}
-
-func TestPushFocusSession_SetsEnvOnSelection(t *testing.T) {
-	fe := &fakeEnvWriter{}
-	pushFocusSession("sess-abc", fe)
-
-	want := [][3]string{{tmux.SessionName, "JIN_FOCUS_SESSION", "sess-abc"}}
-	if !reflect.DeepEqual(fe.sets, want) {
-		t.Errorf("sets = %v, want %v", fe.sets, want)
-	}
-}
-
-// TestPushFocusSession_NoOpOnEmptySelection also stands in for daemon-
-// unavailable and Esc-dismissal equivalence: the three RunE dismissal paths
-// — daemon.List() failing (which returns before pushFocusSession runs at
-// all), sessions=[] (Enter yields Selected() == ""), and Esc/Ctrl+C
-// (Selected() == "") — all funnel into pushFocusSession("", writer) or
-// bypass it entirely. Verifying the empty-string arm is no-op therefore
-// covers all three from the writer's point of view without needing to
-// interface-ify RunE (kept out of scope per design §11.3).
-func TestPushFocusSession_NoOpOnEmptySelection(t *testing.T) {
-	fe := &fakeEnvWriter{}
-	pushFocusSession("", fe)
-
-	if len(fe.sets) != 0 {
-		t.Errorf("sets = %v, want none", fe.sets)
-	}
-}
-
-// TestPushFocusSession_ErrorFromWriterSwallowed guards the V-014 contract:
-// non-tmux invocations must not fatal. pushFocusSession discards the
-// writer error; the panic-recovery guard was removed because the fake writer
-// cannot panic, and go test surfaces any real regression as a normal fail.
-func TestPushFocusSession_ErrorFromWriterSwallowed(t *testing.T) {
-	fe := &fakeEnvWriter{err: errors.New("tmux not running")}
-	pushFocusSession("sess-xyz", fe)
-
-	if len(fe.sets) != 1 {
-		t.Errorf("sets = %v, want single attempt", fe.sets)
-	}
-}
+// pushFocusSession's own behaviour is covered alongside the other popup result
+// writers in TestPushPopupResult (util_test.go): they share one helper.
 
 // TestSessionFilterPopupCmd_Registered guards the cobra wiring: init() must
 // attach the hidden subcommand under rootCmd so `jin session-filter-popup`

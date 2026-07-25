@@ -313,6 +313,7 @@ popups:
   session_filter: { width: 70, height: 70 }
   help:           { width: 60, height: 60 }
   action:         { width: 70, height: 70 }
+  confirm:        { width: 50, height: 50 }  # Kill/Delete の確認 (既定は 48x10 セル)
   plugin_default: { width: 70, height: 70 }
   plugins:                                # プラグイン単位の上書き
     # my-notifier:  { width: 40, height: 20 }

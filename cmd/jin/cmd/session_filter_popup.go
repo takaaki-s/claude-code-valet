@@ -11,12 +11,6 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/tui"
 )
 
-// envWriter is the minimal tmux surface pushFocusSession needs. *tmux.Client
-// satisfies it directly; tests inject a fake.
-type envWriter interface {
-	SetEnvironment(session, name, value string) error
-}
-
 var sessionFilterPopupCmd = &cobra.Command{
 	Use:    "session-filter-popup",
 	Short:  "Internal: switch-session picker for tmux popup",
@@ -50,14 +44,10 @@ var sessionFilterPopupCmd = &cobra.Command{
 }
 
 // pushFocusSession writes the picked session ID to the outer-tmux env so the
-// parent TUI can consume it on the next envTick. No-ops on empty selection
-// (Esc / Ctrl+C dismissal) so a dismissed popup leaves parent state alone.
-// tmux errors are swallowed: non-tmux invocations (V-014) must not fatal.
+// parent TUI can consume it on the next envTick. An empty selection (Esc /
+// Ctrl+C dismissal) writes nothing — see pushPopupResult.
 func pushFocusSession(selected string, tc envWriter) {
-	if selected == "" {
-		return
-	}
-	_ = tc.SetEnvironment(tmux.SessionName, "JIN_FOCUS_SESSION", selected)
+	pushPopupResult(tc, "JIN_FOCUS_SESSION", selected)
 }
 
 func init() {

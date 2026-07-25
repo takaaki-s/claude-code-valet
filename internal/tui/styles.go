@@ -62,6 +62,18 @@ var (
 
 	deletingStyle = lipgloss.NewStyle().
 			Foreground(secondaryColor)
+
+	// Confirm dialog tokens (the kill/delete confirm popup).
+	// Descriptions reuse helpStyle (secondaryColor).
+	//
+	// There is deliberately no frame style here: the confirm dialog draws no
+	// border of its own. tmux already draws one around every display-popup
+	// (measurably — a 12-row popup yields a 10-row inner pty), so a second
+	// frame would nest inside the first, and none of the sibling popup models
+	// draw one either. The "this destroys something" signal rides on the
+	// warning-tinted title instead.
+	confirmTitleStyle = lipgloss.NewStyle().Foreground(warningColor).Bold(true)
+	confirmKeyStyle   = lipgloss.NewStyle().Foreground(primaryColor).Bold(true)
 )
 
 // createPaneStyle wraps content with 1-column horizontal padding and a fixed

@@ -1,10 +1,16 @@
 package tui
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"net"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +19,7 @@ import (
 	"github.com/muesli/termenv"
 	"github.com/takaaki-s/jind-ai/internal/action"
 	"github.com/takaaki-s/jind-ai/internal/config"
+	"github.com/takaaki-s/jind-ai/internal/daemon"
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
@@ -856,6 +863,11 @@ func TestSkipDeletingSessions(t *testing.T) {
 
 // --- Delete confirmation cursor skip ---
 
+// TestDeleteConfirmMoveCursorToNextSession drives the answered-popup entry
+// point (dispatchConfirmResult) rather than a key press, since the prompt now
+// lives in its own tmux popup process. What it pins is unchanged: an approved
+// delete greys out the target and slides the cursor off it, so the user is
+// never left pointing at a session that is transitioning away.
 func TestDeleteConfirmMoveCursorToNextSession(t *testing.T) {
 	makeSessions := func(ids ...string) []session.Info {
 		var ss []session.Info
@@ -865,18 +877,14 @@ func TestDeleteConfirmMoveCursorToNextSession(t *testing.T) {
 		return ss
 	}
 
-	yKey := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")}
-
 	t.Run("cursor moves to next session after delete confirm", func(t *testing.T) {
 		m := Model{
-			sessions:       makeSessions("a", "b", "c"),
-			cursor:         1, // on "b"
-			deletingIDs:    make(map[string]bool),
-			height:         100,
-			confirmDelete:  true,
-			deleteTargetID: "b",
+			sessions:    makeSessions("a", "b", "c"),
+			cursor:      1, // on "b"
+			deletingIDs: make(map[string]bool),
+			height:      100,
 		}
-		result, _ := m.updateListMode(yKey)
+		result, _ := m.dispatchConfirmResult(ConfirmModeDelete, "b", ConfirmResultYes)
 		rm := result.(Model)
 		if rm.cursor == 1 {
 			t.Errorf("cursor should have moved away from deleted session, got %d", rm.cursor)
@@ -888,14 +896,12 @@ func TestDeleteConfirmMoveCursorToNextSession(t *testing.T) {
 
 	t.Run("cursor moves up when deleting last session", func(t *testing.T) {
 		m := Model{
-			sessions:       makeSessions("a", "b", "c"),
-			cursor:         2, // on "c" (last)
-			deletingIDs:    make(map[string]bool),
-			height:         100,
-			confirmDelete:  true,
-			deleteTargetID: "c",
+			sessions:    makeSessions("a", "b", "c"),
+			cursor:      2, // on "c" (last)
+			deletingIDs: make(map[string]bool),
+			height:      100,
 		}
-		result, _ := m.updateListMode(yKey)
+		result, _ := m.dispatchConfirmResult(ConfirmModeDelete, "c", ConfirmResultYes)
 		rm := result.(Model)
 		if rm.cursor != 1 {
 			t.Errorf("expected cursor 1 (previous session), got %d", rm.cursor)
@@ -1099,39 +1105,103 @@ func TestDispatchAction_UnknownID(t *testing.T) {
 	}
 }
 
-// TestDispatchAction_KillSetsConfirm asserts IDKill routes to handleKill by
-// observing the confirm-kill state transition it produces on a non-empty list.
-func TestDispatchAction_KillSetsConfirm(t *testing.T) {
-	m := Model{
-		sessions:    []session.Info{{ID: "s1"}},
-		cursor:      0,
-		deletingIDs: map[string]bool{},
+// TestConfirmRequestForAction is where the kill/delete routing is actually
+// asserted: the confirmation moved into a tmux popup, so dispatchAction's
+// only observable effect for those IDs is an env write a test Model cannot
+// see (tmuxClient=nil). dispatchAction hands the action ID straight to this
+// resolver, so pinning the ID→dialog mapping here pins the routing — and the
+// worktree upgrade of delete, which is the part most likely to break.
+func TestConfirmRequestForAction(t *testing.T) {
+	plain := []session.Info{{ID: "s1", Description: "one"}}
+	worktree := []session.Info{{ID: "s1", Description: "one", IsWorktree: true}}
+
+	cases := []struct {
+		name     string
+		actionID string
+		sessions []session.Info
+		wantMode string
+	}{
+		{"kill", action.IDKill, plain, ConfirmModeKill},
+		{"kill on a worktree session is still a plain kill", action.IDKill, worktree, ConfirmModeKill},
+		{"delete", action.IDDelete, plain, ConfirmModeDelete},
+		{"delete on a worktree session asks about the worktree", action.IDDelete, worktree, ConfirmModeDeleteWorktree},
 	}
-	next, _ := m.dispatchAction(action.IDKill)
-	nm := next.(Model)
-	if !nm.confirmKill {
-		t.Fatal("expected confirmKill to be true after IDKill dispatch")
-	}
-	if nm.killTargetID != "s1" {
-		t.Fatalf("killTargetID = %q, want %q", nm.killTargetID, "s1")
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Model{sessions: tt.sessions, cursor: 0, deletingIDs: map[string]bool{}}
+			req, ok := m.confirmRequestForAction(tt.actionID)
+			if !ok {
+				t.Fatalf("confirmRequestForAction(%q) = not ok, want a request", tt.actionID)
+			}
+			if req.mode != tt.wantMode {
+				t.Errorf("mode = %q, want %q", req.mode, tt.wantMode)
+			}
+			if req.targetID != "s1" {
+				t.Errorf("targetID = %q, want %q", req.targetID, "s1")
+			}
+			if req.targetDesc != "one" {
+				t.Errorf("targetDesc = %q, want %q", req.targetDesc, "one")
+			}
+		})
 	}
 }
 
-// TestDispatchAction_DeleteSetsConfirm asserts IDDelete routes to handleDelete
-// by observing the confirm-delete state transition on a non-empty list.
-func TestDispatchAction_DeleteSetsConfirm(t *testing.T) {
-	m := Model{
-		sessions:    []session.Info{{ID: "s1"}},
-		cursor:      0,
-		deletingIDs: map[string]bool{},
+// TestConfirmRequestForAction_NoTarget covers the guards that keep a prompt
+// from naming a session that is not there (or is on its way out), plus the
+// non-destructive action IDs that must not resolve to a dialog at all.
+func TestConfirmRequestForAction_NoTarget(t *testing.T) {
+	sessions := []session.Info{{ID: "s1", Description: "one"}}
+	cases := []struct {
+		name        string
+		actionID    string
+		sessions    []session.Info
+		cursor      int
+		deletingIDs map[string]bool
+	}{
+		{"empty list", action.IDDelete, nil, 0, map[string]bool{}},
+		{"cursor past end", action.IDDelete, sessions, 3, map[string]bool{}},
+		{"target already deleting", action.IDDelete, sessions, 0, map[string]bool{"s1": true}},
+		{"non-destructive action", action.IDRefresh, sessions, 0, map[string]bool{}},
+		{"unknown action", "core:bogus", sessions, 0, map[string]bool{}},
 	}
-	next, _ := m.dispatchAction(action.IDDelete)
-	nm := next.(Model)
-	if !nm.confirmDelete {
-		t.Fatal("expected confirmDelete to be true after IDDelete dispatch")
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Model{sessions: tt.sessions, cursor: tt.cursor, deletingIDs: tt.deletingIDs}
+			if req, ok := m.confirmRequestForAction(tt.actionID); ok {
+				t.Errorf("confirmRequestForAction = %+v, want no request", req)
+			}
+		})
 	}
-	if nm.deleteTargetID != "s1" {
-		t.Fatalf("deleteTargetID = %q, want %q", nm.deleteTargetID, "s1")
+}
+
+// TestDispatchAction_DestructiveActionsAreSafeWhenUnwired pins the degraded
+// path the palette can hit on an unwired Model: IDKill / IDDelete must reach
+// handleDestructiveAction and stop at the tmuxClient=nil guard rather than
+// panicking or surfacing an error. The mapping itself is covered by
+// TestConfirmRequestForAction.
+func TestDispatchAction_DestructiveActionsAreSafeWhenUnwired(t *testing.T) {
+	for _, id := range []string{action.IDKill, action.IDDelete} {
+		t.Run(id, func(t *testing.T) {
+			m := Model{
+				sessions:    []session.Info{{ID: "s1", Description: "one"}},
+				cursor:      0,
+				deletingIDs: map[string]bool{},
+			}
+			next, cmd := m.dispatchAction(id)
+			if cmd != nil {
+				t.Errorf("expected nil Cmd (the popup is opened synchronously), got %T", cmd)
+			}
+			nm, ok := next.(Model)
+			if !ok {
+				t.Fatalf("expected Model, got %T", next)
+			}
+			if nm.err != nil {
+				t.Errorf("expected no err, got %v", nm.err)
+			}
+			if len(nm.deletingIDs) != 0 {
+				t.Errorf("opening a confirmation must not delete anything, got %v", nm.deletingIDs)
+			}
+		})
 	}
 }
 
@@ -1143,6 +1213,278 @@ func TestDispatchAction_RefreshReturnsCmd(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected non-nil Cmd for IDRefresh (fetchSessions)")
 	}
+}
+
+// --- dispatchConfirmResult ---
+
+// TestDispatchConfirmResult_Routing pins the mode/result table, and in
+// particular the half of it that must do nothing: dispatchConfirmResult is fed
+// from tmux env that can go stale, and every acting branch destroys a session.
+// Cases are separated by the Cmd (issued vs not) plus the state each acting
+// branch leaves behind; which flags reach daemon.Client.Delete is pinned by
+// TestConfirmFlagsOnWire below.
+func TestDispatchConfirmResult_Routing(t *testing.T) {
+	cases := []struct {
+		name           string
+		mode           string
+		targetID       string
+		result         string
+		wantCmd        bool
+		wantDeleting   bool
+		wantProcessing string
+		wantReswitch   bool
+	}{
+		{name: "kill yes", mode: ConfirmModeKill, targetID: "s1", result: ConfirmResultYes,
+			wantCmd: true, wantProcessing: "Stopping...", wantReswitch: true},
+		{name: "delete yes", mode: ConfirmModeDelete, targetID: "s1", result: ConfirmResultYes,
+			wantCmd: true, wantDeleting: true},
+		{name: "delete_worktree yes (session only)", mode: ConfirmModeDeleteWorktree, targetID: "s1", result: ConfirmResultYes,
+			wantCmd: true, wantDeleting: true},
+		{name: "delete_worktree worktree", mode: ConfirmModeDeleteWorktree, targetID: "s1", result: ConfirmResultWorktree,
+			wantCmd: true, wantDeleting: true},
+		{name: "force yes", mode: ConfirmModeDeleteWorktreeForce, targetID: "s1", result: ConfirmResultForceYes,
+			wantCmd: true, wantDeleting: true},
+		{name: "force no falls back to session only", mode: ConfirmModeDeleteWorktreeForce, targetID: "s1", result: ConfirmResultForceNo,
+			wantCmd: true, wantDeleting: true},
+
+		// Everything below must leave the session alone.
+		{name: "kill no", mode: ConfirmModeKill, targetID: "s1", result: ConfirmResultNo},
+		{name: "delete no", mode: ConfirmModeDelete, targetID: "s1", result: ConfirmResultNo},
+		{name: "delete_worktree no", mode: ConfirmModeDeleteWorktree, targetID: "s1", result: ConfirmResultNo},
+		{name: "worktree answer to a plain delete prompt", mode: ConfirmModeDelete, targetID: "s1", result: ConfirmResultWorktree},
+		{name: "force answer to a plain delete prompt", mode: ConfirmModeDelete, targetID: "s1", result: ConfirmResultForceYes},
+		{name: "plain yes to a force prompt", mode: ConfirmModeDeleteWorktreeForce, targetID: "s1", result: ConfirmResultYes},
+		{name: "unknown mode", mode: "delete_everything", targetID: "s1", result: ConfirmResultYes},
+		{name: "unknown result", mode: ConfirmModeDelete, targetID: "s1", result: "sure"},
+		{name: "empty target", mode: ConfirmModeDelete, targetID: "", result: ConfirmResultYes},
+		{name: "all empty", mode: "", targetID: "", result: ""},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Model{
+				sessions:    []session.Info{{ID: "s1", Description: "one", IsWorktree: true}},
+				cursor:      0,
+				deletingIDs: map[string]bool{},
+				height:      100,
+			}
+			next, cmd := m.dispatchConfirmResult(tt.mode, tt.targetID, tt.result)
+			nm := next.(Model)
+			if (cmd != nil) != tt.wantCmd {
+				t.Errorf("Cmd issued = %v, want %v", cmd != nil, tt.wantCmd)
+			}
+			if nm.deletingIDs["s1"] != tt.wantDeleting {
+				t.Errorf("deletingIDs[s1] = %v, want %v", nm.deletingIDs["s1"], tt.wantDeleting)
+			}
+			if nm.processingMsg != tt.wantProcessing {
+				t.Errorf("processingMsg = %q, want %q", nm.processingMsg, tt.wantProcessing)
+			}
+			if nm.needsReswitch != tt.wantReswitch {
+				t.Errorf("needsReswitch = %v, want %v", nm.needsReswitch, tt.wantReswitch)
+			}
+		})
+	}
+}
+
+// fakeDaemon is a minimal daemon speaking the real protocol over a real Unix
+// socket, so a tea.Cmd built by the Model can be run for its wire effect.
+// Modelled on internal/daemon's fakeServerWith; it lives here because the
+// distinction this pins — which booleans reach daemon.Client.Delete — is not
+// observable in the Model's own state.
+type fakeDaemon struct {
+	mu       sync.Mutex
+	requests []daemon.Request
+}
+
+func startFakeDaemon(t *testing.T) (*fakeDaemon, *daemon.Client) {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "d.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	d := &fakeDaemon{}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			d.serve(conn)
+		}
+	}()
+	return d, daemon.NewClient(sock)
+}
+
+func (d *fakeDaemon) serve(conn net.Conn) {
+	defer conn.Close()
+	var req daemon.Request
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		return
+	}
+	d.mu.Lock()
+	d.requests = append(d.requests, req)
+	d.mu.Unlock()
+
+	resp := daemon.Response{ProtocolVersion: daemon.ProtocolVersion, Success: true}
+	if req.Action == "list" {
+		resp.Data = json.RawMessage("[]")
+	}
+	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+// first returns the request that opened the exchange — the kill or delete.
+// (Both Cmds follow up with a "list" to refresh the model.)
+func (d *fakeDaemon) first(t *testing.T) daemon.Request {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.requests) == 0 {
+		t.Fatal("no request reached the daemon")
+	}
+	return d.requests[0]
+}
+
+// TestConfirmFlagsOnWire pins what each approved answer actually asks the
+// daemon to destroy. removeWorktree and force are invisible in Model state —
+// every delete branch looks identical from the outside — yet force is the flag
+// that discards uncommitted work, so the only place the distinction survives
+// is the request on the socket.
+func TestConfirmFlagsOnWire(t *testing.T) {
+	cases := []struct {
+		name         string
+		mode         string
+		result       string
+		wantAction   string
+		wantWorktree bool
+		wantForce    bool
+	}{
+		{"kill", ConfirmModeKill, ConfirmResultYes, "kill", false, false},
+		{"delete", ConfirmModeDelete, ConfirmResultYes, "delete", false, false},
+		{"worktree prompt, session only", ConfirmModeDeleteWorktree, ConfirmResultYes, "delete", false, false},
+		{"worktree prompt, with worktree", ConfirmModeDeleteWorktree, ConfirmResultWorktree, "delete", true, false},
+		{"force prompt, forced", ConfirmModeDeleteWorktreeForce, ConfirmResultForceYes, "delete", true, true},
+		{"force prompt, declined", ConfirmModeDeleteWorktreeForce, ConfirmResultForceNo, "delete", false, false},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			fake, client := startFakeDaemon(t)
+			m := Model{
+				client:      client,
+				sessions:    []session.Info{{ID: "s1", Description: "one", IsWorktree: true}},
+				deletingIDs: map[string]bool{},
+				height:      100,
+			}
+
+			_, cmd := m.dispatchConfirmResult(tt.mode, "s1", tt.result)
+			if cmd == nil {
+				t.Fatalf("%s/%s issued no Cmd", tt.mode, tt.result)
+			}
+			cmd()
+
+			got := fake.first(t)
+			if got.Action != tt.wantAction {
+				t.Fatalf("action = %q, want %q", got.Action, tt.wantAction)
+			}
+			if got.Action == "kill" {
+				var kr daemon.IDRequest
+				if err := json.Unmarshal(got.Data, &kr); err != nil {
+					t.Fatalf("decode kill request: %v", err)
+				}
+				if kr.ID != "s1" {
+					t.Errorf("kill ID = %q, want s1", kr.ID)
+				}
+				return
+			}
+			var dr daemon.DeleteRequest
+			if err := json.Unmarshal(got.Data, &dr); err != nil {
+				t.Fatalf("decode delete request: %v", err)
+			}
+			if dr.ID != "s1" {
+				t.Errorf("delete ID = %q, want s1", dr.ID)
+			}
+			if dr.RemoveWorktree != tt.wantWorktree {
+				t.Errorf("remove_worktree = %v, want %v", dr.RemoveWorktree, tt.wantWorktree)
+			}
+			if dr.ForceRemoveWorktree != tt.wantForce {
+				t.Errorf("force_remove_worktree = %v, want %v", dr.ForceRemoveWorktree, tt.wantForce)
+			}
+		})
+	}
+}
+
+// TestHandleEnvTick_ConfirmAnswerReachesDaemon walks the whole parent half of
+// the handshake in one go: an answer sitting in the tmux env is drained,
+// routed, and turned into the real delete on the daemon socket.
+//
+// The unit tests around it each pin one link (consumeEnvRequests reads the
+// keys, dispatchConfirmResult picks the branch, TestConfirmFlagsOnWire pins the
+// flags) but none of them pins that the links are connected: with the confirm
+// block deleted from the tick, every one of them still passes and the feature
+// is simply off. This test is the one that notices.
+func TestHandleEnvTick_ConfirmAnswerReachesDaemon(t *testing.T) {
+	fake, client := startFakeDaemon(t)
+	env := map[string]string{
+		EnvConfirmResult:     ConfirmResultWorktree,
+		EnvConfirmMode:       ConfirmModeDeleteWorktree,
+		EnvConfirmTargetID:   "s1",
+		EnvConfirmTargetDesc: "one",
+		// An unresolvable focus request rides along on the same tick, which is
+		// what pins the confirm block's *position*: it makes the fast path below
+		// it take its early return (moveCursorToSession fails on an ID the list
+		// does not have). Reorder the two and the approved delete never reaches
+		// the wire — the tick returns the fetch instead. Without this key the
+		// fast path always succeeds and the ordering is unguarded.
+		"JIN_FOCUS_SESSION": "not-in-list",
+	}
+	var unset []string
+	m := Model{
+		client:      client,
+		sessions:    []session.Info{{ID: "s1", Description: "one", IsWorktree: true}},
+		deletingIDs: map[string]bool{},
+		height:      100,
+	}
+
+	next, cmd := m.handleEnvTick(env, func(key string) {
+		unset = append(unset, key)
+		delete(env, key)
+	})
+	if cmd == nil {
+		t.Fatal("an approved delete waiting in the env produced no Cmd")
+	}
+	if !next.(Model).deletingIDs["s1"] {
+		t.Error("deletingIDs[s1] = false, want true (the list greys the target out while the delete runs)")
+	}
+
+	// The tick re-arms itself alongside the work it dispatched, so the Cmd is
+	// a Batch. Running its members is the only way to tell them apart; one of
+	// them is envTickCmd's 250ms timer, which is why this test is not instant.
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Cmd returned %T, want tea.BatchMsg (the re-armed tick plus the delete)", msg)
+	}
+	for _, c := range batch {
+		c()
+	}
+
+	got := fake.first(t)
+	if got.Action != "delete" {
+		t.Fatalf("action on the wire = %q, want %q", got.Action, "delete")
+	}
+	var dr daemon.DeleteRequest
+	if err := json.Unmarshal(got.Data, &dr); err != nil {
+		t.Fatalf("decode delete request: %v", err)
+	}
+	if dr.ID != "s1" || !dr.RemoveWorktree || dr.ForceRemoveWorktree {
+		t.Errorf("delete request = %+v, want id=s1 remove_worktree=true force=false", dr)
+	}
+	// The answer and its prompt must leave the tmux env on this same tick, or
+	// the next TUI process replays the approval against whatever it finds.
+	assertConsumedSet(t, unset, "JIN_FOCUS_SESSION", EnvConfirmResult, EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc)
 }
 
 func TestCurrentCursorSessionID_Cursor(t *testing.T) {
@@ -1210,63 +1552,403 @@ func TestEnvTickInterval(t *testing.T) {
 	}
 }
 
-// TestEnvTickConsume_FocusSession pins the consume-and-unset contract that
-// the JIN_FOCUS_SESSION branch in the envTickMsg handler (model.go) relies
-// on. The real branch reads through m.tmuxClient, a concrete *tmux.Client
-// that shells out to the tmux binary with no fake injection point, so —
-// like its JIN_CREATED_SESSION / JIN_NOTIFY_SESSION / JIN_ACTION_ID
-// siblings — it cannot be driven end-to-end via Model.Update in a unit
-// test. This test instead exercises the same consume-closure shape against
-// a fake env map, asserting a present value is both returned once and
-// flagged for unset so a stale value isn't reapplied on the next tick.
-func TestEnvTickConsume_FocusSession(t *testing.T) {
-	env := map[string]string{"JIN_FOCUS_SESSION": "sess-xyz"}
-	var unsetKeys []string
-	consume := func(key string) string {
-		v := env[key]
-		if v != "" {
-			unsetKeys = append(unsetKeys, key)
-		}
-		return v
-	}
+// --- confirm handshake env contract ---
 
-	var m Model
-	if id := consume("JIN_FOCUS_SESSION"); id != "" {
-		m.focusSessionID = id
-	}
+// fakeEnvConsumer stands in for the envTick consume closure over a fixed env
+// map: it returns each key's value once, records the read, and drops the key
+// so a second read comes back empty — the same shape as the real closure,
+// which unsets the key on tmux.
+type fakeEnvConsumer struct {
+	env      map[string]string
+	consumed []string
+}
 
-	if m.focusSessionID != "sess-xyz" {
-		t.Errorf("focusSessionID = %q, want %q", m.focusSessionID, "sess-xyz")
+func (f *fakeEnvConsumer) consume(key string) string {
+	v := f.env[key]
+	if v != "" {
+		f.consumed = append(f.consumed, key)
+		delete(f.env, key)
 	}
-	if len(unsetKeys) != 1 || unsetKeys[0] != "JIN_FOCUS_SESSION" {
-		t.Errorf("unset keys = %v, want [JIN_FOCUS_SESSION]", unsetKeys)
+	return v
+}
+
+func TestConsumeEnvRequests_FocusSession(t *testing.T) {
+	f := &fakeEnvConsumer{env: map[string]string{"JIN_FOCUS_SESSION": "sess-xyz"}}
+
+	req := consumeEnvRequests(f.consume)
+
+	if req.focusSessionID != "sess-xyz" {
+		t.Errorf("focusSessionID = %q, want %q", req.focusSessionID, "sess-xyz")
+	}
+	if req.answer.result != "" {
+		t.Errorf("answer.result = %q, want empty (no confirm result in env)", req.answer.result)
+	}
+	if len(f.consumed) != 1 || f.consumed[0] != "JIN_FOCUS_SESSION" {
+		t.Errorf("consumed = %v, want [JIN_FOCUS_SESSION]", f.consumed)
 	}
 }
 
-// TestEnvTickConsume_FocusSession_EmptyIsNoOp mirrors the "value absent"
-// path: consume must not report an unset when the key was never set, and
-// focusSessionID must stay untouched.
-func TestEnvTickConsume_FocusSession_EmptyIsNoOp(t *testing.T) {
-	env := map[string]string{}
-	var unsetKeys []string
-	consume := func(key string) string {
-		v := env[key]
-		if v != "" {
-			unsetKeys = append(unsetKeys, key)
+func TestConsumeEnvRequests_EmptyEnvIsNoOp(t *testing.T) {
+	f := &fakeEnvConsumer{env: map[string]string{}}
+
+	req := consumeEnvRequests(f.consume)
+
+	if req != (envRequests{}) {
+		t.Errorf("consumeEnvRequests on an empty env = %+v, want zero value", req)
+	}
+	if len(f.consumed) != 0 {
+		t.Errorf("consumed = %v, want none", f.consumed)
+	}
+}
+
+// TestConsumeEnvRequests_ConfirmAnswer pins that an answered popup comes back
+// whole and that all four JIN_CONFIRM_* keys leave the tmux env on the same
+// tick. Anything left behind either re-applies on a later tick or mislabels
+// the next prompt, and every result here destroys a session.
+func TestConsumeEnvRequests_ConfirmAnswer(t *testing.T) {
+	f := &fakeEnvConsumer{env: map[string]string{
+		EnvConfirmResult:     ConfirmResultWorktree,
+		EnvConfirmMode:       ConfirmModeDeleteWorktree,
+		EnvConfirmTargetID:   "s1",
+		EnvConfirmTargetDesc: "one",
+	}}
+
+	req := consumeEnvRequests(f.consume)
+
+	want := confirmAnswer{mode: ConfirmModeDeleteWorktree, targetID: "s1", result: ConfirmResultWorktree}
+	if req.answer != want {
+		t.Errorf("answer = %+v, want %+v", req.answer, want)
+	}
+	assertConsumedSet(t, f.consumed, EnvConfirmResult, EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc)
+}
+
+// TestConsumeEnvRequests_FocusAndConfirmSameTick is the ordering invariant:
+// the confirm answer is drained on the same pass as the focus IDs, before the
+// caller's focus handling gets a chance to return early from the tick. Moving
+// the confirm read after that early return would strand an approved
+// destructive request in a tmux server that outlives this TUI process, and the
+// next TUI would replay it.
+func TestConsumeEnvRequests_FocusAndConfirmSameTick(t *testing.T) {
+	f := &fakeEnvConsumer{env: map[string]string{
+		"JIN_FOCUS_SESSION":  "sess-xyz",
+		EnvConfirmResult:     ConfirmResultYes,
+		EnvConfirmMode:       ConfirmModeDelete,
+		EnvConfirmTargetID:   "s1",
+		EnvConfirmTargetDesc: "one",
+	}}
+
+	req := consumeEnvRequests(f.consume)
+
+	if req.focusSessionID != "sess-xyz" {
+		t.Errorf("focusSessionID = %q, want %q", req.focusSessionID, "sess-xyz")
+	}
+	if req.answer.result != ConfirmResultYes {
+		t.Errorf("answer.result = %q, want %q — the confirm answer must not wait for a later tick",
+			req.answer.result, ConfirmResultYes)
+	}
+	assertConsumedSet(t, f.consumed,
+		"JIN_FOCUS_SESSION", EnvConfirmResult, EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc)
+	if len(f.env) != 0 {
+		t.Errorf("keys left in env = %v, want none", f.env)
+	}
+}
+
+// TestConsumeEnvRequests_DismissedPopup covers Ctrl+C: the popup writes no
+// result, so there is nothing to act on and the prompt keys stay put for the
+// next writeConfirmRequest (or the startup clear) to wipe.
+func TestConsumeEnvRequests_DismissedPopup(t *testing.T) {
+	f := &fakeEnvConsumer{env: map[string]string{
+		EnvConfirmMode:       ConfirmModeDelete,
+		EnvConfirmTargetID:   "s1",
+		EnvConfirmTargetDesc: "one",
+	}}
+
+	req := consumeEnvRequests(f.consume)
+
+	if req.answer.result != "" {
+		t.Errorf("answer.result = %q, want empty — a dismissed popup approves nothing", req.answer.result)
+	}
+	if len(f.consumed) != 0 {
+		t.Errorf("consumed = %v, want none", f.consumed)
+	}
+}
+
+func assertConsumedSet(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("consumed = %v, want exactly %v", got, want)
+	}
+	for _, key := range want {
+		if !slices.Contains(got, key) {
+			t.Errorf("consumed = %v, missing %q", got, key)
 		}
-		return v
+	}
+}
+
+// recordingEnv captures the outer-tmux env writes of the confirm handshake in
+// order, standing in for *tmux.Client. It also applies them to env, so a test
+// can ask what an interrupted handshake left behind on the tmux server rather
+// than only what it attempted; failSet / failUnset name a key whose
+// SetEnvironment / UnsetEnvironment fails, standing in for a tmux command that
+// errors mid-handshake. Both halves need a failure injector: the write is
+// fail-closed only if a failed *clear* also stops it, since a clear that gave
+// up early is exactly how a stale key survives into the next request.
+type recordingEnv struct {
+	sessions  []string
+	ops       []envOp
+	env       map[string]string
+	failSet   string
+	failUnset string
+}
+
+type envOp struct {
+	name  string
+	value string
+	unset bool
+}
+
+func (r *recordingEnv) SetEnvironment(session, name, value string) error {
+	r.sessions = append(r.sessions, session)
+	r.ops = append(r.ops, envOp{name: name, value: value})
+	if name == r.failSet {
+		return fmt.Errorf("set-environment %s: refused", name)
+	}
+	if r.env == nil {
+		r.env = map[string]string{}
+	}
+	r.env[name] = value
+	return nil
+}
+
+func (r *recordingEnv) UnsetEnvironment(session, name string) error {
+	r.sessions = append(r.sessions, session)
+	r.ops = append(r.ops, envOp{name: name, unset: true})
+	if name == r.failUnset {
+		return fmt.Errorf("set-environment -u %s: refused", name)
+	}
+	delete(r.env, name)
+	return nil
+}
+
+// TestWriteConfirmRequest_ClearsEverythingFirst is the pairing guarantee: the
+// whole handshake must be gone before any of this prompt's values land. An
+// unconsumed answer would otherwise pair with the target being written here,
+// and a dismissed prompt's leftovers (Ctrl+C writes no result, so its mode and
+// target stay put by design) would survive a partial write and pair with it.
+func TestWriteConfirmRequest_ClearsEverythingFirst(t *testing.T) {
+	r := &recordingEnv{}
+
+	if err := writeConfirmRequest(r, confirmRequest{mode: ConfirmModeKill, targetID: "s1", targetDesc: "one"}); err != nil {
+		t.Fatalf("writeConfirmRequest: %v", err)
 	}
 
-	m := Model{focusSessionID: "unchanged"}
-	if id := consume("JIN_FOCUS_SESSION"); id != "" {
-		m.focusSessionID = id
+	var cleared []string
+	for _, op := range r.ops {
+		if !op.unset {
+			break
+		}
+		cleared = append(cleared, op.name)
+	}
+	for _, key := range []string{EnvConfirmResult, EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc} {
+		if !slices.Contains(cleared, key) {
+			t.Errorf("%s was not unset before the first value landed (leading unsets: %v)", key, cleared)
+		}
+	}
+	for _, s := range r.sessions {
+		if s != tmux.SessionName {
+			t.Errorf("wrote to tmux session %q, want %q", s, tmux.SessionName)
+		}
+	}
+}
+
+// TestWriteConfirmRequest_Values pins each field to its own key. A swap here
+// shows the user one session's name while dispatchConfirmResult deletes
+// another, and both prompt and answer look internally consistent.
+func TestWriteConfirmRequest_Values(t *testing.T) {
+	r := &recordingEnv{}
+
+	if err := writeConfirmRequest(r, confirmRequest{
+		mode:       ConfirmModeDeleteWorktree,
+		targetID:   "3f9c-id",
+		targetDesc: "my-session",
+	}); err != nil {
+		t.Fatalf("writeConfirmRequest: %v", err)
 	}
 
-	if m.focusSessionID != "unchanged" {
-		t.Errorf("focusSessionID = %q, want unchanged", m.focusSessionID)
+	want := map[string]string{
+		EnvConfirmMode:       ConfirmModeDeleteWorktree,
+		EnvConfirmTargetID:   "3f9c-id",
+		EnvConfirmTargetDesc: "my-session",
 	}
-	if len(unsetKeys) != 0 {
-		t.Errorf("unset keys = %v, want none", unsetKeys)
+	if !maps.Equal(r.env, want) {
+		t.Errorf("env after write = %v, want %v", r.env, want)
+	}
+}
+
+// TestWriteConfirmRequest_PartialWriteLeavesNothingStale is the fail-closed
+// property, driven through the exact sequence that made it necessary: a prompt
+// for session A was dismissed with Ctrl+C, so A's mode and target are still in
+// the tmux env, and the write for session B fails halfway. Without the leading
+// clear (or with the errors discarded) the env ends up naming B while carrying
+// A's ID, and the popup asks about a session the user can see while the answer
+// destroys one they cannot.
+//
+// The env must come out empty, not merely free of A: the error is what stops
+// openConfirmPopup from showing the popup, so whatever landed before the
+// failure is a request nobody will ever answer — and one a later tick, or a
+// hand-run `jin confirm-popup`, could still pick up.
+func TestWriteConfirmRequest_PartialWriteLeavesNothingStale(t *testing.T) {
+	for _, failKey := range []string{EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc} {
+		t.Run("fails on "+failKey, func(t *testing.T) {
+			r := &recordingEnv{
+				env: map[string]string{
+					EnvConfirmMode:       ConfirmModeDeleteWorktree,
+					EnvConfirmTargetID:   "session-A",
+					EnvConfirmTargetDesc: "A",
+				},
+				failSet: failKey,
+			}
+
+			err := writeConfirmRequest(r, confirmRequest{
+				mode:       ConfirmModeDelete,
+				targetID:   "session-B",
+				targetDesc: "B",
+			})
+
+			if err == nil {
+				t.Fatal("writeConfirmRequest = nil, want the failed SetEnvironment propagated")
+			}
+			if len(r.env) != 0 {
+				t.Errorf("env after a failed write = %v, want empty — neither A's prompt nor B's fragments may survive", r.env)
+			}
+		})
+	}
+}
+
+// TestWriteConfirmRequest_FailedClearWritesNothing covers the other way the
+// handshake can be interrupted: the wipe itself fails. The clear is what turns
+// a partial write into empty keys rather than a previous prompt's, so once it
+// has failed there is no safe value left to write — writing the new mode on top
+// of an unclearable old target is exactly the splice
+// TestWriteConfirmRequest_PartialWriteLeavesNothingStale exists to prevent.
+// Every key is still attempted, since each one left set is a usable fragment.
+//
+// The returned error is also what keeps openConfirmPopup from opening a popup
+// over a half-cleared env: a prompt this process could not publish in full must
+// not be shown.
+func TestWriteConfirmRequest_FailedClearWritesNothing(t *testing.T) {
+	r := &recordingEnv{
+		env: map[string]string{
+			EnvConfirmMode:       ConfirmModeDeleteWorktree,
+			EnvConfirmTargetID:   "session-A",
+			EnvConfirmTargetDesc: "A",
+		},
+		failUnset: EnvConfirmTargetID,
+	}
+
+	err := writeConfirmRequest(r, confirmRequest{
+		mode:       ConfirmModeDelete,
+		targetID:   "session-B",
+		targetDesc: "B",
+	})
+
+	if err == nil {
+		t.Fatal("writeConfirmRequest = nil, want the failed UnsetEnvironment propagated")
+	}
+	for _, op := range r.ops {
+		if !op.unset {
+			t.Errorf("wrote %s=%q after a failed clear, want no writes at all", op.name, op.value)
+		}
+	}
+	unset := map[string]bool{}
+	for _, op := range r.ops {
+		if op.unset {
+			unset[op.name] = true
+		}
+	}
+	for _, key := range []string{EnvConfirmResult, EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc} {
+		if !unset[key] {
+			t.Errorf("%s was never attempted — a clear that stops at the first failure leaves fragments", key)
+		}
+	}
+}
+
+// TestClearConfirmEnv_UnsetsEverything guards the wipe: a key it forgets is a
+// prompt or an approval that outlives whatever it was written for — the outer
+// tmux server outlives the TUI process, so a survivor can be paired with a
+// later request or replayed by the next run.
+func TestClearConfirmEnv_UnsetsEverything(t *testing.T) {
+	r := &recordingEnv{}
+
+	if err := clearConfirmEnv(r, confirmEnvKeys); err != nil {
+		t.Fatalf("clearConfirmEnv: %v", err)
+	}
+
+	unset := map[string]bool{}
+	for _, op := range r.ops {
+		if !op.unset {
+			t.Errorf("clearConfirmEnv set %s=%q, want unsets only", op.name, op.value)
+			continue
+		}
+		unset[op.name] = true
+	}
+	for _, key := range []string{EnvConfirmResult, EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc} {
+		if !unset[key] {
+			t.Errorf("%s was not unset", key)
+		}
+	}
+}
+
+// TestStaleConfirmKeys is the startup wipe's key selection: whatever the
+// snapshot holds gets unset, and nothing else is touched. The narrowing is only
+// safe because an absent key and an unset one are the same state — so what this
+// pins is that every present key is returned, including a lone leftover.
+func TestStaleConfirmKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want []string
+	}{
+		{"clean startup", map[string]string{"JIN_CURRENT_SESSION": "s1"}, nil},
+		{"nil env", nil, nil},
+		{
+			// A prompt dismissed with Ctrl+C in a previous run: no result, but
+			// enough left behind for a hand-run popup to ask about it.
+			name: "dismissed prompt",
+			env: map[string]string{
+				EnvConfirmMode:       ConfirmModeDelete,
+				EnvConfirmTargetID:   "s1",
+				EnvConfirmTargetDesc: "one",
+			},
+			want: []string{EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc},
+		},
+		{
+			// The dangerous one: an approval the previous run never got to
+			// consume, which this run's first envTick would carry out.
+			name: "unconsumed answer",
+			env: map[string]string{
+				EnvConfirmResult:     ConfirmResultYes,
+				EnvConfirmMode:       ConfirmModeKill,
+				EnvConfirmTargetID:   "s1",
+				EnvConfirmTargetDesc: "one",
+			},
+			want: confirmEnvKeys,
+		},
+		{"result alone", map[string]string{EnvConfirmResult: ConfirmResultYes}, []string{EnvConfirmResult}},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := staleConfirmKeys(tt.env)
+			if len(got) != len(tt.want) {
+				t.Fatalf("staleConfirmKeys = %v, want %v", got, tt.want)
+			}
+			for _, key := range tt.want {
+				if !slices.Contains(got, key) {
+					t.Errorf("staleConfirmKeys = %v, missing %q", got, key)
+				}
+			}
+		})
 	}
 }
 

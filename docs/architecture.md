@@ -70,7 +70,7 @@ matched-field list.
 Every popup opened by jind-ai has its width and height resolved from a
 single config schema. Two delivery paths carry the resolved size to tmux:
 
-**Core popups** (`create`, `session_filter`, `help`, `action`):
+**Core popups** (`create`, `session_filter`, `help`, `action`, `confirm`):
 
 ```
 Model.openPopup(name)                  cmd/jin/cmd/tui.go
