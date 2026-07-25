@@ -562,24 +562,32 @@ func TestCardHeight(t *testing.T) {
 
 // --- viewport scroll ---
 
-// TestAdjustScrollForCursor verifies the viewport follows the cursor.
-// The available content area for these tests is small so we can watch the
-// scroll offset track the cursor's card position.
-func TestAdjustScrollForCursor(t *testing.T) {
-	// 10 base cards (3 lines each) + 1 fleet header = 31 lines total.
-	sessions := make([]session.Info, 10)
+// cardListModel builds a model holding n base cards (3 lines each). The
+// rendered layout is one fleet header row followed by the cards, so card i
+// spans lines [1+3i, 3+3i] and the whole list is 1+3n lines. The pane height
+// leaves 9 usable rows, small enough to watch the viewport move.
+//
+// Every card-geometry test below is calibrated to those numbers — if
+// cardHeight or the header layout changes, the hand-computed constants in
+// those tests move together.
+func cardListModel(n int) Model {
+	sessions := make([]session.Info, n)
 	for i := range sessions {
 		sessions[i] = session.Info{ID: string(rune('0' + i)), Description: "s"}
 	}
+	return Model{
+		sessions:    sessions,
+		height:      10, // contentAreaLines() → 10-1 = 9 usable
+		deletingIDs: map[string]bool{},
+	}
+}
 
+// TestAdjustScrollForCursor verifies the viewport follows the cursor.
+func TestAdjustScrollForCursor(t *testing.T) {
 	newModel := func(cursor int) *Model {
-		m := &Model{
-			sessions:    sessions,
-			height:      10, // contentAreaLines() → 10-1 = 9 usable
-			cursor:      cursor,
-			deletingIDs: map[string]bool{},
-		}
-		return m
+		m := cardListModel(10)
+		m.cursor = cursor
+		return &m
 	}
 
 	t.Run("cursor on first card keeps scroll at 0", func(t *testing.T) {
@@ -621,6 +629,183 @@ func TestAdjustScrollForCursor(t *testing.T) {
 		m.clampScroll()
 		if m.scrollOffset != 0 {
 			t.Errorf("clampScroll from negative = %d, want 0", m.scrollOffset)
+		}
+	})
+}
+
+// --- mouse hit-testing ---
+
+func TestSessionIndexAtLine(t *testing.T) {
+	m := cardListModel(10)
+
+	tests := []struct {
+		name    string
+		line    int
+		wantIdx int
+		wantOK  bool
+	}{
+		{name: "negative line", line: -1, wantOK: false},
+		{name: "fleet header row", line: 0, wantOK: false},
+		{name: "first line of first card", line: 1, wantIdx: 0, wantOK: true},
+		{name: "trailing spacer belongs to its card", line: 3, wantIdx: 0, wantOK: true},
+		{name: "first line of second card", line: 4, wantIdx: 1, wantOK: true},
+		{name: "last card", line: 30, wantIdx: 9, wantOK: true},
+		{name: "past the last card", line: 31, wantOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx, ok := m.sessionIndexAtLine(tt.line)
+			if ok != tt.wantOK {
+				t.Fatalf("sessionIndexAtLine(%d) ok = %v, want %v", tt.line, ok, tt.wantOK)
+			}
+			if ok && idx != tt.wantIdx {
+				t.Errorf("sessionIndexAtLine(%d) = %d, want %d", tt.line, idx, tt.wantIdx)
+			}
+		})
+	}
+}
+
+func TestSessionIndexAtRow(t *testing.T) {
+	// contentAreaLines() → 9 rows, so rows 0..8 are live.
+	newModel := func() *Model {
+		m := cardListModel(10)
+		return &m
+	}
+
+	t.Run("row maps straight through at scroll 0", func(t *testing.T) {
+		m := newModel()
+		if idx, ok := m.sessionIndexAtRow(4); !ok || idx != 1 {
+			t.Errorf("sessionIndexAtRow(4) = (%d, %v), want (1, true)", idx, ok)
+		}
+	})
+
+	t.Run("row below the content area misses", func(t *testing.T) {
+		m := newModel()
+		if _, ok := m.sessionIndexAtRow(9); ok {
+			t.Error("sessionIndexAtRow(9) should miss: content area is rows 0..8")
+		}
+	})
+
+	t.Run("scroll offset shifts the mapping", func(t *testing.T) {
+		m := newModel()
+		m.scrollOffset = 7
+		// Row 0 → line 7, which is the first line of card 2.
+		if idx, ok := m.sessionIndexAtRow(0); !ok || idx != 2 {
+			t.Errorf("sessionIndexAtRow(0) at offset 7 = (%d, %v), want (2, true)", idx, ok)
+		}
+	})
+
+	t.Run("error notice pushes the card area down", func(t *testing.T) {
+		m := newModel()
+		m.err = errors.New("boom")
+		// Rows 0..1 are the error line + spacer; row 2 is the fleet header.
+		if _, ok := m.sessionIndexAtRow(1); ok {
+			t.Error("sessionIndexAtRow(1) should miss while an error notice is shown")
+		}
+		if idx, ok := m.sessionIndexAtRow(3); !ok || idx != 0 {
+			t.Errorf("sessionIndexAtRow(3) with error = (%d, %v), want (0, true)", idx, ok)
+		}
+	})
+}
+
+// --- mouse input ---
+
+func TestHandleMouseWheel(t *testing.T) {
+	newModel := func() Model { return cardListModel(10) } // 31 lines total, 9 visible
+
+	wheel := func(m Model, button tea.MouseButton) Model {
+		got, _ := m.handleMouse(tea.MouseMsg{Y: 4, Button: button, Action: tea.MouseActionPress})
+		return got.(Model)
+	}
+
+	t.Run("wheel down scrolls the viewport without moving the cursor", func(t *testing.T) {
+		m := wheel(newModel(), tea.MouseButtonWheelDown)
+		if m.scrollOffset != wheelScrollLines {
+			t.Errorf("scrollOffset = %d, want %d", m.scrollOffset, wheelScrollLines)
+		}
+		if m.cursor != 0 {
+			t.Errorf("cursor = %d, want 0 (wheel must not move the cursor)", m.cursor)
+		}
+	})
+
+	t.Run("wheel up at the top stays clamped at 0", func(t *testing.T) {
+		m := wheel(newModel(), tea.MouseButtonWheelUp)
+		if m.scrollOffset != 0 {
+			t.Errorf("scrollOffset = %d, want 0", m.scrollOffset)
+		}
+	})
+
+	t.Run("wheel down at the bottom stays clamped", func(t *testing.T) {
+		m := newModel()
+		m.scrollOffset = 22 // totalCardLines(31) - contentAreaLines(9)
+		m = wheel(m, tea.MouseButtonWheelDown)
+		if m.scrollOffset != 22 {
+			t.Errorf("scrollOffset = %d, want 22 (clamped at the last page)", m.scrollOffset)
+		}
+	})
+}
+
+func TestHandleMouseLeftClick(t *testing.T) {
+	click := func(m Model, y int) Model {
+		got, _ := m.handleMouse(tea.MouseMsg{Y: y, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+		return got.(Model)
+	}
+
+	newModel := func() Model { return cardListModel(10) }
+
+	t.Run("click on a card moves the cursor there", func(t *testing.T) {
+		// Row 4 → line 4 → first line of card 1.
+		if m := click(newModel(), 4); m.cursor != 1 {
+			t.Errorf("cursor = %d, want 1", m.cursor)
+		}
+	})
+
+	t.Run("click on the fleet header leaves the cursor alone", func(t *testing.T) {
+		m := newModel()
+		m.cursor = 3
+		if got := click(m, 0); got.cursor != 3 {
+			t.Errorf("cursor = %d, want 3 (header row is not selectable)", got.cursor)
+		}
+	})
+
+	t.Run("click below the last card leaves the cursor alone", func(t *testing.T) {
+		m := newModel()
+		m.sessions = cardListModel(1).sessions // header + 3 lines = 4 lines of content
+		m.cursor = 0
+		if got := click(m, 6); got.cursor != 0 {
+			t.Errorf("cursor = %d, want 0 (empty space is not selectable)", got.cursor)
+		}
+	})
+
+	t.Run("click on a deleting card is ignored", func(t *testing.T) {
+		m := newModel()
+		m.deletingIDs = map[string]bool{"1": true}
+		if got := click(m, 4); got.cursor != 0 {
+			t.Errorf("cursor = %d, want 0 (deleting cards are not selectable)", got.cursor)
+		}
+	})
+
+	t.Run("release and drag events do not select", func(t *testing.T) {
+		for _, action := range []tea.MouseAction{tea.MouseActionRelease, tea.MouseActionMotion} {
+			m := newModel()
+			got, _ := m.handleMouse(tea.MouseMsg{Y: 4, Button: tea.MouseButtonLeft, Action: action})
+			if got.(Model).cursor != 0 {
+				t.Errorf("cursor moved on %v; only press should select", action)
+			}
+		}
+	})
+
+	t.Run("click dismisses a transient warning", func(t *testing.T) {
+		m := newModel()
+		m.warning = "hook not allowlisted"
+		// The warning occupies rows 0..1, so the card area starts at row 2:
+		// row 3 is the first line of card 0.
+		got := click(m, 3)
+		if got.warning != "" {
+			t.Errorf("warning = %q, want empty after a click", got.warning)
+		}
+		if got.cursor != 0 {
+			t.Errorf("cursor = %d, want 0", got.cursor)
 		}
 	})
 }

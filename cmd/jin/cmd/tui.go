@@ -557,7 +557,10 @@ func runTUIInner() error {
 
 	model := tui.NewModelWithTmux(client, tc, innerTC, tuiPaneID, displayPaneID)
 
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithReportFocus())
+	// Cell-motion is the cheapest mouse mode Bubble Tea offers that still
+	// reports button presses and wheel notches. Trade-off: while the TUI pane
+	// owns the mouse, terminal drag-to-select there needs Shift held.
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithReportFocus(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		return err
 	}

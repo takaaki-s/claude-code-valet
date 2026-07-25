@@ -241,18 +241,28 @@ func NewModelWithTmux(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID
 	return m
 }
 
+// noticeLines returns how many rows the error / warning notices occupy above
+// the scrollable card area. Kept in sync with renderListContent's prologue by
+// construction — if the notices change shape there, change the counts here in
+// the same commit. Sole owner of that arithmetic: the card area's height
+// (contentAreaLines) and its first row (mouse hit-testing) both derive from it,
+// so a layout change cannot desync them.
+func (m *Model) noticeLines() int {
+	rows := 0
+	if m.err != nil {
+		rows += 2 // "Error: ..." + blank
+	}
+	if m.warning != "" {
+		rows += 2 // "⚠ ..." + blank
+	}
+	return rows
+}
+
 // contentAreaLines returns the number of lines available for the scrollable
 // card area — the pane height minus error / warning rows when active.
 func (m *Model) contentAreaLines() int {
 	// Pane holds (m.height - 1) rows (the extra row is the outer help line).
-	avail := m.height - 1
-	if m.err != nil {
-		avail -= 2 // "Error: ..." + blank
-	}
-	if m.warning != "" {
-		avail -= 2 // "⚠ ..." + blank
-	}
-	return max(avail, 3)
+	return max(m.height-1-m.noticeLines(), 3)
 }
 
 // pageScrollLines returns how many lines PageUp / PageDown scrolls the
@@ -347,6 +357,15 @@ func (m *Model) adjustScrollForCursor() {
 	m.clampScroll()
 }
 
+// scrollBy moves the viewport by lines (negative = towards the top), clamped
+// to the content bounds. The cursor deliberately stays put — every scroll-only
+// input (PageUp / PageDown, wheel) shares that contract, so looking around
+// never changes what the next action targets.
+func (m *Model) scrollBy(lines int) {
+	m.scrollOffset += lines
+	m.clampScroll()
+}
+
 // clampScroll bounds scrollOffset into [0, max(0, totalCardLines-avail)].
 // Call after any change that shrinks or grows the content (session list
 // change, filter toggle, window resize).
@@ -361,6 +380,40 @@ func (m *Model) clampScroll() {
 	if m.scrollOffset < 0 {
 		m.scrollOffset = 0
 	}
+}
+
+// sessionIndexAtLine is the inverse of sessionCardTop: it maps a line offset
+// inside the scrollable card area to the display-index of the session whose
+// card covers that line. Fleet header rows belong to no session and report
+// false, as does any line past the last card. A card's trailing blank spacer
+// counts as part of the card (cardHeight includes it), so clicking the gap
+// under a card hits that card rather than falling into a dead zone.
+//
+// Implemented by scanning sessionCardTop rather than re-walking the groups, so
+// the layout is described in exactly one place. Card tops ascend with the
+// index, which is what lets the scan stop early.
+func (m *Model) sessionIndexAtLine(line int) (int, bool) {
+	for i := range m.getDisplaySessions() {
+		top, height := m.sessionCardTop(i)
+		if top < 0 || top > line {
+			break
+		}
+		if line < top+height {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// sessionIndexAtRow maps a mouse event's pane-relative row to the
+// display-index of the session drawn there, accounting for the notice rows
+// above the card area and the current scroll offset.
+func (m *Model) sessionIndexAtRow(y int) (int, bool) {
+	top := m.noticeLines()
+	if y < top || y >= top+m.contentAreaLines() {
+		return 0, false
+	}
+	return m.sessionIndexAtLine(y - top + m.scrollOffset)
 }
 
 // getDisplaySessions returns the sessions to display.
@@ -774,20 +827,71 @@ func (m Model) handleSelectSession() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// cursorSession returns the session under the cursor. The bool is false when
-// there is nothing actionable there: empty list, cursor out of range, or a
+// wheelScrollLines is how many lines one wheel notch moves the card viewport.
+// Three is the conventional terminal step and keeps part of a card in view
+// across a notch, so the list never jumps without a reference row.
+const wheelScrollLines = 3
+
+// handleMouse handles pointer input over the session list: the wheel scrolls,
+// a left click selects the card under the pointer as if the user had moved
+// there and pressed Enter. A click on a fleet header, on empty space, or on a
+// session being deleted does nothing — unlike keyboard movement, which slides
+// past deleting cards, a click names one specific target.
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.scrollBy(-wheelScrollLines)
+		return m, nil
+
+	case tea.MouseButtonWheelDown:
+		m.scrollBy(wheelScrollLines)
+		return m, nil
+
+	case tea.MouseButtonLeft:
+		// Press only: drag-motion and release events carry the same button and
+		// would otherwise re-fire the selection.
+		if msg.Action != tea.MouseActionPress {
+			return m, nil
+		}
+		// Hit-test before touching m.warning — clearing it shifts the card area
+		// up two rows, and the user aimed at the layout they could see.
+		idx, ok := m.sessionIndexAtRow(msg.Y)
+		if !ok {
+			return m, nil
+		}
+		if _, ok := m.sessionAt(idx); !ok {
+			return m, nil
+		}
+		m.warning = ""
+		m.cursor = idx
+		m.adjustScrollForCursor()
+		m.writeCursorEnv()
+		return m.handleSelectSession()
+	}
+	return m, nil
+}
+
+// sessionAt returns the session at a display-index. The bool is false when
+// there is nothing actionable there: empty list, index out of range, or a
 // target already transitioning away (being deleted). Every caller that acts on
-// "the selected session" goes through this so the guards cannot drift apart.
-func (m Model) cursorSession() (session.Info, bool) {
+// "some selected session" goes through this so the guards cannot drift apart —
+// the cursor via cursorSession, the pointer via handleMouse.
+func (m Model) sessionAt(idx int) (session.Info, bool) {
 	ps := m.getDisplaySessions()
-	if m.cursor < 0 || m.cursor >= len(ps) {
+	if idx < 0 || idx >= len(ps) {
 		return session.Info{}, false
 	}
-	sess := ps[m.cursor]
+	sess := ps[idx]
 	if m.deletingIDs[sess.ID] {
 		return session.Info{}, false
 	}
 	return sess, true
+}
+
+// cursorSession returns the session under the cursor, or false when there is
+// nothing actionable there (see sessionAt).
+func (m Model) cursorSession() (session.Info, bool) {
+	return m.sessionAt(m.cursor)
 }
 
 // currentCursorSessionID returns the session ID under the cursor, or "" when
@@ -1386,10 +1490,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Ignore key input while processing, only handle completion messages
+	// Ignore user input while processing, only handle completion messages
 	if m.processingMsg != "" {
 		switch msg.(type) {
-		case tea.KeyMsg:
+		case tea.KeyMsg, tea.MouseMsg:
 			return m, nil
 		}
 	}
@@ -1399,6 +1503,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tea.KeyMsg:
 		// Dismiss any transient warning on the first key press.
 		m.warning = ""
@@ -1446,14 +1553,12 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleHelp()
 
 		case key.Matches(msg, m.keys.PrevPage):
-			m.scrollOffset -= m.pageScrollLines()
-			m.clampScroll()
+			m.scrollBy(-m.pageScrollLines())
 			m.writeCursorEnv()
 			return m, nil
 
 		case key.Matches(msg, m.keys.NextPage):
-			m.scrollOffset += m.pageScrollLines()
-			m.clampScroll()
+			m.scrollBy(m.pageScrollLines())
 			m.writeCursorEnv()
 			return m, nil
 

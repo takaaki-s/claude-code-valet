@@ -74,6 +74,8 @@ func (m HelpModel) View() string {
 	writeBinding(&b, keyStyle, descStyle, k.Down)
 	writeBinding(&b, keyStyle, descStyle, k.PrevPage)
 	writeBinding(&b, keyStyle, descStyle, k.NextPage)
+	writeShortcut(&b, keyStyle, descStyle, "click", "select session")
+	writeShortcut(&b, keyStyle, descStyle, "wheel", "scroll list")
 	b.WriteString("\n")
 
 	b.WriteString(sectionStyle.Render("Actions"))
