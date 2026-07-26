@@ -17,6 +17,22 @@ Common pitfalls and caveats that agents tend to fall into.
 - **base-index issue**: If `base-index=1` is set in the user's `~/.tmux.conf`,
   the `:0.0` target becomes invalid. Use pane IDs (`%N`) instead.
 
+- **Pane options survive `respawn-pane`.** `respawn-pane -k` replaces the
+  process and `clear-history -H` wipes the screen, but neither resets
+  pane-scoped options. `tmux.PaneLabelOption` feeds `pane-border-format`, so a
+  pane emptied without clearing it keeps the old session's name on its border.
+  Reset it alongside every respawn — `Model.clearDisplayedSession`
+  (`internal/tui/model.go`, the inverse of `recordDisplayedSession`) and
+  `reattachTmux` (`cmd/jin/cmd/tui.go`) are the two places that do.
+
+- **A delete finalizes after the daemon has answered.** `handleDelete` accepts
+  the request once `PreCheckDelete` passes and does the worktree removal and
+  `kill-session` on a background goroutine. Anything still attached to the
+  target keeps displaying it for that whole window — and then displays the dead
+  frame `tmux attach` leaves behind. The TUI moves the display pane off the
+  target at request time (`Model.deleteSession`), not when the record finally
+  disappears from `List`.
+
 ## Session send
 
 - **`SendPrompt` verifies keystrokes landed before pressing Enter.**
@@ -269,6 +285,13 @@ Common pitfalls and caveats that agents tend to fall into.
 - **Test coverage is ~40%**. Test files exist for all packages.
   Uses only the standard library (no testify, etc.). Add tests for new code.
   The `tmux.Runner` interface was introduced for testability.
+
+- **`make test-e2e` covers two packages**, `./test/e2e/` and `./internal/tui/`.
+  The TUI's tmux-backed tests (`model_tmux_e2e_test.go`, build tag `e2e`) drive
+  unexported `Model` methods against a real outer tmux, so they cannot live in
+  the external `e2e` package. `go test ./...` does not build them, and the plain
+  unit CI job has no tmux — the `e2e` job runs `make test-e2e`, so the package
+  list only ever has to be edited in the Makefile.
 
 ## Concurrency
 

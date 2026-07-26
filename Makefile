@@ -47,8 +47,11 @@ test:
 test-short:
 	go test -short -v ./...
 
+# Sole owner of the e2e package list — the CI job runs this target rather than
+# repeating it. internal/tui is in there because the TUI's tmux-backed tests
+# drive unexported Model methods and cannot live in ./test/e2e/.
 test-e2e:
-	go test -tags e2e -v ./test/e2e/
+	go test -tags e2e -v -timeout 120s ./test/e2e/ ./internal/tui/
 
 test-race:
 	go test -race ./...

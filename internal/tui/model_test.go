@@ -1672,6 +1672,174 @@ func TestHandleEnvTick_ConfirmAnswerReachesDaemon(t *testing.T) {
 	assertConsumedSet(t, unset, "JIN_FOCUS_SESSION", EnvConfirmResult, EnvConfirmMode, EnvConfirmTargetID, EnvConfirmTargetDesc)
 }
 
+// --- display-pane hand-off around delete ---
+//
+// These pin the state machine that drives the pane off a session being
+// deleted. The tmux-side half (resetting the pane label) needs a live server
+// and lives in model_tmux_e2e_test.go; see docs/gotchas.md for why both
+// halves are needed.
+
+// TestDeleteSession_MovesDisplayOffTarget pins that the pane stops claiming a
+// session at the moment the delete is issued, not a poll after it lands.
+func TestDeleteSession_MovesDisplayOffTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		sessions []session.Info
+		shown    string
+		want     string
+	}{
+		{
+			name:     "deleting the only session drops the pane to the placeholder",
+			sessions: []session.Info{{ID: "s1", Description: "one"}},
+			shown:    "s1",
+			want:     placeholderSessionID,
+		},
+		{
+			name: "deleting the shown session hands the pane to the survivor",
+			sessions: []session.Info{
+				{ID: "s1", Description: "one"},
+				{ID: "s2", Description: "two", Status: session.StatusIdle, TmuxWindowName: "jin-s2"},
+			},
+			shown: "s1",
+			// switchToSession is a no-op without an outer tmux client, so the
+			// observable part here is only that the pane stopped claiming s1.
+			want: "",
+		},
+		{
+			name: "deleting a session the pane is not showing leaves it alone",
+			sessions: []session.Info{
+				{ID: "s1", Description: "one"},
+				{ID: "s2", Description: "two", Status: session.StatusIdle, TmuxWindowName: "jin-s2"},
+			},
+			shown: "s2",
+			want:  "s2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, client := startFakeDaemon(t)
+			m := Model{
+				client:           client,
+				sessions:         tt.sessions,
+				cursor:           0,
+				deletingIDs:      map[string]bool{},
+				height:           100,
+				currentSessionID: tt.shown,
+			}
+			next, cmd := m.deleteSession("s1", false, false)
+			if cmd == nil {
+				t.Fatal("deleteSession issued no Cmd")
+			}
+			if got := next.(Model).currentSessionID; got != tt.want {
+				t.Errorf("currentSessionID = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestShowCursorSession_PlaceholderWhenCursorHasNoTarget covers the two ways
+// the cursor can point at nothing attachable. The second one is the reason the
+// deleting check cannot be dropped: without it the pane re-attaches to the
+// session the daemon is in the middle of tearing down.
+func TestShowCursorSession_PlaceholderWhenCursorHasNoTarget(t *testing.T) {
+	tests := []struct {
+		name        string
+		sessions    []session.Info
+		deletingIDs map[string]bool
+	}{
+		{
+			name:        "empty list",
+			sessions:    nil,
+			deletingIDs: map[string]bool{},
+		},
+		{
+			name:        "the only session is being deleted",
+			sessions:    []session.Info{{ID: "s1", Description: "one"}},
+			deletingIDs: map[string]bool{"s1": true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Model{
+				sessions:         tt.sessions,
+				cursor:           0,
+				deletingIDs:      tt.deletingIDs,
+				height:           100,
+				currentSessionID: "s1",
+			}
+			m.showCursorSession(false)
+			if m.currentSessionID != placeholderSessionID {
+				t.Errorf("currentSessionID = %q, want %q", m.currentSessionID, placeholderSessionID)
+			}
+		})
+	}
+}
+
+// TestDisplaysLiveSession pins the predicate the sessionsMsg tail uses to
+// decide whether the pane needs re-pointing. The placeholder case is the one
+// that keeps a re-attach possible: treat the sentinel as "live" and a session
+// created after the list went empty would never reach the pane.
+func TestDisplaysLiveSession(t *testing.T) {
+	sessions := []session.Info{{ID: "s1"}, {ID: "s2"}}
+	tests := []struct {
+		name  string
+		shown string
+		want  bool
+	}{
+		{"showing a session still in the list", "s1", true},
+		{"showing a session that vanished", "gone", false},
+		{"showing the placeholder", placeholderSessionID, false},
+		{"nothing decided yet", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Model{sessions: sessions, currentSessionID: tt.shown}
+			if got := m.displaysLiveSession(); got != tt.want {
+				t.Errorf("displaysLiveSession() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSessionsMsg_LastDeleteSettlesOnPlaceholder walks the tail of the flow:
+// the record is gone from the list, so the grey-out clears and the pane must
+// end on the placeholder rather than still naming the session that just left.
+func TestSessionsMsg_LastDeleteSettlesOnPlaceholder(t *testing.T) {
+	m := Model{
+		sessions:         []session.Info{{ID: "s1", Description: "one"}},
+		cursor:           0,
+		deletingIDs:      map[string]bool{"s1": true},
+		height:           100,
+		currentSessionID: "s1",
+	}
+	next, _ := m.updateListMode(sessionsMsg(nil))
+	nm := next.(Model)
+	if nm.currentSessionID != placeholderSessionID {
+		t.Errorf("currentSessionID = %q, want %q", nm.currentSessionID, placeholderSessionID)
+	}
+	if len(nm.deletingIDs) != 0 {
+		t.Errorf("deletingIDs = %v, want empty (the record is gone)", nm.deletingIDs)
+	}
+}
+
+// TestSessionsMsg_PlaceholderReattachesWhenSessionAppears guards the recovery
+// direction: the sentinel must not be sticky, or the pane stays blank forever
+// after the list has been emptied once.
+func TestSessionsMsg_PlaceholderReattachesWhenSessionAppears(t *testing.T) {
+	m := Model{
+		cursor:           0,
+		deletingIDs:      map[string]bool{},
+		height:           100,
+		currentSessionID: placeholderSessionID,
+	}
+	next, _ := m.updateListMode(sessionsMsg([]session.Info{
+		{ID: "s1", Description: "one", Status: session.StatusIdle, TmuxWindowName: "jin-s1"},
+	}))
+	if got := next.(Model).currentSessionID; got == placeholderSessionID {
+		t.Error("currentSessionID stayed on the placeholder; a new session never reaches the pane")
+	}
+}
+
 func TestCurrentCursorSessionID_Cursor(t *testing.T) {
 	m := Model{
 		sessions: []session.Info{

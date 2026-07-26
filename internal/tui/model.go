@@ -28,6 +28,11 @@ import (
 const maxTUIWidth = 50
 const minTUIWidth = 30
 
+// placeholderSessionID is the sentinel currentSessionID carries while the
+// display pane shows the placeholder rather than a session. The leading "_"
+// keeps it out of the session-ID namespace (UUIDs).
+const placeholderSessionID = "_empty"
+
 // KeyMap defines key bindings
 type KeyMap struct {
 	Up       key.Binding
@@ -562,9 +567,8 @@ func (m *Model) switchToSession(sessionID string) {
 
 	// When switching away from a local attach, detach the inner tmux client first
 	// so that "tmux attach" exits cleanly and avoids "pane is dead".
-	if !isLocalAlive && m.displayLocalAttach {
+	if !isLocalAlive {
 		m.detachInnerClient()
-		m.displayLocalAttach = false
 	}
 
 	// Stopped/error sessions: show placeholder in right pane (no TmuxWindowName needed).
@@ -673,7 +677,15 @@ func (m *Model) adoptAttachedSession(attached string) {
 
 // detachInnerClient detaches the inner tmux client running in the display pane.
 // This makes the "tmux attach" process exit cleanly, preventing "pane is dead".
+// No-op when the pane is not running an attach.
+//
+// Owns displayLocalAttach so the flag cannot drift from the detach: every
+// caller used to repeat the same guard-and-reset pair around this call.
 func (m *Model) detachInnerClient() {
+	if !m.displayLocalAttach {
+		return
+	}
+	m.displayLocalAttach = false
 	if m.innerTmuxClient == nil {
 		return
 	}
@@ -694,6 +706,18 @@ func (m *Model) recordDisplayedSession(sess *session.Info) {
 		_ = m.tmuxClient.SetEnvironment(tmux.SessionName, "JIN_CURRENT_SESSION", sess.ID)
 	}
 	m.pushDisplayedDescription(sess.Description)
+}
+
+// clearDisplayedSession is recordDisplayedSession's inverse, for when the pane
+// stops showing a session at all: it drops all four of the things its
+// counterpart writes. See docs/gotchas.md — pane options outlive the process
+// in the pane, so the label has to be reset by hand.
+func (m *Model) clearDisplayedSession() {
+	m.currentSessionID = placeholderSessionID
+	if m.tmuxClient != nil {
+		_ = m.tmuxClient.UnsetEnvironment(tmux.SessionName, "JIN_CURRENT_SESSION")
+	}
+	m.pushDisplayedDescription("")
 }
 
 // moveCursorToSession points the list cursor at the given session and
@@ -719,47 +743,84 @@ func (m *Model) pushDisplayedDescription(desc string) {
 	if m.tmuxClient == nil || m.displayPaneID == "" {
 		return
 	}
-	_ = m.tmuxClient.SetPaneOption(m.displayPaneID, "@session_name", desc)
+	_ = m.tmuxClient.SetPaneOption(m.displayPaneID, tmux.PaneLabelOption, desc)
 	m.lastDisplayedDesc = desc
 }
 
-// refreshDisplayedDescription re-pushes `@session_name` when the currently
+// refreshDisplayedDescription re-pushes the pane label when the currently
 // displayed session's Description has changed since the last poll (e.g.
 // Layer C promoted the baseline to a transcript-derived label). Cheap: it
 // walks m.sessions once and calls set-option at most once per drift.
 func (m *Model) refreshDisplayedDescription() {
-	if m.tmuxClient == nil || m.displayPaneID == "" || m.currentSessionID == "" {
+	if m.tmuxClient == nil || m.displayPaneID == "" || !m.displaysLiveSession() {
 		return
 	}
-	// Skip synthetic placeholders (e.g. "_empty" from respawnPlaceholder).
-	if strings.HasPrefix(m.currentSessionID, "_") {
-		return
-	}
-	for i := range m.sessions {
-		if m.sessions[i].ID != m.currentSessionID {
-			continue
-		}
-		desc := m.sessions[i].Description
-		if desc == m.lastDisplayedDesc {
-			return
-		}
+	i := slices.IndexFunc(m.sessions, func(s session.Info) bool {
+		return s.ID == m.currentSessionID
+	})
+	if desc := m.sessions[i].Description; desc != m.lastDisplayedDesc {
 		m.pushDisplayedDescription(desc)
-		return
 	}
 }
 
-// respawnPlaceholder replaces the display pane with a placeholder command.
-// Detaches any active inner tmux client first to avoid "pane is dead".
+// respawnPlaceholder replaces the display pane with a placeholder command and
+// strips every trace of the session it used to show. Detaches any active inner
+// tmux client first to avoid "pane is dead".
+//
+// Idempotent via the placeholder sentinel: callers may reach it on every poll
+// (an empty list, or a cursor parked on a session that is still being deleted)
+// and only the first one respawns.
 func (m *Model) respawnPlaceholder() {
-	if m.tmuxClient == nil || m.displayPaneID == "" {
+	if m.currentSessionID == placeholderSessionID {
 		return
 	}
-	if m.displayLocalAttach {
+	if m.tmuxClient != nil && m.displayPaneID != "" {
 		m.detachInnerClient()
-		m.displayLocalAttach = false
+		_ = m.tmuxClient.RespawnPane(m.displayPaneID, tmux.PlaceholderCmd)
+		_ = m.tmuxClient.ClearHistory(m.displayPaneID)
 	}
-	_ = m.tmuxClient.RespawnPane(m.displayPaneID, tmux.PlaceholderCmd)
-	_ = m.tmuxClient.ClearHistory(m.displayPaneID)
+	// Runs even without a display pane (legacy mode, tests), where it just
+	// records "no session is on screen" — which is what the callers mean.
+	m.clearDisplayedSession()
+}
+
+// showCursorSession points the display pane at the session under the cursor,
+// falling back to the placeholder when there is nothing attachable there — an
+// empty list, or a cursor sitting on a session that is itself being deleted
+// (sessionAt rejects those).
+//
+// force re-points the pane even when it already claims the cursor session.
+// Only the kill path needs it: a killed session stays in the list, so the pane
+// looks settled while actually holding an attach to a tmux session that is
+// gone. Everywhere else the claim can be trusted, and skipping saves a full
+// detach / respawn / re-attach cycle the user would see as a flash.
+func (m *Model) showCursorSession(force bool) {
+	sess, ok := m.cursorSession()
+	if !ok {
+		m.respawnPlaceholder()
+		return
+	}
+	if !force && sess.ID == m.currentSessionID {
+		return
+	}
+	// Clear first so switchToSession does not take its "already displaying
+	// this" early return, then detach: the inner session behind the current
+	// attach may already be dead, and switch-client cannot recover from that.
+	m.currentSessionID = ""
+	m.detachInnerClient()
+	m.switchToSession(sess.ID)
+}
+
+// displaysLiveSession reports whether the display pane is showing a session
+// that is still in the list. False for the placeholder, for a not-yet-decided
+// pane at startup, and for a session that disappeared between polls.
+func (m Model) displaysLiveSession() bool {
+	if m.currentSessionID == "" || m.currentSessionID == placeholderSessionID {
+		return false
+	}
+	return slices.ContainsFunc(m.sessions, func(s session.Info) bool {
+		return s.ID == m.currentSessionID
+	})
 }
 
 // isSessionAlive returns true if the session status indicates an active process.
@@ -1413,6 +1474,13 @@ func (m Model) deleteSession(targetID string, removeWorktree, force bool) (tea.M
 	name := m.sessionDescription(targetID)
 	m.deletingIDs[targetID] = true
 	m.skipDeletingSessions(1)
+	// Move the display pane off the target before the daemon touches it: the
+	// delete finalizes on a background goroutine (see docs/gotchas.md), so an
+	// attach left in place keeps the doomed session on screen for the whole
+	// removal and then shows the dead frame it leaves behind.
+	if m.currentSessionID == targetID {
+		m.showCursorSession(false)
+	}
 	client := m.client
 	return m, func() tea.Msg {
 		if err := client.Delete(targetID, removeWorktree, force); err != nil {
@@ -1647,69 +1715,27 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Session list changed: clamp scroll so we cannot land past the last
 		// card, and ensure the cursor's card stays in view.
 		m.adjustScrollForCursor()
-		// Reconnect to session at cursor after delete/kill
-		if m.needsReswitch || deleteCompleted {
+		// Re-point the display pane whenever it is not showing a session that
+		// is still in the list: the list went empty, the displayed session
+		// disappeared between polls, nothing has been displayed yet (initial
+		// load), or the placeholder is up and a session became attachable
+		// again. showCursorSession settles on the placeholder when the cursor
+		// has no attachable target, and is a no-op once it is already there.
+		//
+		// A finished delete/kill re-points unconditionally, since the slot the
+		// pane was on has changed under it. Only kill needs force: its record
+		// stays in the list, so the pane still looks settled while its attach
+		// is dead underneath. A delete does not, and must not — deleteSession
+		// already moved the pane at request time, and forcing here would tear
+		// the same attach down and rebuild it as a visible flash.
+		if m.needsReswitch || deleteCompleted || !m.displaysLiveSession() {
+			force := m.needsReswitch
 			m.needsReswitch = false
-			m.currentSessionID = "" // Force reset
-			if m.displayLocalAttach {
-				m.detachInnerClient()
-				m.displayLocalAttach = false
-			}
-			pageSessions := m.getDisplaySessions()
-			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
-				sess := pageSessions[m.cursor]
-				if !m.deletingIDs[sess.ID] {
-					m.switchToSession(sess.ID)
-				}
-			} else {
-				m.respawnPlaceholder()
-			}
-			m.processingMsg = ""
-			m.writeCursorEnv()
-			return m, nil
+			m.showCursorSession(force)
 		}
-		// Reset right pane to placeholder when sessions become empty
-		// Even with empty currentSessionID, stale content may remain in right pane,
-		// so run RespawnPane only once and set "_empty" to skip subsequent calls
-		if len(m.sessions) == 0 {
-			if m.currentSessionID != "_empty" {
-				m.currentSessionID = "_empty"
-				m.respawnPlaceholder()
-			}
-			m.processingMsg = ""
-			m.writeCursorEnv()
-			return m, nil
-		}
-		// Reset right pane when the currently displayed session disappears during polling
-		if m.currentSessionID != "" {
-			found := false
-			for _, s := range m.sessions {
-				if s.ID == m.currentSessionID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				m.currentSessionID = ""
-				pageSessions := m.getDisplaySessions()
-				if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
-					m.switchToSession(pageSessions[m.cursor].ID)
-				} else {
-					m.respawnPlaceholder()
-				}
-			}
-		}
-		// Auto-display first session on initial load
-		if m.currentSessionID == "" {
-			pageSessions := m.getDisplaySessions()
-			if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
-				m.switchToSession(pageSessions[m.cursor].ID)
-			}
-		}
-		// Refresh @session_name for the currently displayed session so the
-		// tmux status bar picks up Layer C description upgrades without a
-		// manual switch. Idempotent: only pushes when the Description changed
-		// since the last poll.
+		// Re-push the pane label for the displayed session so it picks up
+		// Layer C description upgrades without a manual switch. Idempotent:
+		// only pushes when the Description changed since the last poll.
 		m.refreshDisplayedDescription()
 		m.processingMsg = ""
 		// Keep the outer-tmux env in sync so a popup opened right after the
