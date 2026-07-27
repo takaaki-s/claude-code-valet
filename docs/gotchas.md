@@ -270,6 +270,30 @@ Common pitfalls and caveats that agents tend to fall into.
   minimum is tmux 3.3+ (see README's Requirements section), which already
   covers this.
 
+## Display pane (TUI)
+
+- **A kill's reswitch is confirmed against the list, never consumed by
+  whichever poll answers first.** `Model.pendingKillID`
+  (`internal/tui/model.go`, resolved in `updateListMode`'s `sessionsMsg`
+  branch) holds the session whose `Kill` was issued and stays armed until a
+  `sessionsMsg` actually shows that session as no longer alive
+  (`isSessionAlive`), or gone from the list. The session poll runs on its own
+  clock, so a `List()` that started before the daemon saw the `Kill` still
+  answers "running" — acting on that snapshot re-points the display pane at the
+  session being killed, and nothing re-points it afterwards, because the killed
+  record stays in the list and `displaysLiveSession()` therefore reports the
+  pane as settled. What the user sees is whatever the dead attach left behind:
+  `[exited]` when the re-attach beat the inner session's destruction,
+  `no sessions` when it lost. A bare bool cannot express "not this snapshot" —
+  any future re-point request needs to carry the same kind of evidence.
+
+  The arm is not a leak risk. `Manager.Kill` fails only for a session it does
+  not have, and that record is absent from every later list too, which disarms
+  it. The one case that outlives its own kill is a `Kill` that fails in
+  transport while `List` still succeeds: the arm then waits for that session to
+  stop for some other reason, and re-points to whatever the cursor is on at
+  that point — late, and not necessarily where the user last put the pane.
+
 ## Code Structure
 
 - **Debug logging uses `internal/debug.NewLogger`**.

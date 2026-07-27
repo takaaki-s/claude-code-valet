@@ -172,8 +172,11 @@ type Model struct {
 	// Focus after create
 	focusSessionID string // Session ID to focus after creation
 
-	// Reswitch after delete/kill
-	needsReswitch bool // Reconnect to session at cursor after delete/kill
+	// Reswitch after kill. Holds the session whose Kill was issued, not a bare
+	// "something needs reswitching" bit: only a sessionsMsg that actually
+	// reflects the kill may consume it (see updateListMode's sessionsMsg
+	// branch, and docs/gotchas.md for why a bool cannot work here).
+	pendingKillID string
 
 	// Align cursor to the restored currentSessionID on the first sessionsMsg
 	// after TUI restart. Cleared after the first attempt so subsequent user
@@ -1441,11 +1444,12 @@ func (m Model) dispatchConfirmResult(mode, targetID, result string) (tea.Model, 
 	return m, nil
 }
 
-// killSession issues the daemon Kill for targetID. needsReswitch makes the
-// next sessionsMsg reconnect the display pane to whatever the cursor lands on.
+// killSession issues the daemon Kill for targetID. pendingKillID makes the
+// first sessionsMsg that shows the kill landed reconnect the display pane to
+// whatever the cursor lands on.
 func (m Model) killSession(targetID string) (tea.Model, tea.Cmd) {
 	m.processingMsg = "Stopping..."
-	m.needsReswitch = true
+	m.pendingKillID = targetID
 	client := m.client
 	return m, func() tea.Msg {
 		if err := client.Kill(targetID); err != nil {
@@ -1715,6 +1719,35 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Session list changed: clamp scroll so we cannot land past the last
 		// card, and ensure the cursor's card stays in view.
 		m.adjustScrollForCursor()
+		// A kill has landed once the list says so, not when the next snapshot
+		// happens to arrive: the session poll runs on its own clock and can
+		// answer "still running" from a read that predates the Kill. Acting on
+		// that snapshot re-points the pane at the session being killed, after
+		// which nothing re-points it at all — see docs/gotchas.md.
+		//
+		// Resolved here rather than beside the deletingIDs bookkeeping above so
+		// the focus fast path cannot return between the arm being cleared and
+		// the re-point it was cleared for. One slot is enough for overlapping
+		// kills: the re-point target is the cursor rather than the killed
+		// session, and the force below keys off the pane instead of the arm, so
+		// collapsing to the newest request still frees a pane left on an
+		// earlier victim.
+		killCompleted, displayedIsDead := false, false
+		if m.pendingKillID != "" {
+			// "Not listed as alive" is both landings at once: the record
+			// stopped, or it left the list entirely.
+			stillAlive := slices.ContainsFunc(m.sessions, func(s session.Info) bool {
+				return s.ID == m.pendingKillID && isSessionAlive(s.Status)
+			})
+			if !stillAlive {
+				m.pendingKillID = ""
+				killCompleted = true
+				displayedIsDead = slices.ContainsFunc(m.sessions, func(s session.Info) bool {
+					return s.ID == m.currentSessionID && !isSessionAlive(s.Status)
+				})
+			}
+		}
+
 		// Re-point the display pane whenever it is not showing a session that
 		// is still in the list: the list went empty, the displayed session
 		// disappeared between polls, nothing has been displayed yet (initial
@@ -1723,15 +1756,18 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// has no attachable target, and is a no-op once it is already there.
 		//
 		// A finished delete/kill re-points unconditionally, since the slot the
-		// pane was on has changed under it. Only kill needs force: its record
-		// stays in the list, so the pane still looks settled while its attach
-		// is dead underneath. A delete does not, and must not — deleteSession
-		// already moved the pane at request time, and forcing here would tear
-		// the same attach down and rebuild it as a visible flash.
-		if m.needsReswitch || deleteCompleted || !m.displaysLiveSession() {
-			force := m.needsReswitch
-			m.needsReswitch = false
-			m.showCursorSession(force)
+		// pane was on has changed under it. Force is for the one arrangement
+		// that still looks settled: the pane holding an attach to a session
+		// that is listed but no longer alive. Testing the pane rather than
+		// "was this the newest kill's target?" is deliberate — the latter
+		// strands a pane parked on an earlier kill whose arm this one
+		// overwrote. A delete does not need force, and must not have it —
+		// deleteSession already moved the pane at request time, and forcing
+		// here would tear the same attach down and rebuild it as a visible
+		// flash. Nor does a kill while the pane watches a session that is still
+		// alive, for the same reason.
+		if killCompleted || deleteCompleted || !m.displaysLiveSession() {
+			m.showCursorSession(displayedIsDead)
 		}
 		// Re-push the pane label for the displayed session so it picks up
 		// Layer C description upgrades without a manual switch. Idempotent:

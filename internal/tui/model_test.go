@@ -1410,17 +1410,17 @@ func TestDispatchAction_RefreshReturnsCmd(t *testing.T) {
 // TestConfirmFlagsOnWire below.
 func TestDispatchConfirmResult_Routing(t *testing.T) {
 	cases := []struct {
-		name           string
-		mode           string
-		targetID       string
-		result         string
-		wantCmd        bool
-		wantDeleting   bool
-		wantProcessing string
-		wantReswitch   bool
+		name            string
+		mode            string
+		targetID        string
+		result          string
+		wantCmd         bool
+		wantDeleting    bool
+		wantProcessing  string
+		wantPendingKill string
 	}{
 		{name: "kill yes", mode: ConfirmModeKill, targetID: "s1", result: ConfirmResultYes,
-			wantCmd: true, wantProcessing: "Stopping...", wantReswitch: true},
+			wantCmd: true, wantProcessing: "Stopping...", wantPendingKill: "s1"},
 		{name: "delete yes", mode: ConfirmModeDelete, targetID: "s1", result: ConfirmResultYes,
 			wantCmd: true, wantDeleting: true},
 		{name: "delete_worktree yes (session only)", mode: ConfirmModeDeleteWorktree, targetID: "s1", result: ConfirmResultYes,
@@ -1464,8 +1464,8 @@ func TestDispatchConfirmResult_Routing(t *testing.T) {
 			if nm.processingMsg != tt.wantProcessing {
 				t.Errorf("processingMsg = %q, want %q", nm.processingMsg, tt.wantProcessing)
 			}
-			if nm.needsReswitch != tt.wantReswitch {
-				t.Errorf("needsReswitch = %v, want %v", nm.needsReswitch, tt.wantReswitch)
+			if nm.pendingKillID != tt.wantPendingKill {
+				t.Errorf("pendingKillID = %q, want %q", nm.pendingKillID, tt.wantPendingKill)
 			}
 		})
 	}
@@ -1819,6 +1819,198 @@ func TestSessionsMsg_LastDeleteSettlesOnPlaceholder(t *testing.T) {
 	}
 	if len(nm.deletingIDs) != 0 {
 		t.Errorf("deletingIDs = %v, want empty (the record is gone)", nm.deletingIDs)
+	}
+}
+
+// TestSessionsMsg_KillArmSurvivesStaleList is the regression this arm exists
+// for. The session poll runs on its own clock, so a List() that started before
+// the daemon saw the Kill delivers a snapshot where the target is still
+// running. Spending the reswitch on that snapshot re-points the pane at the
+// session being killed, and the sessionsMsg carrying the real outcome then
+// finds nothing to act on: the killed record stays in the list, so
+// displaysLiveSession() reports the pane as settled.
+func TestSessionsMsg_KillArmSurvivesStaleList(t *testing.T) {
+	running := []session.Info{
+		{ID: "s1", Description: "one", Status: session.StatusRunning, TmuxWindowName: "sess-s1"},
+	}
+	m := Model{
+		sessions:         running,
+		cursor:           0,
+		deletingIDs:      map[string]bool{},
+		height:           100,
+		currentSessionID: "s1",
+		pendingKillID:    "s1",
+	}
+
+	next, _ := m.updateListMode(sessionsMsg(running))
+	stale := next.(Model)
+	if stale.pendingKillID != "s1" {
+		t.Fatalf("pendingKillID = %q, want %q — a snapshot that predates the kill spent the reswitch",
+			stale.pendingKillID, "s1")
+	}
+	if stale.currentSessionID != "s1" {
+		t.Errorf("currentSessionID = %q, want %q — the pane was re-pointed off a stale snapshot",
+			stale.currentSessionID, "s1")
+	}
+
+	// The kill's own List(): the record is still listed, now stopped.
+	next, _ = stale.updateListMode(sessionsMsg([]session.Info{
+		{ID: "s1", Description: "one", Status: session.StatusStopped},
+	}))
+	fresh := next.(Model)
+	if fresh.pendingKillID != "" {
+		t.Errorf("pendingKillID = %q, want empty — the list confirmed the kill", fresh.pendingKillID)
+	}
+	if fresh.currentSessionID == "s1" {
+		t.Error("the pane still claims the killed session; its attach is dead underneath")
+	}
+}
+
+// TestSessionsMsg_KillArmSurvivesFocusFastPath covers the other way the arm
+// could be spent without the re-point it was armed for: the focus fast path
+// returns from the middle of the sessionsMsg branch, so anything resolved
+// above it is silently dropped on a list that arrives while a create is still
+// looking for its new session.
+func TestSessionsMsg_KillArmSurvivesFocusFastPath(t *testing.T) {
+	m := Model{
+		sessions:         []session.Info{{ID: "s1", Description: "one", Status: session.StatusRunning}},
+		cursor:           0,
+		deletingIDs:      map[string]bool{},
+		height:           100,
+		currentSessionID: "s1",
+		pendingKillID:    "s1",
+		focusSessionID:   "s2", // created, not in the list yet
+	}
+	// The same snapshot both times: what changes is that focus has given up by
+	// the second one, so it is the arm that decides whether the pane moves.
+	stopped := sessionsMsg([]session.Info{{ID: "s1", Description: "one", Status: session.StatusStopped}})
+
+	next, _ := m.updateListMode(stopped)
+	focused := next.(Model)
+	if focused.currentSessionID != "s1" {
+		t.Fatalf("currentSessionID = %q, want %q — the focus path re-pointed the pane",
+			focused.currentSessionID, "s1")
+	}
+	if focused.pendingKillID != "s1" {
+		t.Fatalf("pendingKillID = %q, want %q — the arm was spent on a list that returned early",
+			focused.pendingKillID, "s1")
+	}
+
+	// Focus gave up, so the next list is free to settle the pane.
+	next, _ = focused.updateListMode(stopped)
+	settled := next.(Model)
+	if settled.pendingKillID != "" {
+		t.Errorf("pendingKillID = %q, want empty", settled.pendingKillID)
+	}
+	if settled.currentSessionID == "s1" {
+		t.Error("the pane still claims the killed session; its attach is dead underneath")
+	}
+}
+
+// TestSessionsMsg_KillOfHiddenSessionKeepsAttach pins how far force reaches.
+// A kill only makes the pane *look* settled when the pane is showing the
+// session that was killed; forcing on any other kill tears down a live attach
+// the user is watching and rebuilds it as a visible flash.
+func TestSessionsMsg_KillOfHiddenSessionKeepsAttach(t *testing.T) {
+	m := Model{
+		sessions: []session.Info{
+			{ID: "s1", Description: "one", Status: session.StatusRunning},
+			{ID: "s2", Description: "two", Status: session.StatusRunning, TmuxWindowName: "sess-s2"},
+		},
+		cursor:           1, // parked on the session the pane shows
+		deletingIDs:      map[string]bool{},
+		height:           100,
+		currentSessionID: "s2",
+		pendingKillID:    "s1",
+	}
+	next, _ := m.updateListMode(sessionsMsg([]session.Info{
+		{ID: "s1", Description: "one", Status: session.StatusStopped},
+		{ID: "s2", Description: "two", Status: session.StatusRunning, TmuxWindowName: "sess-s2"},
+	}))
+	nm := next.(Model)
+	if nm.pendingKillID != "" {
+		t.Errorf("pendingKillID = %q, want empty — the kill landed", nm.pendingKillID)
+	}
+	if nm.currentSessionID != "s2" {
+		t.Errorf("currentSessionID = %q, want %q — s2's live attach was torn down over a kill of s1",
+			nm.currentSessionID, "s2")
+	}
+}
+
+// TestSessionsMsg_OverlappingKillsStillFreeThePane pins why force keys off the
+// pane rather than off the arm. One arm slot keeps only the newest kill, so a
+// second kill can confirm while the pane is still parked on the first one's
+// victim — and "was this the newest kill's target?" answers no there, leaving
+// the pane on a dead attach that nothing else will ever re-point.
+func TestSessionsMsg_OverlappingKillsStillFreeThePane(t *testing.T) {
+	both := []session.Info{
+		{ID: "s1", Description: "one", Status: session.StatusStopped},
+		{ID: "s2", Description: "two", Status: session.StatusStopped},
+	}
+	m := Model{
+		sessions:         both,
+		cursor:           0, // back on the first victim, which the pane still shows
+		deletingIDs:      map[string]bool{},
+		height:           100,
+		currentSessionID: "s1",
+		pendingKillID:    "s2", // the second kill overwrote the first one's arm
+	}
+	next, _ := m.updateListMode(sessionsMsg(both))
+	nm := next.(Model)
+	if nm.pendingKillID != "" {
+		t.Errorf("pendingKillID = %q, want empty — the kill landed", nm.pendingKillID)
+	}
+	if nm.currentSessionID == "s1" {
+		t.Error("the pane still claims s1, whose attach died with the kill that lost the arm slot")
+	}
+}
+
+// TestSessionsMsg_KillArmClearsWhenRecordVanishes keeps the arm from
+// outliving its kill in the one case where the target never reports a stopped
+// status: the record left the list entirely (deleted from elsewhere).
+func TestSessionsMsg_KillArmClearsWhenRecordVanishes(t *testing.T) {
+	m := Model{
+		sessions:         []session.Info{{ID: "s1", Description: "one", Status: session.StatusRunning}},
+		cursor:           0,
+		deletingIDs:      map[string]bool{},
+		height:           100,
+		currentSessionID: "s1",
+		pendingKillID:    "s1",
+	}
+	next, _ := m.updateListMode(sessionsMsg(nil))
+	nm := next.(Model)
+	if nm.pendingKillID != "" {
+		t.Errorf("pendingKillID = %q, want empty — the record is gone, nothing will ever confirm it", nm.pendingKillID)
+	}
+	if nm.currentSessionID != placeholderSessionID {
+		t.Errorf("currentSessionID = %q, want %q", nm.currentSessionID, placeholderSessionID)
+	}
+}
+
+// TestSessionsMsg_KillArmSurvivesListError covers the other order the daemon
+// can answer in: the kill's own List() failed, so the outcome arrives on a
+// later poll instead. The error must not disarm the pending reswitch.
+func TestSessionsMsg_KillArmSurvivesListError(t *testing.T) {
+	m := Model{
+		sessions:         []session.Info{{ID: "s1", Description: "one", Status: session.StatusRunning}},
+		cursor:           0,
+		deletingIDs:      map[string]bool{},
+		height:           100,
+		currentSessionID: "s1",
+		pendingKillID:    "s1",
+	}
+	next, _ := m.updateListMode(errMsg(errors.New("list failed")))
+	errored := next.(Model)
+	if errored.pendingKillID != "s1" {
+		t.Fatalf("pendingKillID = %q, want %q — an unrelated error disarmed the reswitch",
+			errored.pendingKillID, "s1")
+	}
+
+	next, _ = errored.updateListMode(sessionsMsg([]session.Info{
+		{ID: "s1", Description: "one", Status: session.StatusStopped},
+	}))
+	if got := next.(Model).pendingKillID; got != "" {
+		t.Errorf("pendingKillID = %q, want empty — the next poll confirmed the kill", got)
 	}
 }
 
