@@ -53,7 +53,7 @@ Logs: `~/.local/state/jind-ai/daemon-debug.log`, `~/.local/state/jind-ai/hook-de
 
 ## Key Dependencies
 
-Go 1.24.5 / cobra (CLI) / bubbletea (TUI) / viper (config) / lipgloss (styling)
+Go 1.26 / cobra (CLI) / bubbletea (TUI) / viper (config) / lipgloss (styling)
 
 ## Data Directories
 

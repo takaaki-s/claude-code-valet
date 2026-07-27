@@ -875,7 +875,7 @@ tail -f ~/.local/state/jind-ai/daemon-debug.log
 
 ## Requirements
 
-- Go 1.24.5+
+- Go 1.26+
 - tmux 3.3+
 - Claude Code CLI installed
 

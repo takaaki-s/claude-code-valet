@@ -1,6 +1,8 @@
 # ビルド成果物
 bin/
 dist/
+# `make build` は bin/ に出すが、素の `go build ./cmd/jin` はここに吐く
+/jin
 
 # タスク管理（個人用）
 .tasks/

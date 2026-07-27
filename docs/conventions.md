@@ -2,7 +2,7 @@
 
 ## Language & Formatting
 
-- Go 1.24.5
+- Go 1.26
 - Always run `make fmt` (go fmt) before committing
 - Comments should be in English
 - Technical terms, struct/function names remain in English
