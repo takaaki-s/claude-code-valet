@@ -18,7 +18,15 @@ jobs:
           go-version: "1.26"
       - uses: golangci/golangci-lint-action@55c2c1448f86e01eaae002a5a3a9624417608d84 # v6
         with:
-          version: latest
+          # Pinned to match Makefile's GOLANGCI_LINT_VERSION. Bump both together.
+          # Upgrading to v2.x also requires bumping the action to v7+.
+          version: v1.64.8
+          # Build from source instead of downloading the release binary: the
+          # published v1.64.8 binary is itself built with Go 1.24 and refuses a
+          # go.mod targeting a newer version ("the Go language version used to
+          # build golangci-lint is lower than the targeted Go version").
+          # goinstall compiles it with this job's Go instead.
+          install-mode: goinstall
 
   test:
     runs-on: ubuntu-latest
