@@ -4,6 +4,7 @@
 
 - Go 1.26
 - Always run `make fmt` (go fmt) before committing
+- `make lint` runs golangci-lint; its configuration lives in `.golangci.yml`
 - Comments should be in English
 - Technical terms, struct/function names remain in English
 
@@ -12,6 +13,23 @@
 - Propagate errors to the caller via return
 - Log only at boundaries (daemon server, manager, etc.)
 - Wrap with `fmt.Errorf("context: %w", err)`
+
+### Unchecked returns
+
+`.golangci.yml` excludes `Close`, `Flush`, `os.Remove`, `fmt.Fprint*` and
+`os.Setenv`/`os.Unsetenv` from errcheck. errcheck matches on message text and
+cannot tell the safe cases from the unsafe one, so the rule lives here instead.
+
+**Data you wrote must be durable before the function returns.** Reach that with
+a checked `Close` — `internal/session/store.go` does
+`if err := tmp.Close(); err != nil` before the rename — or a checked `Sync`, as
+in `internal/worktreehook/allowlist.go`. A bare `defer f.Close()` on a written
+file is fine only once one of those has run, on an error path that discards the
+file anyway, or where losing the tail costs nothing (the plugin and hook logs).
+
+Read paths, sockets, and cleanup expected to fail need no check —
+`internal/session/store.go`'s `defer os.Remove(tmpName)` is a no-op once the
+rename succeeds.
 
 ## Debug Logging
 

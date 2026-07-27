@@ -1,0 +1,37 @@
+# `version` below is the CONFIG SCHEMA version, not the tool version. It only
+# moves when golangci-lint makes a breaking change to the config format. The
+# tool version is pinned in Makefile's GOLANGCI_LINT_VERSION and in the
+# `version:` input of golangci-lint-action in .github/workflows/{ci,release}.yml;
+# all three move together.
+#
+# Both exclusions below restore what v1 silenced by default — 40 errcheck and 6
+# staticcheck issues — on code that has not changed.
+version: "2"
+
+linters:
+  exclusions:
+    presets:
+      # Restores v1's built-in EXC0001, which matched (case-insensitively)
+      # errcheck on `(os.)?std(out|err).*`, `.*Close`, `.*Flush`,
+      # `os.Remove(All)?`, `.*print(f|ln)?` and `os.(Un)?Setenv`.
+      #
+      # errcheck matches on message text, so this cannot spare the one case
+      # that must stay checked — a `defer f.Close()` that is the only thing
+      # flushing what you wrote. That rule lives in docs/conventions.md, which
+      # also covers what is safe to leave unchecked and why.
+      - std-error-handling
+
+    rules:
+      # staticcheck's QF ("quickfix") checks are refactoring suggestions, not
+      # defect detection, and we do not gate CI on them anywhere in the repo.
+      # v1 never ran them; v2 folded gosimple, stylecheck and quickfix into the
+      # staticcheck linter, which turned them on. Excluding the family rather
+      # than naming individual checks keeps this stable as upstream adds new
+      # QF checks.
+      #
+      # Doing this through linters.settings.staticcheck.checks instead would
+      # REPLACE upstream's default check list and silently re-enable ST1000
+      # and ST1021.
+      - linters:
+          - staticcheck
+        text: "^QF"
