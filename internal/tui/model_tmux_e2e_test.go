@@ -3,7 +3,9 @@
 package tui
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/testutil"
@@ -119,6 +121,99 @@ func TestE2E_DeleteInFlightClearsPaneLabel(t *testing.T) {
 	}
 	if got := next.(Model).currentSessionID; got != placeholderSessionID {
 		t.Errorf("currentSessionID = %q, want %q", got, placeholderSessionID)
+	}
+}
+
+// waitForPaneText polls the pane until want shows up, so a respawned command
+// gets the few milliseconds it needs to draw. Returns the last capture either
+// way, for the failure message.
+func waitForPaneText(t *testing.T, tc *tmux.Client, paneID, want string) (string, bool) {
+	t.Helper()
+	var last string
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, err := tc.CapturePane(paneID, false); err == nil {
+			last = got
+			if strings.Contains(got, want) {
+				return last, true
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return last, false
+}
+
+// paneStartCommand reads back the command the pane was last spawned with, which
+// says which switchToSession branch ran without waiting for output. GetPaneOption
+// wraps its argument in #{…}, so a built-in format variable reads back the same
+// way a custom @option does. tmux wraps a command containing spaces in double
+// quotes; strip them so callers can compare against what they passed in.
+func paneStartCommand(t *testing.T, tc *tmux.Client, paneID string) string {
+	t.Helper()
+	got, err := tc.GetPaneOption(paneID, "pane_start_command")
+	if err != nil {
+		t.Fatalf("GetPaneOption(pane_start_command): %v", err)
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(got, `"`), `"`)
+}
+
+// TestE2E_KillDoesNotReattachOnStaleList is the pane-level half of
+// TestSessionsMsg_KillArmSurvivesStaleList: the session poll can deliver a
+// snapshot taken before the daemon saw the Kill, and spending the reswitch on
+// it respawns the pane onto `tmux attach` for a session that is about to
+// disappear. Only a real tmux can say which command the pane ended up running.
+func TestE2E_KillDoesNotReattachOnStaleList(t *testing.T) {
+	tc, displayPaneID := outerTmuxFixture(t)
+
+	// An inner session name no live jin server can resolve. The pre-fix path
+	// really does run `tmux -L jin attach -t <name>` in the pane, and attach
+	// against an absent session neither starts a server nor disturbs one.
+	const innerSession = "sess-e2e-kill-reswitch-does-not-exist"
+
+	running := []session.Info{{
+		ID:             "s1",
+		Description:    "doomed-session",
+		Status:         session.StatusRunning,
+		TmuxWindowName: innerSession,
+	}}
+	m := Model{
+		sessions:           running,
+		cursor:             0,
+		deletingIDs:        map[string]bool{},
+		height:             100,
+		tmuxClient:         tc,
+		displayPaneID:      displayPaneID,
+		displayLocalAttach: true,
+		pendingKillID:      "s1",
+	}
+	m.recordDisplayedSession(&m.sessions[0])
+	if got := paneStartCommand(t, tc, displayPaneID); got != tmux.PlaceholderCmd {
+		t.Fatalf("fixture: display pane runs %q, want the placeholder (%q)", got, tmux.PlaceholderCmd)
+	}
+
+	// The poll that started before the Kill reached the daemon. It must leave
+	// the pane exactly as it found it — respawning here is both the bug and, on
+	// a session that is merely slow to die, a visible flash.
+	next, _ := m.updateListMode(sessionsMsg(running))
+	if got := paneStartCommand(t, tc, displayPaneID); got != tmux.PlaceholderCmd {
+		t.Fatalf("display pane runs %q after a snapshot that predates the kill, want it untouched (%q)",
+			got, tmux.PlaceholderCmd)
+	}
+
+	// The Kill's own List(): the record is still listed, now stopped.
+	next, _ = next.(Model).updateListMode(sessionsMsg([]session.Info{
+		{ID: "s1", Description: "doomed-session", Status: session.StatusStopped},
+	}))
+
+	if got := paneStartCommand(t, tc, displayPaneID); !strings.HasPrefix(got, "printf") {
+		t.Fatalf("display pane runs %q, want the stopped-session placeholder", got)
+	}
+	got, ok := waitForPaneText(t, tc, displayPaneID, "Press Enter to restart")
+	if !ok {
+		t.Errorf("display pane was respawned with the placeholder but never drew it.\npane content:\n%s", got)
+	}
+	if nm := next.(Model); nm.pendingKillID != "" {
+		t.Errorf("pendingKillID = %q, want empty", nm.pendingKillID)
 	}
 }
 
