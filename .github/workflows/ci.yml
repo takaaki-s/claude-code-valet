@@ -55,4 +55,4 @@ jobs:
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Run E2E tests
-        run: go test -tags e2e -v -timeout 120s ./test/e2e/
+        run: make test-e2e

@@ -40,6 +40,13 @@ const (
 	// idempotent: split --name reuses the existing pane instead of stacking a
 	// new one on every invocation.
 	PaneNameOption = "@jin-pane-name"
+
+	// PaneLabelOption is a custom pane option holding the text the outer
+	// tmux's pane-border-format renders above a pane (see
+	// cmd/jin/cmd/tui.go's paneBorderFormat). Pane options survive
+	// respawn-pane and clear-history, so anything that empties a pane has to
+	// reset this explicitly or the old label stays on the border.
+	PaneLabelOption = "@session_name"
 )
 
 // IfExists policies for named-slot splits: what to do when a pane with the
@@ -657,6 +664,13 @@ func (c *Client) SetWindowOption(target, option, value string) error {
 // SetPaneOption sets a pane-level option on a target (requires tmux 3.0+).
 func (c *Client) SetPaneOption(target, option, value string) error {
 	return c.runSilent("set-option", "-p", "-t", target, option, value)
+}
+
+// GetPaneOption reads a pane-level option back off the server. Returns an
+// empty string for an option that was never set, since tmux expands an unknown
+// #{@name} to nothing rather than failing.
+func (c *Client) GetPaneOption(target, option string) (string, error) {
+	return c.run("display-message", "-t", target, "-p", "#{"+option+"}")
 }
 
 // SetHook sets a tmux hook.

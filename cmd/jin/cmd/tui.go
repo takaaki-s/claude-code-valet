@@ -29,7 +29,7 @@ const envJinTmux = "JIN_TMUX"
 const (
 	activePaneBorderStyle   = "fg=#7aa2f7,bold"
 	inactivePaneBorderStyle = "fg=#414868"
-	paneBorderFormat        = "#{?#{@session_name}, #[bold]#{@session_name}#[nobold] ,}"
+	paneBorderFormat        = "#{?#{" + tmux.PaneLabelOption + "}, #[bold]#{" + tmux.PaneLabelOption + "}#[nobold] ,}"
 	// tuiPaneBorderLabel is the pane-border-format text shown on the TUI (left)
 	// pane. Kept short since the user already knows they're in jind-ai.
 	tuiPaneBorderLabel = "sessions"
@@ -352,7 +352,7 @@ func createAndAttachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 		_ = tc.TagManagedPane(tuiPaneID) // TUI pane survives exit
 		// Label the TUI pane's top border via the shared @session_name option
 		// (same mechanism the display pane uses for the current session name).
-		_ = tc.SetPaneOption(tuiPaneID, "@session_name", tuiPaneBorderLabel)
+		_ = tc.SetPaneOption(tuiPaneID, tmux.PaneLabelOption, tuiPaneBorderLabel)
 	}
 	_ = tc.SetOption("status", "off", true) // Hide tmux status bar
 	_ = tc.SetOption("mouse", "on", true)
@@ -440,7 +440,7 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 		}
 		// Re-apply the border label in case the outer tmux server was
 		// restarted between sessions and cleared the per-pane option.
-		_ = tc.SetPaneOption(tuiPaneID, "@session_name", tuiPaneBorderLabel)
+		_ = tc.SetPaneOption(tuiPaneID, tmux.PaneLabelOption, tuiPaneBorderLabel)
 		// Select TUI pane
 		_ = tc.SelectPane(tuiPaneID)
 	} else {
@@ -449,10 +449,13 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 		_ = tc.SelectWindow(tmux.SessionName + ":" + tmux.UIWindowName)
 	}
 
-	// Restore right pane if dead
+	// Restore right pane if dead. Pane options survive respawn-pane, so the
+	// label has to be cleared alongside it — otherwise the placeholder comes
+	// back wearing the name of whatever session the pane died on.
 	displayPaneID := tc.GetEnvironment(tmux.SessionName, "JIN_DISPLAY_PANE")
 	if displayPaneID != "" && tc.IsPaneDead(displayPaneID) {
 		_ = tc.RespawnPane(displayPaneID, tmux.PlaceholderCmd)
+		_ = tc.SetPaneOption(displayPaneID, tmux.PaneLabelOption, "")
 	}
 	setTransientAgentEnv(tc, agentFlag)
 	applyTogglePaneBinding(tc, configMgr, displayPaneID)

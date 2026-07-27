@@ -3,14 +3,10 @@
 package e2e
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,6 +18,7 @@ import (
 	_ "github.com/takaaki-s/jind-ai/internal/agent/register"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
 	"github.com/takaaki-s/jind-ai/internal/session"
+	"github.com/takaaki-s/jind-ai/internal/testutil"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -34,29 +31,13 @@ func TestMain(m *testing.M) {
 }
 
 // isolateTmuxSocket points every implicit tmux.NewClient() call and the
-// Manager's lazy ensureTmuxClient at a per-test socket via JIN_TMUX_SOCKET,
-// then registers a t.Cleanup that kills the resulting server and removes the
-// socket file. Prevents e2e cleanup from touching the shared "-L jin" server
-// the user (or another daemon) may be attached to.
+// Manager's lazy ensureTmuxClient at a per-test socket via JIN_TMUX_SOCKET.
+// Prevents e2e cleanup from touching the shared "-L jin" server the user (or
+// another daemon) may be attached to.
 func isolateTmuxSocket(t *testing.T) string {
 	t.Helper()
-	var b [4]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	name := "jin-test-" + hex.EncodeToString(b[:])
+	name := testutil.TmuxSocket(t)
 	t.Setenv("JIN_TMUX_SOCKET", name)
-	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-L", name, "kill-server").Run()
-		// tmux 3.x does not unlink its socket file on kill-server; drop it
-		// ourselves so stale sockets do not accumulate under
-		// $TMUX_TMPDIR/tmux-$UID/ across many test runs.
-		tmpdir := os.Getenv("TMUX_TMPDIR")
-		if tmpdir == "" {
-			tmpdir = "/tmp"
-		}
-		_ = os.Remove(filepath.Join(tmpdir, fmt.Sprintf("tmux-%d", os.Getuid()), name))
-	})
 	return name
 }
 
@@ -67,7 +48,7 @@ func setupE2E(t *testing.T) *daemon.Client {
 	isolateTmuxSocket(t)
 
 	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "e2e.sock")
+	socketPath := testutil.SocketPath(t, "e2e.sock")
 	sessionsDir := filepath.Join(tmpDir, "sessions")
 	configDir := filepath.Join(tmpDir, "config")
 	stateDir := filepath.Join(tmpDir, "state")
