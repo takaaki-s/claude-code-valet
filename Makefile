@@ -13,10 +13,17 @@ BINARY := jin
 BUILD_DIR := bin
 
 # Pinned tooling versions. Bump deliberately; both local and CI use the same value.
-# Note: golangci-lint-action@v6 in CI requires v1.x. Upgrading to v2.x requires
-# bumping golangci-lint-action to v7+ and migrating .golangci.yml (currently absent),
-# which is out of scope for incidental changes — bump deliberately.
-GOLANGCI_LINT_VERSION := v1.64.8
+# The `version:` input of golangci-lint-action in .github/workflows/{ci,release}.yml
+# must move with this, and a new major also changes the module path in lint-install
+# below (v2 -> .../golangci-lint/v2/...).
+#
+# WATCH OUT when raising go.mod's `go` directive: `make lint` builds golangci-lint
+# from source with your Go and accepts whatever go.mod says, but CI downloads the
+# release binary, which refuses a go.mod newer than the Go it was itself built with
+# ("the Go language version used to build golangci-lint is lower than the targeted
+# Go version") — so CI breaks while `make lint` stays green. Bump this pin to a
+# golangci-lint released after that Go version at the same time.
+GOLANGCI_LINT_VERSION := v2.12.2
 # `go install` writes to $GOBIN if set, else $GOPATH/bin. Mirror that resolution.
 GOLANGCI_LINT_BIN_DIR := $(shell go env GOBIN)
 ifeq ($(strip $(GOLANGCI_LINT_BIN_DIR)),)
@@ -69,8 +76,12 @@ lint: lint-install
 
 # Install the pinned golangci-lint version into $GOPATH/bin if missing or outdated.
 # Bump GOLANGCI_LINT_VERSION above to upgrade; the next `make lint` will reinstall.
+# v2 renamed the flag (v1 used `version --format short`) and prints the version
+# without a leading "v", so the "v" is prepended here to compare against the
+# pin. A leftover v1 binary fails on the unknown flag and prints nothing, which
+# also compares unequal and reinstalls.
 lint-install:
-	@if ! test -x $(GOLANGCI_LINT) || [ "$$($(GOLANGCI_LINT) version --format short 2>/dev/null)" != "$(GOLANGCI_LINT_VERSION)" ]; then \
+	@if ! test -x $(GOLANGCI_LINT) || [ "v$$($(GOLANGCI_LINT) version --short 2>/dev/null)" != "$(GOLANGCI_LINT_VERSION)" ]; then \
 		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
-		go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	fi
