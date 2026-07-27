@@ -7,7 +7,6 @@ import (
 	"maps"
 	"net"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -21,6 +20,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
 	"github.com/takaaki-s/jind-ai/internal/session"
+	"github.com/takaaki-s/jind-ai/internal/testutil"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -1483,7 +1483,7 @@ type fakeDaemon struct {
 
 func startFakeDaemon(t *testing.T) (*fakeDaemon, *daemon.Client) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	sock := testutil.SocketPath(t, "d.sock")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen: %v", err)

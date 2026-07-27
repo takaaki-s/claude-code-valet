@@ -15,6 +15,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
 	"github.com/takaaki-s/jind-ai/internal/session"
+	"github.com/takaaki-s/jind-ai/internal/testutil"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -28,7 +29,7 @@ func setupE2EWithDataDir(t *testing.T, sessionsDir, configDir string) (*daemon.C
 
 	isolateTmuxSocket(t)
 
-	socketPath := filepath.Join(t.TempDir(), "e2e-tmux.sock")
+	socketPath := testutil.SocketPath(t, "e2e-tmux.sock")
 
 	server, err := daemon.NewServer(socketPath, sessionsDir, configDir, configDir)
 	if err != nil {

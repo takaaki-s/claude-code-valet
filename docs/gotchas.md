@@ -286,6 +286,13 @@ Common pitfalls and caveats that agents tend to fall into.
   Uses only the standard library (no testify, etc.). Add tests for new code.
   The `tmux.Runner` interface was introduced for testability.
 
+- **Never build a Unix socket path out of `t.TempDir()`.** `sun_path` is capped
+  at ~108 bytes, and `t.TempDir()` names its directory after the test — a long
+  subtest name pushes the socket over the limit and `net.Listen` fails with
+  `bind: invalid argument`. Go 1.26 truncates the pattern and Go 1.24 does not,
+  so this passes on a newer local toolchain and fails on the version in
+  `go.mod`. Use `testutil.SocketPath(t, name)`.
+
 - **`make test-e2e` covers two packages**, `./test/e2e/` and `./internal/tui/`.
   The TUI's tmux-backed tests (`model_tmux_e2e_test.go`, build tag `e2e`) drive
   unexported `Model` methods against a real outer tmux, so they cannot live in

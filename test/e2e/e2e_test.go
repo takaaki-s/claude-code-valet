@@ -48,7 +48,7 @@ func setupE2E(t *testing.T) *daemon.Client {
 	isolateTmuxSocket(t)
 
 	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "e2e.sock")
+	socketPath := testutil.SocketPath(t, "e2e.sock")
 	sessionsDir := filepath.Join(tmpDir, "sessions")
 	configDir := filepath.Join(tmpDir, "config")
 	stateDir := filepath.Join(tmpDir, "state")
