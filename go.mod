@@ -1,6 +1,6 @@
 module github.com/takaaki-s/jind-ai
 
-go 1.24.5
+go 1.26.0
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
