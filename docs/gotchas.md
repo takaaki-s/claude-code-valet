@@ -9,6 +9,36 @@ Common pitfalls and caveats that agents tend to fall into.
   Panes added by the user are destroyed immediately.
   (Fixed in commit 980e99f)
 
+- **`Kill` stops the pane's process; it does not destroy the pane.**
+  `TerminatePaneProcess` sends SIGHUP to `#{pane_pid}` and the pane stays as a
+  dead pane, so `TmuxWindowName` / `TmuxPaneID` still address something real
+  after a kill — code that reads either as "this session has live tmux state"
+  needs `Status` too. **SIGTERM does not work here**: the `/bin/sh -c` wrapper
+  tmux starts execs down the chain, so the pane's pid ends up being the
+  *interactive* `$SHELL -ic` that runs the agent, and interactive shells ignore
+  SIGTERM (measured: zsh 5.9 stays in `Ss` with `pane_dead=0`). SIGHUP is what
+  the pane already receives today when `kill-pane` closes the pty. It goes to
+  the pane's own pid, not its process group — the agent sits in a job of its
+  own, which a killpg on the pane's group would miss. Only the fallback path
+  (process ignored the signal, or its pid could not be read) reaches
+  `kill-pane`, and it tears the inner session down with it so nothing is left
+  unowned once the two fields are cleared.
+
+- **A dead pane keeps reporting the pid it started with.** `#{pane_pid}` on a
+  pane with `pane_dead=1` still answers with the exited process's number
+  (verified on tmux 3.6a), which the OS may have reissued to something else
+  entirely. Anything that signals a pane must check `IsPaneDead` first —
+  `stopAgentPane` does, which is what makes a second kill a no-op instead of a
+  shot at a stranger's process. `pane_dead` also only speaks for the pane's
+  direct child; a descendant that survives the pty SIGHUP would leave the pane
+  dead and the agent running.
+
+- **A kill is no longer visible as a cleared `TmuxWindowName`.**
+  `Session.killSeq` is what tells a caller that dropped `m.mu` whether a kill
+  landed while it was away — `applyRecovery` compares it to decide whether its
+  probe results still describe reality. `Status` cannot substitute: a session
+  reloaded from disk is normalized to Stopped before anyone kills anything.
+
 - **tmux session name** is the `tmux.SessionName` constant ("jin"). Do not change it.
 
 - **inner tmux**: jind-ai uses its own tmux socket (`-L jin`).

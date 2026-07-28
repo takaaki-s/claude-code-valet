@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -803,6 +804,71 @@ func (c *Client) ZoomPane(target string) error {
 // KillPane kills a specific pane. If it's the last pane in the window, the window is also destroyed.
 func (c *Client) KillPane(target string) error {
 	return c.runSilent("kill-pane", "-t", target)
+}
+
+// parsePanePID converts a `#{pane_pid}` reading into a usable pid. Split out
+// from TerminatePaneProcess so the parsing half is testable without signalling
+// a real process: every rejected input here is one that would otherwise reach
+// syscall.Kill. Non-positive values are refused because negative pids address a
+// whole process group and 0 addresses the caller's own group — either would
+// turn a pane-scoped stop into a much wider kill.
+func parsePanePID(out string) (int, error) {
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return 0, fmt.Errorf("empty pane_pid")
+	}
+	pid, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("unparsable pane_pid %q: %w", trimmed, err)
+	}
+	if pid <= 0 {
+		return 0, fmt.Errorf("invalid pane_pid %d", pid)
+	}
+	return pid, nil
+}
+
+// TerminatePaneProcess hangs up the process tmux started in target, leaving
+// the pane itself in place. On a pane carrying remain-on-exit (every managed
+// pane — see TagManagedPane) the pane survives as a dead pane, keeping its
+// scrollback and, more importantly, its slot in the window layout, so
+// RespawnPane can later revive the agent exactly where it was.
+//
+// The signal is SIGHUP, not SIGTERM, because of what actually sits at the end
+// of a pane's pid. tmux starts the command through `/bin/sh -c`, but that
+// wrapper execs its way down the chain, so for a command shaped like the one
+// session.Manager builds (`cd …; env … $SHELL -ic '<agent>'`) the pane's pid
+// is the *interactive* shell — and interactive shells ignore SIGTERM.
+// Measured on zsh 5.9: SIGTERM leaves it in Ss with pane_dead=0, SIGHUP takes
+// it and its jobs down. SIGHUP is also what the pane's processes already
+// receive today when kill-pane closes the pty, so agents see the same signal
+// they always have; this only spares the pane itself.
+//
+// It goes to the pane's own pid rather than its process group: the agent
+// running under that shell sits in a job of its own, which a killpg on the
+// pane's group would miss entirely. Hanging up the shell is enough — it HUPs
+// its jobs on the way out, and tmux closes the pty behind it.
+//
+// A pane whose process ignores SIGHUP too stays alive and reports no error;
+// callers that need the stop guaranteed must confirm via IsPaneDead and fall
+// back to KillPane. Note that IsPaneDead only answers for that direct child:
+// a descendant that escaped the shell's job control and the pty (double-forked,
+// setsid'd) keeps running with the pane reported dead. No agent adapter
+// shipped so far does that, but it is the assumption to re-check when adding
+// one.
+//
+// Do not call this on a pane that has already exited. tmux keeps reporting
+// the pid such a pane started with, and the OS is free to have reissued that
+// number to an unrelated process — check IsPaneDead first.
+func (c *Client) TerminatePaneProcess(target string) error {
+	out, err := c.run("display-message", "-t", target, "-p", "#{pane_pid}")
+	if err != nil {
+		return fmt.Errorf("read pane_pid of %s: %w", target, err)
+	}
+	pid, err := parsePanePID(out)
+	if err != nil {
+		return fmt.Errorf("pane %s: %w", target, err)
+	}
+	return syscall.Kill(pid, syscall.SIGHUP)
 }
 
 // GetPaneWindowName returns the window name that contains the given pane.

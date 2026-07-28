@@ -172,10 +172,13 @@ func TestE2E_KillWithTmuxCleanup(t *testing.T) {
 		t.Fatalf("Kill: %v", err)
 	}
 
-	// tmux session should be gone
+	// The inner session outlives the kill: killing stops the agent and leaves
+	// the window standing, so whatever else the user had open in it survives
+	// and a later start revives the agent in place. Releasing it is delete's
+	// job (TestE2E_DeleteWithTmuxCleanup).
 	time.Sleep(200 * time.Millisecond)
-	if hasTmuxSession(innerName) {
-		t.Error("tmux session should not exist after Kill")
+	if !hasTmuxSession(innerName) {
+		t.Error("tmux session should outlive Kill")
 	}
 
 	// Status should be stopped
@@ -386,19 +389,17 @@ func TestE2E_MultipleSessionsTmux(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	// Middle should be gone, others still alive
-	if hasTmuxSession(sessions[1].innerName) {
-		t.Error("killed session's tmux should not exist")
-	}
-	if !hasTmuxSession(sessions[0].innerName) {
-		t.Error("session 0 tmux should still exist after killing session 1")
-	}
-	if !hasTmuxSession(sessions[2].innerName) {
-		t.Error("session 2 tmux should still exist after killing session 1")
+	// Every inner session is still there — the killed one because a kill
+	// keeps its window (see TestE2E_KillWithTmuxCleanup), the others because
+	// killing one session must not touch its neighbours.
+	for i, s := range sessions {
+		if !hasTmuxSession(s.innerName) {
+			t.Errorf("tmux session %d (%s) should still exist after killing session 1", i, s.innerName)
+		}
 	}
 
-	// Delete the rest
-	for _, i := range []int{0, 2} {
+	// Delete all three: the killed one is only released here.
+	for _, i := range []int{0, 1, 2} {
 		if err := client.Delete(sessions[i].id, false, false); err != nil {
 			t.Fatalf("Delete(%d): %v", i, err)
 		}
