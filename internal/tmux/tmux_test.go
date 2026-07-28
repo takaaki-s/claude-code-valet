@@ -556,3 +556,42 @@ func TestEnsureNamedPane_PlainSplitSkipsTagging(t *testing.T) {
 		t.Errorf("SetPaneOption calls = %v, want none for an unnamed split", ops.setCalls)
 	}
 }
+
+func TestParsePanePID(t *testing.T) {
+	tests := []struct {
+		name    string
+		out     string
+		want    int
+		wantErr bool
+	}{
+		{name: "plain", out: "12345", want: 12345},
+		{name: "trailing newline", out: "12345\n", want: 12345},
+		{name: "surrounding space", out: "  12345  ", want: 12345},
+		{name: "empty", out: "", wantErr: true},
+		{name: "whitespace only", out: " \n", wantErr: true},
+		// tmux answers an unknown target with an error, but a format that
+		// resolved to nothing useful must not reach syscall.Kill either.
+		{name: "not a number", out: "%42", wantErr: true},
+		// A negative pid signals a whole process group and 0 signals the
+		// caller's own group: both would reach far past the pane.
+		{name: "negative", out: "-1", wantErr: true},
+		{name: "zero", out: "0", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parsePanePID(tt.out)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parsePanePID(%q) = %d, want error", tt.out, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parsePanePID(%q) returned error: %v", tt.out, err)
+			}
+			if got != tt.want {
+				t.Errorf("parsePanePID(%q) = %d, want %d", tt.out, got, tt.want)
+			}
+		})
+	}
+}

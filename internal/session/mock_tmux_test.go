@@ -78,6 +78,33 @@ type mockTmuxRunner struct {
 	// mid-probe and exercise the apply-phase re-validation guards.
 	onHasSession func(name string)
 
+	// terminateErr injects an error for TerminatePaneProcess on a given
+	// target, standing in for a pane whose pid tmux will not report.
+	terminateErr map[string]error
+
+	// terminateSurvivors marks targets whose process ignores the signal:
+	// TerminatePaneProcess reports success but the pane never goes dead, so
+	// the caller has to reach for its kill-pane fallback.
+	terminateSurvivors map[string]bool
+
+	// onTerminatePaneProcess, if set, fires ONCE on the next
+	// TerminatePaneProcess with the same contract as onHasSession (consumed
+	// under mu, invoked without it). Kill signals the pane outside
+	// Manager.mu, so tests use this to mutate manager state inside that
+	// window and exercise the apply-phase re-validation.
+	onTerminatePaneProcess func(target string)
+
+	// onIsPaneDead is onHasSession's counterpart for the pane probe, fired
+	// once AFTER the return value is decided. Recovery probes HasSession then
+	// IsPaneDead, so this is the hook for landing something (a Kill) in the
+	// window between the last probe and the apply phase.
+	onIsPaneDead func(target string)
+
+	// onRespawnPane fires ONCE while a respawn is in flight, same contract as
+	// the hooks above. The monitor's resume retry respawns without m.mu held,
+	// so this is where a test lands a Kill in that window.
+	onRespawnPane func(target string)
+
 	calls []mockCall // recorded calls for assertion
 }
 
@@ -97,7 +124,18 @@ func newMockTmuxRunner() *mockTmuxRunner {
 		captureCallCount:   make(map[string]int),
 		sendKeysLiteralErr: make(map[string]error),
 		sendKeysErr:        make(map[string]error),
+		terminateErr:       make(map[string]error),
+		terminateSurvivors: make(map[string]bool),
 	}
+}
+
+// takeHook consumes a fire-once callback, clearing it so a later call does not
+// fire it again. Caller must hold mu; the returned callback is invoked without
+// it, so a hook is free to call back into the Manager (and thus into the mock).
+func takeHook(hook *func(string)) func(string) {
+	cb := *hook
+	*hook = nil
+	return cb
 }
 
 // record appends to the call log. Caller must hold mu.
@@ -108,8 +146,7 @@ func (m *mockTmuxRunner) record(method string, args ...string) {
 func (m *mockTmuxRunner) HasSession(name string) bool {
 	m.mu.Lock()
 	m.record("HasSession", name)
-	cb := m.onHasSession
-	m.onHasSession = nil // fire once (see field doc)
+	cb := takeHook(&m.onHasSession)
 	m.mu.Unlock()
 	if cb != nil {
 		cb(name)
@@ -137,8 +174,17 @@ func (m *mockTmuxRunner) NewSessionWithCmdInDir(name string, width, height int, 
 
 func (m *mockTmuxRunner) RespawnPane(target, cmd string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("RespawnPane", target, cmd)
+	cb := takeHook(&m.onRespawnPane)
+	m.mu.Unlock()
+	if cb != nil {
+		// Before the pane comes back, so a callback lands in the window where
+		// the respawn has been issued but has not taken effect.
+		cb(target)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.deadPanes, target) // a respawned pane runs again
 	return nil
 }
 
@@ -154,9 +200,16 @@ func (m *mockTmuxRunner) GetPaneID(sessionName string) (string, error) {
 
 func (m *mockTmuxRunner) IsPaneDead(target string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.record("IsPaneDead", target)
-	return m.deadPanes[target]
+	dead := m.deadPanes[target]
+	cb := takeHook(&m.onIsPaneDead)
+	m.mu.Unlock()
+	if cb != nil {
+		// After the answer is fixed, so a callback that changes deadPanes
+		// cannot rewrite the reading this call already committed to.
+		cb(target)
+	}
+	return dead
 }
 
 func (m *mockTmuxRunner) TagManagedPane(paneID string) error {
@@ -178,6 +231,33 @@ func (m *mockTmuxRunner) KillPane(paneID string) error {
 	defer m.mu.Unlock()
 	m.record("KillPane", paneID)
 	return nil
+}
+
+// TerminatePaneProcess models the real client's contract: on success the
+// pane's process is gone (deadPanes flips) but the pane itself stays, so the
+// window and every other pane in it survive. terminateErr /
+// terminateSurvivors drive the two ways that can fail.
+//
+// Signalling a pane that already exited fails here the way it does in
+// practice: tmux still reports the pid the pane started with, and the kill
+// against that stale number comes back ESRCH. Callers are expected not to get
+// this far — see stopAgentPane's dead-pane check.
+func (m *mockTmuxRunner) TerminatePaneProcess(target string) error {
+	m.mu.Lock()
+	m.record("TerminatePaneProcess", target)
+	cb := takeHook(&m.onTerminatePaneProcess)
+	err := m.terminateErr[target]
+	if err == nil && m.deadPanes[target] {
+		err = fmt.Errorf("kill %s: no such process", target)
+	}
+	if err == nil && !m.terminateSurvivors[target] {
+		m.deadPanes[target] = true
+	}
+	m.mu.Unlock()
+	if cb != nil {
+		cb(target)
+	}
+	return err
 }
 
 func (m *mockTmuxRunner) GetPaneCurrentPath(target string) (string, error) {

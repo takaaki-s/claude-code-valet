@@ -51,8 +51,8 @@ Session (persisted)
 ├─ AgentKind             string    // Adapter identifier ("claude" etc.); always non-empty in persisted form
 ├─ AgentSessionID        string    // Adapter-side persistent id (CC --session-id / --resume value)
 ├─ AgentSessionStarted   bool      // Flipped once the agent has spawned; drives adapter's fresh-vs-resume branch
-├─ TmuxWindowName        string    // Inner tmux session name
-└─ TmuxPaneID            string    // Agent pane ID (e.g., "%42")
+├─ TmuxWindowName        string    // Inner tmux session name; kept across a kill (see Kill below)
+└─ TmuxPaneID            string    // Agent pane ID (e.g., "%42"); kept across a kill
 
 Session (runtime only, json:"-")
 ├─ LastOutputTime    time.Time         // For idle stability detection
@@ -147,14 +147,49 @@ stdout/stderr are saved to `~/.local/state/jind-ai/hook-logs/<session-id>.log` r
      (or permission when persisted, indistinguishable from the transcript
      alone), last entry user → thinking. Unknown/no transcript keeps the
      step-1 decision
-4. Pane dead → StatusStopped (TmuxWindowName preserved for RespawnPane)
+4. Pane dead → StatusStopped (TmuxWindowName preserved for RespawnPane).
+   Killed sessions land here too, since a kill leaves the pane dead rather
+   than destroying it
 5. Session itself gone → Clear TmuxWindowName + StatusStopped
+
+A decision is re-validated before it is applied, and dropped when the session
+was deleted, started, or killed while the (unlocked) probes ran.
 
 Known residual: a recovered session whose status ends up "running" (no
 hook-derived status persisted and no transcript verdict) stays "running"
 until the next hook — the running→idle poll fallback is intentionally
 disabled for recovered sessions (`StartedAt` is runtime-only) to avoid false
 idle transitions while a task is still executing.
+
+## Kill
+
+`Kill()` stops the agent; it does not tear the session's tmux state down.
+It sends SIGTERM to the agent pane's process and leaves the pane in place
+(`remain-on-exit`), so:
+
+- the inner tmux session survives, and with it every other pane in that
+  window — plugin splits, shells the user opened
+- `TmuxWindowName` / `TmuxPaneID` stay set, so `StartBackground()` revives the
+  agent with `RespawnPane` in the pane it already had, at its original size
+  and position, instead of rebuilding the window
+- the pane keeps its scrollback until the restart respawns it
+
+The session reads as `stopped` from the moment the request is accepted, before
+the tmux work runs, so a start arriving mid-kill is not mistaken for a no-op.
+
+A pane that is already dead (killed twice, or an agent that crashed on its
+own) is left alone rather than signalled: tmux keeps reporting the pid the
+pane started with, which the OS may since have reissued elsewhere.
+
+If the process outlives the signal (bounded wait, see `paneTerminateTries`)
+the pane is killed outright, the inner session with it, and both fields are
+cleared — that path loses the session's other panes, which is the price of an
+agent that would not stop. A kill always stops the agent; the preserved window
+is best-effort on top of that.
+
+Otherwise, releasing the tmux resources is `Delete()`'s job: it kills the
+inner session, window and all. A session that is only killed keeps its window
+until it is restarted or deleted.
 
 ## Auto-Recovery on Resume Failure
 

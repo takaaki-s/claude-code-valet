@@ -85,6 +85,19 @@ type Session struct {
 	SSHAuthSock      string           `json:"-"` // SSH_AUTH_SOCK (for git operations, not persisted)
 	DescriptionLayer DescriptionLayer `json:"-"` // Runtime-only enhancer layer; see DescriptionLayer docs + TryUpgradeDescription's restart guard
 	PersistedStatus  Status           `json:"-"` // Status read from disk at load time, before the in-memory normalization to Stopped; consumed once by recovery
+	// killSeq counts the stops Kill has recorded for this session. Unexported
+	// and runtime-only: its whole job is to let code that dropped m.mu tell
+	// whether a Kill landed while it was away. TmuxWindowName used to answer
+	// that (a kill cleared it), but a kill now keeps the window standing so
+	// the session can be revived in place, and a session reloaded from disk
+	// looks Stopped whether or not anyone killed it — neither can be read as
+	// evidence any more.
+	//
+	// Kill is the only writer. Stops from other sources (a hook reporting the
+	// agent exited, the monitor finding the pane dead) do not bump it: those
+	// are observations of a session that stopped by itself, and the next
+	// monitor tick reconverges anything a stale decision got wrong.
+	killSeq uint64
 
 	// Tracked runtime fields (CurrentWorkDir is persisted so worktree/subdir
 	// context survives daemon restarts and enables resume in the last known dir).

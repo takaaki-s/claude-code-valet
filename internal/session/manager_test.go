@@ -1012,8 +1012,447 @@ func TestManager_Kill(t *testing.T) {
 	if got.Status != StatusStopped {
 		t.Errorf("Status = %q, want %q", got.Status, StatusStopped)
 	}
+	if !mock.hasCalledWith("TerminatePaneProcess", "%42") {
+		t.Error("expected TerminatePaneProcess to be called with %42")
+	}
+	if mock.hasCalledWith("KillPane", "%42") {
+		t.Error("KillPane was called; a pane that stopped on its own must be left standing")
+	}
+	// The window and pane are what a later start revives in place, and what
+	// keeps the session's other panes (plugin splits, user shells) alive in
+	// the meantime. Clearing them is the fallback path's job, not this one's.
+	if got.TmuxWindowName != "jin_"+sess.ID {
+		t.Errorf("TmuxWindowName = %q, want it preserved as %q", got.TmuxWindowName, "jin_"+sess.ID)
+	}
+	if got.TmuxPaneID != "%42" {
+		t.Errorf("TmuxPaneID = %q, want it preserved as %q", got.TmuxPaneID, "%42")
+	}
+}
+
+// TestManager_Kill_FallsBackWhenProcessSurvives covers the pane whose process
+// sits through SIGTERM: kill still has to be a kill, so the pane is destroyed
+// outright and the fields that no longer address anything are cleared.
+func TestManager_Kill_FallsBackWhenProcessSurvives(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: "/tmp/kill-survivor", Description: "survivor"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	sess.TmuxWindowName = "jin_" + sess.ID
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusRunning
+	mgr.mu.Unlock()
+
+	mock.terminateSurvivors["%42"] = true
+
+	if err := mgr.Kill(sess.ID); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+
+	got, ok := mgr.Get(sess.ID)
+	if !ok {
+		t.Fatal("Get returned ok=false after Kill")
+	}
+	if got.Status != StatusStopped {
+		t.Errorf("Status = %q, want %q", got.Status, StatusStopped)
+	}
 	if !mock.hasCalledWith("KillPane", "%42") {
-		t.Error("expected KillPane to be called with %42")
+		t.Error("expected the kill-pane fallback for a process that ignored SIGTERM")
+	}
+	if got.TmuxWindowName != "" || got.TmuxPaneID != "" {
+		t.Errorf("TmuxWindowName = %q, TmuxPaneID = %q, want both cleared once the pane is gone", got.TmuxWindowName, got.TmuxPaneID)
+	}
+}
+
+// TestManager_Kill_TerminateErrorFallsBack covers the other failure shape: the
+// pid could not be read at all, so the signal never went anywhere.
+func TestManager_Kill_TerminateErrorFallsBack(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: "/tmp/kill-termerr", Description: "termerr"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	sess.TmuxWindowName = "jin_" + sess.ID
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusRunning
+	mgr.mu.Unlock()
+
+	mock.terminateErr["%42"] = fmt.Errorf("no pane_pid")
+
+	if err := mgr.Kill(sess.ID); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+
+	got, ok := mgr.Get(sess.ID)
+	if !ok {
+		t.Fatal("Get returned ok=false after Kill")
+	}
+	if got.Status != StatusStopped {
+		t.Errorf("Status = %q, want %q", got.Status, StatusStopped)
+	}
+	if !mock.hasCalledWith("KillPane", "%42") {
+		t.Error("expected the kill-pane fallback when the signal could not be delivered")
+	}
+	if got.TmuxPaneID != "" {
+		t.Errorf("TmuxPaneID = %q, want it cleared", got.TmuxPaneID)
+	}
+}
+
+// TestManager_Kill_PreservesWindowForRestart is the behaviour the whole change
+// exists for: a killed session restarts into the pane it already had, so every
+// other pane in that window survives the round trip.
+func TestManager_Kill_PreservesWindowForRestart(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	workDir := t.TempDir()
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: workDir, Description: "revive"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	innerName := "sess-" + sess.ID
+	mock.paneIDs[innerName] = "%99"
+
+	if err := mgr.StartBackground(sess.ID); err != nil {
+		t.Fatalf("StartBackground failed: %v", err)
+	}
+	if err := mgr.Kill(sess.ID); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+
+	killed, _ := mgr.Get(sess.ID)
+	if killed.TmuxWindowName != innerName {
+		t.Fatalf("TmuxWindowName = %q after Kill, want it kept as %q", killed.TmuxWindowName, innerName)
+	}
+
+	// The first start clears any stale inner session of the same name, so the
+	// question is whether the restart adds another one — that call is what
+	// takes the window, and every pane in it, down.
+	killSessionsBefore := mock.countCallsWithArgs("KillSession", innerName)
+
+	if err := mgr.StartBackground(sess.ID); err != nil {
+		t.Fatalf("restart failed: %v", err)
+	}
+
+	if !mock.hasCalledWith("RespawnPane", "%99") {
+		t.Error("expected the restart to respawn the existing pane")
+	}
+	if n := mock.countCallsWithArgs("KillSession", innerName); n != killSessionsBefore {
+		t.Errorf("KillSession calls = %d, want it unchanged at %d; the restart must not rebuild the window", n, killSessionsBefore)
+	}
+}
+
+// TestManager_Kill_DoesNotClobberConcurrentRestart drives a start into the
+// window where Kill has released the lock to signal the pane. The newer state
+// has to win: stamping "stopped" over it would leave a live agent that nothing
+// is monitoring.
+func TestManager_Kill_DoesNotClobberConcurrentRestart(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: "/tmp/kill-race", Description: "race"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	mgr.mu.Lock()
+	sess.TmuxWindowName = "jin_" + sess.ID
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusRunning
+	sess.StartedAt = time.Now().Add(-time.Hour)
+	mgr.mu.Unlock()
+
+	// Stand in for a restart landing mid-kill: same pane, same inner session,
+	// fresh StartedAt — exactly what startSessionTmux's revive branch leaves
+	// behind, which is why StartedAt is the marker Kill re-validates against.
+	mock.onTerminatePaneProcess = func(string) {
+		mgr.mu.Lock()
+		sess.Status = StatusRunning
+		sess.StartedAt = time.Now()
+		mgr.mu.Unlock()
+	}
+
+	if err := mgr.Kill(sess.ID); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+
+	got, ok := mgr.Get(sess.ID)
+	if !ok {
+		t.Fatal("Get returned ok=false after Kill")
+	}
+	if got.Status != StatusRunning {
+		t.Errorf("Status = %q, want the restarted session left alone at %q", got.Status, StatusRunning)
+	}
+	if got.TmuxPaneID != "%42" || got.TmuxWindowName != "jin_"+sess.ID {
+		t.Errorf("TmuxPaneID = %q / TmuxWindowName = %q, want both untouched", got.TmuxPaneID, got.TmuxWindowName)
+	}
+}
+
+// TestManager_Kill_OnAlreadyStoppedPaneKeepsWindow covers killing a session
+// whose agent is already gone — a second `x`, or a kill on a session that
+// crashed on its own. tmux keeps reporting the pid such a pane started with
+// long after the process is gone, so signalling it would fire at a number the
+// OS may have reissued to something unrelated; falling back to kill-pane
+// afterwards would then drop the window and take the session's other panes
+// with it on the next start.
+func TestManager_Kill_OnAlreadyStoppedPaneKeepsWindow(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: "/tmp/kill-twice", Description: "killtwice"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+
+	windowName := "jin_" + sess.ID
+	mgr.mu.Lock()
+	sess.TmuxWindowName = windowName
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusRunning
+	mgr.mu.Unlock()
+
+	if err := mgr.Kill(sess.ID); err != nil {
+		t.Fatalf("first Kill failed: %v", err)
+	}
+	terminatesAfterFirst := mock.countCallsWithArgs("TerminatePaneProcess", "%42")
+
+	if err := mgr.Kill(sess.ID); err != nil {
+		t.Fatalf("second Kill failed: %v", err)
+	}
+
+	if n := mock.countCallsWithArgs("TerminatePaneProcess", "%42"); n != terminatesAfterFirst {
+		t.Errorf("TerminatePaneProcess calls = %d, want it unchanged at %d; a dead pane's pid is stale", n, terminatesAfterFirst)
+	}
+	if mock.hasCalledWith("KillPane", "%42") {
+		t.Error("KillPane was called on an already-dead pane")
+	}
+	got, _ := mgr.Get(sess.ID)
+	if got.TmuxWindowName != windowName || got.TmuxPaneID != "%42" {
+		t.Errorf("TmuxWindowName = %q / TmuxPaneID = %q, want both kept so the restart revives in place", got.TmuxWindowName, got.TmuxPaneID)
+	}
+}
+
+// TestManager_Kill_DoesNotSwallowConcurrentStart pins the other half of the
+// kill window: the session has to read as stopped for the whole time its agent
+// is being taken down, or a start arriving in that window finds a session that
+// "is already running" and returns without doing anything.
+func TestManager_Kill_DoesNotSwallowConcurrentStart(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	workDir := t.TempDir()
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: workDir, Description: "restart-in-window"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	innerName := "sess-" + sess.ID
+	mock.paneIDs[innerName] = "%99"
+	if err := mgr.StartBackground(sess.ID); err != nil {
+		t.Fatalf("StartBackground failed: %v", err)
+	}
+	respawnsBefore := mock.countCallsWithArgs("RespawnPane", "%99", "")
+
+	// A real start, issued while Kill is between its two lock sections.
+	mock.onTerminatePaneProcess = func(string) {
+		if err := mgr.StartBackground(sess.ID); err != nil {
+			t.Errorf("StartBackground during kill failed: %v", err)
+		}
+	}
+
+	if err := mgr.Kill(sess.ID); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+
+	// Which side wins the pane is racy by nature (the kill is still tearing
+	// down what the start just brought back). What must not happen is the
+	// start quietly doing nothing at all.
+	respawns := 0
+	for _, c := range mock.calls {
+		if c.method == "RespawnPane" && len(c.args) > 0 && c.args[0] == "%99" {
+			respawns++
+		}
+	}
+	if respawns <= respawnsBefore {
+		t.Errorf("RespawnPane calls = %d, want more than %d; the start was swallowed by a session still reading as running", respawns, respawnsBefore)
+	}
+}
+
+// TestManager_Kill_SurvivesDyingAgentHook covers the last word an agent gets:
+// terminating it tends to make it fire one final hook, and that hook lands in
+// the window where Kill has released the lock. HandleHookEvent writes whatever
+// status the hook maps to without knowing a kill is in flight, so the kill has
+// to have the final say or the session sits in the list as idle.
+func TestManager_Kill_SurvivesDyingAgentHook(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: "/tmp/kill-dying-hook", Description: "dyinghook"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	mgr.mu.Lock()
+	sess.TmuxWindowName = "jin_" + sess.ID
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusThinking
+	agentSessionID := sess.AgentSessionID
+	mgr.mu.Unlock()
+
+	// The agent's parting Stop hook, delivered mid-kill.
+	mock.onTerminatePaneProcess = func(string) {
+		mgr.HandleHookEvent(agentSessionID, sess.ID, "Stop", "", "", "")
+	}
+
+	if err := mgr.Kill(sess.ID); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+
+	got, ok := mgr.Get(sess.ID)
+	if !ok {
+		t.Fatal("Get returned ok=false after Kill")
+	}
+	if got.Status != StatusStopped {
+		t.Errorf("Status = %q, want %q; a hook fired while dying must not outrank the kill", got.Status, StatusStopped)
+	}
+}
+
+// TestManager_HandlePaneDeath_StoppedSessionDoesNotRespawn is the wiring test
+// for the monitor's guard: a kill that lands between the loop's status read
+// and its pane probe arrives here looking exactly like a crash, and inside the
+// quick-resume window that misreading would hand the user back the agent they
+// just stopped.
+func TestManager_HandlePaneDeath_StoppedSessionDoesNotRespawn(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: "/tmp/panedeath-stopped", Description: "pd-stopped"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	mgr.mu.Lock()
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusStopped // Kill got here first
+	sess.AgentSessionStarted = true
+	sess.StartedAt = time.Now() // inside quickResumeFailWindow
+	mgr.mu.Unlock()
+
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description); !stop {
+		t.Error("handlePaneDeath = false, want the monitor to exit on an already-recorded stop")
+	}
+	if mock.hasCalledWith("RespawnPane", "%42") {
+		t.Error("the agent was respawned after a stop was already recorded")
+	}
+	got, _ := mgr.Get(sess.ID)
+	if got.Status != StatusStopped {
+		t.Errorf("Status = %q, want it left at %q", got.Status, StatusStopped)
+	}
+}
+
+// TestManager_HandlePaneDeath_QuickResumeRetries pins the behaviour the guard
+// above must not break: a genuine resume failure still gets its one retry.
+func TestManager_HandlePaneDeath_QuickResumeRetries(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: t.TempDir(), Description: "pd-retry"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	mgr.mu.Lock()
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusRunning
+	sess.AgentSessionStarted = true
+	sess.StartedAt = time.Now()
+	mgr.mu.Unlock()
+
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description); stop {
+		t.Error("handlePaneDeath = true, want the monitor to keep watching a retried session")
+	}
+	if !mock.hasCalledWith("RespawnPane", "%42") {
+		t.Error("expected the resume retry to respawn the pane")
+	}
+	got, _ := mgr.Get(sess.ID)
+	if got.Status != StatusRunning {
+		t.Errorf("Status = %q, want %q after a successful retry", got.Status, StatusRunning)
+	}
+}
+
+// TestManager_HandlePaneDeath_KillDuringRetryWins drives a kill into the
+// window where the retry has released the lock to respawn. The retry must not
+// publish the agent it just brought back — the user asked for this session to
+// be down after that decision was made.
+func TestManager_HandlePaneDeath_KillDuringRetryWins(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: t.TempDir(), Description: "pd-killrace"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	mgr.mu.Lock()
+	sess.TmuxWindowName = "jin_" + sess.ID
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusRunning
+	sess.AgentSessionStarted = true
+	sess.StartedAt = time.Now()
+	mgr.mu.Unlock()
+
+	mock.onRespawnPane = func(string) {
+		if err := mgr.Kill(sess.ID); err != nil {
+			t.Errorf("Kill during retry failed: %v", err)
+		}
+	}
+
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description); !stop {
+		t.Error("handlePaneDeath = false, want the monitor to exit after the session was killed")
+	}
+	got, _ := mgr.Get(sess.ID)
+	if got.Status != StatusStopped {
+		t.Errorf("Status = %q, want %q; the kill landed after the retry decision", got.Status, StatusStopped)
+	}
+}
+
+// TestClassifyPaneDeath pins the monitor's reading of a dead agent pane. The
+// stopped-inside-the-retry-window row is the regression guard: that is the
+// shape a kill leaves behind, and treating it as a failed resume would respawn
+// the agent the user just stopped.
+func TestClassifyPaneDeath(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		sess Session
+		want paneDeathOutcome
+	}{
+		{
+			name: "killed inside the quick-resume window",
+			sess: Session{Status: StatusStopped, AgentSessionStarted: true, StartedAt: now.Add(-time.Second)},
+			want: paneDeathAlreadyStopped,
+		},
+		{
+			name: "killed outside the quick-resume window",
+			sess: Session{Status: StatusStopped, AgentSessionStarted: true, StartedAt: now.Add(-time.Hour)},
+			want: paneDeathAlreadyStopped,
+		},
+		{
+			name: "resume failed right after start",
+			sess: Session{Status: StatusRunning, AgentSessionStarted: true, StartedAt: now.Add(-time.Second)},
+			want: paneDeathQuickResumeRetry,
+		},
+		{
+			name: "died long after start",
+			sess: Session{Status: StatusIdle, AgentSessionStarted: true, StartedAt: now.Add(-time.Hour)},
+			want: paneDeathRecordStop,
+		},
+		{
+			name: "never spawned an agent",
+			sess: Session{Status: StatusRunning, AgentSessionStarted: false, StartedAt: now.Add(-time.Second)},
+			want: paneDeathRecordStop,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyPaneDeath(&tt.sess, now); got != tt.want {
+				t.Errorf("classifyPaneDeath = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1362,11 +1801,17 @@ func TestManager_RecoverTmuxSessions_SkipsSessionStartedByThisDaemon(t *testing.
 }
 
 // TestManager_RecoverTmuxSessions_KillDuringProbe verifies the apply-phase
-// TmuxWindowName re-validation: a session killed while the unlocked probes
-// run must not be resurrected by the stale "pane alive" observation.
+// re-validation: a session killed while the unlocked probes run must not be
+// resurrected by the stale "pane alive" observation. The kill lands before the
+// pane probe here, so the decision itself already turns into recoverPaneDead —
+// which keeps TmuxWindowName, exactly as Kill left it.
 func TestManager_RecoverTmuxSessions_KillDuringProbe(t *testing.T) {
 	mgr, mock, _ := newTestManager(t)
 	sess := setupLivePaneSession(t, mgr, mock, "%21", StatusThinking)
+
+	mgr.mu.RLock()
+	windowName := sess.TmuxWindowName
+	mgr.mu.RUnlock()
 
 	mock.onHasSession = func(string) {
 		if err := mgr.Kill(sess.ID); err != nil {
@@ -1383,8 +1828,34 @@ func TestManager_RecoverTmuxSessions_KillDuringProbe(t *testing.T) {
 	if got.Status != StatusStopped {
 		t.Errorf("Status = %q, want %q (killed mid-probe)", got.Status, StatusStopped)
 	}
-	if got.TmuxWindowName != "" {
-		t.Errorf("TmuxWindowName = %q, want cleared", got.TmuxWindowName)
+	if got.TmuxWindowName != windowName {
+		t.Errorf("TmuxWindowName = %q, want it kept as %q so the session can be revived in place", got.TmuxWindowName, windowName)
+	}
+}
+
+// TestManager_RecoverTmuxSessions_KillAfterPaneProbe drives the kill into the
+// last gap there is: after every probe has answered "pane alive", with the
+// resume decision already made. The window-name check cannot catch this one —
+// Kill keeps the name — so the status guard is what has to hold, or recovery
+// hands the user back a session they just stopped.
+func TestManager_RecoverTmuxSessions_KillAfterPaneProbe(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	sess := setupLivePaneSession(t, mgr, mock, "%22", StatusThinking)
+
+	mock.onIsPaneDead = func(string) {
+		if err := mgr.Kill(sess.ID); err != nil {
+			t.Errorf("Kill failed: %v", err)
+		}
+	}
+
+	mgr.RecoverTmuxSessions()
+
+	got, ok := mgr.Get(sess.ID)
+	if !ok {
+		t.Fatal("Get returned ok=false")
+	}
+	if got.Status != StatusStopped {
+		t.Errorf("Status = %q, want %q; the resume decision predates the kill", got.Status, StatusStopped)
 	}
 }
 

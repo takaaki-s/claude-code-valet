@@ -171,10 +171,14 @@ type recoverDecision struct {
 	// windowName is TmuxWindowName at snapshot time; apply re-validates it,
 	// so a Kill or restart during the probe window invalidates the decision.
 	windowName string
-	outcome    recoverOutcome
-	fromDisk   Status
-	verdict    StatusUpdate
-	verdictOK  bool
+	// killSeq is Session.killSeq at snapshot time. Apply compares it with the
+	// live counter to notice a Kill that landed while the probes ran — a kill
+	// keeps the window standing, so windowName cannot catch that on its own.
+	killSeq   uint64
+	outcome   recoverOutcome
+	fromDisk  Status
+	verdict   StatusUpdate
+	verdictOK bool
 }
 
 // snapshotForRecovery copies every session under the lock so the probe phase
@@ -213,6 +217,7 @@ func (m *Manager) decideRecovery(snaps []Session, tc tmux.Runner) []recoverDecis
 		d := recoverDecision{
 			id:         snap.ID,
 			windowName: snap.TmuxWindowName,
+			killSeq:    snap.killSeq,
 			fromDisk:   snap.PersistedStatus,
 		}
 		switch {
@@ -280,9 +285,20 @@ func (m *Manager) applyRecovery(decisions []recoverDecision) (saves []Session, m
 		if !live.StartedAt.IsZero() {
 			continue
 		}
-		// A Kill (clears TmuxWindowName) or restart during the probe window
+		// A restart, or a Kill that had to fall back to destroying the pane,
 		// means the probe result describes a window we no longer track.
 		if live.TmuxWindowName != d.windowName {
+			continue
+		}
+		// The ordinary Kill leaves that name in place — it stops the pane's
+		// process and keeps the window standing — so the check above cannot
+		// see it, and Status cannot stand in either: a session reloaded from
+		// disk is already Stopped before anyone kills anything. The counter is
+		// the one mark a kill always leaves. Every probe behind this decision
+		// predates it, so resuming on their say-so would revive a session
+		// someone just stopped.
+		if live.killSeq != d.killSeq {
+			debugLog("[RECOVER] Session %s killed while probing, dropping the stale decision", live.Description)
 			continue
 		}
 
@@ -1928,6 +1944,132 @@ func (m *Manager) snapshotAndUnlock(session *Session) Session {
 	return saved
 }
 
+// paneDeathOutcome is what a dead agent pane means for the session behind it.
+type paneDeathOutcome int
+
+const (
+	// paneDeathAlreadyStopped: someone already recorded a stop for this
+	// session, so the dead pane is the aftermath of their work, not news.
+	paneDeathAlreadyStopped paneDeathOutcome = iota
+	// paneDeathQuickResumeRetry: the pane died so soon after starting that a
+	// failed resume is the likeliest cause; retry with a fresh agent session.
+	paneDeathQuickResumeRetry
+	// paneDeathRecordStop: an ordinary death; record the session as stopped.
+	paneDeathRecordStop
+)
+
+// classifyPaneDeath decides what the monitor should do about a pane it has
+// just found dead. Caller must hold m.mu.
+//
+// The already-stopped case has to be tested first, and it is the whole reason
+// this is a three-way decision rather than the retry test alone: Kill stops
+// the pane's process and records the stop, and the monitor's own status read
+// happens a probe earlier than the pane check, so a kill landing in that gap
+// arrives here looking exactly like a crash. Inside quickResumeFailWindow that
+// misreading would respawn an agent the user just asked to stop.
+func classifyPaneDeath(s *Session, now time.Time) paneDeathOutcome {
+	switch {
+	case s.Status == StatusStopped:
+		return paneDeathAlreadyStopped
+	case s.AgentSessionStarted && now.Sub(s.StartedAt) < quickResumeFailWindow:
+		return paneDeathQuickResumeRetry
+	default:
+		return paneDeathRecordStop
+	}
+}
+
+// handlePaneDeath resolves a pane the monitor has just found dead: exit
+// quietly when someone else already recorded the stop, retry a resume that
+// failed on startup, or record the stop itself. Reports whether the monitor
+// should exit — false means the agent is back up and worth watching.
+//
+// Split out of captureOutputTmux's loop so the decision can be driven without
+// waiting out the 10s ticker; the loop keeps the polling and the target.
+func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) (stop bool) {
+	m.mu.Lock()
+	// Exit without saving if session was already deleted
+	if _, exists := m.sessions[session.ID]; !exists {
+		m.mu.Unlock()
+		debugLog("[TMUX] Session %s pane died but session already deleted, skipping save", sessionName)
+		return true
+	}
+
+	outcome := classifyPaneDeath(session, time.Now())
+	if outcome == paneDeathAlreadyStopped {
+		m.mu.Unlock()
+		debugLog("[TMUX] Session %s pane dead with a stop already recorded, monitor exiting", sessionName)
+		return true
+	}
+
+	// If the agent's --resume fails immediately (within 10 seconds of
+	// startup), auto-restart with a fresh session ID by going back
+	// through the adapter's SpawnCommand (this way agents without a
+	// --resume concept still get sensible retry semantics).
+	if outcome == paneDeathQuickResumeRetry {
+		debugLog("[TMUX] Session %s pane died quickly (resume likely failed), retrying with fresh agent session", session.Description)
+		newSessionID := uuid.New().String()
+		session.AgentSessionStarted = false
+		session.AgentSessionID = newSessionID
+		// Snapshot every field buildAgentShellCmd needs BEFORE
+		// releasing m.mu. Without this the retry runs the builder
+		// with lock-free reads of session.WorkDir /
+		// AgentSessionID / AgentSessionStarted, racing writes from
+		// HandleHookEvent.
+		retrySnap := snapshotForSpawn(session, session.WorkDir, expandTilde(session.WorkDir))
+		// A Kill can land across the respawn below, and the check that spotted
+		// none a moment ago cannot speak for the whole window.
+		killSeqBefore := session.killSeq
+		_ = m.store.Save(m.snapshotAndUnlock(session))
+
+		respawned := false
+		if shellCmd, buildErr := m.buildAgentShellCmd(retrySnap); buildErr != nil {
+			debugLog("[TMUX] Session %s: cannot build retry cmd: %v", sessionName, buildErr)
+		} else if err := m.tmuxClient.RespawnPane(target, shellCmd); err != nil {
+			debugLog("[TMUX] Session %s respawn failed after quick death", sessionName)
+		} else {
+			respawned = true
+		}
+
+		m.mu.Lock()
+		if _, exists := m.sessions[session.ID]; !exists {
+			m.mu.Unlock()
+			return true
+		}
+		if respawned {
+			// The retry is only allowed to publish an agent nobody stopped
+			// meanwhile. A kill that landed during the respawn means the user
+			// asked for this session to be down, so undo the revival rather
+			// than hand back a running agent they did not ask for. The window
+			// name is deliberately withheld from the undo: this path leaves
+			// the session's tmux fields as they are, so tearing the inner
+			// session down here would strand them pointing at nothing.
+			if session.killSeq != killSeqBefore {
+				tc := m.tmuxClient
+				m.mu.Unlock()
+				debugLog("[TMUX] Session %s killed during resume retry, stopping the agent it brought back", sessionName)
+				stopAgentPane(tc, target, "")
+				return true
+			}
+			session.Status = StatusRunning
+			session.AgentSessionStarted = true
+			session.StartedAt = time.Now()
+			session.LastOutputTime = time.Now()
+			_ = m.store.Save(m.snapshotAndUnlock(session))
+			debugLog("[TMUX] Session %s restarted with fresh agent session (id: %s)", sessionName, newSessionID)
+			return false
+		}
+		// Retry exhausted; fall through to record the stop.
+	}
+
+	session.Status = StatusStopped
+	session.LastActiveAt = time.Now()
+	// Keep TmuxWindowName: window survives (remain-on-exit), only CC pane is dead.
+	// RespawnPane can revive CC while preserving user panes in the same window.
+	_ = m.store.Save(m.snapshotAndUnlock(session))
+	debugLog("[TMUX] Session %s pane died, marked as stopped (window preserved)", sessionName)
+	return true
+}
+
 // captureOutputTmux polls a session's tmux pane every 10 seconds: it detects
 // pane death (retrying a quick resume failure once), tracks the agent's
 // working directory and git branch, and falls back to "idle" when no hook
@@ -1959,69 +2101,10 @@ func (m *Manager) captureOutputTmux(session *Session) {
 
 		// Check if pane process has exited
 		if m.tmuxClient.IsPaneDead(target) {
-			m.mu.Lock()
-			// Exit without saving if session was already deleted
-			if _, exists := m.sessions[session.ID]; !exists {
-				m.mu.Unlock()
-				debugLog("[TMUX] Session %s pane died but session already deleted, skipping save", sessionName)
+			if m.handlePaneDeath(session, target, sessionName) {
 				return
 			}
-
-			// If the agent's --resume fails immediately (within 10 seconds of
-			// startup), auto-restart with a fresh session ID by going back
-			// through the adapter's SpawnCommand (this way agents without a
-			// --resume concept still get sensible retry semantics).
-			if session.AgentSessionStarted && time.Since(session.StartedAt) < quickResumeFailWindow {
-				debugLog("[TMUX] Session %s pane died quickly (resume likely failed), retrying with fresh agent session", session.Description)
-				newSessionID := uuid.New().String()
-				session.AgentSessionStarted = false
-				session.AgentSessionID = newSessionID
-				// Snapshot every field buildAgentShellCmd needs BEFORE
-				// releasing m.mu. Without this the retry runs the builder
-				// with lock-free reads of session.WorkDir /
-				// AgentSessionID / AgentSessionStarted, racing writes from
-				// HandleHookEvent.
-				retrySnap := snapshotForSpawn(session, session.WorkDir, expandTilde(session.WorkDir))
-				_ = m.store.Save(m.snapshotAndUnlock(session))
-
-				shellCmd, buildErr := m.buildAgentShellCmd(retrySnap)
-				if buildErr != nil {
-					debugLog("[TMUX] Session %s: cannot build retry cmd: %v", session.Description, buildErr)
-					m.mu.Lock()
-					if _, exists := m.sessions[session.ID]; !exists {
-						m.mu.Unlock()
-						return
-					}
-					session.Status = StatusStopped
-					session.LastActiveAt = time.Now()
-					_ = m.store.Save(m.snapshotAndUnlock(session))
-					return
-				}
-				if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
-					m.mu.Lock()
-					session.Status = StatusRunning
-					session.AgentSessionStarted = true
-					session.StartedAt = time.Now()
-					session.LastOutputTime = time.Now()
-					_ = m.store.Save(m.snapshotAndUnlock(session))
-					debugLog("[TMUX] Session %s restarted with fresh agent session (id: %s)", session.Description, newSessionID)
-					continue
-				}
-				debugLog("[TMUX] Session %s respawn failed after quick death", session.Description)
-				m.mu.Lock()
-				if _, exists := m.sessions[session.ID]; !exists {
-					m.mu.Unlock()
-					return
-				}
-			}
-
-			session.Status = StatusStopped
-			session.LastActiveAt = time.Now()
-			// Keep TmuxWindowName: window survives (remain-on-exit), only CC pane is dead.
-			// RespawnPane can revive CC while preserving user panes in the same window.
-			_ = m.store.Save(m.snapshotAndUnlock(session))
-			debugLog("[TMUX] Session %s pane died, marked as stopped (window preserved)", sessionName)
-			return
+			continue
 		}
 
 		// Track current working directory and git branch
@@ -2321,27 +2404,153 @@ func (m *Manager) HandleAgentSignal(jinSessionID, kind string, payload map[strin
 	}
 }
 
-// Kill terminates a session
+const (
+	// paneTerminatePoll / paneTerminateTries bound how long Kill waits for a
+	// pane's process to go away after the hangup before falling back to
+	// kill-pane. A pane observably dies within a few milliseconds of its
+	// direct child exiting, so ten 50ms probes (450ms) is generous for a slow
+	// machine while staying short enough that a kill request never feels
+	// stalled when the fallback is the one that has to do the work.
+	paneTerminatePoll  = 50 * time.Millisecond
+	paneTerminateTries = 10
+)
+
+// waitPaneDead polls target until tmux reports the pane's process gone,
+// bounded by paneTerminateTries. Reports whether it settled.
+func waitPaneDead(tc tmux.Runner, target string) bool {
+	for i := 0; i < paneTerminateTries; i++ {
+		if i > 0 {
+			time.Sleep(paneTerminatePoll)
+		}
+		if tc.IsPaneDead(target) {
+			return true
+		}
+	}
+	return false
+}
+
+// stopAgentPane stops the agent running in a session's tmux pane and reports
+// whether the session's tmux references survived. Keeping them is what
+// preserves the rest of the window: the inner tmux session stays up, every
+// other pane in it (plugin splits, shells the user opened) keeps running, and
+// the dead pane holds the agent's slot in the layout so a later start revives
+// it in place via RespawnPane rather than rebuilding the window from scratch.
+//
+// True means TmuxPaneID / TmuxWindowName still address something real and the
+// caller must keep them. False means the window is gone — either it was torn
+// down here or it never existed — and the caller must clear both.
+//
+// Takes no lock and touches no Session: the caller snapshots the fields under
+// m.mu, runs this, and re-validates before applying the result — the tmux
+// round-trips here (and the wait above) must not hold up the whole daemon.
+func stopAgentPane(tc tmux.Runner, paneID, windowName string) (keepTmuxRefs bool) {
+	switch {
+	case tc == nil:
+		// No way to observe tmux, so no grounds to declare the references
+		// dead either. Leave them for a client that can check.
+		return true
+	case paneID != "":
+		// A pane that already exited needs nothing done to it, and must not
+		// be signalled: tmux keeps reporting the pid the pane started with
+		// long after the process is gone (verified on 3.6a), and the OS is
+		// free to have handed that number to something else entirely.
+		if tc.IsPaneDead(paneID) {
+			return true
+		}
+		if err := tc.TerminatePaneProcess(paneID); err == nil && waitPaneDead(tc, paneID) {
+			return true
+		}
+		// The signal never landed (unreadable pid) or the process sat through
+		// it. A kill that leaves the agent running is not a kill, so destroy
+		// the pane outright — the old behaviour, now the fallback. The window
+		// goes with it: kill-pane spares a window that still has other panes,
+		// and the caller is about to forget its name, which would leave the
+		// inner session with no owner to reclaim it. Losing those panes is
+		// the price of an agent that would not stop.
+		_ = tc.KillPane(paneID)
+		if windowName != "" {
+			_ = tc.KillSession(windowName)
+		}
+		return false
+	case windowName != "":
+		// No pane to aim at (pre-pane-ID record, or a start that failed
+		// before GetPaneID): the inner session is the only handle there is.
+		_ = tc.KillSession(windowName)
+		return false
+	}
+	return false
+}
+
+// Kill stops a session's agent. The session's inner tmux window survives
+// whenever the agent's pane can be stopped without destroying it, so kill is
+// "stop the agent", not "tear the session's tmux state down" — that is
+// delete's job. This matches what already happened when an agent died on its
+// own (see captureOutputTmux's pane-death branch and recoverPaneDead), so a
+// user-requested stop and a crash now leave a session in the same shape.
+//
+// The tmux work runs between two lock sections rather than inside one: it
+// signals a process and then waits on it, and holding m.mu across that would
+// stall every List, hook and delete for the duration. The second section
+// therefore re-validates before writing, the same way applyRecovery does.
 func (m *Manager) Kill(id string) error {
 	m.mu.Lock()
-
 	session, ok := m.sessions[id]
 	if !ok {
 		m.mu.Unlock()
 		return fmt.Errorf("session %s not found", id)
 	}
+	if session.Status == StatusDeleting {
+		// A delete is already in flight and subsumes this stop; it owns the
+		// record's status until it finishes.
+		m.mu.Unlock()
+		return nil
+	}
+	tc := m.tmuxClient
+	paneID := session.TmuxPaneID
+	windowName := session.TmuxWindowName
+	startedAt := session.StartedAt
 
-	// Kill CC pane in the inner tmux session
-	if m.tmuxClient != nil && session.TmuxPaneID != "" {
-		_ = m.tmuxClient.KillPane(session.TmuxPaneID)
+	// Record the stop before dropping the lock, not after the tmux work: for
+	// the length of that work the agent is on its way out, and a session that
+	// still reads as running in the meantime is one StartBackground would
+	// treat as needing no start at all — a restart request silently doing
+	// nothing. killSeq goes up with it, so anyone else who dropped m.mu
+	// (recovery's probes, the monitor's resume retry) can see a kill landed.
+	session.killSeq++
+	killSeq := session.killSeq
+	session.Status = StatusStopped
+	m.mu.Unlock()
+
+	keepTmuxRefs := stopAgentPane(tc, paneID, windowName)
+
+	m.mu.Lock()
+	session, ok = m.sessions[id]
+	if !ok {
+		// Deleted while we were stopping it; the delete owns the record now.
+		m.mu.Unlock()
+		return nil
+	}
+	// A start or delete that ran while the lock was down owns the record's
+	// state, and finishing our write over theirs would either leave a running
+	// session nobody is watching or reopen a delete's CAS. StartedAt is the
+	// marker for a start: it reuses the same pane and inner session, so the
+	// two names alone cannot tell a revived session from the one we stopped.
+	if session.Status == StatusDeleting || session.killSeq != killSeq ||
+		session.StartedAt != startedAt || session.TmuxPaneID != paneID || session.TmuxWindowName != windowName {
+		m.mu.Unlock()
+		debugLog("[TMUX] Session %s changed hands during kill, leaving the newer state alone", session.Description)
+		return nil
+	}
+	if !keepTmuxRefs {
 		session.TmuxPaneID = ""
-		session.TmuxWindowName = ""
-	} else if m.tmuxClient != nil && session.TmuxWindowName != "" {
-		// Fallback: no pane ID, kill the inner tmux session
-		_ = m.tmuxClient.KillSession(session.TmuxWindowName)
 		session.TmuxWindowName = ""
 	}
 
+	// Re-assert the stop rather than trusting phase 1's: an agent being
+	// terminated tends to fire one last hook on its way out, and
+	// HandleHookEvent writes whatever status that hook maps to without
+	// knowing a kill is in flight. Landing in this window, it would otherwise
+	// leave a killed session reading as idle.
 	session.Status = StatusStopped
 	// Update LastActiveAt for persistence
 	if !session.LastOutputTime.IsZero() {

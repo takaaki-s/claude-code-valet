@@ -12,6 +12,7 @@ type Runner interface {
 	TagManagedPane(paneID string) error
 	SetupAutoCleanDeadPanes() error
 	KillPane(paneID string) error
+	TerminatePaneProcess(target string) error
 	GetPaneCurrentPath(target string) (string, error)
 	SendKeys(target, keys string) error
 	SendKeysLiteral(target, text string) error
