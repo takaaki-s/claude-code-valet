@@ -5218,3 +5218,56 @@ func TestSendVerifyOK_CapturedPanes(t *testing.T) {
 		t.Error("no regression specimen ran; the suite has lost its teeth")
 	}
 }
+
+// TestManager_KillReadsDescriptionUnderLock guards the "changed hands" exit in
+// Kill, which logs the session's description on its way out.
+//
+// TestManager_ConcurrentHookEventsAndKill can catch a race there, but only by
+// luck: that exit is taken when the session's identity changes mid-kill, which
+// twelve unsynchronised goroutines almost never arrange. Measured at roughly
+// one detection per 600 runs — a guard that weak lets the bug back in. Here the
+// branch is forced every time by mutating the session inside the window where
+// Kill has released m.mu to signal the pane, so a concurrent SetDescription has
+// the whole of that exit to collide with.
+func TestManager_KillReadsDescriptionUnderLock(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	sess := newIdleSessionWithPane(t, mgr, t.TempDir(), "killdesc", "%killdesc")
+
+	// The window is one statement wide — Kill unlocks, then logs — so a
+	// single pass rarely lands in it. Repeat, with several writers competing
+	// for the mutex the moment Kill drops it.
+	for round := 0; round < 40; round++ {
+		// StartedAt is one of the fields Kill re-checks after signalling the
+		// pane; moving it makes the session look like it changed hands, which
+		// is the exit under test. Re-armed each round: the hook fires once.
+		mock.onTerminatePaneProcess = func(string) {
+			mgr.mu.Lock()
+			mgr.sessions[sess.ID].StartedAt = time.Now().Add(time.Hour)
+			mgr.mu.Unlock()
+		}
+
+		var wg sync.WaitGroup
+		for w := 0; w < 6; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < 50; i++ {
+					_ = mgr.SetDescription(sess.ID, fmt.Sprintf("desc-%d-%d", w, i))
+				}
+			}(w)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = mgr.Kill(sess.ID)
+		}()
+		wg.Wait()
+
+		// Kill left the session stopped; put it back so the next round takes
+		// the same path rather than exiting early.
+		mgr.mu.Lock()
+		mgr.sessions[sess.ID].Status = StatusIdle
+		mgr.sessions[sess.ID].TmuxPaneID = "%killdesc"
+		mgr.mu.Unlock()
+	}
+}
