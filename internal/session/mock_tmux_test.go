@@ -3,6 +3,7 @@ package session
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
@@ -61,6 +62,24 @@ type mockTmuxRunner struct {
 	// target. Used by SendPrompt tests to simulate a tmux write failure
 	// during the prompt-injection phase.
 	sendKeysLiteralErr map[string]error
+
+	// sendKeysLiteralErrAfterN delays that injection until the Nth call
+	// for the target (1-based): calls before N succeed. A long prompt goes
+	// out as several chunks, so this is what lets a test fail partway
+	// through the sequence rather than on the very first write.
+	sendKeysLiteralErrAfterN map[string]int
+
+	// sendKeysLiteralTimes records when each SendKeysLiteral landed, so a
+	// test can assert the gap SendPrompt leaves between chunks without
+	// timing the call from the outside.
+	sendKeysLiteralTimes map[string][]time.Time
+
+	// loadedBuffers records what the paste transport handed over, so a test
+	// can assert the prompt went across whole. Call COUNTS come from the
+	// shared call log via countCalls — no per-method counter needed.
+	loadedBuffers  map[string]string
+	loadBufferErr  error
+	pasteBufferErr error
 
 	// sendKeysErr injects an error for SendKeys keyed by the "keys" arg
 	// (not the target), so tests can fail a specific key sequence
@@ -126,6 +145,10 @@ func newMockTmuxRunner() *mockTmuxRunner {
 		sendKeysErr:        make(map[string]error),
 		terminateErr:       make(map[string]error),
 		terminateSurvivors: make(map[string]bool),
+
+		sendKeysLiteralErrAfterN: make(map[string]int),
+		sendKeysLiteralTimes:     make(map[string][]time.Time),
+		loadedBuffers:            make(map[string]string),
 	}
 }
 
@@ -284,10 +307,42 @@ func (m *mockTmuxRunner) SendKeysLiteral(target, text string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("SendKeysLiteral", target, text)
+	// sendKeysLiteralTimes doubles as the per-target call counter — it is
+	// appended on every call, so a separate int map would be a second copy
+	// of the same number.
+	m.sendKeysLiteralTimes[target] = append(m.sendKeysLiteralTimes[target], time.Now())
 	if err, ok := m.sendKeysLiteralErr[target]; ok && err != nil {
+		if n, delayed := m.sendKeysLiteralErrAfterN[target]; delayed && len(m.sendKeysLiteralTimes[target]) < n {
+			return nil
+		}
 		return err
 	}
 	return nil
+}
+
+func (m *mockTmuxRunner) LoadBuffer(name, content string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.record("LoadBuffer", name, content)
+	m.loadedBuffers[name] = content
+	return m.loadBufferErr
+}
+
+func (m *mockTmuxRunner) PasteBuffer(target, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.record("PasteBuffer", target, name)
+	return m.pasteBufferErr
+}
+
+// pastedContent returns what the last LoadBuffer stored under name, so a test
+// can assert the WHOLE prompt was handed over in one piece rather than
+// reassembling chunks.
+func (m *mockTmuxRunner) pastedContent(name string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.loadedBuffers[name]
+	return v, ok
 }
 
 func (m *mockTmuxRunner) DisplayPopup(opts tmux.DisplayPopupOptions) error {
@@ -385,6 +440,24 @@ func (m *mockTmuxRunner) countCallsWithArgs(method string, args ...string) int {
 		}
 	}
 	return n
+}
+
+// sendKeysLiteralGaps returns the interval between each consecutive pair of
+// SendKeysLiteral calls for target — the gap SendPrompt leaves between
+// chunks. Returns nil for fewer than two calls. Caller must hold no locks
+// on the mock.
+func (m *mockTmuxRunner) sendKeysLiteralGaps(target string) []time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	times := m.sendKeysLiteralTimes[target]
+	if len(times) < 2 {
+		return nil
+	}
+	gaps := make([]time.Duration, 0, len(times)-1)
+	for i := 1; i < len(times); i++ {
+		gaps = append(gaps, times[i].Sub(times[i-1]))
+	}
+	return gaps
 }
 
 // firstCallIndex returns the index of the first recorded call to method

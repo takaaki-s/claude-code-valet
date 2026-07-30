@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -189,7 +190,14 @@ func (c *Client) baseArgs() []string {
 
 // run executes a tmux command with the dedicated socket.
 func (c *Client) run(args ...string) (string, error) {
+	return c.runInput(nil, args...)
+}
+
+// runInput is run with a stdin source, for the verbs that take their payload
+// on stdin rather than in argv.
+func (c *Client) runInput(stdin io.Reader, args ...string) (string, error) {
 	cmd := exec.Command(c.tmuxPath, append(c.baseArgs(), args...)...)
+	cmd.Stdin = stdin
 	out, err := cmd.CombinedOutput()
 	output := strings.TrimSpace(string(out))
 	if err != nil && output != "" {
@@ -615,13 +623,77 @@ func (c *Client) JoinPane(src, dst string, horizontal bool, percent int, before 
 // --- I/O ---
 
 // SendKeys sends keystrokes to a pane.
+//
+// The `--` is load-bearing: see SendKeysLiteral.
 func (c *Client) SendKeys(target, keys string) error {
-	return c.runSilent("send-keys", "-t", target, keys)
+	return c.runSilent(buildSendKeysArgs(target, keys)...)
+}
+
+// buildSendKeysArgs and buildSendKeysLiteralArgs exist so the `--` placement
+// is assertable without spawning tmux.
+func buildSendKeysArgs(target, keys string) []string {
+	return []string{"send-keys", "-t", target, "--", keys}
+}
+
+func buildSendKeysLiteralArgs(target, text string) []string {
+	return []string{"send-keys", "-t", target, "-l", "--", text}
 }
 
 // SendKeysLiteral sends literal text to a pane (no key name lookup).
+//
+// The `--` terminates option parsing so text beginning with a dash reaches
+// the pane instead of being read as a flag. Without it tmux fails one of two
+// ways, and the quiet one is the dangerous one:
+//
+//	send-keys -t %0 -l "-abc"   -> exit 1, "unknown flag -a"
+//	send-keys -t %0 -l "-R"     -> exit 0, and NOTHING is sent
+//
+// The second case reports success while silently dropping the payload, so
+// Manager.SendPrompt would carry on and commit a prompt with a hole in it.
+// That matters here because SendPrompt splits long prompts on a fixed byte
+// boundary: a chunk can start with a dash even when the prompt does not, and
+// bullet lists and diffs make leading dashes common in exactly the large
+// prompts this path exists to carry.
 func (c *Client) SendKeysLiteral(target, text string) error {
-	return c.runSilent("send-keys", "-t", target, "-l", text)
+	return c.runSilent(buildSendKeysLiteralArgs(target, text)...)
+}
+
+// buildLoadBufferArgs and buildPasteBufferArgs exist so the flag set is
+// assertable without spawning tmux — `-p` in particular, see PasteBuffer.
+func buildLoadBufferArgs(name string) []string {
+	// "-" reads the payload from stdin, so the prompt never appears in argv
+	// (no 16341-byte limit, nothing for `ps` to show) nor on disk.
+	return []string{"load-buffer", "-b", name, "-"}
+}
+
+func buildPasteBufferArgs(target, name string) []string {
+	return []string{"paste-buffer", "-p", "-d", "-b", name, "-t", target}
+}
+
+// LoadBuffer stores content in a named tmux paste buffer, feeding it through
+// stdin rather than the command line.
+func (c *Client) LoadBuffer(name, content string) error {
+	_, err := c.runInput(strings.NewReader(content), buildLoadBufferArgs(name)...)
+	return err
+}
+
+// PasteBuffer pastes a named buffer into a pane as a bracketed paste, then
+// deletes the buffer.
+//
+// `-p` is not optional. It wraps the payload in the bracketed-paste markers
+// that tell a TUI "this is pasted, not typed", which decides two things:
+//
+//   - Without it, tmux replays every newline as a Return keypress, so a
+//     multi-line prompt is SUBMITTED ONE LINE AT A TIME. Measured against a
+//     real OpenCode pane: a three-line buffer became three separate messages.
+//   - With it the TUI inserts the payload in one operation instead of
+//     simulating thousands of keystrokes, which is the whole reason the paste
+//     transport exists — see docs/gotchas.md "Session send".
+//
+// `-d` drops the buffer afterwards so the prompt does not linger in tmux's
+// buffer stack where any client could read it back.
+func (c *Client) PasteBuffer(target, name string) error {
+	return c.runSilent(buildPasteBufferArgs(target, name)...)
 }
 
 // CapturePane captures the visible content of a pane.

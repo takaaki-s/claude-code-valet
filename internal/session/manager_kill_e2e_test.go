@@ -29,6 +29,7 @@ func (e2eAgent) SpawnCommand(SpawnOptions) SpawnPlan { return SpawnPlan{Command:
 func (e2eAgent) Description() DescriptionEnhancer    { return nil }
 func (e2eAgent) StatusSource() StatusSource          { return fakeStatusSource{} }
 func (e2eAgent) ClearInputKeys() []string            { return nil }
+func (e2eAgent) PastePlaceholder(string) string      { return "" }
 
 type e2eResolver struct{}
 

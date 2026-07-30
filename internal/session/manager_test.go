@@ -7,10 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/takaaki-s/jind-ai/internal/config"
@@ -52,7 +54,8 @@ func newTestManager(t *testing.T) (*Manager, *mockTmuxRunner, *mockHookRunner) {
 // into the fakeAgentResolver held by newTestManager).
 type fakeAgent struct {
 	enhancer  DescriptionEnhancer
-	clearKeys []string // returned from ClearInputKeys; nil = opt-out (matches production default)
+	clearKeys []string            // returned from ClearInputKeys; nil = opt-out (matches production default)
+	pasteFn   func(string) string // non-nil opts into the paste transport
 }
 
 func (a *fakeAgent) Kind() string                        { return "claude" }
@@ -61,6 +64,12 @@ func (a *fakeAgent) SpawnCommand(SpawnOptions) SpawnPlan { return SpawnPlan{Comm
 func (a *fakeAgent) Description() DescriptionEnhancer    { return a.enhancer }
 func (a *fakeAgent) StatusSource() StatusSource          { return fakeStatusSource{} }
 func (a *fakeAgent) ClearInputKeys() []string            { return a.clearKeys }
+func (a *fakeAgent) PastePlaceholder(prompt string) string {
+	if a.pasteFn == nil {
+		return ""
+	}
+	return a.pasteFn(prompt)
+}
 
 type fakeStatusSource struct{}
 
@@ -110,12 +119,12 @@ func (r *fakeAgentResolver) Resolve(kind string) (Agent, error) {
 	return a, nil
 }
 
-// installEnhancer swaps the Layer C enhancer the "claude" fake adapter
-// returns via Description(). Tests that used to call
-// Manager.SetDescriptionEnhancer(enh) now do installEnhancer(mgr, enh) —
-// the effect (HandleHookEvent picks up enh on UserPromptSubmit / Stop) is
-// identical.
-func installEnhancer(t *testing.T, mgr *Manager, enh DescriptionEnhancer) {
+// fakeClaudeAgent returns the stub adapter newTestManager registers under
+// kind "claude", so a test can set whatever behaviour SendPrompt (or
+// HandleHookEvent) will read off it. One accessor rather than one wrapper per
+// capability: each new capability would otherwise copy these two type
+// assertions and their diagnostics again.
+func fakeClaudeAgent(t *testing.T, mgr *Manager) *fakeAgent {
 	t.Helper()
 	resolver, ok := mgr.agentResolver.(*fakeAgentResolver)
 	if !ok {
@@ -125,27 +134,25 @@ func installEnhancer(t *testing.T, mgr *Manager, enh DescriptionEnhancer) {
 	if !ok {
 		t.Fatalf(`expected "claude" adapter to be *fakeAgent, got %T`, resolver.agents["claude"])
 	}
-	ag.enhancer = enh
+	return ag
+}
+
+// installEnhancer swaps the Layer C enhancer the "claude" fake adapter
+// returns via Description().
+func installEnhancer(t *testing.T, mgr *Manager, enh DescriptionEnhancer) {
+	t.Helper()
+	fakeClaudeAgent(t, mgr).enhancer = enh
 }
 
 // installClearKeys mutates the resolver's "claude" adapter so
-// ClearInputKeys returns the given keys. Tests that need to exercise the
-// SendPrompt clear path call this after newTestManager and before
-// SendPrompt. Passing an empty (or nil) slice covers the "adapter returns
-// no keys" opt-out variant. The baseline fakeAgent's clearKeys defaults to
-// nil, so tests that never call this observe the fall-through path (that
-// invariant is what keeps the existing verify-by-capture tests intact).
+// ClearInputKeys returns the given keys. Passing an empty (or nil) slice
+// covers the "adapter returns no keys" opt-out variant. The baseline
+// fakeAgent's clearKeys defaults to nil, so tests that never call this
+// observe the fall-through path — that invariant is what keeps the existing
+// verify-by-capture tests intact.
 func installClearKeys(t *testing.T, mgr *Manager, keys []string) {
 	t.Helper()
-	resolver, ok := mgr.agentResolver.(*fakeAgentResolver)
-	if !ok {
-		t.Fatalf("expected *fakeAgentResolver, got %T", mgr.agentResolver)
-	}
-	ag, ok := resolver.agents["claude"].(*fakeAgent)
-	if !ok {
-		t.Fatalf(`expected "claude" adapter to be *fakeAgent, got %T`, resolver.agents["claude"])
-	}
-	ag.clearKeys = keys
+	fakeClaudeAgent(t, mgr).clearKeys = keys
 }
 
 // ---------------------------------------------------------------------------
@@ -3928,24 +3935,91 @@ func TestBuildAgentShellCmd_SnapshotIsolatesFromConcurrentWrites(t *testing.T) {
 // SendPrompt / verify-by-capture tests
 // ---------------------------------------------------------------------------
 
-// withShortSendVerify shortens the verify tuning knobs for the duration of
+// withShortSendVerify shortens the send tuning knobs for the duration of
 // the test so timeout / retry cases finish in milliseconds instead of
 // seconds. Restore is registered on t.Cleanup, so callers don't need a
 // defer at the call site.
+//
+// timeout lands on sendVerifyTimeoutBase and the two per-unit coefficients
+// are zeroed, so the effective budget is exactly what the caller asked for
+// regardless of how many chunks or clear presses the prompt implies.
+// sendChunkDelay is zeroed too: at its production 20ms a multi-chunk test
+// would really sleep once per chunk.
 //
 // Not safe under t.Parallel(): rewrites package-level vars. If parallel
 // send-verify tests are ever added, migrate to a config field on Manager.
 func withShortSendVerify(t *testing.T, timeout, settle, backoff time.Duration) {
 	t.Helper()
-	origTimeout, origSettle, origBackoff := sendVerifyTimeout, sendVerifySettleDelay, sendVerifyBackoff
-	sendVerifyTimeout = timeout
-	sendVerifySettleDelay = settle
-	sendVerifyBackoff = backoff
-	t.Cleanup(func() {
-		sendVerifyTimeout = origTimeout
-		sendVerifySettleDelay = origSettle
-		sendVerifyBackoff = origBackoff
-	})
+	setForTest(t, &sendVerifyTimeoutBase, timeout)
+	setForTest(t, &sendVerifySettleDelay, settle)
+	setForTest(t, &sendVerifyBackoff, backoff)
+	setForTest(t, &sendVerifyPerChunk, 0)
+	setForTest(t, &sendVerifyPerClearKey, 0)
+	setForTest(t, &sendChunkDelay, 0)
+	// One look per attempt reproduces the pre-look structure, so the tests
+	// that reason about attempts (retry counts, clear repeats per attempt)
+	// keep a one-to-one mapping between an attempt and a capture. Base 1 with
+	// the max clamped to 1 defeats the prompt-length scaling too, which would
+	// otherwise give a long prompt extra looks and break those counts.
+	// TestSendPrompt_LooksBeforeResending raises this to cover the look loop.
+	setForTest(t, &sendVerifyLooksBase, 1)
+	setForTest(t, &sendVerifyLooksMax, 1)
+	setForTest(t, &sendVerifyLookDelay, 0)
+}
+
+// setForTest assigns v to *p for the duration of the test and restores the
+// previous value on cleanup. The send tuning knobs are package-level vars, so
+// this is not safe under t.Parallel() — see withShortSendVerify.
+func setForTest[T any](t *testing.T, p *T, v T) {
+	t.Helper()
+	orig := *p
+	*p = v
+	t.Cleanup(func() { *p = orig })
+}
+
+// withVerifyLooks raises the per-attempt look count for the one test that
+// exercises the look loop. Same package-var-rewrite caveat as
+// withShortSendVerify; call it after that helper, which resets the value.
+func withVerifyLooks(t *testing.T, looks int, delay time.Duration) {
+	t.Helper()
+	setForTest(t, &sendVerifyLooksBase, looks)
+	setForTest(t, &sendVerifyLooksMax, looks)
+	setForTest(t, &sendVerifyLookDelay, delay)
+}
+
+// withSmallChunks shrinks sendChunkMaxBytes so a chunking test can drive
+// the multi-chunk path with a short, readable prompt instead of an 800-byte
+// blob. Same package-var-rewrite caveat as withShortSendVerify.
+func withSmallChunks(t *testing.T, max int) {
+	t.Helper()
+	setForTest(t, &sendChunkMaxBytes, max)
+}
+
+// withBudgetCoefficients restores non-zero per-unit terms after
+// withShortSendVerify has zeroed them, for the one test that needs the
+// budget to actually vary with the prompt. Keep the values small: they are
+// multiplied by chunk and keypress counts and land on a real deadline.
+func withBudgetCoefficients(t *testing.T, perChunk, perClearKey time.Duration) {
+	t.Helper()
+	setForTest(t, &sendVerifyPerChunk, perChunk)
+	setForTest(t, &sendVerifyPerClearKey, perClearKey)
+}
+
+// withChunkDelay restores a non-zero inter-chunk delay for the one test that
+// asserts on it — withShortSendVerify zeroes it for everyone else. Carries
+// its own Cleanup rather than leaning on that helper's, so the value cannot
+// leak into later tests if the call order changes.
+func withChunkDelay(t *testing.T, d time.Duration) {
+	t.Helper()
+	setForTest(t, &sendChunkDelay, d)
+}
+
+// wantClearPresses is the number of clear keypresses SendPrompt issues for
+// a prompt of the given length and clear sequence — repeats x keys. Tests
+// assert against this rather than a hardcoded number so a change to
+// sendClearWidthAssumed does not require editing every expectation.
+func wantClearPresses(promptLen, keysPerRepeat int) int {
+	return sendClearRepeats(promptLen) * keysPerRepeat
 }
 
 // withShortSendClear shortens sendClearSettleDelay so clear-key tests
@@ -3975,6 +4049,19 @@ func newIdleSessionWithPane(t *testing.T, mgr *Manager, workDir, description, pa
 
 // countCalls reports how often the mock recorded a method whose first arg
 // matches target. SendPrompt tests use it to assert retry counts.
+// countCallsWithArgs is countCalls narrowed to one further argument — the
+// key for SendKeys, the buffer name for PasteBuffer. Tests asserting that a
+// specific key was (or was not) sent use this rather than re-walking the log.
+func countCallsWithArgs(m *mockTmuxRunner, method, target, arg string) int {
+	n := 0
+	for _, c := range m.calls {
+		if c.method == method && len(c.args) > 1 && c.args[0] == target && c.args[1] == arg {
+			n++
+		}
+	}
+	return n
+}
+
 func countCalls(m *mockTmuxRunner, method, target string) int {
 	n := 0
 	for _, c := range m.calls {
@@ -4004,8 +4091,17 @@ func TestSendPrompt_HitOnFirstAttempt(t *testing.T) {
 	if got := countCalls(mock, "SendKeysLiteral", pane); got != 1 {
 		t.Errorf("SendKeysLiteral called %d times, want 1", got)
 	}
-	if got := countCalls(mock, "SendKeys", pane); got != 1 {
-		t.Errorf("SendKeys called %d times, want 1", got)
+	// Adapter opted out of clearing, so SendKeys is exactly the nudge plus
+	// the commit: assert each by name rather than by total, so adding a key
+	// elsewhere cannot be papered over by a count that still adds up.
+	if got := mock.countCallsWithArgs("SendKeys", pane, sendNudgeKey); got != 1 {
+		t.Errorf("nudge %q sent %d times, want 1", sendNudgeKey, got)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 1 {
+		t.Errorf("Enter sent %d times, want 1", got)
+	}
+	if got := countCalls(mock, "SendKeys", pane); got != 2 {
+		t.Errorf("SendKeys called %d times, want 2 (nudge + Enter)", got)
 	}
 	if got := countCalls(mock, "CapturePane", pane); got != 2 {
 		t.Errorf("CapturePane called %d times, want 2 (before+after)", got)
@@ -4034,8 +4130,12 @@ func TestSendPrompt_HitOnRetry(t *testing.T) {
 	if got := countCalls(mock, "SendKeysLiteral", pane); got != 2 {
 		t.Errorf("SendKeysLiteral called %d times, want 2 (initial + 1 retry)", got)
 	}
-	if got := countCalls(mock, "SendKeys", pane); got != 1 {
-		t.Errorf("SendKeys called %d times, want 1 (Enter after verify)", got)
+	// The nudge fires once per attempt; Enter only after verify passes.
+	if got := mock.countCallsWithArgs("SendKeys", pane, sendNudgeKey); got != 2 {
+		t.Errorf("nudge %q sent %d times, want 2 (one per attempt)", sendNudgeKey, got)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 1 {
+		t.Errorf("Enter sent %d times, want 1 (after verify)", got)
 	}
 }
 
@@ -4057,8 +4157,10 @@ func TestSendPrompt_TimeoutMiss(t *testing.T) {
 	if !strings.Contains(err.Error(), "send verify") {
 		t.Errorf("error %q missing 'send verify' prefix", err.Error())
 	}
-	if got := countCalls(mock, "SendKeys", pane); got != 0 {
-		t.Errorf("SendKeys called %d times on failure, want 0 (no Enter until verify passes)", got)
+	// The nudge is part of every attempt, so a bare SendKeys count is no
+	// longer the right assertion — what must stay at zero is the commit.
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times on failure, want 0 (no commit until verify passes)", got)
 	}
 	if countCalls(mock, "SendKeysLiteral", pane) < 1 {
 		t.Errorf("SendKeysLiteral was not called at all")
@@ -4137,8 +4239,10 @@ func TestSendPrompt_CapturePaneErrorAfter(t *testing.T) {
 	if got := countCalls(mock, "SendKeysLiteral", pane); got != 1 {
 		t.Errorf("SendKeysLiteral called %d times, want 1 (send fires before the after-capture)", got)
 	}
-	if got := countCalls(mock, "SendKeys", pane); got != 0 {
-		t.Errorf("SendKeys called %d times, want 0 (Enter must not fire when after-capture fails)", got)
+	// The nudge precedes the after-capture, so it has already fired here.
+	// Enter is the thing that must not.
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times, want 0 (must not fire when after-capture fails)", got)
 	}
 }
 
@@ -4210,9 +4314,12 @@ func TestSendPrompt_ResidualClearedByAdapter(t *testing.T) {
 		t.Fatalf("SendPrompt returned err=%v, want nil", err)
 	}
 
-	// C-u must fire at least once per attempt; we only did one, so exactly one.
-	if got := mock.countCallsWithArgs("SendKeys", pane, "C-u"); got != 1 {
-		t.Errorf("SendKeys(%q, %q) count = %d, want 1", pane, "C-u", got)
+	// One press only clears one visual row, so the sequence repeats
+	// sendClearRepeats(len(prompt)) times per attempt. We only did one
+	// attempt.
+	wantClear := wantClearPresses(len(prompt), 1)
+	if got := mock.countCallsWithArgs("SendKeys", pane, "C-u"); got != wantClear {
+		t.Errorf("SendKeys(%q, %q) count = %d, want %d", pane, "C-u", got, wantClear)
 	}
 	// Enter fires exactly once at the end.
 	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 1 {
@@ -4261,9 +4368,11 @@ func TestSendPrompt_ResidualClearedOnRetry(t *testing.T) {
 	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
 		t.Fatalf("SendPrompt returned err=%v, want nil", err)
 	}
-	// Two attempts → two C-u sends → two SendKeysLiteral, one Enter.
-	if got := mock.countCallsWithArgs("SendKeys", pane, "C-u"); got != 2 {
-		t.Errorf("SendKeys(%q, %q) count = %d, want 2 (initial + 1 retry)", pane, "C-u", got)
+	// Two attempts → the clear sequence repeats on each → two
+	// SendKeysLiteral, one Enter.
+	wantClear := 2 * wantClearPresses(len(prompt), 1)
+	if got := mock.countCallsWithArgs("SendKeys", pane, "C-u"); got != wantClear {
+		t.Errorf("SendKeys(%q, %q) count = %d, want %d (initial + 1 retry)", pane, "C-u", got, wantClear)
 	}
 	if got := countCalls(mock, "SendKeysLiteral", pane); got != 2 {
 		t.Errorf("SendKeysLiteral called %d times, want 2 (initial + 1 retry)", got)
@@ -4298,12 +4407,15 @@ func TestSendPrompt_MultipleClearKeysAllSentInOrder(t *testing.T) {
 		t.Fatalf("SendPrompt returned err=%v, want nil", err)
 	}
 
-	// Both keys must fire, once each per attempt (one attempt here).
-	if got := mock.countCallsWithArgs("SendKeys", pane, "C-a"); got != 1 {
-		t.Errorf("SendKeys(%q, %q) count = %d, want 1", pane, "C-a", got)
+	// Both keys must fire, once per repeat of the sequence (one attempt
+	// here). The repeat count is per sequence, not per key, so each key
+	// lands the same number of times.
+	wantEach := sendClearRepeats(len(prompt))
+	if got := mock.countCallsWithArgs("SendKeys", pane, "C-a"); got != wantEach {
+		t.Errorf("SendKeys(%q, %q) count = %d, want %d", pane, "C-a", got, wantEach)
 	}
-	if got := mock.countCallsWithArgs("SendKeys", pane, "C-k"); got != 1 {
-		t.Errorf("SendKeys(%q, %q) count = %d, want 1", pane, "C-k", got)
+	if got := mock.countCallsWithArgs("SendKeys", pane, "C-k"); got != wantEach {
+		t.Errorf("SendKeys(%q, %q) count = %d, want %d", pane, "C-k", got, wantEach)
 	}
 	// Order: C-a before C-k (as declared in the ClearInputKeys slice).
 	caIdx := mock.firstCallIndex("SendKeys", pane, "C-a")
@@ -4342,8 +4454,13 @@ func TestSendPrompt_ClearKeysNilFallsThrough(t *testing.T) {
 	if got := mock.countCallsWithArgs("SendKeys", pane, "C-u"); got != 0 {
 		t.Errorf("SendKeys(%q, %q) count = %d, want 0 (adapter opted out via nil ClearInputKeys)", pane, "C-u", got)
 	}
-	if got := countCalls(mock, "SendKeys", pane); got != 1 {
-		t.Errorf("SendKeys count = %d, want 1 (Enter only)", got)
+	// Opting out of the clear does NOT opt out of the nudge: it is a
+	// measured no-op and Codex/OpenCode are unverifiable without it.
+	if got := mock.countCallsWithArgs("SendKeys", pane, sendNudgeKey); got != 1 {
+		t.Errorf("nudge %q sent %d times, want 1 even when clearing is opted out", sendNudgeKey, got)
+	}
+	if got := countCalls(mock, "SendKeys", pane); got != 2 {
+		t.Errorf("SendKeys count = %d, want 2 (nudge + Enter)", got)
 	}
 }
 
@@ -4370,8 +4487,8 @@ func TestSendPrompt_ClearKeysEmptyNoOp(t *testing.T) {
 	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
 		t.Fatalf("SendPrompt returned err=%v, want nil", err)
 	}
-	if got := countCalls(mock, "SendKeys", pane); got != 1 {
-		t.Errorf("SendKeys count = %d, want 1 (Enter only — empty clear keys are opt-out)", got)
+	if got := countCalls(mock, "SendKeys", pane); got != 2 {
+		t.Errorf("SendKeys count = %d, want 2 (nudge + Enter — empty clear keys are opt-out)", got)
 	}
 }
 
@@ -4398,6 +4515,13 @@ func TestSendPrompt_ClearKeyError(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to send clear key") {
 		t.Errorf("error %q missing 'failed to send clear key'", err.Error())
 	}
+	// Fail-fast means the FIRST press returns, not that the loop grinds
+	// through all sendClearMaxKeys repeats collecting the same error. At the
+	// measured per-invocation cost that difference is seconds of spinning
+	// against a pane that is already unusable.
+	if got := mock.countCallsWithArgs("SendKeys", pane, "C-u"); got != 1 {
+		t.Errorf("C-u attempted %d times, want 1 (fail-fast, not up to %d repeats)", got, sendClearMaxKeys)
+	}
 	if got := countCalls(mock, "SendKeysLiteral", pane); got != 0 {
 		t.Errorf("SendKeysLiteral called %d times after clear failure, want 0", got)
 	}
@@ -4409,11 +4533,274 @@ func TestSendPrompt_ClearKeyError(t *testing.T) {
 	}
 }
 
+// TestSendPrompt_ChunksLargePrompt asserts that a prompt too big for one
+// write goes out as several literals whose concatenation is byte-identical
+// to the original, in order, all before the nudge and the commit. A silent
+// reordering or a dropped chunk here would commit a mangled prompt.
+func TestSendPrompt_ChunksLargePrompt(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withSmallChunks(t, 10)
+
+	const pane = "%chunk"
+	prompt := "0123456789abcdefghijKLMNOPQRSTuvwxyz"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-chunk", "chunk", pane)
+
+	mock.capturedSequence[pane] = []string{
+		"$ ",
+		"$ " + prompt,
+	}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+
+	wantChunks := len(chunkPrompt(prompt, 10))
+	if wantChunks < 2 {
+		t.Fatalf("test setup broken: prompt yields %d chunk(s), need >1", wantChunks)
+	}
+	var sent []string
+	for _, c := range mock.calls {
+		if c.method == "SendKeysLiteral" && c.args[0] == pane {
+			sent = append(sent, c.args[1])
+		}
+	}
+	if len(sent) != wantChunks {
+		t.Errorf("SendKeysLiteral called %d times, want %d", len(sent), wantChunks)
+	}
+	if joined := strings.Join(sent, ""); joined != prompt {
+		t.Errorf("chunks rejoin to %q, want %q", joined, prompt)
+	}
+	for i, c := range sent {
+		if len(c) > 10 {
+			t.Errorf("chunk %d is %d bytes, want at most 10", i, len(c))
+		}
+	}
+	// Nudge after every chunk, Enter after the nudge.
+	lastLit := -1
+	for i, c := range mock.calls {
+		if c.method == "SendKeysLiteral" && c.args[0] == pane {
+			lastLit = i
+		}
+	}
+	nudgeIdx := mock.firstCallIndex("SendKeys", pane, sendNudgeKey)
+	enterIdx := mock.firstCallIndex("SendKeys", pane, "Enter")
+	if !(lastLit < nudgeIdx && nudgeIdx < enterIdx) {
+		t.Errorf("order violated: last chunk@%d < nudge@%d < Enter@%d expected", lastLit, nudgeIdx, enterIdx)
+	}
+}
+
+// TestSendPrompt_LooksBeforeResending pins the rule that makes slow TUIs
+// verifiable at all: when the first look misses, the attempt nudges and
+// looks again instead of clearing and pushing the whole prompt a second
+// time. Re-sending discards whatever the TUI had rendered, so an agent that
+// needs longer than one settle delay is reset before it can finish and
+// never converges — measured on Codex, where a 16KB prompt burned the whole
+// budget across 16 re-sends but verified in 1.7s once the attempt looked.
+func TestSendPrompt_LooksBeforeResending(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withVerifyLooks(t, 4, time.Millisecond)
+	withShortSendClear(t, time.Millisecond)
+	installClearKeys(t, mgr, []string{"C-u"})
+
+	const pane = "%looks"
+	const prompt = "slow tui prompt"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-looks", "looks", pane)
+
+	// before, then two misses, then the prompt finally renders.
+	mock.capturedSequence[pane] = []string{
+		"$ ",
+		"$ ",
+		"$ ",
+		"$ slow tui prompt",
+	}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+	// The whole point: one send, several looks.
+	if got := countCalls(mock, "SendKeysLiteral", pane); got != 1 {
+		t.Errorf("SendKeysLiteral called %d times, want 1 (the prompt must not be re-sent while looking)", got)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, sendNudgeKey); got != 3 {
+		t.Errorf("nudge sent %d times, want 3 (one per look until it landed)", got)
+	}
+	// A second attempt would clear again; there must have been only one.
+	wantClear := wantClearPresses(len(prompt), 1)
+	if got := mock.countCallsWithArgs("SendKeys", pane, "C-u"); got != wantClear {
+		t.Errorf("C-u sent %d times, want %d (a single attempt's worth)", got, wantClear)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 1 {
+		t.Errorf("Enter sent %d times, want 1", got)
+	}
+}
+
+// TestSendPrompt_SendKeysLiteralErrorMidChunk covers the partial-delivery
+// failure: the first chunk lands, the second errors. The prompt is now
+// half-written into the input area, so the one thing that must not happen
+// is a commit — Enter would submit a truncated prompt to the agent.
+func TestSendPrompt_SendKeysLiteralErrorMidChunk(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withSmallChunks(t, 10)
+
+	const pane = "%chunk-err"
+	prompt := "0123456789abcdefghijKLMNOPQRST"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-chunk-err", "chunk-err", pane)
+
+	mock.captured[pane] = "$ "
+	mock.sendKeysLiteralErr[pane] = errors.New("tmux disconnected")
+	mock.sendKeysLiteralErrAfterN[pane] = 2 // first chunk lands, second fails
+
+	err := mgr.SendPrompt(sess.ID, prompt)
+	if err == nil {
+		t.Fatalf("SendPrompt returned nil, want error")
+	}
+	if !strings.Contains(err.Error(), "failed to send prompt") {
+		t.Errorf("error %q missing 'failed to send prompt'", err.Error())
+	}
+	if got := countCalls(mock, "SendKeysLiteral", pane); got != 2 {
+		t.Errorf("SendKeysLiteral called %d times, want 2 (stopped at the failing chunk)", got)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times, want 0 (a half-written prompt must never commit)", got)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, sendNudgeKey); got != 0 {
+		t.Errorf("nudge sent %d times, want 0 (send aborted before the nudge)", got)
+	}
+}
+
+// TestSendPrompt_ClearRepeatsCapped pins the best-effort ceiling: past
+// roughly 30KB the clear count stops growing rather than spinning the pane
+// for minutes. The send still proceeds — the residue risk at that size is
+// documented in docs/gotchas.md rather than turned into an error.
+func TestSendPrompt_ClearRepeatsCapped(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendClear(t, time.Millisecond)
+	installClearKeys(t, mgr, []string{"C-u"})
+
+	const pane = "%clr-cap"
+	prompt := strings.Repeat("x", sendClearWidthAssumed*sendClearMaxKeys*2)
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-clr-cap", "clr-cap", pane)
+
+	mock.capturedSequence[pane] = []string{
+		"$ ",
+		"$ " + prompt,
+	}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil (cap is best-effort, not an error)", err)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "C-u"); got != sendClearMaxKeys {
+		t.Errorf("C-u sent %d times, want %d (capped)", got, sendClearMaxKeys)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 1 {
+		t.Errorf("Enter sent %d times, want 1", got)
+	}
+}
+
+// TestSendPrompt_BudgetWiredFromPromptShape checks that SendPrompt actually
+// feeds the send's shape into sendVerifyBudget, rather than merely that the
+// function computes the right number — the arithmetic is already pinned by
+// TestSendVerifyBudget, and passing it (0, 0) would restore the flat timeout
+// this scaling exists to replace while leaving that test green.
+//
+// The timeout error reports the budget it enforced, so the assertion reads
+// it back out of the message instead of timing the call, which keeps it
+// deterministic. Coefficients are shrunk to keep the deadline in
+// milliseconds.
+func TestSendPrompt_BudgetWiredFromPromptShape(t *testing.T) {
+	cases := []struct {
+		name      string
+		prompt    string
+		clearKeys []string
+	}{
+		{"short", "hi", []string{"C-u"}},
+		{"multi-chunk", strings.Repeat("x", 90), []string{"C-u"}},
+		// Two keys per repeat: pins that the budget counts actual presses
+		// (repeats x keys), not repeats alone.
+		{"two-clear-keys", strings.Repeat("x", 90), []string{"C-a", "C-k"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, mock, _ := newTestManager(t)
+			withShortSendVerify(t, time.Millisecond, 0, time.Millisecond)
+			withShortSendClear(t, 0)
+			withSmallChunks(t, 10)
+			withBudgetCoefficients(t, 2*time.Millisecond, time.Millisecond)
+			installClearKeys(t, mgr, tc.clearKeys)
+
+			const pane = "%budget"
+			sess := newIdleSessionWithPane(t, mgr, "/tmp/send-budget-"+tc.name, "budget-"+tc.name, pane)
+			mock.captured[pane] = "$ " // never shows the prompt: always a miss
+
+			want := sendVerifyBudget(
+				len(chunkPrompt(tc.prompt, sendChunkMaxBytes)),
+				wantClearPresses(len(tc.prompt), len(tc.clearKeys)),
+				sendVerifyLookCount(len(tc.prompt)),
+			)
+			if want == sendVerifyTimeoutBase {
+				t.Fatalf("test setup broken: budget %v equals the base, so this "+
+					"case cannot distinguish a wired budget from a flat one", want)
+			}
+
+			err := mgr.SendPrompt(sess.ID, tc.prompt)
+			if err == nil {
+				t.Fatalf("SendPrompt returned nil, want a verify timeout")
+			}
+
+			// Anchor on the surrounding literals: a bare Contains on the
+			// duration alone matches a longer one that ends with it
+			// ("7ms" inside "17ms"), which lets a skewed budget through.
+			needle := "within " + want.String() + " (attempts="
+			if !strings.Contains(err.Error(), needle) {
+				t.Errorf("error %q does not report the expected budget %v; "+
+					"SendPrompt is not deriving it from the prompt's shape", err.Error(), want)
+			}
+		})
+	}
+}
+
+// TestSendPrompt_DelaysBetweenChunks pins D2. Without a gap between writes
+// Codex coalesces adjacent chunks into one read and folds them into a paste
+// placeholder, which defeats the split entirely — and since Codex ignores an
+// unknown `-c` key silently, the spawn-side paste-burst override cannot be
+// relied on to cover it. Every other send test zeroes sendChunkDelay, so
+// deleting the sleep would otherwise go unnoticed.
+func TestSendPrompt_DelaysBetweenChunks(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, 0, time.Millisecond)
+	withSmallChunks(t, 10)
+	const delay = 5 * time.Millisecond
+	withChunkDelay(t, delay)
+
+	const pane = "%chunk-delay"
+	prompt := strings.Repeat("y", 25) // 3 chunks at max=10
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-chunk-delay", "chunk-delay", pane)
+	mock.capturedSequence[pane] = []string{"$ ", "$ " + prompt}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+
+	gaps := mock.sendKeysLiteralGaps(pane)
+	if len(gaps) != 2 {
+		t.Fatalf("recorded %d inter-chunk gaps, want 2 (3 chunks)", len(gaps))
+	}
+	for i, gap := range gaps {
+		if gap < delay {
+			t.Errorf("gap between chunk %d and %d was %v, want at least %v", i, i+1, gap, delay)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers used by SendPrompt
 // ---------------------------------------------------------------------------
 
-func TestCollapseWS(t *testing.T) {
+func TestNormalizeForVerify(t *testing.T) {
 	cases := []struct {
 		name string
 		in   string
@@ -4423,14 +4810,25 @@ func TestCollapseWS(t *testing.T) {
 		{"single-space", " ", ""},
 		{"only-whitespace", "   \t\n\r", ""},
 		{"single-word", "hello", "hello"},
-		{"internal-runs", "hello\t\n  world", "hello world"},
+		// Whitespace is removed, not collapsed: capture-pane inserts a
+		// newline at each wrap position where the prompt has nothing, so
+		// collapsing to one space would still leave the two sides
+		// disagreeing exactly at the seam.
+		{"internal-runs-removed", "hello\t\n  world", "helloworld"},
 		{"leading-trailing", "  hi  ", "hi"},
-		{"cr-lf", "a\r\nb", "a b"},
+		{"cr-lf", "a\r\nb", "ab"},
+		// OpenCode draws a vertical bar at the start of every wrapped row.
+		{"box-drawing-vertical", "abc\n┃ def", "abcdef"},
+		{"box-drawing-range-ends", "a─b╿c", "abc"},
+		// Runes just outside U+2500-U+257F must survive untouched.
+		{"below-box-range-kept", "a⓿b", "a⓿b"},
+		{"above-box-range-kept", "a▀b", "a▀b"},
+		{"japanese-kept", "日本語 の テスト", "日本語のテスト"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := collapseWS(tc.in); got != tc.want {
-				t.Errorf("collapseWS(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := normalizeForVerify(tc.in); got != tc.want {
+				t.Errorf("normalizeForVerify(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -4446,16 +4844,216 @@ func TestPromptTail(t *testing.T) {
 		{"short-prompt-full", "hi", 32, "hi"},
 		{"exact-length", "abcdefgh", 8, "abcdefgh"},
 		{"longer-than-n", "aaaaaaaaaaaaaaaaabcdef", 6, "abcdef"},
-		{"whitespace-collapse", "aa  \n bb\tcc", 32, "aa bb cc"},
-		{"whitespace-collapse-then-truncate", "aaaaaaaa  bbb ccc", 5, "b ccc"},
+		{"whitespace-removed", "aa  \n bb\tcc", 32, "aabbcc"},
+		{"whitespace-removed-then-truncate", "aaaaaaaa  bbb ccc", 5, "bbccc"},
 		{"empty", "", 32, ""},
+		{"only-whitespace", "  \n\t ", 32, ""},
+		// Rune-boundary truncation: 5 bytes back from the end of
+		// "あいう" (9 bytes) lands mid-rune, so the leading fragment is
+		// dropped and only the last whole rune survives. A byte slice
+		// here would produce invalid UTF-8 that can never match the
+		// equally-normalized haystack.
+		{"multibyte-boundary", "あいう", 5, "う"},
+		{"multibyte-exact-fit", "あいう", 6, "いう"},
+		{"multibyte-whole", "あいう", 32, "あいう"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := promptTail(tc.prompt, tc.n); got != tc.want {
+			got := promptTail(tc.prompt, tc.n)
+			if got != tc.want {
 				t.Errorf("promptTail(%q, %d) = %q, want %q", tc.prompt, tc.n, got, tc.want)
 			}
+			if !utf8.ValidString(got) {
+				t.Errorf("promptTail(%q, %d) = %q, which is not valid UTF-8", tc.prompt, tc.n, got)
+			}
+			if len(got) > tc.n {
+				t.Errorf("promptTail(%q, %d) = %q (%d bytes), want at most %d", tc.prompt, tc.n, got, len(got), tc.n)
+			}
 		})
+	}
+}
+
+// TestPromptVerifiable pins the predicate callers use to reject prompts
+// SendPrompt could not prove landed. Box-drawing-only input is the case the
+// old whitespace-only check missed once normalizeForVerify started stripping
+// those runes: it normalizes to nothing, so verify has no needle and would
+// accept it without evidence.
+func TestPromptVerifiable(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"ordinary", "hello", true},
+		{"japanese", "日本語", true},
+		{"leading-dash", "-R", true},
+		{"empty", "", false},
+		{"spaces", "   ", false},
+		{"mixed-whitespace", " \t\n\r ", false},
+		{"box-drawing-only", "────────", false},
+		{"box-drawing-and-space", "┃ ─ ┃", false},
+		{"box-drawing-with-text", "┃ ok", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PromptVerifiable(tc.in); got != tc.want {
+				t.Errorf("PromptVerifiable(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+			// The contract that makes the predicate worth having: whatever it
+			// rejects is exactly what sendVerifyOK would wave through blind.
+			if trivial := sendVerifyOK("$ ", "$ ", tc.in); trivial == tc.want {
+				t.Errorf("PromptVerifiable(%q)=%v but sendVerifyOK accepts-blind=%v; "+
+					"the two must be exact opposites or unverified prompts slip past", tc.in, tc.want, trivial)
+			}
+		})
+	}
+}
+
+func TestChunkPrompt(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		max  int
+		want []string
+	}{
+		{"empty", "", 800, nil},
+		{"zero-max", "abc", 0, nil},
+		{"single-byte", "a", 800, []string{"a"}},
+		{"exact-fit", "abcd", 4, []string{"abcd"}},
+		{"one-over", "abcde", 4, []string{"abcd", "e"}},
+		{"even-split", "abcdef", 2, []string{"ab", "cd", "ef"}},
+		// The cut would land inside the 3-byte "い", so it backs off to
+		// the rune boundary and emits a short chunk instead.
+		{"multibyte-backoff", "あいう", 4, []string{"あ", "い", "う"}},
+		{"multibyte-two-per-chunk", "あいうえ", 6, []string{"あい", "うえ"}},
+		// A rune wider than max is emitted whole rather than split — the
+		// chunk exceeds max, but progress is guaranteed. Unreachable at
+		// the production 800, reachable in a test that shrinks it.
+		{"rune-wider-than-max", "あa", 2, []string{"あ", "a"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := chunkPrompt(tc.in, tc.max)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("chunkPrompt(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+			}
+			// Invariants that must hold for every input, not just these.
+			if joined := strings.Join(got, ""); joined != tc.in && tc.max > 0 {
+				t.Errorf("chunks rejoin to %q, want %q (round-trip must be exact)", joined, tc.in)
+			}
+			for i, c := range got {
+				if !utf8.ValidString(c) {
+					t.Errorf("chunk %d = %q is not valid UTF-8", i, c)
+				}
+			}
+		})
+	}
+}
+
+// TestChunkPrompt_LargeRoundTrip drives the production chunk size with
+// inputs past tmux's own 16341-byte send-keys limit, which is the failure
+// this split exists to avoid.
+func TestChunkPrompt_LargeRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"ascii-20k", strings.Repeat("abcdefghij", 2000)},
+		{"japanese-20k", strings.Repeat("日本語テスト", 1200)},
+		{"no-whitespace-blob", strings.Repeat("x", 20000)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := chunkPrompt(tc.in, sendChunkMaxBytes)
+			if strings.Join(got, "") != tc.in {
+				t.Fatalf("round-trip mismatch for %s", tc.name)
+			}
+			for i, c := range got {
+				if len(c) > sendChunkMaxBytes {
+					t.Errorf("chunk %d is %d bytes, want at most %d", i, len(c), sendChunkMaxBytes)
+				}
+				if !utf8.ValidString(c) {
+					t.Errorf("chunk %d is not valid UTF-8", i)
+				}
+			}
+		})
+	}
+}
+
+func TestSendClearRepeats(t *testing.T) {
+	cases := []struct {
+		name      string
+		promptLen int
+		want      int
+	}{
+		{"empty", 0, 4},
+		{"under-one-row", 10, 4},
+		{"exactly-one-row", sendClearWidthAssumed, 5},
+		{"ten-rows", sendClearWidthAssumed * 10, 14},
+		// The cap engages well before the count could run away. At the
+		// assumed 60-column width that is roughly 30KB of residue; past
+		// this point SendPrompt continues best-effort with a possibly
+		// incomplete clear (see docs/gotchas.md).
+		{"at-cap", sendClearWidthAssumed * sendClearMaxKeys, sendClearMaxKeys},
+		{"past-cap", sendClearWidthAssumed * sendClearMaxKeys * 10, sendClearMaxKeys},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sendClearRepeats(tc.promptLen); got != tc.want {
+				t.Errorf("sendClearRepeats(%d) = %d, want %d", tc.promptLen, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSendVerifyLookCount pins the scaling of the look budget. Each look
+// sends one nudge, and on an agent whose input window follows the cursor
+// those nudges are what walk a tall prompt's tail into view — so a longer
+// prompt must get more of them, up to a ceiling that bounds the wall-clock
+// cost of a send that is never going to verify.
+func TestSendVerifyLookCount(t *testing.T) {
+	if got := sendVerifyLookCount(0); got != sendVerifyLooksBase {
+		t.Errorf("sendVerifyLookCount(0) = %d, want the base %d", got, sendVerifyLooksBase)
+	}
+	small := sendVerifyLookCount(100)
+	large := sendVerifyLookCount(4000)
+	if large <= small {
+		t.Errorf("sendVerifyLookCount(4000)=%d <= (100)=%d; a taller prompt needs more nudges "+
+			"to walk its tail into view", large, small)
+	}
+	if got := sendVerifyLookCount(1 << 20); got != sendVerifyLooksMax {
+		t.Errorf("sendVerifyLookCount(1MB) = %d, want the cap %d", got, sendVerifyLooksMax)
+	}
+	// A 2KB prompt was measured to need roughly 20 presses on a 48-column
+	// pane; the allowance must comfortably clear that or the case this
+	// scaling exists for still fails.
+	if got := sendVerifyLookCount(2048); got < 25 {
+		t.Errorf("sendVerifyLookCount(2048) = %d, too few: 2KB needed ~20 nudges when measured", got)
+	}
+}
+
+// TestSendVerifyBudget pins the shape of the scaling rule: a bigger send
+// must get a bigger budget, or large prompts silently lose their retries.
+func TestSendVerifyBudget(t *testing.T) {
+	base := sendVerifyBudget(0, 0, 0)
+	if base != sendVerifyTimeoutBase {
+		t.Errorf("sendVerifyBudget(0, 0, 0) = %v, want %v", base, sendVerifyTimeoutBase)
+	}
+	// Each term has to move the budget on its own, or the corresponding cost
+	// silently stops being covered.
+	if got := sendVerifyBudget(10, 0, 0); got <= base {
+		t.Errorf("sendVerifyBudget(10, 0, 0) = %v, want > base %v", got, base)
+	}
+	if got := sendVerifyBudget(0, 100, 0); got <= base {
+		t.Errorf("sendVerifyBudget(0, 100, 0) = %v, want > base %v", got, base)
+	}
+	if got := sendVerifyBudget(0, 0, 30); got <= base {
+		t.Errorf("sendVerifyBudget(0, 0, 30) = %v, want > base %v", got, base)
+	}
+	want := sendVerifyTimeoutBase + 10*sendVerifyPerChunk +
+		100*sendVerifyPerClearKey + 30*sendVerifyLookDelay
+	if got := sendVerifyBudget(10, 100, 30); got != want {
+		t.Errorf("sendVerifyBudget(10, 100, 30) = %v, want %v", got, want)
 	}
 }
 
@@ -4524,5 +5122,99 @@ func TestSendVerifyOK(t *testing.T) {
 					tc.before, tc.after, tc.prompt, got, tc.want)
 			}
 		})
+	}
+}
+
+// legacyVerifyOK reproduces the pre-fix verify: whitespace runs collapsed
+// to a single space instead of removed, and no box-drawing handling. It
+// exists only so TestSendVerifyOK_CapturedPanes can prove its regression
+// specimens actually exercise the bug — a specimen that passes under this
+// too would silently contribute nothing.
+func legacyVerifyOK(before, after, prompt string) bool {
+	collapse := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	s := collapse(prompt)
+	tail := s
+	if len(s) > sendVerifyTailBytes {
+		tail = s[len(s)-sendVerifyTailBytes:]
+	}
+	if tail == "" {
+		return true
+	}
+	nAfter := strings.Count(collapse(after), tail)
+	if nAfter == 0 {
+		return false
+	}
+	return nAfter > strings.Count(collapse(before), tail)
+}
+
+// TestSendVerifyOK_CapturedPanes replays real capture-pane output taken
+// from Claude Code and OpenCode driven through a throwaway tmux server.
+// Every specimen is a prompt that genuinely landed in the input area, so
+// verify must accept all of them.
+//
+// The `regression` flag marks specimens where the prompt's 32-byte tail
+// straddles a wrapped row — the case that used to fail. Those are the only
+// ones with any diagnostic power: the others repeat a phrase often enough
+// that some occurrence avoids the seam, so they passed before the fix too
+// and would keep passing if it were reverted.
+func TestSendVerifyOK_CapturedPanes(t *testing.T) {
+	cases := []struct {
+		name       string
+		agent      string
+		regression bool
+		why        string
+	}{
+		{"noseam", "claude", false, "seam falls outside the tail — control"},
+		{"seam", "claude", false, "seam present but misses the tail — control"},
+		{"s1", "claude", true, "seam pierces the tail at +28"},
+		{"s2", "claude", true, "seam pierces the tail at +16"},
+		{"s3", "claude", true, "seam pierces the tail at +4"},
+		{"oc1", "opencode", false, "tail fit on one row"},
+		{"oc2", "opencode", true, "tail split with a box-drawing bar between the halves"},
+		{"ja", "claude", false, "japanese; tail cut mid-UTF-8 by the old byte slice"},
+		{"en", "claude", false, "spaced tail wraps at a word boundary"},
+		{"w1", "claude", false, "spaced tail, wrap variant"},
+		{"w2", "claude", false, "spaced tail, wrap variant"},
+		{"w3", "claude", false, "spaced tail, wrap variant"},
+		{"blob", "claude", false, "unspaced long token, seam missed the tail"},
+	}
+
+	read := func(t *testing.T, name, ext string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("testdata", "sendverify", name+"."+ext))
+		if err != nil {
+			t.Fatalf("read specimen: %v", err)
+		}
+		return string(b)
+	}
+
+	sawRegression := false
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prompt := read(t, tc.name, "prompt")
+			before := read(t, tc.name, "before")
+			after := read(t, tc.name, "after")
+
+			if !sendVerifyOK(before, after, prompt) {
+				t.Errorf("sendVerifyOK = false, want true (%s agent, %s)", tc.agent, tc.why)
+			}
+			// The same pane compared against itself must NOT verify: the
+			// occurrence count has to increase, not merely be non-zero.
+			// Without this, a normalization aggressive enough to match
+			// anything would look correct above.
+			if sendVerifyOK(before, before, prompt) {
+				t.Errorf("sendVerifyOK(before, before) = true, want false (no new occurrence)")
+			}
+			if tc.regression {
+				sawRegression = true
+				if legacyVerifyOK(before, after, prompt) {
+					t.Errorf("specimen passes under the pre-fix verify too, so it "+
+						"guards nothing; re-check %s or drop the regression flag", tc.name)
+				}
+			}
+		})
+	}
+	if !sawRegression {
+		t.Error("no regression specimen ran; the suite has lost its teeth")
 	}
 }

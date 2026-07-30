@@ -88,3 +88,9 @@ func (a *Agent) HooksSettingsPath() string { return a.hooksPath }
 // return nil to opt out; empty here would mean "opt out" and disable the
 // residual-concat protection for claude sessions.
 func (a *Agent) ClearInputKeys() []string { return []string{"C-u"} }
+
+// PastePlaceholder returns "": Claude Code receives prompts as keystrokes because
+// its placeholder numbers pastes ("#1", "#2", ...) rather than
+// measuring them, so a fold would leave nothing to verify against — and at
+// 32KB the keystroke path is fast enough that there is nothing to gain.
+func (a *Agent) PastePlaceholder(string) string { return "" }

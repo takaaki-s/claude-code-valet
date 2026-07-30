@@ -16,6 +16,8 @@ type Runner interface {
 	GetPaneCurrentPath(target string) (string, error)
 	SendKeys(target, keys string) error
 	SendKeysLiteral(target, text string) error
+	LoadBuffer(name, content string) error
+	PasteBuffer(target, name string) error
 	DisplayPopup(opts DisplayPopupOptions) error
 	SplitPane(target string, opts SplitOptions) (string, error)
 	FindPaneByName(target, name string) (string, error)

@@ -80,8 +80,67 @@ func TestSpawnCommand_NoHookArgsWhenExecPathEmpty(t *testing.T) {
 		AgentSessionStarted: false,
 	}, "")
 
-	if plan.Command != "codex" {
-		t.Errorf("Command = %q, want %q (no hooks when execPath is empty)", plan.Command, "codex")
+	if strings.Contains(plan.Command, "--enable hooks") {
+		t.Errorf("Command = %q, want no hooks when execPath is empty", plan.Command)
+	}
+	if strings.Contains(plan.Command, "hooks.") {
+		t.Errorf("Command = %q, want no hook events when execPath is empty", plan.Command)
+	}
+	// The config overrides are independent of hooks: they must survive
+	// even when hook injection is skipped entirely.
+	want := "codex " + strings.Join(configArgs(), " ")
+	if plan.Command != want {
+		t.Errorf("Command = %q, want %q", plan.Command, want)
+	}
+}
+
+// TestSpawnCommand_ConfigArgs pins the two behaviour overrides. Both guard
+// failures that are invisible at spawn time — Codex ignores unknown `-c`
+// keys silently — so a rename upstream has to be caught here.
+func TestSpawnCommand_ConfigArgs(t *testing.T) {
+	want := []string{
+		"-c 'disable_paste_burst=true'",
+		"-c 'check_for_update_on_startup=false'",
+	}
+	cases := []struct {
+		name string
+		opts agent.SpawnOptions
+	}{
+		{"fresh", agent.SpawnOptions{AgentSessionStarted: false}},
+		{"resume", agent.SpawnOptions{
+			AgentSessionID:      "01900000-0000-7000-8000-000000000abc",
+			AgentSessionStarted: true,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := SpawnCommand(tc.opts, testExecPath)
+			for _, w := range want {
+				if !strings.Contains(plan.Command, w) {
+					t.Errorf("Command missing %q: %q", w, plan.Command)
+				}
+			}
+		})
+	}
+}
+
+// TestSpawnCommand_ConfigArgsFollowBase checks the assembly order: the
+// base command still comes first, so `codex resume UUID` keeps its
+// positional argument adjacent to the subcommand.
+func TestSpawnCommand_ConfigArgsFollowBase(t *testing.T) {
+	uuid := "01900000-0000-7000-8000-000000000abc"
+	plan := SpawnCommand(agent.SpawnOptions{
+		AgentSessionID:      uuid,
+		AgentSessionStarted: true,
+	}, testExecPath)
+
+	resumeIdx := strings.Index(plan.Command, "codex resume "+uuid)
+	cfgIdx := strings.Index(plan.Command, "-c 'disable_paste_burst=true'")
+	if resumeIdx < 0 || cfgIdx < 0 {
+		t.Fatalf("both segments must be present: %q", plan.Command)
+	}
+	if resumeIdx > cfgIdx {
+		t.Errorf("`codex resume UUID` must precede the -c overrides: %q", plan.Command)
 	}
 }
 

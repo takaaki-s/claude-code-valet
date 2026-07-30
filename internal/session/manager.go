@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/takaaki-s/jind-ai/internal/config"
@@ -1028,52 +1030,316 @@ func (m *Manager) SetStatus(id string, status Status) {
 
 // Verify-by-capture tuning. Kept as vars so tests can shorten them.
 // See SendPrompt for the mechanism, and docs/gotchas.md for the rationale.
+// The values below were fixed by measurement against Claude Code 2.1.220,
+// Codex 0.144.6 and OpenCode 1.17.18 driven through a throwaway tmux server.
 var (
-	// sendVerifyTimeout bounds the whole send-verify retry loop. On
-	// timeout SendPrompt returns an error before ever pressing Enter,
-	// so buffered/dropped keystrokes never reach the agent as a
-	// half-formed prompt.
-	sendVerifyTimeout = 5 * time.Second
-	// sendVerifySettleDelay is how long we wait between SendKeysLiteral
-	// and the follow-up CapturePane. Empirically ~50ms is enough for
-	// tmux to reflect the literal into the pane's visible buffer.
+	// sendVerifyTimeoutBase is the fixed part of the send-verify retry
+	// budget. The total also scales with the prompt (see sendVerifyBudget):
+	// a large prompt costs more per attempt, so a flat 5s would leave big
+	// sends with no retries at all. On timeout SendPrompt returns an error
+	// before ever pressing Enter, so buffered/dropped keystrokes never
+	// reach the agent as a half-formed prompt.
+	sendVerifyTimeoutBase = 5 * time.Second
+	// sendVerifyPerChunk and sendVerifyPerClearKey extend that budget by
+	// the cost of one chunk send and one clear keypress. Every tmux verb
+	// is a separate process (Client resolves the binary once via
+	// exec.LookPath, then execs it per call), so the dominant term is
+	// process startup — the payload barely matters.
+	//
+	// Measured against a throwaway tmux server driving a plain shell pane:
+	//
+	//	direct tmux 3.6a binary     ~1.4ms per send-keys / capture-pane
+	//	exec.Command from Go        ~3ms   (what this package actually does)
+	//	from a shell, via a shim    ~33ms  (the shim re-execs the real one)
+	//
+	// The budget is sized from the slow figure. Over-estimating only makes
+	// a genuinely stuck send take longer to report failure; under-estimating
+	// silently reduces large prompts to a single attempt with no retry,
+	// which is the failure this scaling exists to prevent. perChunk also
+	// carries sendChunkDelay, which is paid between every pair of chunks.
+	sendVerifyPerClearKey = 35 * time.Millisecond
+	// Derived rather than written as a literal so that changing
+	// sendChunkDelay cannot silently under-budget the loop: a chunk costs one
+	// tmux invocation plus the delay that follows it.
+	sendVerifyPerChunk = sendVerifyPerClearKey + sendChunkDelay + 5*time.Millisecond
+	// sendVerifySettleDelay is how long we wait between the last chunk
+	// (plus nudge) and the follow-up CapturePane. Empirically ~50ms is
+	// enough for tmux to reflect the literal into the pane's visible
+	// buffer.
 	sendVerifySettleDelay = 50 * time.Millisecond
 	// sendVerifyBackoff is the pause between a failed verify and the
 	// next re-send. Kept small so a genuinely-not-ready TUI recovers
 	// within a few hundred ms once it is ready.
 	sendVerifyBackoff = 100 * time.Millisecond
-	// sendVerifyTailBytes controls how many trailing bytes of the prompt
-	// we look for in the capture. Long prompts get wrapped by the TUI's
-	// input area, so matching only the tail avoids reflow false negatives
-	// while still uniquely identifying the send.
+	// sendVerifyTailBytes controls how many trailing bytes of the
+	// normalized prompt we look for in the capture. Long prompts get
+	// wrapped by the TUI's input area, so matching only the tail avoids
+	// reflow false negatives while still uniquely identifying the send.
+	//
+	// Do not raise this hoping for a stronger anchor: a longer needle is
+	// MORE likely to straddle a wrapped row, not less. normalizeForVerify
+	// is what makes the match robust, not the length.
 	sendVerifyTailBytes = 32
 	// sendClearSettleDelay is how long we wait after sending the adapter's
 	// ClearInputKeys sequence before capturing the baseline. Long enough
 	// for a well-behaved TUI to render the empty input line; short enough
-	// that it contributes negligibly to sendVerifyTimeout even across a
+	// that it contributes negligibly to the verify budget even across a
 	// full retry chain. Skipped entirely when the resolved adapter returns
 	// nil / empty keys (opt-out) or the resolver could not produce one.
 	sendClearSettleDelay = 20 * time.Millisecond
+
+	// sendVerifyLooks is how many times one attempt re-checks the pane
+	// before giving up and re-sending, and sendVerifyLookDelay is the gap
+	// between those looks (the first uses sendVerifySettleDelay, so a TUI
+	// that renders promptly stays as responsive as before).
+	//
+	// Looking is cheap — a nudge plus a capture — while re-sending clears
+	// the input and pushes the whole prompt again, discarding whatever the
+	// TUI had drawn. Without this, an agent slower than one settle delay is
+	// reset before it can finish and never verifies at all: Codex with a
+	// 16KB prompt burned the entire budget across 16 attempts, then passed
+	// in 1.7s once the attempt looked instead of re-sending.
+	//
+	// The count scales with the prompt because each look sends one nudge, and
+	// on OpenCode the nudge is what walks the cursor toward the end of a
+	// multi-row input (see sendNudgeKey). One look per assumed row, plus a
+	// base for agents that just need a repaint or two. Claude and Codex
+	// verify on the first look, so the extra allowance costs them nothing.
+	sendVerifyLooksBase = 10
+	sendVerifyLooksMax  = 60
+	sendVerifyLookDelay = 200 * time.Millisecond
+
+	// sendChunkMaxBytes caps one SendKeysLiteral payload. Two separate
+	// ceilings force the split:
+	//
+	//   - tmux send-keys -l refuses arguments over 16341 bytes outright
+	//     ("command too long").
+	//   - the agent TUIs fold a single oversized read into a
+	//     "[Pasted Content N chars]" placeholder, which hides the prompt
+	//     tail from capture-pane and breaks verify even though the text
+	//     landed. Measured fold thresholds: Claude 801B, Codex 1001B,
+	//     OpenCode none.
+	//
+	// 800 is the largest value that stays under every measured threshold.
+	// Deliberately NOT an adapter capability: all three agents are served
+	// by one number, and no measured pain justifies the branch yet. Promote
+	// it when a fourth agent actually needs a different ceiling.
+	sendChunkMaxBytes = 800
+	// sendChunkDelay separates consecutive chunk sends. With no delay,
+	// Codex coalesces adjacent chunks into a single read and folds them
+	// anyway — which defeats the split entirely (measured: 12x800B at 0ms
+	// produced placeholders swallowing 2400-3200B; at 20ms, zero). Claude
+	// does not need it and is unharmed by it.
+	sendChunkDelay = 20 * time.Millisecond
+	// sendNudgeKey is sent before each verify capture. Two agents need it
+	// for two different reasons:
+	//
+	//   - Codex repaints only on key events, so without one a capture can
+	//     show stale content indefinitely (measured: still stale after 37s).
+	//   - OpenCode draws only a fixed-size window of its input buffer, and
+	//     that window follows the CURSOR. A prompt taller than the window
+	//     leaves the tail undrawn — and undrawn means capture-pane cannot see
+	//     it at all: the rest of the text lives only inside OpenCode and was
+	//     never written to the terminal.
+	//
+	// "Down" rather than "End" because of that second case. `End` goes to the
+	// end of the current visual row, which on a wrapped multi-row input never
+	// reaches the end of the buffer, so the window never scrolls and the tail
+	// is never drawn. `Down` advances one row at a time, walking the cursor —
+	// and the window with it — toward the end. Measured on a 48-column pane:
+	// a 2KB prompt stayed invisible under `End` at every interval tried, and
+	// became visible after roughly 20 `Down` presses. `C-End`, `NPage` and
+	// `C-e` did nothing.
+	//
+	// Safe to send unconditionally, which is why this stays one constant
+	// instead of an adapter capability. Measured on Claude and Codex: five
+	// presses against an empty input changed the pane not at all — no history
+	// recall dropping text into the field, which would be the worst outcome
+	// available, since it would commit something nobody sent — and twenty
+	// presses against a filled input preserved every byte. Both still verify
+	// a 16KB prompt with it.
+	sendNudgeKey = "Down"
+	// sendPasteBufferName is the tmux buffer the paste transport reuses.
+	// A fixed name keeps the buffer stack from growing; PasteBuffer's `-d`
+	// removes it right after pasting, so a prompt is never left readable
+	// there.
+	sendPasteBufferName = "jin-prompt"
+	// sendClearWidthAssumed is the input-line width assumed when deciding
+	// how many times to repeat the clear sequence. Each press clears one
+	// visual row, so the count has to cover however many rows the residue
+	// occupies.
+	//
+	// Deliberately below every measured width (Claude 196, Codex 197,
+	// OpenCode 70): overshooting is harmless — the clear key is a no-op on
+	// empty input (verified at 80 presses on Claude, 40 on Codex and
+	// OpenCode) — while undershooting leaves residue that concatenates
+	// with the prompt at Enter time.
+	sendClearWidthAssumed = 60
+	// sendClearMaxKeys caps the repeat count so a pathological prompt
+	// cannot spin the pane for minutes. 512 repeats x 60 columns covers
+	// roughly 30KB of residue; past that SendPrompt continues best-effort
+	// with a possibly-incomplete clear (documented in docs/gotchas.md).
+	//
+	// This is the dominant cost of a large send: one tmux process per
+	// press. A 16KB prompt costs 277 of them — under a second at the ~3ms
+	// the daemon actually pays, but ~9s if tmux resolves through a shell
+	// wrapper. `send-keys -N` would batch them, but it was measured to have
+	// no effect on Claude or OpenCode (only Codex honours it), so the
+	// presses cannot be collapsed.
+	sendClearMaxKeys = 512
 )
 
-// promptTail returns the last n bytes of prompt with whitespace
-// collapsed. Used by sendVerifyOK to build a compact needle that
-// survives TUI reflow, ANSI decoration and trailing newlines.
+// normalizeForVerify strips every rune that the TUI may inject into — or
+// around — the prompt while rendering it, so a needle taken from the
+// prompt still matches the captured pane.
+//
+// Two classes are removed:
+//
+//   - Whitespace. capture-pane emits a newline at each wrap position and
+//     the TUIs pad with cursor-positioning spaces. Collapsing runs to a
+//     single space is not enough: the wrap inserts a separator where the
+//     prompt has none, so the needle and the haystack disagree exactly at
+//     the seam. Measured failure rate for a 32-byte tail: ~16% on Claude
+//     and Codex, ~44% on OpenCode. Japanese text meets the condition
+//     essentially always.
+//   - Box-drawing runes (U+2500-U+257F). OpenCode draws a vertical bar at
+//     the start of every wrapped row, so whitespace removal alone still
+//     leaves a stray glyph inside the needle's span.
+//
+// Applied to BOTH sides of the comparison, so a prompt that legitimately
+// contains box-drawing characters stays symmetric and still matches.
+func normalizeForVerify(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if survivesNormalize(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// survivesNormalize is the single statement of what normalizeForVerify keeps.
+// PromptVerifiable is defined as "at least one rune survives", so both read
+// the rule from here: adding a third stripped class must not silently stop
+// the daemon's guard from covering it.
+func survivesNormalize(r rune) bool { return !unicode.IsSpace(r) && !isBoxDrawing(r) }
+
+// isBoxDrawing reports whether r is in the Box Drawing block. Note that the
+// Block Elements that follow it (U+2580 and up) are NOT included: agent TUIs
+// use those for solid banners, which do not appear inside the input area.
+func isBoxDrawing(r rune) bool { return r >= 0x2500 && r <= 0x257F }
+
+// PromptVerifiable reports whether SendPrompt can prove that the given
+// prompt reached the pane. Verification works by finding the prompt's tail
+// in the captured pane, and normalizeForVerify discards whitespace and
+// box-drawing runes — so a prompt built only from those normalizes to
+// nothing, leaves no needle to search for, and would be accepted without
+// any evidence it landed.
+//
+// Callers that accept prompts from outside should reject the ones this
+// rejects, rather than letting SendPrompt press Enter unverified. Exported
+// so that check lives next to the normalization it depends on, and shares
+// its rule via survivesNormalize.
+func PromptVerifiable(prompt string) bool {
+	// Scan for the first surviving rune rather than building the normalized
+	// copy: the answer is a bool, and an ordinary prompt decides it on the
+	// first character.
+	for _, r := range prompt {
+		if survivesNormalize(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// promptTail returns the needle sendVerifyOK looks for: the prompt run
+// through normalizeForVerify, truncated to at most n bytes. Truncation
+// backs off to a rune boundary so a multi-byte character is never cut in
+// half — a byte-sliced tail cannot match the equally-normalized haystack
+// once its leading fragment is no longer valid UTF-8.
 func promptTail(prompt string, n int) string {
-	s := collapseWS(prompt)
+	s := normalizeForVerify(prompt)
 	if len(s) <= n {
 		return s
 	}
-	return s[len(s)-n:]
+	s = s[len(s)-n:]
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
+	}
+	return s
 }
 
-// collapseWS folds every run of whitespace into a single space and trims
-// the result. This makes verify tolerant to the TUI splitting the input
-// across multiple visible rows or padding it with cursor-positioning
-// spaces. strings.Fields already splits on unicode.IsSpace, so joining
-// its output with a single space produces the same normalized form.
-func collapseWS(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+// chunkPrompt splits s into consecutive pieces of at most max bytes,
+// never cutting a rune in half. Concatenating the result reproduces s
+// exactly. Returns nil for an empty string so the caller sends nothing.
+//
+// A rune longer than max is emitted whole rather than split: the chunk
+// then exceeds max, which is still far below tmux's hard limit, and it
+// guarantees forward progress. At max=800 this is unreachable, but a
+// test shrinking the value must not deadlock.
+func chunkPrompt(s string, max int) []string {
+	if s == "" || max <= 0 {
+		return nil
+	}
+	var out []string
+	for len(s) > 0 {
+		if len(s) <= max {
+			out = append(out, s)
+			break
+		}
+		cut := max
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		if cut == 0 {
+			_, size := utf8.DecodeRuneInString(s)
+			cut = size
+		}
+		out = append(out, s[:cut])
+		s = s[cut:]
+	}
+	return out
+}
+
+// sendClearRepeats returns how many times the adapter's clear sequence
+// must be repeated to wipe a residue of at most promptLen bytes. The count
+// is derived from the prompt's own length: a retry can only ever face
+// residue from what we sent, which makes the prompt an upper bound. The +4
+// covers the partial first row plus rounding.
+//
+// The per-row assumption comes from Claude Code, which was measured to drop
+// exactly one visual row per press (72 characters off a 270-character
+// input, 171 off a 1350-character one). Codex and OpenCode empty their
+// input on the first press, so every repeat after that is a no-op there —
+// wasteful, but harmless, and one number keeps the caller free of
+// per-adapter branching.
+//
+// The result is a repeat count for the whole sequence, not a keypress
+// count — an adapter returning two keys issues 2*n presses.
+func sendClearRepeats(promptLen int) int {
+	return min(promptLen/sendClearWidthAssumed+4, sendClearMaxKeys)
+}
+
+// sendVerifyLookCount returns how many times one attempt re-checks the pane
+// before re-sending. It scales with the prompt because each look sends one
+// nudge, and on an agent whose input window follows the cursor those nudges
+// are what walk the tail into view — a taller prompt needs more of them.
+func sendVerifyLookCount(promptLen int) int {
+	return min(sendVerifyLooksBase+promptLen/sendClearWidthAssumed, sendVerifyLooksMax)
+}
+
+// sendVerifyBudget returns how long the retry loop may run for a send of
+// the given shape. A large prompt costs more per attempt — more chunks,
+// each with its delay, more clear presses, each a tmux process, and more
+// looks, each with its delay — so a flat timeout would silently reduce big
+// sends to a single attempt, or cut the look loop short before the tail has
+// been walked into view.
+func sendVerifyBudget(chunks, clearPresses, looks int) time.Duration {
+	return sendVerifyTimeoutBase +
+		time.Duration(chunks)*sendVerifyPerChunk +
+		time.Duration(clearPresses)*sendVerifyPerClearKey +
+		time.Duration(looks)*sendVerifyLookDelay
 }
 
 // sendVerifyOK reports whether the pane's captured content shows that
@@ -1083,20 +1349,41 @@ func collapseWS(s string) string {
 // (previous conversation, help text, etc.) does not falsely satisfy
 // the verify.
 //
-// An empty prompt is treated as trivially accepted: SendPrompt is only
-// reachable via daemon.handleSend which already rejects empty and
-// whitespace-only prompts, so this branch exists only to keep the
-// helper total.
+// A prompt that normalizes to nothing is treated as trivially accepted,
+// because there is no needle to look for. That branch is only safe as long
+// as callers reject those first — daemon.handleSend does, via
+// PromptVerifiable, which is defined as the exact complement of this case.
 func sendVerifyOK(before, after, prompt string) bool {
-	tail := promptTail(prompt, sendVerifyTailBytes)
-	if tail == "" {
+	return sendVerifyLanded(normalizeForVerify(before), after,
+		promptTail(prompt, sendVerifyTailBytes))
+}
+
+// sendVerifyLanded is sendVerifyOK with the invariant work hoisted out: the
+// needle is fixed for the whole send and the baseline for the whole attempt,
+// while only `after` changes between looks. SendPrompt normalizes `after`
+// itself and calls sendVerifyAppeared, because it looks up to
+// sendVerifyLooksMax times per attempt against as many as two needles, and
+// normalizing a 32KB capture per needle per look would cost more than the
+// capture it is checking.
+func sendVerifyLanded(beforeNorm, after, tail string) bool {
+	return sendVerifyAppeared(beforeNorm, normalizeForVerify(after), tail)
+}
+
+// sendVerifyAppeared reports whether needle occurs more often in the pane now
+// than it did at the baseline. Both sides are already normalized.
+//
+// Comparing counts rather than testing presence is what stops pane content
+// that already carried the needle — an earlier turn in the same conversation,
+// help text — from vouching for a prompt that never arrived.
+func sendVerifyAppeared(beforeNorm, afterNorm, needle string) bool {
+	if needle == "" {
 		return true
 	}
-	nAfter := strings.Count(collapseWS(after), tail)
+	nAfter := strings.Count(afterNorm, needle)
 	if nAfter == 0 {
 		return false
 	}
-	return nAfter > strings.Count(collapseWS(before), tail)
+	return nAfter > strings.Count(beforeNorm, needle)
 }
 
 // SendPrompt sends a prompt to a session's tmux pane.
@@ -1107,14 +1394,32 @@ func sendVerifyOK(before, after, prompt string) bool {
 // startup redraw and drops the incoming keys. To make this observable,
 // SendPrompt captures the pane before and after each send attempt and
 // checks that the tail of prompt appeared in the visible buffer.
-// Attempts repeat with backoff until the check passes or
-// sendVerifyTimeout elapses. Enter is only pressed after verify
-// succeeds, so fully-dropped prompts never get committed.
+// Attempts repeat with backoff until the check passes or the budget from
+// sendVerifyBudget elapses. Enter is only pressed after verify succeeds,
+// so fully-dropped prompts never get committed.
 //
-// Input-area clear: the adapter's ClearInputKeys sequence is sent before
-// each attempt's baseline capture — so residual text in the input area
-// (previous user typing, or a partial delivery from an earlier attempt)
-// cannot concatenate with the new prompt at Enter time. Adapters that
+// One attempt is:
+//
+//	clear x sendClearRepeats -> capture before -> chunked literal sends
+//	-> (nudge -> settle -> capture after -> verify) x sendVerifyLooks
+//
+// The inner loop looks repeatedly before the outer one re-sends, because
+// re-sending discards whatever the TUI had rendered — see the comment on
+// the look loop below.
+//
+// Chunking: the prompt goes out in sendChunkMaxBytes pieces separated by
+// sendChunkDelay, because a single oversized write either exceeds tmux's
+// own argument limit or gets folded into a "[Pasted Content N chars]"
+// placeholder that hides the tail from capture-pane. See the constants
+// for the measured thresholds.
+//
+// Input-area clear: the adapter's ClearInputKeys sequence is repeated
+// before each attempt's baseline capture — so residual text in the input
+// area (previous user typing, or a partial delivery from an earlier
+// attempt) cannot concatenate with the new prompt at Enter time. The
+// repeat count is sized for Claude Code, where one press clears one visual
+// row; a single press already empties Codex and OpenCode, so the extra
+// presses there are harmless no-ops. Adapters that
 // return nil / empty keys skip this step and keep the pre-refactor
 // behaviour; the residual-concat risk then applies to those adapters
 // (documented in docs/gotchas.md "Session send"). A missing AgentResolver
@@ -1144,14 +1449,52 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		return fmt.Errorf("tmux client not available")
 	}
 
-	// Resolve the adapter's clear-keys once, up front: it never changes
-	// across the retry loop, and Resolve is a cheap map lookup but doing it
-	// per attempt would still be gratuitous. Any failure at this step falls
-	// through to "no clear" — adapters opt in, and the transport layer must
-	// never refuse a send just because the resolver is misconfigured.
-	clearKeys := m.resolveClearKeys(agentKind)
+	// Ask the adapter once, up front, how it wants to be driven: neither
+	// answer changes across the retry loop. A missing or misconfigured
+	// resolver falls through to the defaults — no clearing, keystrokes —
+	// because the transport layer must never refuse a send over it.
+	var clearKeys []string
+	var placeholder string
+	if ag := m.resolveAgent(agentKind); ag != nil {
+		clearKeys, placeholder = ag.ClearInputKeys(), ag.PastePlaceholder(prompt)
+	}
+	pasting := placeholder != ""
 
-	deadline := time.Now().Add(sendVerifyTimeout)
+	// Chunking is the keystroke path's business; a paste hands the prompt
+	// over whole. Leaving chunks nil on the paste path also keeps
+	// sendVerifyBudget from charging a per-chunk cost that path never pays.
+	var chunks []string
+	if !pasting {
+		chunks = chunkPrompt(prompt, sendChunkMaxBytes)
+	}
+	// Size the clear from the residue a retry can actually face. On the
+	// keystroke path that is the whole prompt, typed out. On the paste path
+	// our own residue is at most one summary line, or a paste too small for
+	// the TUI to fold — bounded by the fold threshold, not by the prompt.
+	//
+	// Sizing it from the prompt there is pure waste: a 64KB paste would
+	// spend 512 tmux processes, one per press, clearing a single row before
+	// issuing the two calls that do the work. Measured, that was the bulk of
+	// the send — 1.12s against 114ms with the clamp, with 64KB still 3/3.
+	//
+	// Known limit: this only covers residue a HUMAN left in the input. The
+	// clamped count wipes ~500 typed characters but not ~5000 (measured on
+	// OpenCode); anything pasted collapses to one row and clears in a single
+	// press either way. The unclamped count was never a principled defence
+	// against that case either — it scales with our prompt, which says
+	// nothing about what someone typed before it.
+	clearRepeats := sendClearRepeats(len(prompt))
+	if pasting {
+		clearRepeats = min(clearRepeats, sendClearRepeats(sendChunkMaxBytes))
+	}
+	looks := sendVerifyLookCount(len(prompt))
+	// Fixed for the whole send: hoisted so the look loop does not re-normalize
+	// them on every pass.
+	tail := promptTail(prompt, sendVerifyTailBytes)
+	foldNeedle := normalizeForVerify(placeholder)
+	budget := sendVerifyBudget(len(chunks), clearRepeats*len(clearKeys), looks)
+
+	deadline := time.Now().Add(budget)
 	attempts := 0
 	for {
 		attempts++
@@ -1160,13 +1503,16 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		// snapshot reflects the post-clear state and sendVerifyOK's
 		// occurrence-count delta stays clean. Fail-fast on a SendKeys error:
 		// if we cannot even push a control key, the pane is unusable and
-		// nothing downstream will succeed either.
-		for _, k := range clearKeys {
-			if err := m.tmuxClient.SendKeys(paneID, k); err != nil {
-				return fmt.Errorf("failed to send clear key %q: %w", k, err)
-			}
-		}
+		// nothing downstream will succeed either — so bail on the first
+		// failure rather than grinding through the remaining repeats.
 		if len(clearKeys) > 0 {
+			for i := 0; i < clearRepeats; i++ {
+				for _, k := range clearKeys {
+					if err := m.tmuxClient.SendKeys(paneID, k); err != nil {
+						return fmt.Errorf("failed to send clear key %q: %w", k, err)
+					}
+				}
+			}
 			time.Sleep(sendClearSettleDelay)
 		}
 
@@ -1174,19 +1520,82 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		if err != nil {
 			return fmt.Errorf("capture-pane before failed: %w", err)
 		}
+		beforeNorm := normalizeForVerify(before)
 
-		if err := m.tmuxClient.SendKeysLiteral(paneID, prompt); err != nil {
-			return fmt.Errorf("failed to send prompt: %w", err)
+		if pasting {
+			// One atomic bracketed paste. No chunking, so the split-boundary
+			// hazards this path was built around — the argv limit and a chunk
+			// that starts with a dash — cannot arise at all.
+			if err := m.tmuxClient.LoadBuffer(sendPasteBufferName, prompt); err != nil {
+				return fmt.Errorf("failed to load paste buffer: %w", err)
+			}
+			if err := m.tmuxClient.PasteBuffer(paneID, sendPasteBufferName); err != nil {
+				return fmt.Errorf("failed to paste prompt: %w", err)
+			}
+		} else {
+			for i, c := range chunks {
+				if i > 0 {
+					time.Sleep(sendChunkDelay)
+				}
+				if err := m.tmuxClient.SendKeysLiteral(paneID, c); err != nil {
+					return fmt.Errorf("failed to send prompt: %w", err)
+				}
+			}
 		}
 
-		time.Sleep(sendVerifySettleDelay)
+		// Look for the prompt, nudging before each look, WITHOUT re-sending.
+		//
+		// Re-sending is destructive: the next attempt clears the input area
+		// and pushes the whole prompt again, which throws away whatever the
+		// TUI had rendered so far. A TUI slower than one settle delay then
+		// never converges — it is restarted from zero every time. Measured
+		// on Codex with a 16KB prompt: re-sending immediately produced 16
+		// failed attempts over the full budget, while looking without
+		// re-sending verified in 1.7s.
+		//
+		// The nudge is what makes looking worthwhile: Codex repaints only on
+		// key events, and OpenCode's viewport does not follow the cursor on
+		// its own. It is sent even when the adapter opted out of clearing —
+		// a measured no-op, and skipping it leaves those two unverifiable.
+		landed := false
+		for look := 0; look < looks; look++ {
+			// A pasted prompt needs no nudge: the placeholder renders where
+			// the input already is, and sending keys into a folded paste
+			// would only risk disturbing it.
+			if !pasting {
+				if err := m.tmuxClient.SendKeys(paneID, sendNudgeKey); err != nil {
+					return fmt.Errorf("failed to send nudge key %q: %w", sendNudgeKey, err)
+				}
+			}
+			if look == 0 {
+				time.Sleep(sendVerifySettleDelay)
+			} else {
+				time.Sleep(sendVerifyLookDelay)
+			}
 
-		after, err := m.tmuxClient.CapturePane(paneID, false)
-		if err != nil {
-			return fmt.Errorf("capture-pane after failed: %w", err)
+			after, err := m.tmuxClient.CapturePane(paneID, false)
+			if err != nil {
+				return fmt.Errorf("capture-pane after failed: %w", err)
+			}
+			// Normalize once, then try each needle. On the paste path the
+			// prompt text is usually not on screen at all — the placeholder
+			// stands in for it — but a small paste the TUI declined to fold
+			// still shows its tail, so accept whichever appears rather than
+			// depending on where that fold threshold sits.
+			afterNorm := normalizeForVerify(after)
+			ok := sendVerifyAppeared(beforeNorm, afterNorm, tail)
+			if !ok && pasting {
+				ok = sendVerifyAppeared(beforeNorm, afterNorm, foldNeedle)
+			}
+			if ok {
+				landed = true
+				break
+			}
+			if time.Now().After(deadline) {
+				break
+			}
 		}
-
-		if sendVerifyOK(before, after, prompt) {
+		if landed {
 			break
 		}
 
@@ -1194,7 +1603,7 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 			return fmt.Errorf(
 				"send verify: prompt did not appear in pane within %s (attempts=%d); "+
 					"the TUI may not have been ready to receive input",
-				sendVerifyTimeout, attempts)
+				budget, attempts)
 		}
 		time.Sleep(sendVerifyBackoff)
 	}
@@ -1205,20 +1614,23 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 	return nil
 }
 
-// resolveClearKeys returns the adapter's ClearInputKeys sequence for the
-// given kind, or nil when the resolver is not installed, the kind is
-// unknown, or the adapter opts out (returns nil / empty). Errors are logged
-// and swallowed — see the fall-through contract in SendPrompt's doc.
-func (m *Manager) resolveClearKeys(kind string) []string {
+// resolveAgent returns the adapter for kind, or nil when the resolver is not
+// installed or the kind is unknown.
+//
+// Errors are logged and swallowed rather than returned: SendPrompt reads
+// optional capabilities off the adapter, and every one of them has a safe
+// default, so a misconfigured resolver must degrade the send rather than
+// refuse it.
+func (m *Manager) resolveAgent(kind string) Agent {
 	if m.agentResolver == nil {
 		return nil
 	}
 	ag, err := m.agentResolver.Resolve(kind)
 	if err != nil {
-		debugLog("[SEND] resolveClearKeys: agent %q unknown: %v", kind, err)
+		debugLog("[SEND] resolveAgent: agent %q unknown: %v", kind, err)
 		return nil
 	}
-	return ag.ClearInputKeys()
+	return ag
 }
 
 // paneTargetLocked resolves a session's tmux target: the recorded pane ID when

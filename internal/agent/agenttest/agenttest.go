@@ -22,6 +22,10 @@ type StubAgent struct {
 	SetupFn     func(session.SetupContext) error
 	DescribeFn  session.DescriptionEnhancer
 	ClearKeys   []string
+	// PasteFn opts this stub into SendPrompt's paste transport; see
+	// session.Agent.PastePlaceholder. Nil (the default) keeps the
+	// keystroke path, which is what most tests want.
+	PasteFn func(prompt string) string
 }
 
 func (s *StubAgent) Kind() string {
@@ -50,6 +54,15 @@ func (s *StubAgent) StatusSource() session.StatusSource { return statusSourceFn(
 func (s *StubAgent) Description() session.DescriptionEnhancer { return s.DescribeFn }
 
 func (s *StubAgent) ClearInputKeys() []string { return s.ClearKeys }
+
+// PastePlaceholder returns "" by default, so stubs take SendPrompt's
+// keystroke path unless a test opts into the paste transport via PasteFn.
+func (s *StubAgent) PastePlaceholder(prompt string) string {
+	if s.PasteFn == nil {
+		return ""
+	}
+	return s.PasteFn(prompt)
+}
 
 type statusSourceFn func(session.StatusSignal) (session.StatusUpdate, bool)
 
