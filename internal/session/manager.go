@@ -2640,14 +2640,15 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 
 	m.mu.RLock()
 	kind := session.AgentKind
+	desc := session.Description
 	m.mu.RUnlock()
 	if m.agentResolver == nil {
-		debugLog("[HOOK] Session %s: no agent resolver configured", session.Description)
+		debugLog("[HOOK] Session %s: no agent resolver configured", desc)
 		return
 	}
 	ag, err := m.agentResolver.Resolve(kind)
 	if err != nil {
-		debugLog("[HOOK] Session %s: cannot resolve agent %q: %v", session.Description, kind, err)
+		debugLog("[HOOK] Session %s: cannot resolve agent %q: %v", desc, kind, err)
 		return
 	}
 
@@ -2949,8 +2950,9 @@ func (m *Manager) Kill(id string) error {
 	// two names alone cannot tell a revived session from the one we stopped.
 	if session.Status == StatusDeleting || session.killSeq != killSeq ||
 		session.StartedAt != startedAt || session.TmuxPaneID != paneID || session.TmuxWindowName != windowName {
+		desc := session.Description
 		m.mu.Unlock()
-		debugLog("[TMUX] Session %s changed hands during kill, leaving the newer state alone", session.Description)
+		debugLog("[TMUX] Session %s changed hands during kill, leaving the newer state alone", desc)
 		return nil
 	}
 	if !keepTmuxRefs {
