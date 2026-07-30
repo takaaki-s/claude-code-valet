@@ -107,12 +107,18 @@ func TestAgent_Setup_ConcurrentSafe(t *testing.T) {
 
 func TestAgent_SpawnCommand_BeforeSetup(t *testing.T) {
 	// If SpawnCommand fires before Setup (defensive), execPath is empty
-	// and HookArgs returns nil, yielding a bare `codex`. This ensures the
-	// session still starts even if Setup was skipped or failed silently.
+	// and HookArgs returns nil, so only the config overrides remain. This
+	// ensures the session still starts even if Setup was skipped or failed
+	// silently — and that the overrides, which do not depend on execPath,
+	// are not lost along with the hooks.
 	a := New()
 	plan := a.SpawnCommand(agent.SpawnOptions{})
-	if plan.Command != "codex" {
-		t.Errorf("pre-Setup Command = %q, want %q", plan.Command, "codex")
+	want := "codex " + strings.Join(configArgs(), " ")
+	if plan.Command != want {
+		t.Errorf("pre-Setup Command = %q, want %q", plan.Command, want)
+	}
+	if strings.Contains(plan.Command, "hooks") {
+		t.Errorf("pre-Setup Command = %q, want no hook args", plan.Command)
 	}
 }
 
