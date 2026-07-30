@@ -18,7 +18,10 @@
 package opencode
 
 import (
+	"fmt"
+	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/debug"
@@ -105,3 +108,45 @@ func (a *Agent) Description() agent.DescriptionSource { return nil }
 // opt out; empty here would mean "opt out" and disable the residual-concat
 // protection for opencode sessions.
 func (a *Agent) ClearInputKeys() []string { return []string{"C-u"} }
+
+// PastePlaceholder opts opencode into SendPrompt's paste transport, and
+// predicts the summary line opencode will render for this prompt.
+//
+// opencode is the one adapter where typing a prompt is genuinely expensive:
+// it renders each character as if keyed, so an 8KB prompt takes 88s and grows
+// RSS by 770MB, while the same prompt pasted settles in 0.41s with no growth.
+// Past roughly 3KB the keystroke path cannot finish inside the verify budget
+// at all, which put a ~2KB ceiling on what a session could be sent.
+//
+// The cost is a weaker check: a folded paste hides the text, so the line
+// count is all there is to compare against. That is worth it here because a
+// paste is one atomic write — the chunk-boundary losses the tail match was
+// built to catch cannot happen on this path — and because opencode still
+// inserts small pastes as plain text, where SendPrompt falls back to matching
+// the tail as usual.
+//
+// The "~" opencode prints is decoration; the number is exact, checked against
+// 1, 2, 3, 7, 33, 100, 200, 999, 1000 and 2500 lines over payloads from 900B
+// to 62KB. It says "lines" even for one.
+func (a *Agent) PastePlaceholder(prompt string) string {
+	return fmt.Sprintf("[Pasted ~%d lines]", pasteLineCount(prompt))
+}
+
+// pasteLineCount counts prompt's lines the way opencode counts them when it
+// summarises a paste. Two details are measured, not assumed, and getting
+// either wrong would reject sends that in fact landed:
+//
+//   - CR is a line break in its own right, so CRLF breaks twice.
+//     "a\r\nb\r\nc" is reported as 5 lines, not 3.
+//   - Trailing blank or whitespace-only lines are dropped, however many.
+//     "a\nb\nc\n", "a\nb\nc\n\n" and "a\nb\nc\n   " are all 3.
+//
+// Blank lines in the MIDDLE count, and a prompt with no break at all is 1.
+// Verified as a prediction on cases the rule was not derived from (6/6).
+func pasteLineCount(s string) int {
+	s = strings.TrimRightFunc(s, unicode.IsSpace)
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n") + strings.Count(s, "\r") + 1
+}

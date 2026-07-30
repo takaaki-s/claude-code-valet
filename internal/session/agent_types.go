@@ -189,6 +189,28 @@ type Agent interface {
 	// drift would let residual concat regress unnoticed when a new adapter
 	// lands. Opt-out is explicit: return nil.
 	ClearInputKeys() []string
+	// PastePlaceholder returns the text this adapter's TUI will show for
+	// prompt when it arrives as a single bracketed paste, or "" to receive
+	// prompts as literal keystrokes instead (the default).
+	//
+	// Returning a placeholder selects the paste transport. A TUI usually
+	// collapses a large paste into a summary line, so the prompt text is not
+	// on screen at all and SendPrompt's usual tail match cannot succeed;
+	// what it looks for instead is exactly the string returned here. That
+	// makes this a statement of fact about the agent — "paste this and you
+	// will see that" — with the adapter owning both the wording and whatever
+	// quantity it embeds, and the manager owning only the comparison.
+	//
+	// Worth it only where typing is pathologically expensive — OpenCode is
+	// the one shipped adapter where it is, by two orders of magnitude (see
+	// docs/gotchas.md "Session send"). Claude Code could not use this
+	// anyway: its summary numbers pastes ("#1", "#2") rather than measuring
+	// them, so it is not predictable from the prompt.
+	//
+	// The returned text is matched after SendPrompt's usual normalization,
+	// so it need not account for line wrapping or the box-drawing a TUI
+	// paints around its input.
+	PastePlaceholder(prompt string) string
 }
 
 // AgentResolver bridges the Manager to the process-global agent registry

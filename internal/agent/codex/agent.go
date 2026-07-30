@@ -87,3 +87,10 @@ func (a *Agent) Description() agent.DescriptionSource { return a.enhancer }
 // return nil to opt out; empty here would mean "opt out" and disable the
 // residual-concat protection for codex sessions.
 func (a *Agent) ClearInputKeys() []string { return []string{"C-u"} }
+
+// PastePlaceholder returns "": Codex receives prompts as keystrokes because
+// at 16KB the keystroke path verifies in 1.7s, so trading the tail match
+// for a placeholder count buys nothing. Its placeholder does carry an exact
+// byte count ("[Pasted Content N chars]"), so this could be revisited if a
+// size shows up that typing cannot reach.
+func (a *Agent) PastePlaceholder(string) string { return "" }

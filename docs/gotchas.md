@@ -4,6 +4,36 @@ Common pitfalls and caveats that agents tend to fall into.
 
 ## tmux
 
+- **Put `--` before any user-supplied positional argument.** `send-keys`
+  reads a leading dash as a flag, and it fails two different ways —
+  `send-keys -l "-abc"` exits 1 with `unknown flag -a`, but `send-keys -l
+  "-R"` exits **0 and sends nothing**, because every character happens to be
+  a valid flag. The quiet one is the dangerous one: the caller sees success
+  and carries on with a payload that never arrived. `SendKeys` and
+  `SendKeysLiteral` both pass `--` (see the comment on `SendKeysLiteral` in
+  `internal/tmux/tmux.go`), which matters most for `SendPrompt`, since it
+  splits long prompts on a byte boundary and a chunk can start with a dash
+  even when the prompt does not.
+
+  Of the tmux verbs this package wraps, `send-keys` is the only one that
+  takes a user-controlled string as its first positional — everywhere else
+  such values sit in a flag's argument slot, where option parsing already
+  consumes them. Re-check that if you add a verb.
+
+- **Driving an agent pane with a long burst of keys can leave the outer
+  terminal in a state where tmux's prefix stops working.** Symptom: `C-b` and
+  any other keybinding does nothing, while the mouse still switches panes.
+  The cause is a keyboard-protocol negotiation (kitty keyboard / CSI-u): once
+  the real terminal is in that mode it encodes `C-b` as an escape sequence
+  rather than byte 0x02, and tmux with `extended-keys off` does not recognise
+  it. Mouse events use a separate protocol, hence the asymmetry.
+
+  Recovery is to reset the terminal — closing and reopening the tab is
+  reliable; `printf '\033[<u\033[>4;0m'` or `reset` also works. Setting
+  `extended-keys on` makes tmux decode what the terminal is now sending,
+  which restores the prefix without touching the terminal. Worth knowing
+  before assuming tmux or jin has hung.
+
 - **remain-on-exit is set at the pane level** (not globally).
   `TagManagedPane()` applies it only to managed panes.
   Panes added by the user are destroyed immediately.
@@ -71,12 +101,41 @@ Common pitfalls and caveats that agents tend to fall into.
   observable, `Manager.SendPrompt` captures the pane before and after the
   send and checks that the tail of the prompt appeared in the visible buffer
   (`sendVerifyOK` in `internal/session/manager.go`). Attempts repeat with
-  backoff for up to `sendVerifyTimeout` (default 5s); Enter is only pressed
-  after a successful verify. This means the CLI contract is stronger than it
-  looks: when `jin session send` returns nil, the prompt is in the input
-  buffer — orchestration callers do NOT need to interleave
+  backoff until the budget from `sendVerifyBudget` runs out; Enter is only
+  pressed after a successful verify. This means the CLI contract is stronger
+  than it looks: when `jin session send` returns nil, the prompt is in the
+  input buffer — orchestration callers do NOT need to interleave
   `jin session wait --status idle` between `session new` and the first
   `session send`.
+
+- **The retry budget scales with the prompt, so it is not a fixed 5s.**
+  A big prompt costs more per attempt (more chunks, far more clear
+  keypresses, more nudges), and a flat timeout would quietly leave large
+  sends with one attempt and no retry — or cut the look loop short before the
+  tail has been walked into view. `sendVerifyBudget` adds a per-chunk, a
+  per-clear-key and a per-look term on top of `sendVerifyTimeoutBase`. A short
+  prompt still gets roughly the old 5s and stays responsive.
+
+- **A failed verify retries by looking again, not by re-sending.** Re-sending
+  is destructive: the next attempt clears the input area and pushes the whole
+  prompt again, throwing away whatever the TUI had rendered. An agent slower
+  than one settle delay is then restarted from zero every time and never
+  converges. So one attempt nudges and re-checks the pane up to
+  `sendVerifyLookCount` times before it gives up and re-sends. Measured on Codex
+  with a 16KB prompt: re-sending immediately produced 16 failed attempts
+  across the entire budget, while looking without re-sending verified in
+  1.7s. The same change took a small prompt to OpenCode from never verifying
+  to verifying reliably.
+
+- **The clear phase dominates the cost of a large send.** Every tmux verb is
+  a separate process, and the input-area clear issues one press per visual
+  row of possible residue — 277 presses for a 16KB prompt. Measured
+  per-invocation: ~1.4ms calling the tmux binary directly, ~3ms via
+  `exec.Command` from a Go process (what the daemon actually does), and
+  ~33ms from a shell when `tmux` on `PATH` is a version-manager shim that
+  re-execs the real binary. `send-keys -N` would batch the presses, but it
+  was measured to have no effect on Claude Code or OpenCode — only Codex
+  honours it — so they cannot be collapsed.
 
 - **`send --wait-running` only verifies the agent took the prompt.** Since
   `SendPrompt` itself guarantees keystroke reception, `--wait-running` is
@@ -86,12 +145,54 @@ Common pitfalls and caveats that agents tend to fall into.
 
 - **The verify check keys off the prompt's tail, not full text.** TUIs wrap
   long input across visible rows and may add ANSI styling. `promptTail` /
-  `collapseWS` normalize both sides to whitespace-collapsed plain text and
-  match only the last `sendVerifyTailBytes` bytes. A prompt whose entire
-  tail happens to already exist in the pane (rare — e.g. re-sending the same
-  short phrase seen elsewhere on screen) will not falsely satisfy verify
-  because the check compares occurrence counts before/after, not mere
-  presence.
+  `normalizeForVerify` reduce both sides to the same form and match only the
+  last `sendVerifyTailBytes` bytes. A prompt whose entire tail happens to
+  already exist in the pane (rare — e.g. re-sending the same short phrase
+  seen elsewhere on screen) will not falsely satisfy verify because the
+  check compares occurrence counts before/after, not mere presence.
+
+- **Verify removes whitespace rather than collapsing it, and drops
+  box-drawing runes.** `capture-pane` emits a newline at each wrap position
+  where the prompt itself has nothing, so collapsing runs to a single space
+  still leaves the needle and the pane disagreeing exactly at the seam —
+  measured failure rate for a 32-byte tail was ~16% on Claude Code and
+  Codex and ~44% on OpenCode, and Japanese text meets the condition
+  essentially always. OpenCode additionally draws a vertical bar at the
+  start of every wrapped row, hence stripping U+2500–U+257F. Both sides are
+  normalized identically, so a prompt that legitimately contains box-drawing
+  characters still matches. Do not "strengthen" verify by raising
+  `sendVerifyTailBytes`: a longer needle is *more* likely to straddle a
+  wrap, not less. Real captured panes covering this live in
+  `internal/session/testdata/sendverify/`.
+
+- **Prompts are sent in chunks, not one write.** A single oversized
+  `send-keys -l` either exceeds tmux's own argument limit (16341 bytes,
+  reported as `command too long`) or gets folded by the agent TUI into a
+  `[Pasted Content N chars]` placeholder that hides the tail from
+  `capture-pane` — so the send looks dropped even though it landed. Measured
+  fold thresholds: Claude Code 801B, Codex 1001B, OpenCode none;
+  `sendChunkMaxBytes` is 800 to stay under all of them. `sendChunkDelay`
+  separates the writes because with no gap Codex coalesces adjacent chunks
+  into one read and folds them anyway.
+
+- **A nudge key is sent before every verify capture, and it is `Down`, not
+  `End`.** Codex only repaints on key events — a capture taken without one
+  can show stale content indefinitely (still stale after 37s in testing).
+  OpenCode needs it for a different reason: it draws only a fixed-size window
+  of its input buffer, and that window follows the *cursor*. `End` moves to
+  the end of the current visual row, which on a wrapped multi-row input never
+  reaches the end of the buffer, so the window never scrolls and the tail is
+  never drawn — and undrawn text cannot be captured at all, because it lives
+  only inside OpenCode and was never written to the terminal. `Down` advances
+  a row at a time, walking the cursor and the window toward the end.
+
+  `Down` is sent for every adapter, including ones that opted out of
+  clearing. It was measured safe on Claude Code and Codex in the way that
+  matters: five presses against an *empty* input left the pane byte-identical
+  — no history recall dropping text into the field, which would commit
+  something nobody sent — and twenty presses against a filled input preserved
+  every byte. Both still verify a 16KB prompt with it. `C-End`, `NPage` and
+  `C-e` moved nothing on OpenCode.
 
 - **Input-area clear per attempt suppresses residual-concat corruption.**
   `Manager.SendPrompt` sends the key sequence returned by the adapter's
@@ -109,6 +210,210 @@ Common pitfalls and caveats that agents tend to fall into.
   will see their input erased when `SendPrompt` is invoked externally.
   This is deliberate — the input area belongs to the transport layer
   during a send.
+
+- **One clear press only clears one visual row, so the sequence repeats.**
+  The count comes from the prompt's own length (a retry can only face
+  residue from what we sent, which makes the prompt an upper bound), using a
+  deliberately narrow assumed width — overshooting is harmless because the
+  clear key is a no-op on empty input, while undershooting leaves residue.
+  Never substitute `C-c` for this: it was measured to terminate Codex and
+  OpenCode outright on a single press against empty input, and Claude Code
+  on two presses under a second. An empty input area is the normal state, so
+  a defensive `C-c` would kill sessions routinely.
+
+  **`C-l` is the same trap and looks more tempting.** It appears to wipe
+  Claude Code's input in one keystroke, but measured against a 270-byte
+  input the first press changed nothing and only the second emptied the
+  screen — and two presses is reported to run `clear`, discarding the
+  conversation context. It fails at the job on one press and is destructive
+  on two, against an input area that is usually already empty.
+
+  How many presses the clear actually needs differs per agent *and per input
+  size*, so do not tune the count from one measurement: a single `C-u` empties
+  Codex and OpenCode at small sizes, while Claude Code removes one visual row
+  per press (measured: 72 characters off a 270-character input, 171 off a
+  1350-character one, matching its row width). The repeat count is sized for
+  the agent that needs the most.
+
+  **"OpenCode clears in one press" only holds for small buffers.** At 3072B it
+  took 98–230 presses before the input read as empty, and at 4096B 300 presses
+  did not empty it — whereas `sendClearRepeats` would send only 55 at that
+  size. Those counts are an upper bound, not a requirement: presses sent while
+  the agent is stalled may be coalesced. Do not turn "one press is enough"
+  into an adapter-declared constant on this evidence.
+
+- **OpenCode used to cap out around 2KB per send, and the cap was ours, not
+  its.** This is the measurement that led to the paste transport below; it
+  still describes what happens on the keystroke path, which OpenCode no longer
+  takes. Measured on tmux 3.5a against a real pane, driving production
+  `SendPrompt` with Enter swallowed, restarting the agent before each size:
+
+  | prompt | result | budget | time OpenCode needs | `C-u` presses to empty |
+  |---|---|---|---|---|
+  | 256B–2048B | **3/3** | 15.3s | 0.5s → 8.4s | 1 |
+  | 3072B | 2/3 | 19.2s | 14.0–19.3s | 98–230 |
+  | 4096B | 0/3 | 19.9s | ~24s | 300 was not enough |
+  | 8192B | 0/2 | 22.6s | **88s** | — |
+  | 8192B, 5.5-minute window | **3/3** | (forced) | 88s, RSS ~1.47GB | 1 |
+
+  Given enough time and memory headroom OpenCode handles 8KB fine — three
+  independent runs at 1m28s each, peaking at ~1.47GB RSS from a ~700MB idle
+  baseline, and the box still cleared in one press afterwards. It is expensive,
+  not broken: one 4096-byte prompt grows RSS by about 500MB, and each nudge
+  keypress costs roughly 0.87s of CPU. Claude Code takes 32KB and Codex 16KB on
+  the same machine, so the cost is specific to OpenCode.
+
+  **Two of our own limits stop it well before the agent does**, and neither
+  scales with the prompt:
+
+  - `sendVerifyBudget` gives 22.6s at 8192B, because `sendVerifyLookCount` is
+    capped by `sendVerifyLooksMax = 60`. The cap binds from 3072B upward, so
+    4096B and 8192B differ by only 2.7s of budget while the work grows from
+    ~24s to 88s.
+  - `defaultRequestTimeout` in the daemon client is 60s, so raising the send
+    budget alone would just move the failure to the IPC layer.
+
+  Raising the ceiling means raising both, deliberately — an unbounded verify
+  budget would let one send block a session for minutes.
+
+  **The 88 seconds is redraw, not transport, and bracketed paste removes it.**
+  Delivering the bytes takes about 0.1s by any route; the rest is OpenCode
+  rendering 8192 characters as if they had been typed. Measured at 8192B with a
+  fresh agent per mode:
+
+  | delivery | outcome | elapsed | RSS |
+  |---|---|---|---|
+  | chunked `send-keys -l` (what we do) | tail visible | 88s | +770MB |
+  | `paste-buffer` without `-p` | tail visible | 96.7s | +860MB |
+  | **`paste-buffer -p`** | folds to `[Pasted ~1 lines]` | **0.41s** | **±0MB** |
+
+  An earlier note here said paste-buffer offered no advantage. That comparison
+  omitted `-p`: with no paste markers tmux just writes the bytes, the TUI treats
+  them as typed input, and the cost is identical to send-keys by construction.
+
+  The catch is that a fold hides the tail, so `sendVerifyOK` can never match.
+  Whether a placeholder can stand in for the tail depends on the agent:
+
+  | agent | folds above | placeholder | the number means |
+  |---|---|---|---|
+  | Claude Code | ~801B | `[Pasted text #N]` | **a counter** (1, 2, 3 …) — useless |
+  | Codex | ~1001B | `[Pasted Content N chars]` | **exact byte count** |
+  | OpenCode | always, with `-p` | `[Pasted ~N lines]` | **exact line count** |
+
+  OpenCode's count held at 1, 2, 3, 7, 33, 100, 999 and 2500 lines across
+  900B–62KB (the `~` is cosmetic), and 62KB pastes instantly — far past anything
+  send-keys reaches. A folded paste does submit in full: 8216B of 101 lines
+  pasted, folded, and submitted came back as 8217B and 101 lines in OpenCode's
+  own message store, the extra byte being a trailing newline it appends.
+
+  **OpenCode now takes the paste path.** An adapter opts in by returning the
+  text its TUI will show for the prompt from `Agent.PastePlaceholder`;
+  `SendPrompt` then delivers the prompt as one bracketed paste and looks for
+  that string instead of the prompt's tail. The adapter owns both the wording
+  and the count it embeds, so nothing OpenCode-specific lives in the manager.
+  Measured end to end through production `SendPrompt` on the same pane, at the
+  normal budget:
+
+  | prompt | before (keystrokes) | after (paste) |
+  |---|---|---|
+  | 64B | ok | 3/3, 89ms |
+  | 8192B | **0/3**, needed 88s | **3/3, 0.11s** |
+  | 16384B | out of reach | 3/3, 0.11s |
+  | 65536B | out of reach | **3/3, 0.11s** |
+
+  Claude Code and Codex stay on keystrokes: Claude Code's summary numbers
+  pastes (`#1`, `#2`) instead of measuring them, and both already handle 32KB
+  and 16KB fast enough that trading the tail match for a count buys nothing.
+
+  Three properties of the paste path are worth remembering:
+
+  - A count cannot detect bytes lost *inside* a line. Acceptable here because
+    a paste is one atomic write, so the chunk-boundary losses the tail match
+    was built to catch cannot occur.
+  - OpenCode does not fold every paste (100B stayed text, 512B folded), so the
+    tail match remains the fallback. `SendPrompt` accepts whichever shape
+    appears rather than depending on where that threshold sits.
+  - **The input clear is clamped on this path.** Sizing it from the prompt
+    would spend 512 tmux processes wiping a single row before issuing the two
+    calls that do the work — measured as the bulk of a 64KB send (1.12s
+    against 0.11s clamped). The trade is that the clamped count wipes ~500
+    typed characters but not ~5000; anything *pasted* collapses to one row and
+    clears in a single press either way. The unclamped count never defended
+    against human-typed residue anyway, since it scales with our prompt.
+
+  Two consequences worth knowing:
+
+  - **Failures at these sizes are the agent stalling, not keys being lost.**
+    Keys are queued, not dropped: a character typed during a stall showed up
+    later as delayed cursor movement. The agent also recovers — RSS fell back
+    to 697MB after GC and the box then cleared in one press.
+  - **Only the total verify window matters; the nudge cadence does not.** At
+    4096B, 200ms × 78 looks (production) gave 0/3, while both 1500ms × 40
+    looks and 200ms × 300 looks — same ~60s window — gave 3/3. Note that
+    raising `sendVerifyLooksMax` alone does not widen the window, because
+    `sendVerifyLookCount` returns `looksBase + len/60` and the cap only ever
+    lowers that.
+
+  **Terminal width does not matter, despite an earlier claim that it did.**
+  2048B measured 3/3 at both 48 and 152 columns with the same timings
+  (6.99/8.41/9.35s vs 6.97/8.42/8.20s). If anything wider is worse: 4096B was
+  OOM-killed at 152 columns but survived at 48. The cost tracks rendered
+  cells, not wrapped rows. The earlier "0/3 at 48 columns, 3/3 at 152" came
+  from measuring on tmux 3.6a, which injects garbage into the input on attach.
+
+  **The prompt itself always arrives.** Measured by deleting a known number of
+  characters from the end and reading back how much remained, a 1080-byte
+  prompt was present in full, and the same content split at 25, 50, 100 and
+  270 bytes arrived complete every time — chunking is not the cause. Even the
+  failing 8192B case had all 8192 bytes plus the tail marker sitting in the
+  box. Because verify fails rather than passing on partial evidence, Enter is
+  never pressed, so nothing truncated is committed. The failure is a loud
+  "could not verify", not silent corruption.
+
+  The nudge must still not be sent in a burst: at 50ms intervals it never
+  revealed the tail, at 200ms or slower it often did, which is why
+  `sendVerifyLookDelay` is not tightened.
+
+
+- **tmux version matters more than the README floor suggests. 3.5a is the one
+  that works.** Measured against real agent panes on one machine:
+
+  | tmux | garbage in the input on attach | rendering | repeated attach |
+  |---|---|---|---|
+  | 3.3a | — | — | **2nd attach fails: `can't find session`** |
+  | **3.5a** | **no** | **fine** | **fine** |
+  | 3.6a | **yes** | fine | fine |
+  | 3.7a | no | **broken** | fine |
+
+  - **3.3a** — the second attach to a session fails outright. jind-ai attaches
+    repeatedly by design, so this is not usable even though it clears the
+    declared minimum.
+  - **3.6a** drops a short run of garbage into an agent's input area whenever a
+    client attaches — `c/0000cccc/cccc/cccc…`, fragments of `rgb:…`
+    colour-query responses. It does not corrupt a send (the run is short and
+    the per-attempt input clear removes it), but **numbers measured on 3.6a
+    with a client attaching mid-run may have had garbage injected into the
+    input**. Treat older measurements accordingly.
+  - **3.7a** fixes that and breaks vertical redraw instead: OpenCode's input
+    box stops growing as lines are added and only part of it paints, and Claude
+    Code's post-submit working view renders wrong.
+
+  The garbage was initially misattributed to OpenCode mishandling its own
+  colour query — wrong on both counts, since it is version-dependent and not
+  OpenCode's doing. Suspect the tmux version before the agent.
+
+- **Above roughly 30KB the clear is best-effort and consistency is not
+  guaranteed.** `sendClearMaxKeys` caps the repeats so a pathological prompt
+  cannot spin the pane for minutes. Past the cap the input area may still
+  hold residue, and the send proceeds anyway — `sendVerifyOK` only checks
+  that the tail appeared one more time than before, so a leading
+  `<residual>` is invisible to it and Enter would commit the concatenation.
+  There is no error for this case. Callers that need a hard guarantee at
+  that size should split the prompt themselves. Related: Claude Code elides
+  the middle of very long input as `[...Truncated text #1 +N lines...]`
+  above ~20800B and does not restore it for any key sequence, so
+  "everything I sent is present" cannot be confirmed from the pane at all —
+  only "the tail arrived".
 
 ## Hook
 
@@ -142,6 +447,17 @@ Common pitfalls and caveats that agents tend to fall into.
 - **Directory trust ("Do you trust this directory?")** is a separate
   Codex sandbox prompt shown on the first launch in a given cwd; it is
   unrelated to `/hooks` and answered independently.
+
+- **jind-ai forces two `-c` overrides on every Codex spawn** —
+  `disable_paste_burst=true` so a large input is not folded into a
+  `[Pasted text …]` placeholder that hides the prompt tail from verify, and
+  `check_for_update_on_startup=false` so the update prompt does not eat the
+  first keystrokes. They are passed per spawn, never written into
+  `~/.codex/config.toml`. **Visible trade-off:** a human pasting into a
+  jind-ai-managed Codex pane gets raw text instead of the placeholder.
+  Rationale and the silent-ignore caveat are on `configArgs` in
+  `internal/agent/codex/spawn.go` — read it before removing either key or
+  relying on one to justify dropping the chunking.
 
 - **`AgentSessionID` is unknown until SessionStart.** Codex has no
   `--session-id` equivalent (openai/codex#13242). jind-ai spawns fresh

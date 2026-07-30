@@ -595,3 +595,95 @@ func TestParsePanePID(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildSendKeysArgs_TerminatesOptions pins the `--` before the payload.
+// Without it, tmux reads a leading dash as a flag, and the quiet failure is
+// the dangerous one: `send-keys -l "-R"` exits 0 while sending nothing, so a
+// caller that trusts the exit status carries on with a hole in its input.
+// SendPrompt splits long prompts on a byte boundary, so a chunk can start
+// with a dash even when the prompt does not.
+func TestBuildSendKeysArgs_TerminatesOptions(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{"plain", "hello"},
+		{"leading-dash", "-abc"},
+		{"valid-flag-letters", "-R"},
+		{"double-dash", "--flag=1"},
+		{"dash-only", "-"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			literal := buildSendKeysLiteralArgs("%1", tc.payload)
+			wantLiteral := []string{"send-keys", "-t", "%1", "-l", "--", tc.payload}
+			if !reflect.DeepEqual(literal, wantLiteral) {
+				t.Errorf("buildSendKeysLiteralArgs = %q, want %q", literal, wantLiteral)
+			}
+
+			keys := buildSendKeysArgs("%1", tc.payload)
+			wantKeys := []string{"send-keys", "-t", "%1", "--", tc.payload}
+			if !reflect.DeepEqual(keys, wantKeys) {
+				t.Errorf("buildSendKeysArgs = %q, want %q", keys, wantKeys)
+			}
+
+			// The payload must be the final element, with `--` immediately
+			// before it — an argument appended after the payload would be
+			// parsed as another key and injected into the pane.
+			for _, got := range [][]string{literal, keys} {
+				if got[len(got)-1] != tc.payload {
+					t.Errorf("payload %q is not the last argument in %q", tc.payload, got)
+				}
+				if got[len(got)-2] != "--" {
+					t.Errorf("%q does not have `--` immediately before the payload", got)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildPasteBufferArgs_KeepsBracketedPaste pins `-p`.
+//
+// Dropping it is a silent, dangerous regression rather than a slow path:
+// without paste markers tmux replays each newline as a Return, so a
+// multi-line prompt is SUBMITTED ONE LINE AT A TIME. Measured against a real
+// OpenCode pane, a three-line buffer became three separate messages. Nothing
+// errors, so only this assertion stands between that and a release.
+func TestBuildPasteBufferArgs_KeepsBracketedPaste(t *testing.T) {
+	got := buildPasteBufferArgs("%7", "jin-prompt")
+	want := []string{"paste-buffer", "-p", "-d", "-b", "jin-prompt", "-t", "%7"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildPasteBufferArgs = %q, want %q", got, want)
+	}
+
+	var hasP, hasD bool
+	for _, a := range got {
+		switch a {
+		case "-p":
+			hasP = true
+		case "-d":
+			hasD = true
+		}
+	}
+	if !hasP {
+		t.Error("-p missing: newlines would be replayed as Return and the prompt " +
+			"submitted line by line")
+	}
+	if !hasD {
+		t.Error("-d missing: the prompt would stay readable in tmux's buffer stack")
+	}
+}
+
+// TestBuildLoadBufferArgs_ReadsStdin pins the "-" that keeps the prompt out of
+// argv — that is what removes the 16341-byte command-line limit and stops the
+// prompt showing up in `ps`.
+func TestBuildLoadBufferArgs_ReadsStdin(t *testing.T) {
+	got := buildLoadBufferArgs("jin-prompt")
+	want := []string{"load-buffer", "-b", "jin-prompt", "-"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildLoadBufferArgs = %q, want %q", got, want)
+	}
+	if got[len(got)-1] != "-" {
+		t.Error(`last arg must be "-" so the payload arrives on stdin, not in argv`)
+	}
+}

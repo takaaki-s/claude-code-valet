@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -490,13 +489,19 @@ func (s *Server) handleSend(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 
-	// Reject prompts that are empty or whitespace-only. The whitespace check
-	// pairs with Manager.SendPrompt's verify path: sendVerifyOK treats a
-	// whitespace-only prompt as trivially accepted (nothing meaningful to
-	// look for in the pane), so allowing one through here would send an
-	// unverified Enter to the TUI.
-	if strings.TrimSpace(req.Prompt) == "" {
+	// Reject prompts SendPrompt could not verify. Its verify path searches
+	// the captured pane for the prompt's tail, and a prompt that normalizes
+	// to nothing leaves no needle — sendVerifyOK then accepts it trivially,
+	// so allowing one through here would send an unverified Enter to the
+	// TUI. This covers whitespace-only prompts and, because verify also
+	// discards box-drawing runes, ones built only from those; deferring to
+	// session.PromptVerifiable keeps the two rules from drifting apart.
+	if req.Prompt == "" {
 		return Response{Success: false, Error: "prompt is required"}
+	}
+	if !session.PromptVerifiable(req.Prompt) {
+		return Response{Success: false, Error: "prompt has no verifiable content " +
+			"(only whitespace or box-drawing characters)"}
 	}
 	if err := s.manager.SendPrompt(req.ID, req.Prompt); err != nil {
 		return Response{Success: false, Error: err.Error()}

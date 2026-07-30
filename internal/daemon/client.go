@@ -47,10 +47,25 @@ const (
 	// docs/ipc-protocol.md), so the response wait no longer has to cover an
 	// external process of unknown duration. What is left is tmux subprocess
 	// calls and local file reads, plus one handler with a named cost: "send"
-	// waits up to sendVerifyTimeout (5s) for the prompt to appear in the
-	// pane. Those handlers also queue behind the manager lock, so 60s is
-	// chosen to clear a backlog of them comfortably — hitting it should mean
-	// "the daemon is wedged", not "this machine is loaded".
+	// retries for up to session.sendVerifyBudget, which scales with the
+	// prompt rather than sitting at a flat 5s. That budget is checked
+	// between attempts, so the real ceiling is roughly budget plus one full
+	// attempt.
+	//
+	// Worked through at the measured ~33ms-per-tmux-invocation figure (see
+	// "Session send" in docs/gotchas.md), a 30KB prompt — where the clear
+	// count hits its own cap — lands near 38s, so 60s still covers ordinary
+	// use with room for a queued backlog. It stops covering the extreme:
+	// past roughly 200KB the chunk count pushes the ceiling over 60s, and
+	// the client would report a timeout while the daemon is still working
+	// and may yet press Enter. Anything that large is already outside what
+	// the agents render usefully, but if prompts of that size become real,
+	// "send" needs its own prompt-derived bound rather than a bigger
+	// constant here.
+	//
+	// Those handlers also queue behind the manager lock, so 60s is chosen to
+	// clear a backlog of them comfortably — hitting it should mean "the
+	// daemon is wedged", not "this machine is loaded".
 	defaultRequestTimeout = 60 * time.Second
 
 	// hookRequestTimeout bounds the agent-facing hook path. The trade cuts
