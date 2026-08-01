@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/takaaki-s/jind-ai/internal/atomicfile"
 )
 
 // Store handles session persistence
@@ -12,14 +14,27 @@ type Store struct {
 }
 
 // tmpSuffixPattern is appended to a session id to form the os.CreateTemp
-// pattern used by Save. The trailing ".tmp" keeps LoadAll from picking the
-// file up mid-write, since LoadAll only considers a ".json" extension.
+// pattern Save hands to atomicfile.Write. The trailing ".tmp" keeps LoadAll
+// from picking the file up mid-write, since LoadAll only considers a ".json"
+// extension, and cleanupTempFiles globs this same suffix to reclaim strays.
+// The pattern is therefore a contract between three places, not a detail of
+// Save — which is why atomicfile.Write takes it rather than choosing a name.
 const tmpSuffixPattern = ".json.*.tmp"
 
 // sessionFileMode is the permission new session files are created with.
 // Session records live under XDG state and are per-user data, so they are not
 // world-readable.
 const sessionFileMode os.FileMode = 0600
+
+// atomicWrite is the write Save publishes through. It is a variable so tests
+// can capture the temp pattern Save builds: that pattern is a contract with
+// LoadAll and cleanupTempFiles, and now that it crosses a package boundary as
+// an argument, nothing else would catch it drifting.
+//
+// Extracting the pattern into a helper and testing that instead would not do
+// the same job — it would pin what the helper returns, not what Save passes,
+// leaving Save free to hand over something else entirely.
+var atomicWrite = atomicfile.Write
 
 // NewStore creates a new store
 func NewStore(dataDir string) (*Store, error) {
@@ -52,17 +67,11 @@ func (s *Store) cleanupTempFiles() {
 
 // Save persists a session.
 //
-// The write goes to a temp file in the same directory and is then renamed over
-// the target. Several goroutines reach Save without holding a shared lock, so a
-// plain os.WriteFile could interleave two truncate/write pairs and leave a
-// half-written record — which LoadAll then skips, making the session disappear.
-// Rename is atomic against a concurrent writer, so a reader only ever sees a
-// complete file.
-//
-// This buys atomicity, not durability: the data is not fsynced, so a machine
-// crash can still lose the most recent save. Making that guarantee would need
-// the file and the parent directory synced, which costs roughly an order of
-// magnitude more per save than the whole write does today.
+// The write is atomic (see atomicfile.Write). Several goroutines reach Save
+// without holding a shared lock, so a plain os.WriteFile could interleave two
+// truncate/write pairs and leave a half-written record — which LoadAll then
+// skips, making the session disappear. The rename buys atomicity, not
+// durability: a machine crash can still lose the most recent save.
 //
 // Save takes session by value: it marshals every field, so a caller reading a
 // live *Session outside a lock would race with concurrent mutators. Taking
@@ -85,27 +94,7 @@ func (s *Store) Save(session Session) error {
 		mode = fi.Mode().Perm()
 	}
 
-	tmp, err := os.CreateTemp(s.dataDir, session.ID+tmpSuffixPattern)
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename below succeeds
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	// CreateTemp always makes the file 0600, so the mode has to be set
-	// explicitly rather than left to the umask the way os.WriteFile did.
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return atomicWrite(path, data, mode, session.ID+tmpSuffixPattern)
 }
 
 // Load loads a session by ID. Legacy schema (top-level "name") is migrated

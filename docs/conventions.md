@@ -14,6 +14,25 @@
 - Log only at boundaries (daemon server, manager, etc.)
 - Wrap with `fmt.Errorf("context: %w", err)`
 
+## Atomic file writes
+
+Publishing a file through a temp sibling and a rename goes through
+`internal/atomicfile.Write`, not a fresh create/write/chmod/close/rename. The
+same handful of lines was independently rederived three times before it was
+pulled into one place.
+
+`Write` takes the temp-name pattern as an argument because callers scan the
+directory they write into — state the rule your own scan imposes at the call
+site, as `internal/session`'s `tmpSuffixPattern` and the opencode adapter's
+`pluginTmpPattern` do.
+
+Two deliberate exceptions, both documented where they live:
+
+- `copyExecutable` (`internal/session/hookbinary.go`) streams through `io.Copy`
+  instead of taking a `[]byte`, so a whole executable never lands in memory.
+- `writeAtomic` (`pkg/plugin/manifest/registry.go`) keeps its own copy so that
+  package stays free of module-internal dependencies.
+
 ### Unchecked returns
 
 `.golangci.yml` excludes `Close`, `Flush`, `os.Remove`, `fmt.Fprint*` and
@@ -21,15 +40,15 @@
 cannot tell the safe cases from the unsafe one, so the rule lives here instead.
 
 **Data you wrote must be durable before the function returns.** Reach that with
-a checked `Close` — `internal/session/store.go` does
+a checked `Close` — `internal/atomicfile/atomicfile.go` does
 `if err := tmp.Close(); err != nil` before the rename — or a checked `Sync`, as
 in `internal/worktreehook/allowlist.go`. A bare `defer f.Close()` on a written
 file is fine only once one of those has run, on an error path that discards the
 file anyway, or where losing the tail costs nothing (the plugin and hook logs).
 
 Read paths, sockets, and cleanup expected to fail need no check —
-`internal/session/store.go`'s `defer os.Remove(tmpName)` is a no-op once the
-rename succeeds.
+`internal/atomicfile/atomicfile.go`'s `defer os.Remove(tmpName)` is a no-op once
+the rename succeeds.
 
 ## Debug Logging
 

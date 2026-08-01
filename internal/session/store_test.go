@@ -409,3 +409,68 @@ func TestStore_NewStore_ReclaimsStaleTempFiles(t *testing.T) {
 		t.Errorf("real record was removed: %v", err)
 	}
 }
+
+// TestStore_Save_TempPatternMatchesReclaimGlob pins the contract the temp name
+// carries: LoadAll must not load it, and cleanupTempFiles must be able to
+// reclaim it. The other temp-file tests build that name by hand, which leaves
+// the producer side free to drift — Save could hand atomicfile.Write a pattern
+// missing the ".tmp" and nothing would notice. This one captures what Save
+// actually passes and checks both protections against that real name.
+//
+// Not safe under t.Parallel(): rewrites a package-level var.
+func TestStore_Save_TempPatternMatchesReclaimGlob(t *testing.T) {
+	store, dir := newTestStore(t)
+
+	var gotPattern string
+	orig := atomicWrite
+	setForTest(t, &atomicWrite, func(path string, data []byte, mode os.FileMode, tmpPattern string) error {
+		gotPattern = tmpPattern
+		return orig(path, data, mode, tmpPattern)
+	})
+
+	if err := store.Save(Session{ID: "abc"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if gotPattern == "" {
+		t.Fatal("Save did not publish through atomicWrite")
+	}
+
+	// Materialise a temp file the way Save would, then hold it against both
+	// consumers of the name.
+	f, err := os.CreateTemp(dir, gotPattern)
+	if err != nil {
+		t.Fatalf("CreateTemp(%q): %v", gotPattern, err)
+	}
+	tmpName := f.Name()
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Loadable content, not the empty file CreateTemp leaves. LoadAll rebuilds
+	// the path from the entry name with ".json" trimmed, so an unparseable temp
+	// gets skipped for the wrong reason and the LoadAll assertion below would
+	// hold for any pattern at all. With a complete record inside, a pattern
+	// that drifted to a ".json" ending surfaces as a phantom second session.
+	if err := os.WriteFile(tmpName, []byte(`{"id":"abc"}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	sessions, err := store.LoadAll()
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "abc" {
+		t.Errorf("LoadAll returned %d sessions, want 1 — a write in flight must not be loaded", len(sessions))
+	}
+
+	// The other consumer: a crash that stranded this file must leave it
+	// reclaimable. Drive the real reclaim path rather than rebuilding its glob
+	// here — a copy of that expression would keep passing however
+	// cleanupTempFiles changed.
+	store.cleanupTempFiles()
+	if _, statErr := os.Stat(tmpName); statErr == nil {
+		t.Errorf("cleanupTempFiles left %s behind — a crashed Save would strand it forever",
+			filepath.Base(tmpName))
+	} else if !os.IsNotExist(statErr) {
+		t.Fatalf("Stat: %v", statErr)
+	}
+}

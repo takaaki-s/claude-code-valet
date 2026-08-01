@@ -24,8 +24,15 @@ func TestWritePlugin_Layout(t *testing.T) {
 	}
 	// The path must satisfy opencode's {plugin,plugins}/*.{ts,js} glob,
 	// relative to the directory handed over as OPENCODE_CONFIG_DIR.
-	if _, err := os.Stat(filepath.Join(configDir, "plugin", "jin.ts")); err != nil {
-		t.Errorf("plugin not at <configDir>/plugin/jin.ts: %v", err)
+	fi, err := os.Stat(filepath.Join(configDir, "plugin", "jin.ts"))
+	if err != nil {
+		t.Fatalf("plugin not at <configDir>/plugin/jin.ts: %v", err)
+	}
+	// Spelled out rather than compared against pluginFileMode, which would
+	// restate the constant and pass however it changed. os.CreateTemp makes its
+	// file 0600, so this only holds because the write chmods.
+	if got, want := fi.Mode().Perm(), os.FileMode(0o644); got != want {
+		t.Errorf("plugin mode = %v, want %v", got, want)
 	}
 }
 
@@ -254,7 +261,7 @@ func TestWritePlugin_Concurrent(t *testing.T) {
 	wg.Wait()
 
 	// Exactly one file also proves no temp file survived any of the
-	// racing writes — writeFileAtomic creates them in this directory.
+	// racing writes — atomicfile.Write creates them in this directory.
 	entries, err := os.ReadDir(filepath.Join(stateDir, "opencode", "plugin"))
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
@@ -280,5 +287,37 @@ func TestWritePlugin_UnwritableDir(t *testing.T) {
 
 	if _, err := WritePlugin(stateDir, "/usr/local/bin/jin"); err == nil {
 		t.Error("WritePlugin on an unwritable state dir returned nil error")
+	}
+}
+
+// TestPluginTmpPattern_StaysOutsideOpencodeGlob pins the one property the temp
+// name has to have. opencode globs {plugin,plugins}/*.{ts,js} in this very
+// directory on every start, so a temp file named like a module would be
+// imported half-written — which is the whole reason WritePlugin passes a
+// pattern rather than letting the helper choose. Nothing else would catch the
+// constant drifting into a name the glob accepts.
+func TestPluginTmpPattern_StaysOutsideOpencodeGlob(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.CreateTemp(dir, pluginTmpPattern)
+	if err != nil {
+		t.Fatalf("CreateTemp(%q): %v", pluginTmpPattern, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The real arbiter is opencode's own loader, so this stands in for it with
+	// Go's Glob. The approximation errs strict: Go's Match does not skip
+	// dotfiles the way a shell would, so a leading "." never hides a name here
+	// that opencode might still pick up.
+	for _, glob := range []string{"*.ts", "*.js"} {
+		matches, err := filepath.Glob(filepath.Join(dir, glob))
+		if err != nil {
+			t.Fatalf("Glob(%q): %v", glob, err)
+		}
+		if len(matches) != 0 {
+			t.Errorf("pluginTmpPattern %q produced %s, which opencode's %q glob would import",
+				pluginTmpPattern, filepath.Base(matches[0]), glob)
+		}
 	}
 }

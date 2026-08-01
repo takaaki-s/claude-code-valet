@@ -310,6 +310,12 @@ func parseRegistry(body []byte) (*RegistryDocument, error) {
 	return &doc, nil
 }
 
+// writeAtomic publishes data through a temp sibling and a rename.
+//
+// It duplicates internal/atomicfile.Write on purpose. This package is imported
+// directly as the single source of truth for manifest validation, so it is kept
+// free of module-internal dependencies; reaching into internal/ would tie every
+// consumer of the validator to the rest of the module.
 func writeAtomic(path string, data []byte, mode os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
