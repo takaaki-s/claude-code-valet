@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/takaaki-s/jind-ai/internal/atomicfile"
 )
 
 // pluginSource is the TypeScript plugin opencode loads to report status
@@ -25,6 +27,20 @@ var pluginSource string
 // It stands alone in the template rather than inside quotes because the
 // substituted value brings its own — see quoteForJS.
 const execPathPlaceholder = "__JIN_BIN__"
+
+// pluginFileMode is the permission the materialised plugin gets. opencode only
+// ever reads it.
+const pluginFileMode os.FileMode = 0o644
+
+// pluginTmpPattern names the in-flight temp file so it stays outside the glob
+// opencode runs over this directory on every start ({plugin,plugins}/*.{ts,js}),
+// which is what keeps it from importing a half-written module.
+//
+// A temp file stranded by a crash between create and rename is inert for the
+// same reason, but nothing here reclaims it — there is no counterpart to the
+// session Store's cleanupTempFiles, since WritePlugin has no construction point
+// safe to sweep from.
+const pluginTmpPattern = ".jin-plugin-*.tmp"
 
 // WritePlugin materialises the embedded plugin under stateDir and returns
 // the directory to hand to opencode as OPENCODE_CONFIG_DIR.
@@ -61,39 +77,11 @@ func WritePlugin(stateDir, execPath string) (string, error) {
 	}
 
 	src := strings.ReplaceAll(pluginSource, execPathPlaceholder, quoteForJS(execPath))
-	if err := writeFileAtomic(filepath.Join(pluginDir, "jin.ts"), []byte(src)); err != nil {
+	pluginPath := filepath.Join(pluginDir, "jin.ts")
+	if err := atomicfile.Write(pluginPath, []byte(src), pluginFileMode, pluginTmpPattern); err != nil {
 		return "", fmt.Errorf("opencode: write plugin: %w", err)
 	}
 	return configDir, nil
-}
-
-// writeFileAtomic writes via a temp file in the same directory followed by a
-// rename, so opencode — which globs this directory on every start — can
-// never import a half-written module.
-func writeFileAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".jin-plugin-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		// No-op once the rename below succeeded; cleans up every failure
-		// path in between without needing a success flag.
-		_ = os.Remove(tmpName)
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
 }
 
 // quoteForJS renders s as a complete JavaScript string literal, quotes

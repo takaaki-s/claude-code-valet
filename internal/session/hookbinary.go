@@ -63,6 +63,10 @@ func (m *Manager) hookBinaryPath() string {
 // half-written file. A rename over a binary a hook is already executing is safe
 // on POSIX — the running process keeps the old inode, and new hooks pick up the
 // new one — so no locking is needed against in-flight hooks.
+//
+// It keeps its own temp-and-rename rather than going through atomicfile.Write:
+// that helper takes the payload as a []byte, while streaming through io.Copy
+// keeps a whole executable out of memory.
 func copyExecutable(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
