@@ -44,8 +44,26 @@ type Server struct {
 	configMgr  *config.Manager
 	stateMgr   *config.StateManager
 	pluginDisp *plugin.EventDispatcher
-	listener   net.Listener
 	createMu   sync.Mutex // Mutual exclusion for session creation
+
+	// Shutdown state, written by Stop and read by Start's accept loop from
+	// another goroutine. lifecycleMu guards both fields.
+	//
+	// stopping is an explicit sentinel rather than a `listener == nil` check:
+	// conflating "the field was cleared" with "shutdown was intended" is what
+	// forced the accept loop to read a field Stop was concurrently writing.
+	// It also lets Stop publish the intent *before* closing the listener, so
+	// the loop can never observe a close-induced Accept error while the
+	// sentinel still says "unexpected" and spin on the dead listener.
+	//
+	// A mutex is used over an atomic flag because listener needs guarding
+	// anyway (Start writes it, Stop reads it), and one lock covering both
+	// keeps them from drifting apart. It is never held across Accept, which
+	// blocks until a connection arrives or the listener closes.
+	lifecycleMu sync.Mutex
+	listener    net.Listener
+	stopping    bool
+	stopOnce    sync.Once
 }
 
 // Message types
@@ -157,7 +175,24 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
+	// Publishing the listener and re-checking the sentinel happen under one
+	// lock, which closes the window between net.Listen returning and the
+	// field being visible to Stop. A Stop landing in that window would
+	// otherwise find a nil listener, close nothing, and leave the accept loop
+	// below blocked forever on a listener nobody owns. Exactly one side wins:
+	// either Stop sees the listener and closes it, or we see stopping and
+	// close it here.
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		listener.Close()
+		// Stop's own os.Remove ran before net.Listen recreated the socket
+		// file, so clean up the leftover here.
+		os.Remove(s.socketPath)
+		return nil
+	}
 	s.listener = listener
+	s.lifecycleMu.Unlock()
 
 	// Handle signals
 	sigCh := make(chan os.Signal, 1)
@@ -171,9 +206,11 @@ func (s *Server) Start() error {
 	log.Printf("Daemon listening on %s", s.socketPath)
 
 	for {
+		// listener is the local variable on purpose: Accept blocks, so
+		// holding lifecycleMu across it would deadlock Stop.
 		conn, err := listener.Accept()
 		if err != nil {
-			if s.listener == nil {
+			if s.stopRequested() {
 				return nil // Server stopped
 			}
 			log.Printf("Accept error: %v", err)
@@ -183,13 +220,37 @@ func (s *Server) Start() error {
 	}
 }
 
-// Stop stops the daemon server
+// stopRequested reports whether Stop has been entered, telling the accept
+// loop whether an Accept error is our own shutdown or a genuine fault.
+func (s *Server) stopRequested() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.stopping
+}
+
+// Stop stops the daemon server.
+//
+// Safe to call concurrently and more than once: the signal handler goroutine
+// installed by Start, handleStop's goroutine, and an explicit call can all
+// fire at the same time. sync.Once (rather than an early return on a flag)
+// means later callers block until the first has finished closing the listener
+// and removing the socket, so a caller that follows Stop with os.Exit cannot
+// exit before the cleanup lands.
 func (s *Server) Stop() {
-	if s.listener != nil {
-		s.listener.Close()
+	s.stopOnce.Do(func() {
+		// Publish the intent before closing, so the accept loop is guaranteed
+		// to see stopping=true on the Accept error that the Close below wakes.
+		s.lifecycleMu.Lock()
+		s.stopping = true
+		listener := s.listener
 		s.listener = nil
-	}
-	os.Remove(s.socketPath)
+		s.lifecycleMu.Unlock()
+
+		if listener != nil {
+			listener.Close()
+		}
+		os.Remove(s.socketPath)
+	})
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
