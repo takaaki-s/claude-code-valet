@@ -222,11 +222,16 @@ func TestE2E_MultipleSessionsConcurrent(t *testing.T) {
 		t.Fatalf("expected 5 sessions, got %d", len(sessions))
 	}
 
-	// Delete all
+	// Delete all. Each Delete returns before its DeleteFinalize goroutine
+	// finishes, so issue them all first and then wait for every record —
+	// asserting the empty list without waiting races the last finalize.
 	for _, id := range ids {
 		if err := client.Delete(id, false, false); err != nil {
 			t.Fatalf("Delete(%s): %v", id, err)
 		}
+	}
+	for _, id := range ids {
+		waitForSessionGone(t, client, id, 5*time.Second)
 	}
 
 	sessions, err = client.List()

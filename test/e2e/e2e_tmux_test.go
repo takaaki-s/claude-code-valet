@@ -95,6 +95,16 @@ func waitForStatus(t *testing.T, client *daemon.Client, sessionID string, want s
 
 // waitForSessionGone polls client.List until the session no longer appears or times out.
 // Needed because Delete now returns before the async DeleteFinalize goroutine finishes.
+//
+// Every client.Delete in this package must be followed by this call before any
+// assertion about the deleted session's aftermath — an empty List, a removed
+// JSON file, a killed tmux session, a removed worktree. DeleteFinalize does all
+// of that and only then drops the record, so "gone from List" is the barrier
+// that covers all of it. A bare time.Sleep is not: it made
+// TestE2E_MultipleSessionsConcurrent fail CI intermittently with
+// "expected 0 sessions, got 1". The async contract itself is deliberate and
+// pinned by internal/daemon.TestHandleDelete_ReturnsBeforeFinalization — do not
+// "fix" it on the production side.
 func waitForSessionGone(t *testing.T, client *daemon.Client, sessionID string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -213,13 +223,14 @@ func TestE2E_DeleteWithTmuxCleanup(t *testing.T) {
 		t.Fatal("tmux session should exist before Delete")
 	}
 
-	// Delete
+	// Delete returns before DeleteFinalize kills the tmux session; wait for
+	// the record to disappear, which happens after the kill.
 	if err := client.Delete(info.ID, false, false); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
+	waitForSessionGone(t, client, info.ID, 5*time.Second)
 
 	// tmux session should be gone
-	time.Sleep(200 * time.Millisecond)
 	if hasTmuxSession(innerName) {
 		t.Error("tmux session should not exist after Delete")
 	}
@@ -398,13 +409,17 @@ func TestE2E_MultipleSessionsTmux(t *testing.T) {
 		}
 	}
 
-	// Delete all three: the killed one is only released here.
+	// Delete all three: the killed one is only released here. Each Delete
+	// returns before its DeleteFinalize goroutine kills the tmux session, so
+	// wait for every record to disappear before probing tmux.
 	for _, i := range []int{0, 1, 2} {
 		if err := client.Delete(sessions[i].id, false, false); err != nil {
 			t.Fatalf("Delete(%d): %v", i, err)
 		}
 	}
-	time.Sleep(200 * time.Millisecond)
+	for _, s := range sessions {
+		waitForSessionGone(t, client, s.id, 5*time.Second)
+	}
 
 	// All tmux sessions should be gone
 	for i, s := range sessions {
@@ -531,10 +546,12 @@ func TestE2E_DeleteWithoutWorktreeCleanup(t *testing.T) {
 		t.Fatalf("NewWithOptions: %v", err)
 	}
 
-	// Delete without worktree removal
+	// Delete without worktree removal. Delete returns before DeleteFinalize
+	// drops the record, so wait before asserting the list is empty.
 	if err := client.Delete(info.ID, false, false); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
+	waitForSessionGone(t, client, info.ID, 5*time.Second)
 
 	// Session should be gone
 	sessions, err := client.List()
