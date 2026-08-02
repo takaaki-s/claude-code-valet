@@ -8,6 +8,20 @@ A CLI tool for running and managing multiple agent sessions simultaneously
 
 https://github.com/user-attachments/assets/68778af9-07eb-412e-8b11-0e6ec916010b
 
+## Project status
+
+jind-ai is a personal project, built and maintained by one developer for their
+own daily use and released in the hope that it is useful to others. Please use
+it with these expectations:
+
+- **No support guarantee.** Issues and pull requests may go unanswered.
+- **Pre-1.0.** Breaking changes to configuration, IPC, and plugin manifests can
+  land in any release.
+- **Deliberately narrow scope.** See [CONTRIBUTING.md](CONTRIBUTING.md) before
+  opening an issue or pull request.
+
+Bug reports with reproduction steps are the most welcome kind of contribution.
+
 ## Supported agents
 
 | Kind | CLI | Notes |

@@ -1,0 +1,107 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report.
+
+        jind-ai is maintained by one person in their spare time, so there is no
+        guaranteed response time. A complete report with reproduction steps is
+        the single biggest factor in whether a bug gets fixed.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before reporting
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I am running the latest release, or I have confirmed the issue exists there.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: jind-ai version
+      description: Output of `jin --version`
+      placeholder: jin 0.9.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent kind
+      description: Which adapter is involved? Choose "Not agent-specific" for daemon, TUI, or tmux issues.
+      options:
+        - claude
+        - codex
+        - opencode (experimental)
+        - Not agent-specific
+    validations:
+      required: true
+
+  - type: input
+    id: tmux
+    attributes:
+      label: tmux version
+      description: Output of `tmux -V`
+      placeholder: tmux 3.5a
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands and keystrokes, starting from a clean state.
+      placeholder: |
+        1. jin daemon start
+        2. jin session new --workdir ~/repos/example
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include the full error message if there is one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug log
+      description: |
+        Optional but very helpful. Restart the daemon with debug logging and
+        reproduce the issue:
+
+        ```
+        jin daemon stop
+        JIN_DEBUG=1 jin daemon start
+        ```
+
+        Then attach the relevant portion of `~/.local/state/jind-ai/daemon-debug.log`.
+        Please review it for paths or content you would rather not share.
+      render: text
