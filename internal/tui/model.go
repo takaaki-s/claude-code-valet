@@ -287,15 +287,39 @@ const (
 	// listHeaderLines covers the count line plus one blank spacer. Without the
 	// spacer the header collides visually with the first fleet header.
 	listHeaderLines = 2
-	// detailPaneLines covers rule + name + status + repo/branch + last user
-	// message + last assistant message. Fixed even when fields are empty:
-	// every scroll and hit-test calculation is built on the height, so it must
-	// not depend on the session under the cursor.
-	detailPaneLines = 6
+	// detailNameLines is how many rows the detail pane reserves for the session
+	// name. The pane exists to show more than a list row does, and on one row it
+	// showed exactly as much — the same name cut at the same column. Two rows is
+	// the smallest budget that beats the row above it.
+	//
+	// The name gets both rows whether or not it fills them; a short name pads
+	// with a blank. Sizing the block to the name instead — the obvious
+	// implementation — would put the session under the cursor back into the list
+	// height that adjustScrollForCursor derives the viewport from: move the
+	// cursor, the list resizes, the viewport scrolls, repeat. It would also
+	// revive the hand-synced height contract sessionRowHeight retired.
+	detailNameLines = 2
+	// detailPaneLines covers rule + name (detailNameLines rows) + status +
+	// repo/branch + last user message + last assistant message. Fixed even when
+	// fields are empty: every scroll and hit-test calculation is built on the
+	// height, so it must not depend on the session under the cursor.
+	detailPaneLines = 5 + detailNameLines
 	// minListLines is the smallest list we shrink to before the detail pane is
 	// dropped whole. Degrading the detail pane gradually instead would make
 	// its height a third variable in every geometry test, which is exactly the
 	// property detailPaneLines exists to avoid.
+	//
+	// Deliberately unchanged when detailNameLines grew the pane: this bounds the
+	// LIST, and lowering it to hold the drop-the-pane threshold where it was
+	// would buy the pane a row by taking one from the five rows of list that
+	// make the pane worth drawing at all. The threshold moves up by a row
+	// instead — the same row the list gives up at every other height.
+	//
+	// What that costs is worth stating plainly, since it is not the one-row
+	// change it sounds like: on a terminal of exactly 14 rows (16 with one
+	// notice, 18 with two) the pane no longer appears AT ALL, where it used to
+	// sit under a five-row list. Below the threshold the pane goes whole, so
+	// the user sees it vanish rather than shrink.
 	minListLines = 5
 )
 
@@ -313,7 +337,7 @@ func (m *Model) headerLines() int {
 // alone and never calls listAreaLines — listAreaLines subtracts detailLines, so
 // consulting it here would be a cycle.
 //
-// With no notices and a valid cursor the threshold works out to m.height >= 14.
+// With no notices and a valid cursor the threshold works out to m.height >= 15.
 //
 // The cursor-range check is not merely defensive: renderListContent indexes the
 // session slice with m.cursor to pick the pane's subject, so an out-of-range
@@ -2174,17 +2198,117 @@ func (m Model) renderListHeader(sessions []session.Info, width int) string {
 // name, so every name starts in the same column and the list reads as a table.
 const sessionRowLead = 5
 
-// sessionNameText fits a session's Description into avail display columns.
+// sessionNameParts returns the text a session's name is drawn from and the
+// marker that trails it — "*" when the name was set by hand and the agent may
+// not overwrite it, "" otherwise. A name with nothing left in it gets no
+// marker: there is nothing there to be locked.
+//
+// The text is the Description with everything that could break the row it is
+// drawn on taken out. Both classes arrive the same way — SetDescription stores
+// what the IPC caller sent, verbatim — and both defeat a bound this file is
+// built on:
+//
+//   - Escape sequences. ansi.Truncate re-emits the styles open at its cut and
+//     closes them, so its result is NOT a prefix of its input; the wrap in
+//     sessionNameLines advances by trimming the prefix it just took, so it
+//     would make no progress and draw the same text on both rows. They are
+//     also a hole straight to the terminal: "\x1b[2J" in a session name is a
+//     clear-screen the TUI would faithfully forward.
+//   - C0 control characters, which ansi.Strip leaves alone. A newline is the
+//     one that bites: it costs nothing in width, so every truncation here
+//     happily keeps it, and then splits the "one line" it was measured as into
+//     two — breaking sessionRowHeight in the list and detailPaneLines in the
+//     pane, both of which the scroll and hit-test arithmetic treats as fact.
+//     View() clips the overflow from the BOTTOM, silently, so the symptom is a
+//     missing last row rather than an error.
+//
+// Replaced with a space rather than dropped, so "a\nb" reads as two words.
+func sessionNameParts(sess session.Info) (name, mark string) {
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, ansi.Strip(sess.Description))
+	if sess.DescriptionLocked && name != "" {
+		mark = "*"
+	}
+	return name, mark
+}
+
+// sessionNameText fits a session's name into avail display columns.
 //
 // The lock marker is taken out of the budget rather than appended past it: both
 // callers draw fixed-height blocks, and one column of overflow wraps the line
 // into a second physical row.
 func sessionNameText(sess session.Info, avail int) string {
-	lockMark := ""
-	if sess.DescriptionLocked && sess.Description != "" {
-		lockMark = "*"
+	name, mark := sessionNameParts(sess)
+	return truncateString(name, avail-lipgloss.Width(mark)) + mark
+}
+
+// sessionNameLines lays a session's name across exactly `lines` rows of `avail`
+// columns, returning one string per row — blank rows included. What is left
+// over after the last row is cut with an ellipsis, exactly as a list row cuts
+// it.
+//
+// The row count is the contract, not a maximum: the caller draws a fixed-height
+// block whose height the list geometry is subtracted from, so a name may
+// neither claim a row more nor give one back (see detailNameLines).
+//
+// Three details worth stating:
+//
+//   - The break is by display column, not by word. Session names are as often
+//     Japanese — where there is no space to break on — as English, so a
+//     word-aware wrap would help one language and still break mid-word in the
+//     other. Whitespace at a break is dropped rather than opening the next row.
+//   - It does not reuse wrapText, which accumulates width rune by rune. A VS16
+//     emoji ("⚠️" — base plus selector) measures as its base alone that way, so
+//     a "wrapped" line can still come out wider than avail; here that overflow
+//     wraps in the terminal and costs the block a row. truncateToWidth walks
+//     grapheme clusters with the same ruler that finally measures the line.
+//     (wrapText itself has no callers left in this package and only that bug
+//     to its name; removing it is a cleanup this change stayed out of.)
+//   - The loop advances by trimming off the prefix it just drew, which holds
+//     only because sessionNameParts has already taken the escape sequences out
+//     — see there for what happens when it has not.
+func sessionNameLines(sess session.Info, avail, lines int) []string {
+	out := make([]string, max(lines, 0))
+	if avail < 1 {
+		return out
 	}
-	return truncateString(sess.Description, avail-lipgloss.Width(lockMark)) + lockMark
+
+	name, mark := sessionNameParts(sess)
+	markWidth := lipgloss.Width(mark)
+
+	rest := name
+	for i := range out {
+		if rest == "" {
+			break // the name ended earlier; the remaining rows stay blank
+		}
+		if i == len(out)-1 {
+			// The last row there is: everything still in hand has to fit on it,
+			// marker included, and what does not is cut with an ellipsis.
+			out[i] = truncateString(rest, avail-markWidth) + mark
+			break
+		}
+		head := truncateToWidth(rest, avail)
+		out[i] = head
+		rest = strings.TrimLeft(strings.TrimPrefix(rest, head), " ")
+		if rest != "" {
+			continue
+		}
+		// The name ends on this row. Its marker rides along when there is room;
+		// when there is not, the marker moves down rather than costing an
+		// ellipsis and three columns of a name that had just fitted — otherwise
+		// a name one column LONGER would show more of itself, not less.
+		if lipgloss.Width(head)+markWidth <= avail {
+			out[i] += mark
+		} else {
+			out[i+1] = mark
+		}
+		break
+	}
+	return out
 }
 
 // renderSession renders a single session as one list row:
@@ -2284,7 +2408,7 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 // detailIndent is the indent every detail line carries except the rule, which
 // spans the full width so it reads as a divider between the list and the
 // detail pane. detailIndentWidth is its display width, spelled out as a
-// constant because every budget on lines 2-6 is computed as width minus this.
+// constant because every budget below the rule is computed as width minus this.
 const (
 	detailIndent      = " "
 	detailIndentWidth = 1
@@ -2293,7 +2417,8 @@ const (
 // renderDetailPane renders the fixed-height detail block for one session:
 //
 //	──────────────────────────  rule
-//	 plugin registry の crawler  name
+//	 plugin registry の crawler  name, row 1 of detailNameLines
+//	 を実装して                  name, row 2 (blank when unused)
 //	 ⚡ THINKING        claude   status + agent kind
 //	 jind-ai     feat/registry   repo (left) / branch (right)
 //	 👤 次の task を進めて        last user message
@@ -2333,15 +2458,20 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	// --- Line 1: rule ---
 	lines = append(lines, rule)
 
-	// --- Line 2: session name ---
-	// Dimmed while deleting, exactly as the list row dims it.
+	// --- Lines 2-3: session name, one row per detailNameLines ---
+	// Dimmed while deleting, exactly as the list row dims it. Every reserved row
+	// is emitted, blank ones included — the list geometry subtracts this block's
+	// height, so it may not follow the name it happens to be showing (see
+	// detailNameLines).
 	nameStyle := sessionNameStyle
 	if deleting {
 		nameStyle = deletingStyle
 	}
-	lines = append(lines, detailIndent+nameStyle.Render(sessionNameText(sess, avail)))
+	for _, nameLine := range sessionNameLines(sess, avail, detailNameLines) {
+		lines = append(lines, detailIndent+nameStyle.Render(nameLine))
+	}
 
-	// --- Line 3: status label, agent kind right-aligned ---
+	// --- Line 4: status label, agent kind right-aligned ---
 	// padIcon fixes the icon cell at 2 columns; the separating space is
 	// explicit, exactly as in a list row.
 	icon, label, statusStyle := getStatusDisplay(status)
@@ -2361,10 +2491,10 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	}
 	lines = append(lines, statusLine)
 
-	// --- Line 4: repo (left) / branch (right) ---
+	// --- Line 5: repo (left) / branch (right) ---
 	lines = append(lines, detailIndent+renderDetailRepoBranch(sess, avail))
 
-	// --- Lines 5-6: the last message from each side ---
+	// --- Lines 6-7: the last message from each side ---
 	// "👤 " and "🤖 " are 3 columns: a 2-column emoji plus its space. Below
 	// four columns there is room for the icon and nothing after it, which says
 	// less than a blank line does, so the whole message goes. Deliberately no
