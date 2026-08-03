@@ -147,6 +147,14 @@ func TestE2E_HookEventFlow(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
+	// Barrier before the first hook, not decoration. New returns a
+	// StatusCreating reservation while the daemon's goroutine is still
+	// running; for Start:false that goroutine's last act is to write
+	// StatusStopped. Sending a hook first only means the two writes race, and
+	// a late-landing "stopped" overwrites the "thinking" this test is about —
+	// which is exactly how it failed CI on PR #148 and passed on re-run.
+	waitForStatus(t, client, info.ID, session.StatusStopped, 5*time.Second)
+
 	// UserPromptSubmit → thinking
 	if err := client.SendHook(daemon.HookRequest{
 		JinSessionID:  info.ID,
