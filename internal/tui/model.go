@@ -287,15 +287,33 @@ const (
 	// listHeaderLines covers the count line plus one blank spacer. Without the
 	// spacer the header collides visually with the first fleet header.
 	listHeaderLines = 2
-	// detailPaneLines covers rule + name + status + repo/branch + last user
-	// message + last assistant message. Fixed even when fields are empty:
-	// every scroll and hit-test calculation is built on the height, so it must
-	// not depend on the session under the cursor.
-	detailPaneLines = 6
+	// detailNameLines is how many rows the detail pane reserves for the session
+	// name. The pane exists to show more than a list row does, and on one row it
+	// showed exactly as much — the same name cut at the same column. Two rows is
+	// the smallest budget that beats the row above it.
+	//
+	// The name gets both rows whether or not it fills them; a short name pads
+	// with a blank. Sizing the block to the name instead — the obvious
+	// implementation — would put the session under the cursor back into the list
+	// height that adjustScrollForCursor derives the viewport from: move the
+	// cursor, the list resizes, the viewport scrolls, repeat. It would also
+	// revive the hand-synced height contract sessionRowHeight retired.
+	detailNameLines = 2
+	// detailPaneLines covers rule + name (detailNameLines rows) + status +
+	// repo/branch + last user message + last assistant message. Fixed even when
+	// fields are empty: every scroll and hit-test calculation is built on the
+	// height, so it must not depend on the session under the cursor.
+	detailPaneLines = 5 + detailNameLines
 	// minListLines is the smallest list we shrink to before the detail pane is
 	// dropped whole. Degrading the detail pane gradually instead would make
 	// its height a third variable in every geometry test, which is exactly the
 	// property detailPaneLines exists to avoid.
+	//
+	// Deliberately unchanged when detailNameLines grew the pane: this bounds the
+	// LIST, and lowering it to hold the drop-the-pane threshold where it was
+	// would buy the pane a row by taking one from the five rows of list that
+	// make the pane worth drawing at all. The threshold moves up by a row
+	// instead — the same row the list gives up at every other height.
 	minListLines = 5
 )
 
@@ -313,7 +331,7 @@ func (m *Model) headerLines() int {
 // alone and never calls listAreaLines — listAreaLines subtracts detailLines, so
 // consulting it here would be a cycle.
 //
-// With no notices and a valid cursor the threshold works out to m.height >= 14.
+// With no notices and a valid cursor the threshold works out to m.height >= 15.
 //
 // The cursor-range check is not merely defensive: renderListContent indexes the
 // session slice with m.cursor to pick the pane's subject, so an out-of-range
@@ -2174,17 +2192,74 @@ func (m Model) renderListHeader(sessions []session.Info, width int) string {
 // name, so every name starts in the same column and the list reads as a table.
 const sessionRowLead = 5
 
+// sessionLockMark returns the marker that says a session's name was set by hand
+// and will not be overwritten by the agent, or "" when there is none. An empty
+// name gets no marker: there is nothing there to be locked.
+func sessionLockMark(sess session.Info) string {
+	if sess.DescriptionLocked && sess.Description != "" {
+		return "*"
+	}
+	return ""
+}
+
 // sessionNameText fits a session's Description into avail display columns.
 //
 // The lock marker is taken out of the budget rather than appended past it: both
 // callers draw fixed-height blocks, and one column of overflow wraps the line
 // into a second physical row.
 func sessionNameText(sess session.Info, avail int) string {
-	lockMark := ""
-	if sess.DescriptionLocked && sess.Description != "" {
-		lockMark = "*"
+	mark := sessionLockMark(sess)
+	return truncateString(sess.Description, avail-lipgloss.Width(mark)) + mark
+}
+
+// sessionNameLines lays a session's Description across exactly `lines` rows of
+// `avail` columns, returning one string per row — blank rows included. What is
+// left over after the last row is cut with an ellipsis, exactly as a list row
+// cuts it.
+//
+// The row count is the contract, not a maximum: the caller draws a fixed-height
+// block whose height the list geometry is subtracted from, so a name may
+// neither claim a row more nor give one back (see detailNameLines).
+//
+// Two details worth stating:
+//
+//   - The break is by display column, not by word. Session names are as often
+//     Japanese — where there is no space to break on — as English, so a
+//     word-aware wrap would help one language and still break mid-word in the
+//     other. Whitespace at a break is dropped rather than opening the next row.
+//   - It does not reuse wrapText, which accumulates width rune by rune. A VS16
+//     emoji ("⚠️" — base plus selector) measures as its base alone that way, so
+//     a "wrapped" line can still come out wider than avail; here that overflow
+//     wraps in the terminal and costs the block a row. truncateToWidth walks
+//     grapheme clusters with the same ruler that finally measures the line.
+func sessionNameLines(sess session.Info, avail, lines int) []string {
+	out := make([]string, max(lines, 0))
+	if avail < 1 || len(out) == 0 {
+		return out
 	}
-	return truncateString(sess.Description, avail-lipgloss.Width(lockMark)) + lockMark
+
+	// Paid for on whichever row the name ends, so a name that fits keeps its
+	// marker beside it instead of orphaning it on the row below.
+	mark := sessionLockMark(sess)
+	markWidth := lipgloss.Width(mark)
+
+	rest := sess.Description
+	for i := range out {
+		if rest == "" {
+			break // the name ended earlier; the remaining rows stay blank
+		}
+		head := truncateToWidth(rest, avail)
+		tail := strings.TrimLeft(strings.TrimPrefix(rest, head), " ")
+		if i == len(out)-1 || tail == "" {
+			// The last row we have, or the last one the name needs: everything
+			// still in hand has to fit here, marker included.
+			out[i] = truncateString(rest, avail-markWidth) + mark
+			break
+		}
+		out[i] = head
+		rest = tail
+	}
+	return out
 }
 
 // renderSession renders a single session as one list row:
@@ -2293,7 +2368,8 @@ const (
 // renderDetailPane renders the fixed-height detail block for one session:
 //
 //	──────────────────────────  rule
-//	 plugin registry の crawler  name
+//	 plugin registry の crawler  name, row 1 of detailNameLines
+//	 を実装して                  name, row 2 (blank when unused)
 //	 ⚡ THINKING        claude   status + agent kind
 //	 jind-ai     feat/registry   repo (left) / branch (right)
 //	 👤 次の task を進めて        last user message
@@ -2333,15 +2409,21 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	// --- Line 1: rule ---
 	lines = append(lines, rule)
 
-	// --- Line 2: session name ---
+	// --- Lines 2-3: session name, one row per detailNameLines ---
 	// Dimmed while deleting, exactly as the list row dims it.
+	//
+	// Every reserved row is emitted, blank ones included: this block's height is
+	// what the list geometry is subtracted from, so it may not follow the length
+	// of the name it happens to be showing.
 	nameStyle := sessionNameStyle
 	if deleting {
 		nameStyle = deletingStyle
 	}
-	lines = append(lines, detailIndent+nameStyle.Render(sessionNameText(sess, avail)))
+	for _, nameLine := range sessionNameLines(sess, avail, detailNameLines) {
+		lines = append(lines, detailIndent+nameStyle.Render(nameLine))
+	}
 
-	// --- Line 3: status label, agent kind right-aligned ---
+	// --- Line 4: status label, agent kind right-aligned ---
 	// padIcon fixes the icon cell at 2 columns; the separating space is
 	// explicit, exactly as in a list row.
 	icon, label, statusStyle := getStatusDisplay(status)
@@ -2361,10 +2443,10 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	}
 	lines = append(lines, statusLine)
 
-	// --- Line 4: repo (left) / branch (right) ---
+	// --- Line 5: repo (left) / branch (right) ---
 	lines = append(lines, detailIndent+renderDetailRepoBranch(sess, avail))
 
-	// --- Lines 5-6: the last message from each side ---
+	// --- Lines 6-7: the last message from each side ---
 	// "👤 " and "🤖 " are 3 columns: a 2-column emoji plus its space. Below
 	// four columns there is room for the icon and nothing after it, which says
 	// less than a blank line does, so the whole message goes. Deliberately no
