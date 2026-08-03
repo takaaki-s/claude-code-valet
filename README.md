@@ -2,58 +2,12 @@
 
 # jind-ai
 
-A CLI tool for running and managing multiple agent sessions simultaneously
-(Claude Code is the first-class citizen; other agents plug in via
-`internal/agent/<kind>/`).
+**Ten agent sessions. One screen.**
+
+jind-ai runs each coding-agent session in its own tmux pane and puts the whole
+fleet in a single list — status, repository and branch for all of them.
 
 https://github.com/user-attachments/assets/68778af9-07eb-412e-8b11-0e6ec916010b
-
-## Project status
-
-jind-ai is a personal project, built and maintained by one developer for their
-own daily use and released in the hope that it is useful to others. Please use
-it with these expectations:
-
-- **No support guarantee.** Issues and pull requests may go unanswered.
-- **Pre-1.0.** Breaking changes to configuration, IPC, and plugin manifests can
-  land in any release.
-- **Deliberately narrow scope.** See [CONTRIBUTING.md](CONTRIBUTING.md) before
-  opening an issue or pull request.
-
-Bug reports with reproduction steps are the most welcome kind of contribution.
-
-## Supported agents
-
-| Kind | CLI | Notes |
-|---|---|---|
-| `claude` (default) | [Claude Code](https://claude.com/product/claude-code) 2.x | First-class support. Uses `--session-id` / `--resume` and Claude Code's native hook system for state tracking. |
-| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) 0.144+ | Hooks are injected per-invocation via `-c hooks.X=[...]`; grant trust once through the `/hooks` dialog on first launch (see [docs/gotchas.md](docs/gotchas.md#codex-adapter)). Session name / resume UUID are learned from Codex's `SessionStart` hook payload (no `--session-id` equivalent upstream yet). |
-| `opencode` | [opencode](https://github.com/sst/opencode) 1.17+ | **Experimental.** Status is reported by a TypeScript plugin embedded in the `jin` binary and materialised under jind-ai state; opencode is pointed at it via `OPENCODE_CONFIG_DIR`, which is additive and leaves `~/.config/opencode` untouched (see [docs/gotchas.md](docs/gotchas.md#opencode-adapter)). No external bun install is required. The resume id is learned from the plugin's `SessionStart` (no `--session-id` equivalent upstream). |
-
-Select a non-default adapter per session:
-
-```bash
-jin session new --agent codex --workdir ~/repos/myrepo
-```
-
-Or set a persistent default via `default_agent: codex` in `~/.config/jind-ai/config.yaml`.
-
-The TUI create form includes an **agent picker step** whenever more than one adapter is registered — pick the kind per session with ↑↓/j/k + Enter. Initial selection is resolved as `--agent > default_agent > "claude"`. Use `jin ui --agent codex` to preselect Codex for this TUI run only (config is left untouched):
-
-```bash
-jin ui --agent codex   # transient default; ends when TUI exits
-```
-
-## Features
-
-- **Multi-session management**: Run multiple Claude Code sessions in the background simultaneously
-- **tmux-native**: Each session runs in its own tmux pane, so your existing `~/.tmux.conf`, custom keybindings, status bar, and copy-mode setup work as-is
-- **Decoupled UI / logic architecture**: All session management, state transitions, and hook handling live in the daemon. The TUI is a thin client that talks to the daemon over a Unix socket and holds no session-management logic. In principle any alternate UI (web, editor extension, ...) can drive the same IPC (see [docs/architecture.md](docs/architecture.md) / [docs/ipc-protocol.md](docs/ipc-protocol.md))
-- **TUI**: Interactive terminal UI for listing, monitoring, and operating sessions
-- **Attach/Detach**: Quickly switch between sessions (`Ctrl+]` to detach)
-- **Real-time status tracking**: Live display of working directory, branch, and latest message
-- **Switch session & Paging**: `/` opens a fuzzy-search popup over session name, directory, branch, fleet, and agent kind
-- **Plugins**: Run your own shell-executable plugins on session status changes or on demand — for example, desktop notifications via `jin plugin install jind-ai-notifier` (registry name; git URLs and local `--link` paths are also supported)
 
 ## Installation
 
@@ -82,6 +36,56 @@ cd jind-ai
 make build    # Build to bin/jin
 make install  # Install to $GOPATH/bin
 ```
+
+## Project status
+
+jind-ai is a personal project, built and maintained by one developer for their
+own daily use and released in the hope that it is useful to others. Please use
+it with these expectations:
+
+- **No support guarantee.** Issues and pull requests may go unanswered.
+- **Pre-1.0.** Breaking changes to configuration, IPC, and plugin manifests can
+  land in any release.
+- **Deliberately narrow scope.** See [CONTRIBUTING.md](CONTRIBUTING.md) before
+  opening an issue or pull request.
+
+Bug reports with reproduction steps are the most welcome kind of contribution.
+
+## Supported agents
+
+| Kind | CLI | Notes |
+|---|---|---|
+| `claude` (default) | [Claude Code](https://claude.com/product/claude-code) 2.x | First-class support. Uses `--session-id` / `--resume` and Claude Code's native hook system for state tracking. |
+| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) 0.144+ | Hooks are injected per-invocation via `-c hooks.X=[...]`; grant trust once through the `/hooks` dialog on first launch (see [docs/gotchas.md](docs/gotchas.md#codex-adapter)). Session name / resume UUID are learned from Codex's `SessionStart` hook payload (no `--session-id` equivalent upstream yet). |
+| `opencode` | [opencode](https://github.com/sst/opencode) 1.17+ | **Experimental.** Status is reported by a TypeScript plugin embedded in the `jin` binary and materialised under jind-ai state; opencode is pointed at it via `OPENCODE_CONFIG_DIR`, which is additive and leaves `~/.config/opencode` untouched (see [docs/gotchas.md](docs/gotchas.md#opencode-adapter)). No external bun install is required. The resume id is learned from the plugin's `SessionStart` (no `--session-id` equivalent upstream). |
+
+Claude Code is the first-class citizen; other agents plug in as adapters under
+`internal/agent/<kind>/`.
+
+Select a non-default adapter per session:
+
+```bash
+jin session new --agent codex --workdir ~/repos/myrepo
+```
+
+Or set a persistent default via `default_agent: codex` in `~/.config/jind-ai/config.yaml`.
+
+The TUI create form includes an **agent picker step** whenever more than one adapter is registered — pick the kind per session with ↑↓/j/k + Enter. Initial selection is resolved as `--agent > default_agent > "claude"`. Use `jin ui --agent codex` to preselect Codex for this TUI run only (config is left untouched):
+
+```bash
+jin ui --agent codex   # transient default; ends when TUI exits
+```
+
+## Features
+
+- **Multi-session management**: Run multiple Claude Code sessions in the background simultaneously
+- **tmux-native**: Each session runs in its own tmux pane, so your existing `~/.tmux.conf`, custom keybindings, status bar, and copy-mode setup work as-is
+- **Decoupled UI / logic architecture**: All session management, state transitions, and hook handling live in the daemon. The TUI is a thin client that talks to the daemon over a Unix socket and holds no session-management logic. In principle any alternate UI (web, editor extension, ...) can drive the same IPC (see [docs/architecture.md](docs/architecture.md) / [docs/ipc-protocol.md](docs/ipc-protocol.md))
+- **TUI**: Interactive terminal UI for listing, monitoring, and operating sessions
+- **Attach/Detach**: Quickly switch between sessions (`Ctrl+]` to detach)
+- **Real-time status tracking**: Live display of working directory, branch, and latest message
+- **Switch session & Paging**: `/` opens a fuzzy-search popup over session name, directory, branch, fleet, and agent kind
+- **Plugins**: Run your own shell-executable plugins on session status changes or on demand — for example, desktop notifications via `jin plugin install jind-ai-notifier` (registry name; git URLs and local `--link` paths are also supported)
 
 ## Quick Start
 

@@ -2,52 +2,12 @@
 
 # jind-ai
 
-複数の対話エージェントセッションを同時に稼働させ、一元管理するための CLI ツール
-(Claude Code を first-class citizen としてサポート。他エージェントは
-`internal/agent/<kind>/` にアダプタを追加することで拡張可能)。
+**10 のエージェントセッションを、1 つの画面で。**
+
+jind-ai は各コーディングエージェントのセッションを個別の tmux ペインで走らせ、
+状態・リポジトリ・ブランチを 1 つの一覧にまとめます。
 
 https://github.com/user-attachments/assets/68778af9-07eb-412e-8b11-0e6ec916010b
-
-## プロジェクトの状態
-
-jind-ai は個人プロジェクトです。開発者が自身の日常利用のために開発・メンテナンス
-しており、他の方にも役立つことを期待して公開しています。以下を前提としてご利用
-ください。
-
-- **サポートの保証はありません。** Issue / Pull Request に返信できないことがあります。
-- **1.0 未満です。** 設定・IPC・plugin manifest に対する破壊的変更が任意の
-  リリースで入り得ます。
-- **スコープは意図的に狭く保っています。** Issue / PR を作成する前に
-  [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) をご覧ください。
-
-再現手順つきのバグ報告が最も歓迎される貢献です。
-
-## 対応エージェント
-
-| Kind | CLI | 備考 |
-|---|---|---|
-| `claude` (デフォルト) | [Claude Code](https://claude.com/product/claude-code) 2.x | first-class サポート。`--session-id` / `--resume` と CC のネイティブ hook で状態追跡。 |
-| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) 0.144+ | spawn ごとに `-c hooks.X=[...]` で hook を注入。初回のみ `/hooks` ダイアログでトラスト承認が必要 (詳細: [docs/gotchas.md](docs/gotchas.md#codex-adapter))。Codex には `--session-id` 相当がないため、session UUID は `SessionStart` hook で受け取って daemon 側に書き戻す。 |
-| `opencode` | [opencode](https://github.com/sst/opencode) 1.17+ | **Experimental。** 状態通知は `jin` バイナリに埋め込んだ TypeScript plugin が担当する。plugin は jind-ai の state 配下に展開し、`OPENCODE_CONFIG_DIR` で opencode に読ませる。この env は検索パスへの**加算**なので `~/.config/opencode` は汚さない (詳細: [docs/gotchas.md](docs/gotchas.md#opencode-adapter))。外部の bun インストールは不要。opencode にも `--session-id` 相当がないため、resume 用 ID は plugin の `SessionStart` で受け取る。 |
-
-セッションごとに adapter を選ぶ:
-
-```bash
-jin session new --agent codex --workdir ~/repos/myrepo
-```
-
-`~/.config/jind-ai/config.yaml` に `default_agent: codex` を書けば常時デフォルトを切り替えられる。TUI の作成フォームは現状このデフォルトを使う (picker 追加は後続 PR を予定)。
-
-## 特長
-
-- **複数セッション管理**: 複数の Claude Code セッションをバックグラウンドで同時実行
-- **tmux ネイティブ**: セッションの実体は tmux 上で動く独立ペイン。普段お使いの `~/.tmux.conf` やカスタムキーバインド、ステータスバー、コピーモード等がそのまま使える
-- **UI / ロジック分離アーキテクチャ**: セッション管理・状態遷移・hook 処理などのロジックは全て daemon に集約。TUI は Unix socket 経由で daemon を叩く薄いクライアントで、セッション管理ロジックを持たない。同じ IPC を叩けば TUI を別実装（Web UI・エディタ拡張等）に差し替えることも理論上可能（詳細は [docs/architecture.md](docs/architecture.md) / [docs/ipc-protocol.md](docs/ipc-protocol.md)）
-- **TUI**: セッション一覧・状態確認・操作を対話的に行えるターミナル UI
-- **アタッチ/デタッチ**: セッション間を素早く切り替え（`Ctrl+]` でデタッチ）
-- **リアルタイム状態追跡**: 作業ディレクトリ・ブランチ・最新メッセージをリアルタイム表示
-- **セッション切り替え・ページング**: `M-f`（Alt+f、旧: `/`）でファジー検索ポップアップを起動、セッション名・ディレクトリ・ブランチ・フリート・エージェント種別を横断検索
-- **プラグイン**: セッションの状態変化やオンデマンドで独自のシェルスクリプトを実行可能。例: `jin plugin install jind-ai-notifier` でデスクトップ通知を有効化（レジストリ名指定。git URL やローカル `--link` パスにも対応）
 
 ## インストール
 
@@ -76,6 +36,50 @@ cd jind-ai
 make build    # bin/jin にビルド
 make install  # $GOPATH/bin にインストール
 ```
+
+## プロジェクトの状態
+
+jind-ai は個人プロジェクトです。開発者が自身の日常利用のために開発・メンテナンス
+しており、他の方にも役立つことを期待して公開しています。以下を前提としてご利用
+ください。
+
+- **サポートの保証はありません。** Issue / Pull Request に返信できないことがあります。
+- **1.0 未満です。** 設定・IPC・plugin manifest に対する破壊的変更が任意の
+  リリースで入り得ます。
+- **スコープは意図的に狭く保っています。** Issue / PR を作成する前に
+  [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) をご覧ください。
+
+再現手順つきのバグ報告が最も歓迎される貢献です。
+
+## 対応エージェント
+
+| Kind | CLI | 備考 |
+|---|---|---|
+| `claude` (デフォルト) | [Claude Code](https://claude.com/product/claude-code) 2.x | first-class サポート。`--session-id` / `--resume` と CC のネイティブ hook で状態追跡。 |
+| `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) 0.144+ | spawn ごとに `-c hooks.X=[...]` で hook を注入。初回のみ `/hooks` ダイアログでトラスト承認が必要 (詳細: [docs/gotchas.md](docs/gotchas.md#codex-adapter))。Codex には `--session-id` 相当がないため、session UUID は `SessionStart` hook で受け取って daemon 側に書き戻す。 |
+| `opencode` | [opencode](https://github.com/sst/opencode) 1.17+ | **Experimental。** 状態通知は `jin` バイナリに埋め込んだ TypeScript plugin が担当する。plugin は jind-ai の state 配下に展開し、`OPENCODE_CONFIG_DIR` で opencode に読ませる。この env は検索パスへの**加算**なので `~/.config/opencode` は汚さない (詳細: [docs/gotchas.md](docs/gotchas.md#opencode-adapter))。外部の bun インストールは不要。opencode にも `--session-id` 相当がないため、resume 用 ID は plugin の `SessionStart` で受け取る。 |
+
+Claude Code を first-class citizen としてサポートしています。他エージェントは
+`internal/agent/<kind>/` にアダプタを追加することで拡張可能です。
+
+セッションごとに adapter を選ぶ:
+
+```bash
+jin session new --agent codex --workdir ~/repos/myrepo
+```
+
+`~/.config/jind-ai/config.yaml` に `default_agent: codex` を書けば常時デフォルトを切り替えられる。TUI の作成フォームは現状このデフォルトを使う (picker 追加は後続 PR を予定)。
+
+## 特長
+
+- **複数セッション管理**: 複数の Claude Code セッションをバックグラウンドで同時実行
+- **tmux ネイティブ**: セッションの実体は tmux 上で動く独立ペイン。普段お使いの `~/.tmux.conf` やカスタムキーバインド、ステータスバー、コピーモード等がそのまま使える
+- **UI / ロジック分離アーキテクチャ**: セッション管理・状態遷移・hook 処理などのロジックは全て daemon に集約。TUI は Unix socket 経由で daemon を叩く薄いクライアントで、セッション管理ロジックを持たない。同じ IPC を叩けば TUI を別実装（Web UI・エディタ拡張等）に差し替えることも理論上可能（詳細は [docs/architecture.md](docs/architecture.md) / [docs/ipc-protocol.md](docs/ipc-protocol.md)）
+- **TUI**: セッション一覧・状態確認・操作を対話的に行えるターミナル UI
+- **アタッチ/デタッチ**: セッション間を素早く切り替え（`Ctrl+]` でデタッチ）
+- **リアルタイム状態追跡**: 作業ディレクトリ・ブランチ・最新メッセージをリアルタイム表示
+- **セッション切り替え・ページング**: `M-f`（Alt+f、旧: `/`）でファジー検索ポップアップを起動、セッション名・ディレクトリ・ブランチ・フリート・エージェント種別を横断検索
+- **プラグイン**: セッションの状態変化やオンデマンドで独自のシェルスクリプトを実行可能。例: `jin plugin install jind-ai-notifier` でデスクトップ通知を有効化（レジストリ名指定。git URL やローカル `--link` パスにも対応）
 
 ## クイックスタート
 
