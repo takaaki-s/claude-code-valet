@@ -6,6 +6,22 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded runs on pull requests only: pushing again to a PR makes the
+# older run uninteresting, since only the tip is going to be merged.
+#
+# Pushes to main are serialized but never cancelled. A run there answers "is
+# main broken?", and cancelling intermediate runs throws that away: after a
+# burst of merges a red main can no longer be attributed to a commit. That is
+# not hypothetical here — PRs are validated against main as it was when their
+# CI ran, so two PRs open at the same time never test each other's changes.
+# main is the first place that combination is exercised.
+#
+# github.workflow is part of the group so Release (tag-triggered) can never
+# share a group with this workflow.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
