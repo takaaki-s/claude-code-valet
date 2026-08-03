@@ -737,7 +737,15 @@ func TestListAreaLines(t *testing.T) {
 	})
 }
 
-// --- viewport scroll ---
+// --- model fixtures ---
+
+// plainModel is the minimal Model the renderers need: no optimistic deletes
+// pending. deletingIDs is the only map they read, and every render helper is a
+// Model method so its answers can agree with the rows drawn beneath it (see
+// effectiveStatus).
+func plainModel() Model {
+	return Model{deletingIDs: map[string]bool{}}
+}
 
 // cardListModel builds a model holding n session rows. Every session renders
 // as exactly one line (sessionRowHeight), and the rendered list is one fleet
@@ -756,16 +764,16 @@ func TestListAreaLines(t *testing.T) {
 // Every geometry test below is calibrated to those numbers — if the row height
 // or the region budget changes, the hand-computed constants move together.
 func cardListModel(n int) Model {
-	sessions := make([]session.Info, n)
-	for i := range sessions {
-		sessions[i] = session.Info{ID: string(rune('0' + i)), Description: "s"}
+	m := plainModel()
+	m.sessions = make([]session.Info, n)
+	for i := range m.sessions {
+		m.sessions[i] = session.Info{ID: string(rune('0' + i)), Description: "s"}
 	}
-	return Model{
-		sessions:    sessions,
-		height:      16, // contentAreaLines() → 15; 15-2-6 = 7 list rows
-		deletingIDs: map[string]bool{},
-	}
+	m.height = 16 // contentAreaLines() → 15; 15-2-6 = 7 list rows
+	return m
 }
+
+// --- viewport scroll ---
 
 // TestAdjustScrollForCursor verifies the viewport follows the cursor.
 func TestAdjustScrollForCursor(t *testing.T) {
@@ -1357,13 +1365,6 @@ func TestPendingCursorRestore(t *testing.T) {
 
 // --- list header ---
 
-// hdrModel is a Model with no optimistic deletes pending — the plain case for
-// the header helpers, which are Model methods so their counts can agree with
-// the rows drawn beneath them (see effectiveStatus).
-func hdrModel() Model {
-	return Model{deletingIDs: map[string]bool{}}
-}
-
 // TestStatusCounts pins the three properties the header depends on: urgency
 // order (PERMISSION first, so a narrow pane drops the least urgent groups),
 // omission of empty statuses, and one trailing bucket for everything the
@@ -1390,7 +1391,7 @@ func TestStatusCounts(t *testing.T) {
 			{session.StatusStopped, 1},
 			{session.StatusDeleting, 1},
 		}
-		got := hdrModel().statusCounts(sessions)
+		got := plainModel().statusCounts(sessions)
 		if len(got) != len(want) {
 			t.Fatalf("statusCounts() = %v, want %v", got, want)
 		}
@@ -1406,7 +1407,7 @@ func TestStatusCounts(t *testing.T) {
 			{ID: "1", Status: session.StatusIdle},
 			{ID: "2", Status: session.StatusIdle},
 		}
-		got := hdrModel().statusCounts(sessions)
+		got := plainModel().statusCounts(sessions)
 		want := []statusCount{{session.StatusIdle, 2}}
 		if len(got) != 1 || got[0] != want[0] {
 			t.Errorf("statusCounts() = %v, want %v", got, want)
@@ -1414,7 +1415,7 @@ func TestStatusCounts(t *testing.T) {
 	})
 
 	t.Run("no sessions yields no groups", func(t *testing.T) {
-		if got := hdrModel().statusCounts(nil); len(got) != 0 {
+		if got := plainModel().statusCounts(nil); len(got) != 0 {
 			t.Errorf("statusCounts(nil) = %v, want empty", got)
 		}
 	})
@@ -1425,7 +1426,7 @@ func TestStatusCounts(t *testing.T) {
 			{ID: "2", Status: session.Status("")},
 			{ID: "3", Status: session.StatusIdle},
 		}
-		got := hdrModel().statusCounts(sessions)
+		got := plainModel().statusCounts(sessions)
 		if len(got) != 2 {
 			t.Fatalf("statusCounts() = %v, want 2 groups (idle + unknown bucket)", got)
 		}
@@ -1459,7 +1460,7 @@ func TestRenderListHeader(t *testing.T) {
 	}
 
 	t.Run("total plus one group per non-empty status", func(t *testing.T) {
-		got := hdrModel().renderListHeader(sessions(map[session.Status]int{
+		got := plainModel().renderListHeader(sessions(map[session.Status]int{
 			session.StatusPermission: 1,
 			session.StatusThinking:   2,
 			session.StatusIdle:       4,
@@ -1475,7 +1476,7 @@ func TestRenderListHeader(t *testing.T) {
 	})
 
 	t.Run("singular total", func(t *testing.T) {
-		got := hdrModel().renderListHeader(sessions(map[session.Status]int{session.StatusIdle: 1}), 40)
+		got := plainModel().renderListHeader(sessions(map[session.Status]int{session.StatusIdle: 1}), 40)
 		if !strings.Contains(got, "1 session") || strings.Contains(got, "1 sessions") {
 			t.Errorf("renderListHeader() = %q, want the singular %q", got, "1 session")
 		}
@@ -1490,7 +1491,7 @@ func TestRenderListHeader(t *testing.T) {
 		// "7 sessions" (10) + gap 3 + "? 1" (3) = 16 fits; the next group
 		// would need 3 + 4 = 7 more.
 		const width = 18
-		got := hdrModel().renderListHeader(all, width)
+		got := plainModel().renderListHeader(all, width)
 		if w := lipgloss.Width(got); w > width {
 			t.Fatalf("rendered width = %d, want <= %d: %q", w, width, got)
 		}
@@ -1510,7 +1511,7 @@ func TestRenderListHeader(t *testing.T) {
 	})
 
 	t.Run("a width that fits nothing but the total", func(t *testing.T) {
-		got := hdrModel().renderListHeader(sessions(map[session.Status]int{session.StatusPermission: 3}), 10)
+		got := plainModel().renderListHeader(sessions(map[session.Status]int{session.StatusPermission: 3}), 10)
 		if got != helpStyle.Render("3 sessions") {
 			t.Errorf("renderListHeader() = %q, want the bare total", got)
 		}
@@ -1637,7 +1638,7 @@ func TestEffectiveStatus_OneAnswerPerFrame(t *testing.T) {
 // own, relying on a clamp several functions away; a line that outgrew the pane
 // would wrap and cost the fixed-height block a row.
 func TestRenderDetailPane_NarrowWidths(t *testing.T) {
-	m := Model{deletingIDs: map[string]bool{}}
+	m := plainModel()
 	sess := session.Info{
 		ID: "s", Description: "a session", Status: session.StatusPermission,
 		AgentKind: "claude", RepoName: "jind-ai", CurrentBranch: "feat/x",
@@ -1743,7 +1744,7 @@ func TestOneRuler_RowAndPaneSurviveWideGlyphs(t *testing.T) {
 		strings.Repeat("絵文字と全角", 20),
 	}
 
-	m := Model{deletingIDs: map[string]bool{}}
+	m := plainModel()
 	for _, s := range hostile {
 		sess := session.Info{
 			ID: "s", Description: s, Status: session.StatusIdle, AgentKind: s,
@@ -1783,7 +1784,7 @@ func detailPaneLineCount(s string) int {
 // detailPaneLines as a constant, so a pane that grew or shrank with its
 // session's contents would silently move the list out from under the cursor.
 func TestRenderDetailPane_FixedHeight(t *testing.T) {
-	m := Model{deletingIDs: map[string]bool{}}
+	m := plainModel()
 	const width = 38
 
 	long := strings.Repeat("absurdly-long-value-", 30)
@@ -1843,7 +1844,7 @@ func TestRenderDetailPane_FixedHeight(t *testing.T) {
 // sessions on one repo is the main use, and there the repo name is identical on
 // every row while the branch is the only thing telling them apart.
 func TestRenderDetailPane_BranchPriority(t *testing.T) {
-	m := Model{deletingIDs: map[string]bool{}}
+	m := plainModel()
 	sess := session.Info{
 		ID: "s", Description: "d", Status: session.StatusIdle,
 		RepoName: "jind-ai", CurrentBranch: "feat/plugin-multi-action-dispatch",
@@ -2130,12 +2131,12 @@ func TestRenderSession_OneLine(t *testing.T) {
 	}{
 		{
 			name: "plain",
-			m:    Model{deletingIDs: map[string]bool{}},
+			m:    plainModel(),
 			sess: session.Info{ID: "s", Description: "plain", Status: session.StatusIdle},
 		},
 		{
 			name: "empty description",
-			m:    Model{deletingIDs: map[string]bool{}},
+			m:    plainModel(),
 			sess: session.Info{ID: "s", Status: session.StatusIdle},
 		},
 		{
@@ -2145,27 +2146,27 @@ func TestRenderSession_OneLine(t *testing.T) {
 		},
 		{
 			name: "deleting via the daemon-reported status",
-			m:    Model{deletingIDs: map[string]bool{}},
+			m:    plainModel(),
 			sess: session.Info{ID: "s", Description: "going away", Status: session.StatusDeleting},
 		},
 		{
 			name: "very long name",
-			m:    Model{deletingIDs: map[string]bool{}},
+			m:    plainModel(),
 			sess: session.Info{ID: "s", Description: longName, Status: session.StatusThinking},
 		},
 		{
 			name: "full-width name",
-			m:    Model{deletingIDs: map[string]bool{}},
+			m:    plainModel(),
 			sess: session.Info{ID: "s", Description: cjkName, Status: session.StatusThinking},
 		},
 		{
 			name: "locked description",
-			m:    Model{deletingIDs: map[string]bool{}},
+			m:    plainModel(),
 			sess: session.Info{ID: "s", Description: longName, DescriptionLocked: true, Status: session.StatusIdle},
 		},
 		{
 			name: "message fields no longer render (they moved to the detail pane)",
-			m:    Model{deletingIDs: map[string]bool{}},
+			m:    plainModel(),
 			sess: session.Info{
 				ID: "s", Description: "chatty", Status: session.StatusIdle,
 				CurrentBranch: "feat/x", LastUserMessage: "hi", LastAssistantMessage: "yo",
@@ -2199,7 +2200,7 @@ func TestRenderSession_OneLine(t *testing.T) {
 // starts at sessionRowLead so the list reads as a table, and a locked
 // description keeps its '*' marker.
 func TestRenderSession_Layout(t *testing.T) {
-	m := Model{deletingIDs: map[string]bool{}}
+	m := plainModel()
 	const width = 40
 
 	t.Run("name starts at the same column whatever the icon width", func(t *testing.T) {

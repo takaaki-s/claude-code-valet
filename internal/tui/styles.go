@@ -34,14 +34,14 @@ var (
 	helpStyle = lipgloss.NewStyle().
 			Foreground(secondaryColor)
 
-	// Selected item style: the "cursor" — a bold, blue vertical bar '▎'
-	// spanning every line of the card, and a bold, blue name on line 1.
+	// Selected item style: the "cursor" — a bold, blue vertical bar '▎' in the
+	// row's first column, and a bold, blue name beside it.
 	selectedItemStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(primaryColor)
 
 	// Viewed background: the session currently shown in the display pane
-	// gets a subtle full-row background reverse across every card line.
+	// gets a subtle background across the full width of its row.
 	// AdaptiveColor auto-picks a subdued shade for light and dark terminal
 	// themes (lipgloss queries the terminal background via OSC 11 on start).
 	// Chosen to be perceptibly present without stealing attention from the

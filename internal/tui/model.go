@@ -250,11 +250,11 @@ func NewModelWithTmux(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID
 }
 
 // noticeLines returns how many rows the error / warning notices occupy above
-// the scrollable card area. Kept in sync with renderListContent's prologue by
+// the list header. Kept in sync with renderListContent's prologue by
 // construction — if the notices change shape there, change the counts here in
-// the same commit. Sole owner of that arithmetic: the card area's height
-// (contentAreaLines) and its first row (mouse hit-testing) both derive from it,
-// so a layout change cannot desync them.
+// the same commit. Sole owner of that arithmetic: everything below the notices
+// (contentAreaLines, and the row the mouse hit-test counts from) derives from
+// it, so a layout change cannot desync them.
 func (m *Model) noticeLines() int {
 	rows := 0
 	if m.err != nil {
@@ -370,13 +370,9 @@ func (m *Model) sessionCardTop(idx int) (top, height int) {
 		return -1, 0
 	}
 	targetID := sessions[idx].ID
-	groups := groupSessionsByFleet(sessions)
-	showHeaders := len(groups) >= 1
 	line := 0
-	for _, g := range groups {
-		if showHeaders {
-			line++ // fleet header row
-		}
+	for _, g := range groupSessionsByFleet(sessions) {
+		line++ // fleet header row; every group draws one
 		for _, sess := range g.Sessions {
 			if sess.ID == targetID {
 				return line, sessionRowHeight
@@ -1969,20 +1965,21 @@ func (m *Model) skipDeletingSessions(dir int) {
 func (m Model) renderListContent(contentWidth int) string {
 	var content strings.Builder
 
-	// Both notices are truncated to the content width. noticeLines() promises
-	// each one occupies exactly two rows, and everything below — the header
-	// offset, the list window, the mouse hit-test origin — counts from that
-	// promise. A notice long enough to wrap would quietly turn two rows into
-	// three and shift every session row out from under the cursor.
-	if m.err != nil {
-		notice := truncateString(fmt.Sprintf("Error: %v", m.err), contentWidth)
-		content.WriteString(lipgloss.NewStyle().Foreground(errorColor).Render(notice))
+	// Both notices go through one emitter so they cannot drift apart. It
+	// truncates to the content width and always writes exactly two rows, which
+	// is what noticeLines() promises and what everything below — the header
+	// offset, the list window, the mouse hit-test origin — counts from. A notice
+	// long enough to wrap would quietly turn two rows into three and shift every
+	// session row out from under the cursor.
+	writeNotice := func(color lipgloss.Color, text string) {
+		content.WriteString(lipgloss.NewStyle().Foreground(color).Render(truncateString(text, contentWidth)))
 		content.WriteString("\n\n")
 	}
+	if m.err != nil {
+		writeNotice(errorColor, fmt.Sprintf("Error: %v", m.err))
+	}
 	if m.warning != "" {
-		notice := truncateString(fmt.Sprintf("⚠ %s", m.warning), contentWidth)
-		content.WriteString(lipgloss.NewStyle().Foreground(warningColor).Render(notice))
-		content.WriteString("\n\n")
+		writeNotice(warningColor, "⚠ "+m.warning)
 	}
 
 	displaySessions := m.getDisplaySessions()
@@ -2004,16 +2001,14 @@ func (m Model) renderListContent(contentWidth int) string {
 	// Build the full card content into a separate buffer so we can slice it
 	// by lines and expose only the visible window (no per-page arithmetic).
 	var cards strings.Builder
-	groups := groupSessionsByFleet(displaySessions)
-	showHeaders := len(groups) >= 1
 	idToIdx := make(map[string]int, len(displaySessions))
 	for i, sess := range displaySessions {
 		idToIdx[sess.ID] = i
 	}
-	for _, group := range groups {
-		if showHeaders {
-			cards.WriteString(renderFleetHeader(group.Name, contentWidth))
-		}
+	// One header row per group, matching what sessionCardTop and totalCardLines
+	// count.
+	for _, group := range groupSessionsByFleet(displaySessions) {
+		cards.WriteString(renderFleetHeader(group.Name, contentWidth))
 		for _, sess := range group.Sessions {
 			idx := idToIdx[sess.ID]
 			viewed := sess.ID == m.currentSessionID
@@ -2102,17 +2097,14 @@ func (m Model) statusCounts(sessions []session.Info) []statusCount {
 		session.StatusDeleting,
 	}
 	counts := make(map[session.Status]int, len(order))
-	for _, status := range order {
-		counts[status] = 0
-	}
 	unknown := 0
 	for _, sess := range sessions {
 		status := m.effectiveStatus(sess)
-		if _, known := counts[status]; known {
-			counts[status]++
+		if !slices.Contains(order, status) {
+			unknown++
 			continue
 		}
-		unknown++
+		counts[status]++
 	}
 
 	result := make([]statusCount, 0, len(order)+1)
@@ -2167,6 +2159,19 @@ func (m Model) renderListHeader(sessions []session.Info, width int) string {
 // status icon cell (2) + separator (1). What is left of the row belongs to the
 // name, so every name starts in the same column and the list reads as a table.
 const sessionRowLead = 5
+
+// sessionNameText fits a session's Description into avail display columns.
+//
+// The lock marker is taken out of the budget rather than appended past it: both
+// callers draw fixed-height blocks, and one column of overflow wraps the line
+// into a second physical row.
+func sessionNameText(sess session.Info, avail int) string {
+	lockMark := ""
+	if sess.DescriptionLocked && sess.Description != "" {
+		lockMark = "*"
+	}
+	return truncateString(sess.Description, avail-lipgloss.Width(lockMark)) + lockMark
+}
 
 // renderSession renders a single session as one list row:
 //
@@ -2226,7 +2231,7 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 	// minTUIWidth, so this is a floor under the arithmetic rather than a case a
 	// user reaches.
 	if width < sessionRowLead+1 {
-		return padBg(max(width, 0)) + "\n"
+		return padBg(width) + "\n"
 	}
 
 	var cursorBar string
@@ -2247,19 +2252,10 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 		nameStyle = selectedItemStyle
 	}
 
-	// The lock marker is taken out of the name budget rather than appended
-	// past it: one column of overflow wraps the row, and everything downstream
-	// assumes one session is one line.
-	lockMark := ""
-	if sess.DescriptionLocked && sess.Description != "" {
-		lockMark = "*"
-	}
-	// No floor on the budget: raising it to a readable minimum would emit a row
-	// wider than the pane, trading a cramped name for a wrapped one. The guard
-	// above guarantees at least one column here.
-	nameAvail := width - sessionRowLead
-	name := truncateString(sess.Description, nameAvail-lipgloss.Width(lockMark)) + lockMark
-	nameStyled := withBg(nameStyle).Render(name)
+	// No floor on the name budget: raising it to a readable minimum would emit a
+	// row wider than the pane, trading a cramped name for a wrapped one. The
+	// guard above guarantees at least one column here.
+	nameStyled := withBg(nameStyle).Render(sessionNameText(sess, width-sessionRowLead))
 
 	var b strings.Builder
 	b.WriteString(cursorBar)
@@ -2307,9 +2303,10 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	// return the full height anyway, since the geometry depends on the line
 	// count and must never depend on what the session carries.
 	avail := width - detailIndentWidth
+	rule := lipgloss.NewStyle().Foreground(dimColor).Render(strings.Repeat("─", max(width, 0)))
 	if avail < 1 {
 		blank := make([]string, detailPaneLines)
-		blank[0] = lipgloss.NewStyle().Foreground(dimColor).Render(strings.Repeat("─", max(width, 0)))
+		blank[0] = rule
 		return strings.Join(blank, "\n")
 	}
 
@@ -2320,22 +2317,15 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	deleting := status == session.StatusDeleting
 
 	// --- Line 1: rule ---
-	lines = append(lines, lipgloss.NewStyle().Foreground(dimColor).Render(strings.Repeat("─", max(width, 0))))
+	lines = append(lines, rule)
 
 	// --- Line 2: session name ---
-	// Same lock-marker budgeting as a list row: the '*' is taken out of the
-	// name's width rather than appended past it.
-	lockMark := ""
-	if sess.DescriptionLocked && sess.Description != "" {
-		lockMark = "*"
-	}
-	name := truncateString(sess.Description, avail-lipgloss.Width(lockMark)) + lockMark
 	// Dimmed while deleting, exactly as the list row dims it.
 	nameStyle := sessionNameStyle
 	if deleting {
 		nameStyle = deletingStyle
 	}
-	lines = append(lines, detailIndent+nameStyle.Render(name))
+	lines = append(lines, detailIndent+nameStyle.Render(sessionNameText(sess, avail)))
 
 	// --- Line 3: status label, agent kind right-aligned ---
 	// padIcon fixes the icon cell at 2 columns; the separating space is
@@ -2419,6 +2409,16 @@ func renderDetailRepoBranch(sess session.Info, avail int) string {
 		repoTruncatable = true
 	}
 
+	branch := sess.CurrentBranch
+	if branch == "" {
+		// Nothing is competing for the columns here, so the full-or-nothing
+		// rule does not apply: it exists to decide who wins a width fight, and
+		// a blank line loses to a truncated repo name every time.
+		return helpStyle.Render(truncateString(repo, avail))
+	}
+
+	// fitRepo reports what the repo gets to show inside budget columns, and
+	// whether it earned any of them at all.
 	fitRepo := func(budget int) (string, bool) {
 		if repo == "" || budget < 1 {
 			return "", false
@@ -2430,14 +2430,6 @@ func renderDetailRepoBranch(sess session.Info, avail int) string {
 			return "", false
 		}
 		return repo, true
-	}
-
-	branch := sess.CurrentBranch
-	if branch == "" {
-		// Nothing is competing for the columns here, so the full-or-nothing
-		// rule does not apply: it exists to decide who wins a width fight, and
-		// a blank line loses to a truncated repo name every time.
-		return helpStyle.Render(truncateString(repo, avail))
 	}
 
 	branchText := truncateStringFromEnd(branch, avail)
