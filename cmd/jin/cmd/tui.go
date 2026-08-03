@@ -31,8 +31,19 @@ const (
 	inactivePaneBorderStyle = "fg=#414868"
 	paneBorderFormat        = "#{?#{" + tmux.PaneLabelOption + "}, #[bold]#{" + tmux.PaneLabelOption + "}#[nobold] ,}"
 	// tuiPaneBorderLabel is the pane-border-format text shown on the TUI (left)
-	// pane. Kept short since the user already knows they're in jind-ai.
-	tuiPaneBorderLabel = "sessions"
+	// pane. Deliberately empty: the session list renders its own header row
+	// (count plus a status breakdown) directly below the border, so a border
+	// label repeated the same word on two adjacent lines. The header carries
+	// strictly more — counts and the permission warning colour — so the border
+	// is the side that goes. paneBorderFormat is a conditional, so an empty
+	// label leaves a plain border. Labelling only the display pane also makes
+	// "labelled == live session" a useful asymmetry.
+	//
+	// Do NOT delete the SetPaneOption calls that write this value. @session_name
+	// is a tmux-side pane option that outlives the process: dropping the writes
+	// would leave the old "sessions" text on any tmux server that an earlier
+	// build already labelled. Writing the empty string is what clears it.
+	tuiPaneBorderLabel = ""
 )
 
 // applyPaneBorderStyle applies the modern pane-border styling to the outer
@@ -350,8 +361,10 @@ func createAndAttachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	_ = tc.SetupAutoCleanDeadPanes() // Safety net: auto-kill untagged dead panes
 	if tuiPaneID != "" {
 		_ = tc.TagManagedPane(tuiPaneID) // TUI pane survives exit
-		// Label the TUI pane's top border via the shared @session_name option
+		// Write the TUI pane's border label via the shared @session_name option
 		// (same mechanism the display pane uses for the current session name).
+		// The label is empty by design — see tuiPaneBorderLabel; the write stays
+		// so a server still holding an older build's label gets cleared.
 		_ = tc.SetPaneOption(tuiPaneID, tmux.PaneLabelOption, tuiPaneBorderLabel)
 	}
 	_ = tc.SetOption("status", "off", true) // Hide tmux status bar
@@ -439,7 +452,9 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 			_ = tc.RespawnPane(tuiPaneID, tuiInnerCmd)
 		}
 		// Re-apply the border label in case the outer tmux server was
-		// restarted between sessions and cleared the per-pane option.
+		// restarted between sessions and cleared the per-pane option. Also the
+		// path that clears a stale label left behind by an older build, so keep
+		// the write even though tuiPaneBorderLabel is empty.
 		_ = tc.SetPaneOption(tuiPaneID, tmux.PaneLabelOption, tuiPaneBorderLabel)
 		// Select TUI pane
 		_ = tc.SelectPane(tuiPaneID)
