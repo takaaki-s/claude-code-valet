@@ -314,6 +314,17 @@ func (m *Model) headerLines() int {
 // consulting it here would be a cycle.
 //
 // With no notices and a valid cursor the threshold works out to m.height >= 14.
+//
+// The cursor-range check is not merely defensive: renderListContent indexes the
+// session slice with m.cursor to pick the pane's subject, so an out-of-range
+// cursor is a panic rather than a blank pane. The sessionsMsg handler clamps on
+// every path, which is what keeps that from happening; this is the second lock
+// on the door.
+//
+// Note that a scrolled-away cursor still gets its pane. PageUp / PageDown move
+// the viewport and deliberately leave the cursor put, so the pane keeps
+// describing the session the next action will actually hit — which is the
+// question worth answering while the user is looking somewhere else.
 func (m *Model) detailVisible() bool {
 	sessions := m.getDisplaySessions()
 	if m.cursor < 0 || m.cursor >= len(sessions) {
@@ -1750,6 +1761,17 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Clamp before the focus fast path below, not after: that path returns
+		// early, and a frame where sessions disappeared and a pending focus
+		// missed would otherwise reach the renderer with a cursor past the end
+		// of the list — which indexes the slice to pick the detail pane's
+		// subject. resolveFocusSession sets its own cursor when it succeeds, so
+		// clamping first costs it nothing.
+		displaySessions := m.getDisplaySessions()
+		if m.cursor >= len(displaySessions) {
+			m.cursor = max(len(displaySessions)-1, 0)
+		}
+
 		// Focus on newly created session + switch right pane. Slow path:
 		// even after a fresh List we may still miss (target killed between
 		// popup selection and this frame); in that case clear the pending
@@ -1760,10 +1782,6 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.writeCursorEnv()
 			}
 			return m, nil
-		}
-		displaySessions := m.getDisplaySessions()
-		if m.cursor >= len(displaySessions) && m.cursor > 0 {
-			m.cursor = len(displaySessions) - 1
 		}
 		// Session list changed: clamp scroll so we cannot land past the last
 		// card, and ensure the cursor's card stays in view.
@@ -1979,7 +1997,7 @@ func (m Model) renderListContent(contentWidth int) string {
 	}
 
 	// --- Header (fixed) ---
-	content.WriteString(renderListHeader(displaySessions, contentWidth))
+	content.WriteString(m.renderListHeader(displaySessions, contentWidth))
 	content.WriteString("\n\n") // count line + blank spacer = listHeaderLines
 
 	// --- Scrollable list area ---
@@ -2037,6 +2055,21 @@ func (m Model) renderListContent(contentWidth int) string {
 	return content.String()
 }
 
+// effectiveStatus returns the status to display for a session on this frame.
+//
+// m.deletingIDs is the TUI's own optimistic mark, set the moment a delete is
+// accepted and cleared when the record goes away — the daemon does not report
+// StatusDeleting until its next poll. Three places draw a session's status on
+// the same frame (its list row, the detail pane, the header breakdown), so all
+// three ask here rather than each deciding for itself; otherwise the header
+// counts a session as IDLE while the row under it already shows "⟳".
+func (m Model) effectiveStatus(sess session.Info) session.Status {
+	if m.deletingIDs[sess.ID] {
+		return session.StatusDeleting
+	}
+	return sess.Status
+}
+
 // statusCount pairs a status with how many sessions currently carry it.
 type statusCount struct {
 	Status session.Status
@@ -2052,10 +2085,13 @@ type statusCount struct {
 // IDLE's "finished": folding them into one number hides the one that needs
 // attention, which is the whole reason this breakdown exists.
 //
+// Statuses come from effectiveStatus, so the breakdown agrees with the rows
+// beneath it while an optimistic delete is in flight.
+//
 // session.Manager.CountActive is deliberately not reused — it lumps permission
 // in with running/thinking, precisely the distinction the header is here to
 // make.
-func statusCounts(sessions []session.Info) []statusCount {
+func (m Model) statusCounts(sessions []session.Info) []statusCount {
 	order := []session.Status{
 		session.StatusPermission,
 		session.StatusThinking,
@@ -2071,8 +2107,9 @@ func statusCounts(sessions []session.Info) []statusCount {
 	}
 	unknown := 0
 	for _, sess := range sessions {
-		if _, known := counts[sess.Status]; known {
-			counts[sess.Status]++
+		status := m.effectiveStatus(sess)
+		if _, known := counts[status]; known {
+			counts[status]++
 			continue
 		}
 		unknown++
@@ -2104,7 +2141,7 @@ func statusCounts(sessions []session.Info) []statusCount {
 // orders them by urgency exactly so the ones that fall off a narrow pane are
 // the least urgent. The total is never dropped: it is the one number that is
 // always true.
-func renderListHeader(sessions []session.Info, width int) string {
+func (m Model) renderListHeader(sessions []session.Info, width int) string {
 	total := fmt.Sprintf("%d sessions", len(sessions))
 	if len(sessions) == 1 {
 		total = "1 session"
@@ -2113,7 +2150,7 @@ func renderListHeader(sessions []session.Info, width int) string {
 	used := lipgloss.Width(line)
 
 	const groupGap = 3
-	for _, sc := range statusCounts(sessions) {
+	for _, sc := range m.statusCounts(sessions) {
 		icon, _, style := getStatusDisplay(sc.Status)
 		group := style.Render(fmt.Sprintf("%s %d", icon, sc.N))
 		cost := groupGap + lipgloss.Width(group)
@@ -2155,13 +2192,9 @@ const sessionRowLead = 5
 // is the intent: a table, not a stack of blocks.
 func (m Model) renderSession(sess session.Info, selected bool, viewed bool, width int) string {
 	// Deleting sessions are dim and not selectable, but keep the row shape:
-	// the geometry must not depend on a session's state. m.deletingIDs is the
-	// TUI's own optimistic mark, set before the daemon reports the status.
-	deleting := m.deletingIDs[sess.ID] || sess.Status == session.StatusDeleting
-	status := sess.Status
-	if deleting {
-		status = session.StatusDeleting
-	}
+	// the geometry must not depend on a session's state.
+	status := m.effectiveStatus(sess)
+	deleting := status == session.StatusDeleting
 	statusIcon, _, statusStyle := getStatusDisplay(status)
 
 	// withBg composes any inline style with the viewed row background when
@@ -2184,6 +2217,16 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 			return bgOnly.Render(strings.Repeat(" ", n))
 		}
 		return strings.Repeat(" ", n)
+	}
+
+	// Narrower than the fixed lead plus a single column of name: the lead alone
+	// would overflow, and a row that overflows wraps into two physical rows,
+	// which is the one thing sessionRowHeight may never allow. Emit a blank row
+	// of exactly `width` columns instead. View() clamps the pane to
+	// minTUIWidth, so this is a floor under the arithmetic rather than a case a
+	// user reaches.
+	if width < sessionRowLead+1 {
+		return padBg(max(width, 0)) + "\n"
 	}
 
 	var cursorBar string
@@ -2211,7 +2254,10 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 	if sess.DescriptionLocked && sess.Description != "" {
 		lockMark = "*"
 	}
-	nameAvail := max(width-sessionRowLead, 8)
+	// No floor on the budget: raising it to a readable minimum would emit a row
+	// wider than the pane, trading a cramped name for a wrapped one. The guard
+	// above guarantees at least one column here.
+	nameAvail := width - sessionRowLead
 	name := truncateString(sess.Description, nameAvail-lipgloss.Width(lockMark)) + lockMark
 	nameStyled := withBg(nameStyle).Render(name)
 
@@ -2225,10 +2271,14 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 	return b.String()
 }
 
-// detailIndent is the one-column indent every detail line carries except the
-// rule, which spans the full width so it reads as a divider between the list
-// and the detail pane.
-const detailIndent = " "
+// detailIndent is the indent every detail line carries except the rule, which
+// spans the full width so it reads as a divider between the list and the
+// detail pane. detailIndentWidth is its display width, spelled out as a
+// constant because every budget on lines 2-6 is computed as width minus this.
+const (
+	detailIndent      = " "
+	detailIndentWidth = 1
+)
 
 // renderDetailPane renders the fixed-height detail block for one session:
 //
@@ -2250,8 +2300,24 @@ const detailIndent = " "
 // of this pane. That is also why the name is on line 2 — with two "current"
 // sessions on screen, the block has to say which one it describes.
 func (m Model) renderDetailPane(sess session.Info, width int) string {
-	avail := max(width-lipgloss.Width(detailIndent), 1)
 	lines := make([]string, 0, detailPaneLines)
+
+	// Every content line hangs inside the indent, so that is what the budget is
+	// measured against. Below one usable column nothing but the rule fits —
+	// return the full height anyway, since the geometry depends on the line
+	// count and must never depend on what the session carries.
+	avail := width - detailIndentWidth
+	if avail < 1 {
+		blank := make([]string, detailPaneLines)
+		blank[0] = lipgloss.NewStyle().Foreground(dimColor).Render(strings.Repeat("─", max(width, 0)))
+		return strings.Join(blank, "\n")
+	}
+
+	// The pane and the session's list row are drawn from the same frame, so
+	// they resolve "is this being deleted" the same way. Anything else lets
+	// the two blocks describing one session disagree in front of the user.
+	status := m.effectiveStatus(sess)
+	deleting := status == session.StatusDeleting
 
 	// --- Line 1: rule ---
 	lines = append(lines, lipgloss.NewStyle().Foreground(dimColor).Render(strings.Repeat("─", max(width, 0))))
@@ -2264,20 +2330,22 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 		lockMark = "*"
 	}
 	name := truncateString(sess.Description, avail-lipgloss.Width(lockMark)) + lockMark
-	lines = append(lines, detailIndent+sessionNameStyle.Render(name))
+	// Dimmed while deleting, exactly as the list row dims it.
+	nameStyle := sessionNameStyle
+	if deleting {
+		nameStyle = deletingStyle
+	}
+	lines = append(lines, detailIndent+nameStyle.Render(name))
 
 	// --- Line 3: status label, agent kind right-aligned ---
-	// The optimistic delete mark is honoured here for the same reason the list
-	// row honours it: the row and the pane describe the same session on the
-	// same frame, so they must not disagree about its status.
-	status := sess.Status
-	if m.deletingIDs[sess.ID] {
-		status = session.StatusDeleting
-	}
 	// padIcon fixes the icon cell at 2 columns; the separating space is
 	// explicit, exactly as in a list row.
 	icon, label, statusStyle := getStatusDisplay(status)
-	statusCluster := statusStyle.Render(padIcon(icon) + " " + label)
+	// Truncated like every other line. The longest label ("PERMISSION") plus
+	// the icon cell needs 13 columns and the narrowest pane offers 27, so this
+	// never fires today — but that headroom lives in View()'s width clamp, far
+	// from here, and a line that outgrows it would wrap and cost the pane a row.
+	statusCluster := statusStyle.Render(truncateString(padIcon(icon)+" "+label, avail))
 	statusLine := detailIndent + statusCluster
 	if sess.AgentKind != "" {
 		// Below two columns of gap the kind reads as part of the label, so it
@@ -2293,18 +2361,24 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	lines = append(lines, detailIndent+renderDetailRepoBranch(sess, avail))
 
 	// --- Lines 5-6: the last message from each side ---
-	// "👤 " and "🤖 " are 3 columns: a 2-column emoji plus its space.
+	// "👤 " and "🤖 " are 3 columns: a 2-column emoji plus its space. Below
+	// four columns there is room for the icon and nothing after it, which says
+	// less than a blank line does, so the whole message goes. Deliberately no
+	// floor on the budget: clamping it up to 1 would emit a line wider than the
+	// pane, and a wrapped line costs this fixed-height block a row.
 	const msgIconWidth = 3
-	msgAvail := max(avail-msgIconWidth, 1)
+	msgAvail := avail - msgIconWidth
 	userMsg := ""
-	if sess.LastUserMessage != "" {
-		userMsg = "👤 " + truncateString(sess.LastUserMessage, msgAvail)
-	}
 	assistantMsg := ""
-	if sess.LastAssistantMessage != "" {
-		// Kept from the end: the assistant's answer lands in its last words,
-		// while its opening is usually restating the question.
-		assistantMsg = "🤖 " + truncateStringFromEnd(sess.LastAssistantMessage, msgAvail)
+	if msgAvail >= 1 {
+		if sess.LastUserMessage != "" {
+			userMsg = "👤 " + truncateString(sess.LastUserMessage, msgAvail)
+		}
+		if sess.LastAssistantMessage != "" {
+			// Kept from the end: the assistant's answer lands in its last
+			// words, while its opening is usually restating the question.
+			assistantMsg = "🤖 " + truncateStringFromEnd(sess.LastAssistantMessage, msgAvail)
+		}
 	}
 	lines = append(lines, detailIndent+helpStyle.Render(userMsg))
 	lines = append(lines, detailIndent+helpStyle.Render(assistantMsg))

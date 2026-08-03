@@ -1357,6 +1357,13 @@ func TestPendingCursorRestore(t *testing.T) {
 
 // --- list header ---
 
+// hdrModel is a Model with no optimistic deletes pending — the plain case for
+// the header helpers, which are Model methods so their counts can agree with
+// the rows drawn beneath them (see effectiveStatus).
+func hdrModel() Model {
+	return Model{deletingIDs: map[string]bool{}}
+}
+
 // TestStatusCounts pins the three properties the header depends on: urgency
 // order (PERMISSION first, so a narrow pane drops the least urgent groups),
 // omission of empty statuses, and one trailing bucket for everything the
@@ -1383,7 +1390,7 @@ func TestStatusCounts(t *testing.T) {
 			{session.StatusStopped, 1},
 			{session.StatusDeleting, 1},
 		}
-		got := statusCounts(sessions)
+		got := hdrModel().statusCounts(sessions)
 		if len(got) != len(want) {
 			t.Fatalf("statusCounts() = %v, want %v", got, want)
 		}
@@ -1399,7 +1406,7 @@ func TestStatusCounts(t *testing.T) {
 			{ID: "1", Status: session.StatusIdle},
 			{ID: "2", Status: session.StatusIdle},
 		}
-		got := statusCounts(sessions)
+		got := hdrModel().statusCounts(sessions)
 		want := []statusCount{{session.StatusIdle, 2}}
 		if len(got) != 1 || got[0] != want[0] {
 			t.Errorf("statusCounts() = %v, want %v", got, want)
@@ -1407,7 +1414,7 @@ func TestStatusCounts(t *testing.T) {
 	})
 
 	t.Run("no sessions yields no groups", func(t *testing.T) {
-		if got := statusCounts(nil); len(got) != 0 {
+		if got := hdrModel().statusCounts(nil); len(got) != 0 {
 			t.Errorf("statusCounts(nil) = %v, want empty", got)
 		}
 	})
@@ -1418,7 +1425,7 @@ func TestStatusCounts(t *testing.T) {
 			{ID: "2", Status: session.Status("")},
 			{ID: "3", Status: session.StatusIdle},
 		}
-		got := statusCounts(sessions)
+		got := hdrModel().statusCounts(sessions)
 		if len(got) != 2 {
 			t.Fatalf("statusCounts() = %v, want 2 groups (idle + unknown bucket)", got)
 		}
@@ -1452,7 +1459,7 @@ func TestRenderListHeader(t *testing.T) {
 	}
 
 	t.Run("total plus one group per non-empty status", func(t *testing.T) {
-		got := renderListHeader(sessions(map[session.Status]int{
+		got := hdrModel().renderListHeader(sessions(map[session.Status]int{
 			session.StatusPermission: 1,
 			session.StatusThinking:   2,
 			session.StatusIdle:       4,
@@ -1468,7 +1475,7 @@ func TestRenderListHeader(t *testing.T) {
 	})
 
 	t.Run("singular total", func(t *testing.T) {
-		got := renderListHeader(sessions(map[session.Status]int{session.StatusIdle: 1}), 40)
+		got := hdrModel().renderListHeader(sessions(map[session.Status]int{session.StatusIdle: 1}), 40)
 		if !strings.Contains(got, "1 session") || strings.Contains(got, "1 sessions") {
 			t.Errorf("renderListHeader() = %q, want the singular %q", got, "1 session")
 		}
@@ -1483,7 +1490,7 @@ func TestRenderListHeader(t *testing.T) {
 		// "7 sessions" (10) + gap 3 + "? 1" (3) = 16 fits; the next group
 		// would need 3 + 4 = 7 more.
 		const width = 18
-		got := renderListHeader(all, width)
+		got := hdrModel().renderListHeader(all, width)
 		if w := lipgloss.Width(got); w > width {
 			t.Fatalf("rendered width = %d, want <= %d: %q", w, width, got)
 		}
@@ -1503,11 +1510,177 @@ func TestRenderListHeader(t *testing.T) {
 	})
 
 	t.Run("a width that fits nothing but the total", func(t *testing.T) {
-		got := renderListHeader(sessions(map[session.Status]int{session.StatusPermission: 3}), 10)
+		got := hdrModel().renderListHeader(sessions(map[session.Status]int{session.StatusPermission: 3}), 10)
 		if got != helpStyle.Render("3 sessions") {
 			t.Errorf("renderListHeader() = %q, want the bare total", got)
 		}
 	})
+}
+
+// TestSessionsMsg_ClampsCursorOnEveryPath pins the invariant renderListContent
+// relies on: after a session list update the cursor indexes a real session.
+// The detail pane's subject is picked with displaySessions[m.cursor], so an
+// out-of-range cursor is a panic, not a blank pane. The pending-focus branch
+// returns early, so it has to be clamped before that fork, not after.
+func TestSessionsMsg_ClampsCursorOnEveryPath(t *testing.T) {
+	sessions := func(n int) []session.Info {
+		out := make([]session.Info, n)
+		for i := range out {
+			out[i] = session.Info{
+				ID:          fmt.Sprintf("id-%d", i),
+				Description: fmt.Sprintf("s%d", i),
+				Status:      session.StatusIdle,
+				Fleet:       session.DefaultFleet,
+			}
+		}
+		return out
+	}
+
+	cases := []struct {
+		name           string
+		focusSessionID string
+	}{
+		{name: "plain update"},
+		{name: "pending focus that cannot be resolved", focusSessionID: "ghost-id"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, remaining := range []int{0, 1, 3} {
+				m := Model{
+					sessions:       sessions(9),
+					cursor:         8, // valid before the shrink, past the end after
+					height:         16,
+					width:          40,
+					deletingIDs:    map[string]bool{},
+					focusSessionID: tc.focusSessionID,
+				}
+				next, _ := m.Update(sessionsMsg(sessions(remaining)))
+				got := next.(Model)
+
+				if got.cursor < 0 || (remaining > 0 && got.cursor >= remaining) {
+					t.Fatalf("remaining=%d: cursor = %d, out of range", remaining, got.cursor)
+				}
+				// The renderer must survive the same frame.
+				_ = got.renderListContent(38)
+			}
+		})
+	}
+}
+
+// --- one frame, one answer ---
+
+// TestEffectiveStatus_OneAnswerPerFrame pins the agreement between the three
+// places that draw a session's status. m.deletingIDs is the TUI's own
+// optimistic mark, set the moment a delete is accepted and before the daemon
+// reports StatusDeleting, so any renderer that reads sess.Status directly
+// disagrees with its neighbours for a whole poll interval.
+func TestEffectiveStatus_OneAnswerPerFrame(t *testing.T) {
+	sessions := []session.Info{
+		{ID: "going", Description: "going-away", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "staying", Description: "staying-put", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+	}
+	m := Model{
+		sessions:    sessions,
+		height:      16,
+		width:       40,
+		deletingIDs: map[string]bool{"going": true},
+	}
+
+	t.Run("the header counts the optimistic delete", func(t *testing.T) {
+		got := m.statusCounts(sessions)
+		want := []statusCount{{session.StatusIdle, 1}, {session.StatusDeleting, 1}}
+		if len(got) != len(want) {
+			t.Fatalf("statusCounts() = %v, want %v — the header still counts the session the list already shows as deleting", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("statusCounts()[%d] = %v, want %v", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("the row, the pane and the header show the same icon", func(t *testing.T) {
+		deletingIcon, _, _ := getStatusDisplay(session.StatusDeleting)
+
+		row := m.renderSession(sessions[0], true, false, 38)
+		if !strings.Contains(row, deletingIcon) {
+			t.Errorf("list row = %q, want the deleting icon %q", row, deletingIcon)
+		}
+		m.cursor = 0
+		pane := m.renderDetailPane(sessions[0], 38)
+		if !strings.Contains(pane, deletingIcon) {
+			t.Errorf("detail pane = %q, want the deleting icon %q", pane, deletingIcon)
+		}
+		if !strings.Contains(pane, "DELETING") {
+			t.Errorf("detail pane = %q, want the DELETING label", pane)
+		}
+		header := m.renderListHeader(sessions, 38)
+		if !strings.Contains(header, deletingIcon) {
+			t.Errorf("header = %q, want a group for the deleting session", header)
+		}
+	})
+
+	t.Run("the pane dims the name like the row does", func(t *testing.T) {
+		// deletingStyle's foreground is what "dim" means here; asserting on the
+		// rendered SGR keeps the test honest about what the user sees.
+		want := deletingStyle.Render("going-away")
+		pane := m.renderDetailPane(sessions[0], 38)
+		if !strings.Contains(pane, want) {
+			t.Errorf("detail pane does not dim the name of a deleting session: %q", pane)
+		}
+	})
+}
+
+// TestRenderDetailPane_NarrowWidths drives the pane below the width View()
+// ever hands it. The status line was the one line with no truncation of its
+// own, relying on a clamp several functions away; a line that outgrew the pane
+// would wrap and cost the fixed-height block a row.
+func TestRenderDetailPane_NarrowWidths(t *testing.T) {
+	m := Model{deletingIDs: map[string]bool{}}
+	sess := session.Info{
+		ID: "s", Description: "a session", Status: session.StatusPermission,
+		AgentKind: "claude", RepoName: "jind-ai", CurrentBranch: "feat/x",
+		LastUserMessage: "hello", LastAssistantMessage: "hi",
+	}
+	for width := 1; width <= 30; width++ {
+		got := m.renderDetailPane(sess, width)
+		if n := detailPaneLineCount(got); n != detailPaneLines {
+			t.Errorf("width %d: %d lines, want %d", width, n, detailPaneLines)
+		}
+		for i, line := range strings.Split(got, "\n") {
+			if w := lipgloss.Width(line); w > width {
+				t.Errorf("width %d: line %d is %d columns: %q", width, i, w, line)
+			}
+		}
+	}
+}
+
+// TestRenderSession_NarrowWidths is the list-row counterpart to
+// TestRenderDetailPane_NarrowWidths: one row must stay one row and stay inside
+// the pane no matter how little room there is, since sessionRowHeight is a
+// constant the scroll and hit-test arithmetic is built on.
+func TestRenderSession_NarrowWidths(t *testing.T) {
+	m := Model{deletingIDs: map[string]bool{"del": true}}
+	cases := []session.Info{
+		{ID: "s", Description: "a session", Status: session.StatusThinking},
+		{ID: "s", Description: strings.Repeat("全角", 20), Status: session.StatusPermission, DescriptionLocked: true},
+		{ID: "del", Description: "going away", Status: session.StatusIdle},
+		{ID: "s", Status: session.StatusIdle},
+	}
+	for _, sess := range cases {
+		for width := 1; width <= 30; width++ {
+			for _, selected := range []bool{false, true} {
+				got := m.renderSession(sess, selected, true, width)
+				if n := strings.Count(got, "\n"); n != 1 {
+					t.Fatalf("width %d selected=%v: %d newlines, want 1: %q", width, selected, n, got)
+				}
+				if w := lipgloss.Width(strings.TrimSuffix(got, "\n")); w > width {
+					t.Errorf("width %d selected=%v: row is %d columns: %q", width, selected, w, got)
+				}
+			}
+		}
+	}
 }
 
 // --- one ruler ---
