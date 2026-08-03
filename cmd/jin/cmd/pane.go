@@ -48,7 +48,7 @@ Example:
 
 		selector := args[0]
 		if len(args) < 2 {
-			return errors.New("cmd is required (use -- <cmd...>)")
+			return usageError(cmd, "cmd is required (use -- <cmd...>)")
 		}
 		cmdStr := strings.Join(args[1:], " ")
 
@@ -194,7 +194,7 @@ Example:
 		}
 
 		if len(args) < 1 {
-			return errors.New("selector is required (or use --here)")
+			return usageError(cmd, "selector is required (or use --here)")
 		}
 		selector := args[0]
 		var cmdStr string
@@ -293,7 +293,7 @@ and no selector is given:
 		}
 
 		if len(args) != 1 {
-			return errors.New("selector is required (or use --here)")
+			return usageError(cmd, "selector is required (or use --here)")
 		}
 		client := daemon.NewClient(getSocketPath())
 		sessionID, sessionDesc, err := resolveSession(client, args[0])

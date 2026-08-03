@@ -66,7 +66,7 @@ seconds), and exits non-zero on timeout so callers can retry or escalate.`,
 				prompt = strings.Join(args[1:], " ")
 			}
 		} else {
-			return fmt.Errorf("prompt is required")
+			return usageError(cmd, "prompt is required")
 		}
 
 		if prompt == "" {
