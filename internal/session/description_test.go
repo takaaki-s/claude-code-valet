@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -98,17 +99,20 @@ func TestGenerateBaselineDescription(t *testing.T) {
 			want:       filepath.Base(orphanWorktreeDir),
 		},
 		{
-			name:       "worktree prepends main repo basename",
+			// The main repo name is deliberately absent: the session list
+			// carries it as its own field, so repeating it here would spend
+			// the label on a string every row in that repo already shares.
+			name:       "worktree uses the worktree basename alone",
 			workDir:    worktreeDir,
 			isWorktree: true,
-			want:       filepath.Base(mainRepoDir) + ":jin-abcd1234",
+			want:       "jin-abcd1234",
 		},
 		{
 			name:          "worktree with branch appends branch after worktree name",
 			workDir:       worktreeDir,
 			currentBranch: "wip/refactor",
 			isWorktree:    true,
-			want:          filepath.Base(mainRepoDir) + ":jin-abcd1234:wip/refactor",
+			want:          "jin-abcd1234:wip/refactor",
 		},
 		{
 			name:     "tmuxHint is ignored in this phase",
@@ -134,6 +138,119 @@ func TestGenerateBaselineDescription(t *testing.T) {
 				t.Errorf("invariant violated: returned empty string")
 			}
 		})
+	}
+}
+
+// repoFixtures builds a main repo plus a worktree pointing back into it, the
+// two layouts every repo-name assertion below needs.
+func repoFixtures(t *testing.T) (mainRepoDir, worktreeDir string) {
+	t.Helper()
+
+	mainRepoDir = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(mainRepoDir, ".git", "worktrees", "jin-abcd1234"), 0o755); err != nil {
+		t.Fatalf("mkdir main repo .git/worktrees: %v", err)
+	}
+	worktreeDir = filepath.Join(t.TempDir(), "jin-abcd1234")
+	if err := os.MkdirAll(worktreeDir, 0o755); err != nil {
+		t.Fatalf("mkdir worktree dir: %v", err)
+	}
+	gitFile := "gitdir: " + filepath.Join(mainRepoDir, ".git", "worktrees", "jin-abcd1234") + "\n"
+	if err := os.WriteFile(filepath.Join(worktreeDir, ".git"), []byte(gitFile), 0o644); err != nil {
+		t.Fatalf("write worktree .git file: %v", err)
+	}
+	return mainRepoDir, worktreeDir
+}
+
+// TestResolveRepoName pins the one behaviour the detail pane depends on: a
+// worktree reports the repo it came from, not its own "jin-xxxxxxxx" dir name.
+func TestResolveRepoName(t *testing.T) {
+	mainRepoDir, worktreeDir := repoFixtures(t)
+
+	nonGitDir := t.TempDir()
+
+	orphanWorktreeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(orphanWorktreeDir, ".git"), []byte("gitdir: /nowhere\n"), 0o644); err != nil {
+		t.Fatalf("write orphan .git file: %v", err)
+	}
+
+	subdir := filepath.Join(mainRepoDir, "internal", "session")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		workDir string
+		want    string
+	}{
+		{name: "empty input", workDir: "", want: ""},
+		{name: "non-git dir has no repo", workDir: nonGitDir, want: ""},
+		{name: "main repo root", workDir: mainRepoDir, want: filepath.Base(mainRepoDir)},
+		{name: "subdir walks up to the repo root", workDir: subdir, want: filepath.Base(mainRepoDir)},
+		{name: "worktree resolves to the main repo", workDir: worktreeDir, want: filepath.Base(mainRepoDir)},
+		{name: "unresolvable gitdir falls back to the local root", workDir: orphanWorktreeDir, want: filepath.Base(orphanWorktreeDir)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ResolveRepoName(tc.workDir); got != tc.want {
+				t.Errorf("ResolveRepoName(%q) = %q, want %q", tc.workDir, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBaselineDescriptions_AcceptsLegacyFormat is the regression guarding the
+// silent failure that shortening the worktree baseline would otherwise cause:
+// a session persisted by an older jind-ai carries "<main-repo>:<worktree>",
+// DescriptionLayer is json:"-" so a daemon restart zeroes it, and comparing
+// only against the new format would make Guard 1 read that as "someone already
+// upgraded this" — blocking Layer C for the rest of the session's life.
+func TestBaselineDescriptions_AcceptsLegacyFormat(t *testing.T) {
+	mainRepoDir, worktreeDir := repoFixtures(t)
+
+	legacy := filepath.Base(mainRepoDir) + ":jin-abcd1234"
+	current := "jin-abcd1234"
+
+	got := baselineDescriptions(worktreeDir)
+	if len(got) != 2 {
+		t.Fatalf("baselineDescriptions(worktree) = %q, want both the current and legacy formats", got)
+	}
+	if got[0] != current {
+		t.Errorf("baselineDescriptions()[0] = %q, want the current format %q (index 0 is what we write)", got[0], current)
+	}
+	if !slices.Contains(got, legacy) {
+		t.Errorf("baselineDescriptions() = %q, want it to contain the legacy format %q", got, legacy)
+	}
+
+	// A session left on the legacy label must still look untouched.
+	sess := &Session{Description: legacy, DescriptionLayer: DescriptionLayerBaseline}
+	if sess.descriptionDriftedFrom(got) {
+		t.Error("a legacy-format baseline was treated as drifted; Layer C would be blocked forever")
+	}
+
+	// The current format, and only genuine drift, keep their old meaning.
+	sess.Description = current
+	if sess.descriptionDriftedFrom(got) {
+		t.Error("the current-format baseline was treated as drifted")
+	}
+	sess.Description = "refactor the plugin registry"
+	if !sess.descriptionDriftedFrom(got) {
+		t.Error("a Layer C description was not treated as drifted")
+	}
+
+	// Non-worktree dirs have nothing to be compatible with: one entry only.
+	if got := baselineDescriptions(mainRepoDir); len(got) != 1 {
+		t.Errorf("baselineDescriptions(main repo) = %q, want a single entry", got)
+	}
+}
+
+// TestDescriptionDriftedFrom_IgnoresNonBaselineLayers verifies the guard only
+// speaks about sessions still sitting at Layer A; once a layer is recorded in
+// this process, the upgrade path relies on Guard 2 instead.
+func TestDescriptionDriftedFrom_IgnoresNonBaselineLayers(t *testing.T) {
+	sess := &Session{Description: "anything at all", DescriptionLayer: DescriptionLayerAgentName}
+	if sess.descriptionDriftedFrom([]string{"some-baseline"}) {
+		t.Error("descriptionDriftedFrom must return false once DescriptionLayer is non-zero")
 	}
 }
 

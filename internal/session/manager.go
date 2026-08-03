@@ -524,6 +524,10 @@ func NewManager(sessionsDir, stateDir string, configMgr *config.Manager) (*Manag
 		// disk so the TUI's delete modal shows the worktree option
 		// immediately, without waiting for the 10s captureOutputTmux poll.
 		s.IsWorktree = git.IsGitWorktreeDir(s.WorkDir)
+		// Same story for RepoName, and it matters more for stopped sessions:
+		// they never reach captureOutputTmux at all, so the poll would never
+		// fill it in.
+		s.RepoName = ResolveRepoName(s.WorkDir)
 		m.sessions[s.ID] = s
 	}
 
@@ -776,6 +780,10 @@ func (m *Manager) ReserveCreation(opts CreateOptions) (*Session, Info, error) {
 		// create a worktree"; also check the WorkDir for cases where the
 		// user pointed at an existing worktree directly.
 		IsWorktree: opts.Worktree || git.IsGitWorktreeDir(opts.WorkDir),
+		// For the worktree case this resolves opts.WorkDir (still the repo
+		// root at this point), which yields the same repo name the final
+		// worktree path will; ProvisionAsync recomputes it anyway.
+		RepoName: ResolveRepoName(opts.WorkDir),
 	}
 
 	m.mu.Lock()
@@ -833,6 +841,14 @@ func (m *Manager) ProvisionAsync(sess *Session, opts CreateOptions) (string, err
 		return "", err
 	}
 
+	// ResolveRepoName stats the filesystem, so settle it before taking the
+	// lock. Note the contrast with GenerateBaselineDescription below, which is
+	// called while the lock IS held: that call is only reached when the
+	// description is unlocked, and it was accepted there as a bounded cost.
+	// Do not read it as this file's rule — walking the filesystem under m.mu
+	// stalls every other session.
+	repoName := ResolveRepoName(prov.worktreePath)
+
 	m.mu.Lock()
 	live, ok := m.sessions[sess.ID]
 	if !ok {
@@ -854,6 +870,15 @@ func (m *Manager) ProvisionAsync(sess *Session, opts CreateOptions) (string, err
 		return "", fmt.Errorf("session already exists for directory: %s (session: %s)", prov.worktreePath, s.Description)
 	}
 	live.WorkDir = prov.worktreePath
+	// Recomputed against the final path rather than left on ReserveCreation's
+	// seed. The two agree in every reachable case today — a worktree resolves
+	// to the repo it was cut from, which is the repo root the reservation
+	// already saw — so this changes nothing on its own. It is here to keep the
+	// pair honest: WorkDir is being reassigned on this line, and RepoName
+	// describes WorkDir. Anything that later makes the reserved path and the
+	// provisioned path name different repos gets the right answer for free
+	// instead of a stale one nobody thought to look for.
+	live.RepoName = repoName
 	if !live.DescriptionLocked {
 		live.Description = GenerateBaselineDescription(prov.worktreePath, "", false, "")
 	}
@@ -1921,15 +1946,15 @@ func (m *Manager) TryUpgradeDescription(id string, enhancer DescriptionEnhancer)
 		return
 	}
 
-	// Baseline must be computed with the same arguments CreateWithOptions and
+	// Baselines must be computed with the same arguments CreateWithOptions and
 	// SetDescription use. Threading CurrentBranch / IsWorktree / TmuxWindowName
 	// here would make the comparison miss as soon as captureOutputTmux populates
 	// those runtime fields, silently disabling Layer C on the very first poll.
-	baseline := GenerateBaselineDescription(snapshot.WorkDir, "", false, "")
+	baselines := baselineDescriptions(snapshot.WorkDir)
 
 	// Guard 1, evaluated against the snapshot purely to skip the transcript
 	// scan. commitDescriptionUpgrade runs the authoritative one.
-	if snapshot.descriptionDriftedFrom(baseline) {
+	if snapshot.descriptionDriftedFrom(baselines) {
 		return
 	}
 
@@ -1938,7 +1963,7 @@ func (m *Manager) TryUpgradeDescription(id string, enhancer DescriptionEnhancer)
 		return
 	}
 
-	saved, ok := m.commitDescriptionUpgrade(id, &snapshot, baseline, candidate, layer)
+	saved, ok := m.commitDescriptionUpgrade(id, &snapshot, baselines, candidate, layer)
 	if !ok {
 		return
 	}
@@ -1975,7 +2000,7 @@ func (m *Manager) snapshotForUpgrade(id string) (Session, bool) {
 // field, is what lets a write that landed during the unlocked window win: a
 // deletion misses the map, a manual SetDescription has set DescriptionLocked,
 // and a concurrent upgrade has raised DescriptionLayer past Guard 2.
-func (m *Manager) commitDescriptionUpgrade(id string, snapshot *Session, baseline, candidate string, layer DescriptionLayer) (Session, bool) {
+func (m *Manager) commitDescriptionUpgrade(id string, snapshot *Session, baselines []string, candidate string, layer DescriptionLayer) (Session, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1984,18 +2009,18 @@ func (m *Manager) commitDescriptionUpgrade(id string, snapshot *Session, baselin
 		return Session{}, false
 	}
 
-	// baseline describes snapshot.WorkDir. Once the session moves it says
+	// baselines describe snapshot.WorkDir. Once the session moves they say
 	// nothing about the session in front of us, so drop the round rather than
-	// compare against a stale value; the next hook recomputes both. (baseline
-	// also depends on the filesystem layout around WorkDir, which cannot be
-	// pinned down the same way — this is a best-effort check, and a miss only
-	// costs one skipped round.)
+	// compare against stale values; the next hook recomputes both. (They also
+	// depend on the filesystem layout around WorkDir, which cannot be pinned
+	// down the same way — this is a best-effort check, and a miss only costs
+	// one skipped round.)
 	if session.WorkDir != snapshot.WorkDir {
 		return Session{}, false
 	}
 
 	// Guard 1, authoritative.
-	if session.descriptionDriftedFrom(baseline) {
+	if session.descriptionDriftedFrom(baselines) {
 		return Session{}, false
 	}
 
@@ -2305,10 +2330,18 @@ func (m *Manager) updateGitBranch(session *Session, currentPath, lastTrackedPath
 		if fi, err := os.Lstat(gitPath); err == nil {
 			isWorktree = fi.Mode().IsRegular()
 		}
+		// One Lstat per level walked up to the repo root, plus an Lstat and a
+		// ReadFile for the worktree pointer — all against a rev-parse
+		// fork/exec we already paid for on this same tick. Recomputing
+		// unconditionally (rather than only when currentPath moved) keeps this
+		// branch free of "is it still empty?" state, and follows the agent
+		// when it cd's into a different repo.
+		repoName := ResolveRepoName(currentPath)
 		m.mu.Lock()
 		session.CurrentBranch = branch
 		session.IsGitRepo = true
 		session.IsWorktree = isWorktree
+		session.RepoName = repoName
 		m.mu.Unlock()
 	} else if currentPath != lastTrackedPath {
 		// Only clear git info when entering a non-git directory
@@ -2316,6 +2349,7 @@ func (m *Manager) updateGitBranch(session *Session, currentPath, lastTrackedPath
 		session.CurrentBranch = ""
 		session.IsGitRepo = false
 		session.IsWorktree = false
+		session.RepoName = ""
 		m.mu.Unlock()
 	}
 }

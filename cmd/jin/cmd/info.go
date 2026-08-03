@@ -54,6 +54,9 @@ func renderSessionInfoText(w io.Writer, info *session.Info) {
 	if info.CurrentWorkDir != "" {
 		fmt.Fprintf(tw, "CurrentWorkDir:\t%s\n", info.CurrentWorkDir)
 	}
+	if info.RepoName != "" {
+		fmt.Fprintf(tw, "Repo:\t%s\n", info.RepoName)
+	}
 	if info.CurrentBranch != "" {
 		fmt.Fprintf(tw, "Branch:\t%s\n", info.CurrentBranch)
 	}
