@@ -1959,9 +1959,10 @@ func (m *Model) skipDeletingSessions(dir int) {
 //	[session rows]          <- listAreaLines(), windowed by m.scrollOffset
 //	[detail pane]           <- detailLines(), the session under the cursor
 //
-// The "sessions" title is rendered on the tmux pane-border above via the
-// pane's @session_name option, so the content area starts directly with
-// err/warn (if any) or the header.
+// There is no separate title: renderListHeader's count line is it. The tmux
+// pane border above deliberately carries no label (see tuiPaneBorderLabel in
+// cmd/jin/cmd/tui.go), so the content area starts directly with err/warn (if
+// any) or the header.
 func (m Model) renderListContent(contentWidth int) string {
 	var content strings.Builder
 
