@@ -635,6 +635,12 @@ func TestTotalCardLines(t *testing.T) {
 	})
 }
 
+// detailPaneHeightThreshold is the smallest m.height, with no notices and a
+// valid cursor, that still leaves the detail pane a home: the help line, the
+// list header, the pane itself, and the shortest list worth putting above it.
+// Derived rather than written out, so it follows detailNameLines.
+const detailPaneHeightThreshold = 1 + listHeaderLines + detailPaneLines + minListLines // 15
+
 // TestListAreaLines covers how contentAreaLines is split into the three
 // regions, and the D-3 boundary where the detail pane is dropped whole rather
 // than shrunk.
@@ -646,7 +652,6 @@ func TestTotalCardLines(t *testing.T) {
 //	detail is drawn iff list >= minListLines(5), i.e. m.height >= 15
 func TestListAreaLines(t *testing.T) {
 	t.Run("detail pane appears at the height threshold", func(t *testing.T) {
-		threshold := 1 + listHeaderLines + detailPaneLines + minListLines // 15
 		tests := []struct {
 			height        int
 			wantDetail    int
@@ -655,9 +660,9 @@ func TestListAreaLines(t *testing.T) {
 			// One row short: the detail pane goes away entirely and the list
 			// takes every row it leaves behind (13-2 = 11), rather than the
 			// detail pane shrinking to 6.
-			{height: threshold - 1, wantDetail: 0, wantListLines: 11},
-			{height: threshold, wantDetail: detailPaneLines, wantListLines: minListLines},
-			{height: threshold + 1, wantDetail: detailPaneLines, wantListLines: minListLines + 1},
+			{height: detailPaneHeightThreshold - 1, wantDetail: 0, wantListLines: 11},
+			{height: detailPaneHeightThreshold, wantDetail: detailPaneLines, wantListLines: minListLines},
+			{height: detailPaneHeightThreshold + 1, wantDetail: detailPaneLines, wantListLines: minListLines + 1},
 		}
 		for _, tt := range tests {
 			m := cardListModel(3)
@@ -672,10 +677,11 @@ func TestListAreaLines(t *testing.T) {
 	})
 
 	t.Run("notices shrink the same budget", func(t *testing.T) {
-		// An error notice costs 2 rows, so height 17 with a notice lands on
-		// exactly the same 14-row content area as height 15 without one.
+		// An error notice costs 2 rows, so the threshold height plus those two
+		// lands on exactly the same 14-row content area as the threshold does
+		// with no notice at all.
 		m := cardListModel(3)
-		m.height = 17
+		m.height = detailPaneHeightThreshold + 2
 		m.err = errors.New("boom")
 		if got := m.listAreaLines(); got != minListLines {
 			t.Errorf("listAreaLines() with an error notice = %d, want %d", got, minListLines)
@@ -1954,22 +1960,41 @@ func TestRenderDetailPane_FixedHeight(t *testing.T) {
 	}
 }
 
-// detailRepoBranchRow is the index of the repo/branch line inside a rendered
-// detail pane: the rule, the name rows and the status line come first. Derived
-// rather than hard-coded so it follows detailNameLines.
-const detailRepoBranchRow = 1 + detailNameLines + 1
+// Row indexes inside a rendered detail pane: the rule comes first, then the
+// name rows, then the status line, then repo/branch. Derived rather than
+// hard-coded so they follow detailNameLines.
+const (
+	detailNameRow       = 1
+	detailStatusRow     = detailNameRow + detailNameLines
+	detailRepoBranchRow = detailStatusRow + 1
+)
 
 // --- the detail pane's session name ---
 
 // detailNameRows returns the pane's name rows with their styling and indent
 // removed, so assertions read the text the user sees.
 func detailNameRows(pane string) []string {
-	rows := strings.Split(pane, "\n")[1 : 1+detailNameLines]
+	rows := strings.Split(pane, "\n")[detailNameRow : detailNameRow+detailNameLines]
 	out := make([]string, len(rows))
 	for i, row := range rows {
 		out[i] = strings.TrimPrefix(stripANSI(row), detailIndent)
 	}
 	return out
+}
+
+// nameShapeSessions are the name shapes the pane's name block has to survive:
+// one that fits a row, one that wraps onto the second, one that outruns both,
+// full-width text, an empty name, and a locked one. Spread over two fleets, so
+// the list above the pane carries fleet headers as well as session rows.
+func nameShapeSessions() []session.Info {
+	return []session.Info{
+		{ID: "a", Description: "a", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "b", Description: strings.Repeat("medium-length-name-", 3), Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "c", Description: strings.Repeat("absurdly-long-name-", 40), Status: session.StatusThinking, Fleet: "backend"},
+		{ID: "d", Description: strings.Repeat("全角の長い名前", 20), Status: session.StatusPermission, Fleet: "backend"},
+		{ID: "e", Description: "", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "f", Description: "short", DescriptionLocked: true, Status: session.StatusIdle, Fleet: "backend"},
+	}
 }
 
 // TestRenderDetailPane_NameSpansTwoRows is the point of the pane's name block:
@@ -1978,7 +2003,6 @@ func detailNameRows(pane string) []string {
 func TestRenderDetailPane_NameSpansTwoRows(t *testing.T) {
 	m := plainModel()
 	const width = 38
-	avail := width - detailIndentWidth
 
 	t.Run("a short name leaves the second row blank", func(t *testing.T) {
 		sess := session.Info{ID: "s", Description: "short-name", Status: session.StatusIdle}
@@ -2027,7 +2051,7 @@ func TestRenderDetailPane_NameSpansTwoRows(t *testing.T) {
 		}
 		// The row after the name block belongs to the status line, not to an
 		// overflowing name.
-		status := stripANSI(strings.Split(pane, "\n")[1+detailNameLines])
+		status := stripANSI(strings.Split(pane, "\n")[detailStatusRow])
 		if !strings.Contains(status, "IDLE") {
 			t.Errorf("the row after the name block = %q, want the status line", status)
 		}
@@ -2051,6 +2075,7 @@ func TestRenderDetailPane_NameSpansTwoRows(t *testing.T) {
 		if !strings.HasSuffix(rows[1], "*") {
 			t.Errorf("row 2 = %q, want the marker on the last row the name reaches", rows[1])
 		}
+		avail := width - detailIndentWidth
 		if w := lipgloss.Width(rows[1]); w > avail {
 			t.Errorf("row 2 is %d columns with the marker, want <= %d: %q", w, avail, rows[1])
 		}
@@ -2087,17 +2112,17 @@ func TestSessionName_ControlCharactersKeepTheRowCount(t *testing.T) {
 	for _, name := range names {
 		sess := session.Info{ID: "s", Description: name, Status: session.StatusIdle, DescriptionLocked: true}
 
-		if n := detailPaneLineCount(m.renderDetailPane(sess, width)); n != detailPaneLines {
+		pane := m.renderDetailPane(sess, width)
+		if n := detailPaneLineCount(pane); n != detailPaneLines {
 			t.Errorf("name %q: detail pane is %d lines, want %d", name, n, detailPaneLines)
 		}
-		row := m.renderSession(sess, false, false, width)
-		if n := strings.Count(row, "\n"); n != 1 {
-			t.Errorf("name %q: list row has %d newlines, want 1", name, n)
-		}
-		for i, line := range strings.Split(m.renderDetailPane(sess, width), "\n") {
+		for i, line := range strings.Split(pane, "\n") {
 			if w := lipgloss.Width(line); w > width {
 				t.Errorf("name %q: pane line %d is %d columns: %q", name, i, w, line)
 			}
+		}
+		if n := strings.Count(m.renderSession(sess, false, false, width), "\n"); n != 1 {
+			t.Errorf("name %q: list row has %d newlines, want 1", name, n)
 		}
 	}
 
@@ -2113,43 +2138,35 @@ func TestSessionName_ControlCharactersKeepTheRowCount(t *testing.T) {
 // the pane itself never reaches. The row count is a contract, not a maximum:
 // the caller subtracts it from the list height.
 func TestSessionNameLines(t *testing.T) {
-	t.Run("always returns exactly the rows it was asked for", func(t *testing.T) {
-		names := []string{"", "s", "a name that fits", strings.Repeat("long-", 40), strings.Repeat("全角", 40)}
-		for _, name := range names {
-			for _, avail := range []int{1, 2, 5, 20, 37, 100} {
-				for _, lines := range []int{1, 2, 3} {
-					sess := session.Info{Description: name, DescriptionLocked: true}
-					got := sessionNameLines(sess, avail, lines)
-					if len(got) != lines {
-						t.Fatalf("sessionNameLines(%q, %d, %d) returned %d rows, want %d",
-							name, avail, lines, len(got), lines)
-					}
-					for i, row := range got {
-						if w := lipgloss.Width(row); w > avail {
-							t.Errorf("sessionNameLines(%q, %d, %d) row %d is %d columns: %q",
-								name, avail, lines, i, w, row)
-						}
-					}
-				}
-			}
-		}
-	})
-
-	t.Run("wide glyphs never push a row past its budget", func(t *testing.T) {
-		// The rulers that disagree under a ja_JP locale or on VS16 emoji: a row
-		// one column too wide wraps in the terminal and costs the pane a row.
-		hostile := []string{
+	t.Run("returns exactly the rows it was asked for, none wider than its budget", func(t *testing.T) {
+		names := []string{
+			"", "s", "a name that fits", strings.Repeat("long-", 40), strings.Repeat("全角", 40),
+			// The glyphs the two rulers disagree about — VS16 emoji, and the
+			// East-Asian ambiguous characters go-runewidth sizes from the
+			// process locale. A row one column too wide wraps in the terminal
+			// and costs the pane a row.
 			strings.Repeat("✔️", 40),
 			strings.Repeat("⚠️ alert ", 20),
 			strings.Repeat("○■▶·", 30),
 			strings.Repeat("絵文字と全角", 20),
 			strings.Repeat("全角abc", 30),
 		}
-		for _, name := range hostile {
-			for avail := 1; avail <= 40; avail++ {
-				for _, row := range sessionNameLines(session.Info{Description: name}, avail, detailNameLines) {
-					if w := lipgloss.Width(row); w > avail {
-						t.Errorf("avail %d: row is %d columns wide: %q", avail, w, row)
+		for _, name := range names {
+			for _, locked := range []bool{false, true} {
+				sess := session.Info{Description: name, DescriptionLocked: locked}
+				for avail := 1; avail <= 100; avail++ {
+					for _, lines := range []int{1, 2, 3} {
+						got := sessionNameLines(sess, avail, lines)
+						if len(got) != lines {
+							t.Fatalf("sessionNameLines(%q, %d, %d) returned %d rows, want %d",
+								name, avail, lines, len(got), lines)
+						}
+						for i, row := range got {
+							if w := lipgloss.Width(row); w > avail {
+								t.Errorf("sessionNameLines(%q, %d, %d) locked=%v row %d is %d columns: %q",
+									name, avail, lines, locked, i, w, row)
+							}
+						}
 					}
 				}
 			}
@@ -2293,29 +2310,20 @@ func TestSessionNameLines(t *testing.T) {
 // and the two feed each other. The name gets a fixed row budget precisely so
 // this test can hold.
 func TestDetailPaneNameNeverMovesTheList(t *testing.T) {
-	sessions := []session.Info{
-		{ID: "a", Description: "a", Status: session.StatusIdle, Fleet: session.DefaultFleet},
-		{ID: "b", Description: strings.Repeat("medium-length-name-", 3), Status: session.StatusIdle, Fleet: session.DefaultFleet},
-		{ID: "c", Description: strings.Repeat("absurdly-long-name-", 40), Status: session.StatusThinking, Fleet: session.DefaultFleet},
-		{ID: "d", Description: strings.Repeat("全角の長い名前", 20), Status: session.StatusPermission, Fleet: session.DefaultFleet},
-		{ID: "e", Description: "", Status: session.StatusIdle, Fleet: session.DefaultFleet},
-	}
+	sessions := nameShapeSessions()
 
-	for _, height := range []int{15, 16, 24, 40} {
+	for _, height := range []int{detailPaneHeightThreshold, detailPaneHeightThreshold + 1, 24, 40} {
+		// Cursor 0 sets the reference the rest of the column must match.
 		m := Model{sessions: sessions, height: height, width: 40, deletingIDs: map[string]bool{}}
+		m.adjustScrollForCursor()
+		wantList, wantDetail := m.listAreaLines(), m.detailLines()
+		wantLines := len(strings.Split(m.renderListContent(38), "\n"))
 
-		wantList := 0
-		wantDetail := 0
-		wantLines := 0
-		for cursor := range sessions {
+		for cursor := 1; cursor < len(sessions); cursor++ {
 			m.cursor = cursor
 			m.adjustScrollForCursor()
 			gotLines := len(strings.Split(m.renderListContent(38), "\n"))
 
-			if cursor == 0 {
-				wantList, wantDetail, wantLines = m.listAreaLines(), m.detailLines(), gotLines
-				continue
-			}
 			if got := m.listAreaLines(); got != wantList {
 				t.Errorf("height %d cursor %d: listAreaLines() = %d, want %d — the list resized under the cursor",
 					height, cursor, got, wantList)
@@ -2586,16 +2594,10 @@ func TestRenderListContent_MatchesGeometry(t *testing.T) {
 // per-renderer tests cannot make: MaxHeight clips silently and from the wrong
 // end, so a pane one row over budget loses its bottom line rather than erroring.
 func TestView_NarrowAndShortTerminals(t *testing.T) {
-	sessions := []session.Info{
-		{ID: "a", Description: strings.Repeat("a-very-long-session-name-", 8), Status: session.StatusThinking, Fleet: session.DefaultFleet},
-		{ID: "b", Description: strings.Repeat("全角の長い名前", 12), Status: session.StatusPermission, Fleet: "backend"},
-		{ID: "c", Description: "short", DescriptionLocked: true, Status: session.StatusIdle, Fleet: "backend"},
-	}
+	sessions := nameShapeSessions()
 
-	// The pane is m.height-1 rows; the last row is the help line.
-	threshold := 1 + listHeaderLines + detailPaneLines + minListLines
 	for _, width := range []int{minTUIWidth, minTUIWidth + 5, maxTUIWidth} {
-		for height := 5; height <= threshold+2; height++ {
+		for height := 5; height <= detailPaneHeightThreshold+2; height++ {
 			for cursor := range sessions {
 				m := Model{sessions: sessions, cursor: cursor, width: width, height: height, deletingIDs: map[string]bool{}}
 				m.adjustScrollForCursor()

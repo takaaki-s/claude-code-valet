@@ -2273,7 +2273,7 @@ func sessionNameText(sess session.Info, avail int) string {
 //     — see there for what happens when it has not.
 func sessionNameLines(sess session.Info, avail, lines int) []string {
 	out := make([]string, max(lines, 0))
-	if avail < 1 || len(out) == 0 {
+	if avail < 1 {
 		return out
 	}
 
@@ -2292,17 +2292,15 @@ func sessionNameLines(sess session.Info, avail, lines int) []string {
 			break
 		}
 		head := truncateToWidth(rest, avail)
-		tail := strings.TrimLeft(strings.TrimPrefix(rest, head), " ")
-		if tail != "" {
-			out[i] = head
-			rest = tail
+		out[i] = head
+		rest = strings.TrimLeft(strings.TrimPrefix(rest, head), " ")
+		if rest != "" {
 			continue
 		}
 		// The name ends on this row. Its marker rides along when there is room;
 		// when there is not, the marker moves down rather than costing an
 		// ellipsis and three columns of a name that had just fitted — otherwise
 		// a name one column LONGER would show more of itself, not less.
-		out[i] = head
 		if lipgloss.Width(head)+markWidth <= avail {
 			out[i] += mark
 		} else {
@@ -2410,7 +2408,7 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 // detailIndent is the indent every detail line carries except the rule, which
 // spans the full width so it reads as a divider between the list and the
 // detail pane. detailIndentWidth is its display width, spelled out as a
-// constant because every budget on lines 2-6 is computed as width minus this.
+// constant because every budget below the rule is computed as width minus this.
 const (
 	detailIndent      = " "
 	detailIndentWidth = 1
@@ -2461,11 +2459,10 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	lines = append(lines, rule)
 
 	// --- Lines 2-3: session name, one row per detailNameLines ---
-	// Dimmed while deleting, exactly as the list row dims it.
-	//
-	// Every reserved row is emitted, blank ones included: this block's height is
-	// what the list geometry is subtracted from, so it may not follow the length
-	// of the name it happens to be showing.
+	// Dimmed while deleting, exactly as the list row dims it. Every reserved row
+	// is emitted, blank ones included — the list geometry subtracts this block's
+	// height, so it may not follow the name it happens to be showing (see
+	// detailNameLines).
 	nameStyle := sessionNameStyle
 	if deleting {
 		nameStyle = deletingStyle
