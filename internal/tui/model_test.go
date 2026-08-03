@@ -2002,19 +2002,16 @@ func TestRenderDetailPane_NameSpansTwoRows(t *testing.T) {
 		if rows[1] == "" {
 			t.Fatalf("row 2 is blank; the name should have continued onto it: %q", rows[0])
 		}
-		// Whitespace at the break is dropped, so the rows do not rejoin
-		// byte-for-byte — but everything on row 2 must come from the name.
-		if !strings.Contains(sess.Description, strings.TrimSpace(rows[1])) {
+		if !strings.Contains(sess.Description, rows[1]) {
 			t.Errorf("row 2 = %q is not a slice of the name %q", rows[1], sess.Description)
 		}
-		if strings.HasPrefix(rows[1], " ") {
-			t.Errorf("row 2 = %q starts with the whitespace the break consumed", rows[1])
-		}
-		// The whole reason for the second row: strictly more than one row of it.
-		listRow := stripANSI(m.renderSession(sess, false, false, width))
-		if len(strings.TrimSpace(rows[0])+strings.TrimSpace(rows[1])) <= len(strings.TrimSpace(listRow)) {
-			t.Errorf("the pane (%q + %q) shows no more of the name than the list row (%q)",
-				rows[0], rows[1], listRow)
+		// The whole reason for the second row: strictly more of the name than
+		// the list row shows, measured with the ruler that decides what fits.
+		paneName := lipgloss.Width(rows[0] + rows[1])
+		listName := lipgloss.Width(sessionNameText(sess, width-sessionRowLead))
+		if paneName <= listName {
+			t.Errorf("the pane shows %d columns of the name (%q + %q), the list row %d — the second row bought nothing",
+				paneName, rows[0], rows[1], listName)
 		}
 	})
 
@@ -2043,7 +2040,7 @@ func TestRenderDetailPane_NameSpansTwoRows(t *testing.T) {
 			t.Errorf("row 1 = %q, want the marker beside the name it belongs to", rows[0])
 		}
 		if rows[1] != "" {
-			t.Errorf("row 2 = %q, want the marker never orphaned onto its own row", rows[1])
+			t.Errorf("row 2 = %q, want the marker to cost no row of its own", rows[1])
 		}
 
 		long := session.Info{
@@ -2068,6 +2065,46 @@ func TestRenderDetailPane_NameSpansTwoRows(t *testing.T) {
 			if row != "" {
 				t.Errorf("row %d = %q, want blank", i+1, row)
 			}
+		}
+	})
+}
+
+// TestSessionName_ControlCharactersKeepTheRowCount is the regression for a name
+// that carries its own line breaks. A newline is free in display width, so every
+// truncation here keeps it and then splits the "one line" it was just measured
+// as — which breaks sessionRowHeight in the list and detailPaneLines in the
+// pane, the two numbers all the scroll and hit-test arithmetic treats as fact.
+// The failure is invisible from inside a renderer: View() clips the overflow
+// from the bottom, so the symptom is a missing last row and no error at all.
+//
+// Descriptions come from whatever the IPC caller sent (`jin session rename`,
+// the agents' own rename hook), so this is reachable input, not a hypothetical.
+func TestSessionName_ControlCharactersKeepTheRowCount(t *testing.T) {
+	m := plainModel()
+	const width = 38
+
+	names := []string{"a\nb", "a\nb\nc\nd", "\nleading", "trailing\n", "tab\there", "cr\rhere", "bell\a", "\x1b[31mstyled\x1b[0m"}
+	for _, name := range names {
+		sess := session.Info{ID: "s", Description: name, Status: session.StatusIdle, DescriptionLocked: true}
+
+		if n := detailPaneLineCount(m.renderDetailPane(sess, width)); n != detailPaneLines {
+			t.Errorf("name %q: detail pane is %d lines, want %d", name, n, detailPaneLines)
+		}
+		row := m.renderSession(sess, false, false, width)
+		if n := strings.Count(row, "\n"); n != 1 {
+			t.Errorf("name %q: list row has %d newlines, want 1", name, n)
+		}
+		for i, line := range strings.Split(m.renderDetailPane(sess, width), "\n") {
+			if w := lipgloss.Width(line); w > width {
+				t.Errorf("name %q: pane line %d is %d columns: %q", name, i, w, line)
+			}
+		}
+	}
+
+	t.Run("a line break reads as a word break", func(t *testing.T) {
+		rows := detailNameRows(m.renderDetailPane(session.Info{ID: "s", Description: "first\nsecond"}, width))
+		if rows[0] != "first second" {
+			t.Errorf("row 1 = %q, want the break shown as a space rather than swallowed", rows[0])
 		}
 	})
 }
@@ -2123,6 +2160,92 @@ func TestSessionNameLines(t *testing.T) {
 		got := sessionNameLines(session.Info{Description: "abcdefghij"}, 5, 2)
 		if got[0] != "abcde" || got[1] != "fghij" {
 			t.Errorf("sessionNameLines = %q, want [abcde fghij]", got)
+		}
+	})
+
+	t.Run("the first row spends its whole budget even when locked", func(t *testing.T) {
+		// The marker comes out of the row the name ENDS on, so a name that
+		// runs past this row must not pay for it here as well.
+		got := sessionNameLines(session.Info{Description: "abcdefghij", DescriptionLocked: true}, 5, 2)
+		if got[0] != "abcde" {
+			t.Errorf("row 1 = %q, want the full %d columns — the marker is not owed here", got[0], 5)
+		}
+		// The last row does owe it, and pays the same way a list row does: the
+		// ellipsis says something was cut, rather than the marker quietly
+		// hiding a character.
+		if want := sessionNameText(session.Info{Description: "fghij", DescriptionLocked: true}, 5); got[1] != want {
+			t.Errorf("row 2 = %q, want %q — the last row budgets exactly as a one-line name does", got[1], want)
+		}
+	})
+
+	t.Run("whitespace at the break is dropped", func(t *testing.T) {
+		// The break has to land exactly on the space for this to bite: four
+		// columns take "abcd", leaving " ef" to open the next row.
+		got := sessionNameLines(session.Info{Description: "abcd ef"}, 4, 2)
+		if got[0] != "abcd" || got[1] != "ef" {
+			t.Errorf("sessionNameLines = %q, want [abcd ef] — the break's space should not indent row 2", got)
+		}
+	})
+
+	t.Run("no columns to work with yields blank rows, not a stray marker", func(t *testing.T) {
+		// Unreachable from renderDetailPane, which returns early below one
+		// usable column — but the guard is what keeps a locked name from
+		// emitting a lone "*" into a pane that has no room for it.
+		for _, avail := range []int{0, -1, -8} {
+			got := sessionNameLines(session.Info{Description: "name", DescriptionLocked: true}, avail, detailNameLines)
+			if len(got) != detailNameLines {
+				t.Fatalf("avail %d: got %d rows, want %d", avail, len(got), detailNameLines)
+			}
+			for i, row := range got {
+				if row != "" {
+					t.Errorf("avail %d: row %d = %q, want blank", avail, i, row)
+				}
+			}
+		}
+	})
+
+	t.Run("the marker moves down rather than shortening a name that fitted", func(t *testing.T) {
+		// A one-column window where the name fills the row exactly. Paying for
+		// the marker here would cost an ellipsis plus a column while row 2 sat
+		// empty, so a name one column LONGER would show more of itself.
+		exact := sessionNameLines(session.Info{Description: strings.Repeat("x", 5), DescriptionLocked: true}, 5, 2)
+		if exact[0] != "xxxxx" {
+			t.Errorf("row 1 = %q, want the name whole — it fitted before the marker was considered", exact[0])
+		}
+		if exact[1] != "*" {
+			t.Errorf("row 2 = %q, want the marker that had no room above", exact[1])
+		}
+		// Monotonic: one column more of name may not show LESS of it.
+		longer := sessionNameLines(session.Info{Description: strings.Repeat("x", 6), DescriptionLocked: true}, 5, 2)
+		if shown, was := lipgloss.Width(longer[0]+longer[1]), lipgloss.Width(exact[0]+exact[1]); shown < was {
+			t.Errorf("a 6-column name shows %d columns (%q) but a 5-column one shows %d (%q)",
+				shown, longer, was, exact)
+		}
+	})
+
+	t.Run("escape sequences neither duplicate a row nor reach the terminal", func(t *testing.T) {
+		// ansi.Truncate re-opens the styles it cut through, so its result is not
+		// a prefix of its input and the wrap's "advance past what I drew" would
+		// advance by nothing — drawing row 1 again on row 2. Stripping upstream
+		// of the wrap is what makes the prefix assumption true.
+		styled := session.Info{Description: "\x1b[31mred name that is quite long and wraps\x1b[0m"}
+		got := sessionNameLines(styled, 30, 2)
+		if got[0] == got[1] {
+			t.Errorf("both rows are %q — the wrap made no progress", got[0])
+		}
+		// The whole sequence goes, not just its ESC: blanking the ESC alone
+		// would keep the invariant and still print "[31m" at the user.
+		if got[0] != "red name that is quite long an" {
+			t.Errorf("row 1 = %q, want the sequence gone rather than defanged", got[0])
+		}
+		for i, row := range got {
+			if strings.ContainsAny(row, "\x1b[") {
+				t.Errorf("row %d = %q still carries part of an escape sequence", i, row)
+			}
+		}
+		// A clear-screen in a session name must not survive to be forwarded.
+		if clear := sessionNameLines(session.Info{Description: "before\x1b[2Jafter"}, 30, 2); clear[0] != "beforeafter" {
+			t.Errorf("row 1 = %q, want %q", clear[0], "beforeafter")
 		}
 	})
 
@@ -2489,25 +2612,27 @@ func TestView_NarrowAndShortTerminals(t *testing.T) {
 					}
 				}
 
+				// The rule is a full-width run, so a stray "─" inside a name or
+				// a branch cannot be mistaken for it.
+				body := lines[:len(lines)-1]
+				ruleRow := -1
+				for i, line := range body {
+					if strings.Contains(stripANSI(line), strings.Repeat("─", 4)) {
+						ruleRow = i
+						break
+					}
+				}
+
 				// Below the threshold the pane is dropped whole rather than
 				// shrunk — the name rows are not what gives, the block is.
-				hasRule := strings.Contains(view, "─")
-				if want := m.detailVisible(); hasRule != want {
-					t.Errorf("%s: detail rule present = %v, want %v", label, hasRule, want)
+				if want := m.detailVisible(); (ruleRow >= 0) != want {
+					t.Errorf("%s: detail rule present = %v, want %v", label, ruleRow >= 0, want)
 				}
 				if !m.detailVisible() {
 					continue
 				}
 				// Present means whole: the rule and every row under it survived
 				// the height clamp.
-				body := lines[:len(lines)-1]
-				ruleRow := -1
-				for i, line := range body {
-					if strings.Contains(line, "─") {
-						ruleRow = i
-						break
-					}
-				}
 				if got := len(body) - ruleRow; got != detailPaneLines {
 					t.Errorf("%s: %d rows from the rule to the pane's bottom, want %d", label, got, detailPaneLines)
 				}
