@@ -173,31 +173,56 @@ func TestTimeAgo(t *testing.T) {
 
 // --- getStatusDisplay ---
 
+// TestGetStatusDisplay pins the icon-collision bug that motivated the
+// PERMISSION/UNKNOWN split: PERMISSION used to share "?" with the default
+// case, and once the one-line session list started showing the icon without
+// its label, the two became indistinguishable. It also exercises padIcon,
+// since the list's column alignment depends on every icon padding to the
+// same 2-column cell.
 func TestGetStatusDisplay(t *testing.T) {
-	tests := []struct {
-		name      string
+	// The table pins the vocabulary itself; the loop below pins the invariant
+	// that no two entries may ever converge again.
+	statuses := []struct {
 		status    session.Status
 		wantIcon  string
 		wantLabel string
 	}{
-		{"thinking", session.StatusThinking, "⚡", "THINKING"},
-		{"permission", session.StatusPermission, "?", "PERMISSION"},
-		{"running", session.StatusRunning, "▶", "RUNNING"},
-		{"creating", session.StatusCreating, "+", "CREATING"},
-		{"idle", session.StatusIdle, "○", "IDLE"},
-		{"stopped", session.StatusStopped, "■", "STOPPED"},
-		{"unknown", session.Status("unknown"), "?", "UNKNOWN"},
+		{session.StatusThinking, "⚡", "THINKING"},
+		{session.StatusPermission, "?", "PERMISSION"},
+		{session.StatusRunning, "▶", "RUNNING"},
+		{session.StatusCreating, "+", "CREATING"},
+		{session.StatusIdle, "○", "IDLE"},
+		{session.StatusStopped, "■", "STOPPED"},
+		{session.StatusDeleting, "⟳", "DELETING"},
+		{session.Status("bogus-status"), "·", "UNKNOWN"}, // falls through to default
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			icon, label, _ := getStatusDisplay(tt.status)
-			if icon != tt.wantIcon {
-				t.Errorf("getStatusDisplay(%q) icon = %q, want %q", tt.status, icon, tt.wantIcon)
-			}
-			if label != tt.wantLabel {
-				t.Errorf("getStatusDisplay(%q) label = %q, want %q", tt.status, label, tt.wantLabel)
-			}
-		})
+
+	seenIcons := make(map[string]session.Status)
+	for _, tt := range statuses {
+		status := tt.status
+		icon, label, _ := getStatusDisplay(status)
+
+		if icon != tt.wantIcon {
+			t.Errorf("getStatusDisplay(%q) icon = %q, want %q", status, icon, tt.wantIcon)
+		}
+		if label != tt.wantLabel {
+			t.Errorf("getStatusDisplay(%q) label = %q, want %q", status, label, tt.wantLabel)
+		}
+
+		if prior, collides := seenIcons[icon]; collides {
+			t.Errorf("getStatusDisplay(%q) icon %q collides with %q's icon", status, icon, prior)
+		}
+		seenIcons[icon] = status
+
+		padded := padIcon(icon)
+		if w := lipgloss.Width(padded); w != 2 {
+			t.Errorf("padIcon(getStatusDisplay(%q)) = %q, width = %d, want 2", status, padded, w)
+		}
+		// "⚡" (THINKING) is already 2 columns wide; padIcon must pass it
+		// through rather than appending a space that would overshoot.
+		if lipgloss.Width(icon) >= 2 && padded != icon {
+			t.Errorf("padIcon(%q) = %q, want unchanged (already >= 2 columns)", icon, padded)
+		}
 	}
 }
 
@@ -520,67 +545,235 @@ func TestTruncateFromEndToWidth(t *testing.T) {
 	}
 }
 
-// --- cardHeight ---
+// --- list geometry ---
 
-func TestCardHeight(t *testing.T) {
-	m := Model{deletingIDs: map[string]bool{"deleting-id": true}}
-
-	tests := []struct {
-		name string
-		sess session.Info
-		want int
-	}{
-		{
-			name: "base card (name + status + spacer)",
-			sess: session.Info{ID: "s1", Description: "s"},
-			want: 3,
-		},
-		{
-			name: "with user message",
-			sess: session.Info{ID: "s2", Description: "s", LastUserMessage: "hi"},
-			want: 4,
-		},
-		{
-			name: "with both messages",
-			sess: session.Info{ID: "s3", Description: "s", LastUserMessage: "hi", LastAssistantMessage: "yo"},
-			want: 5,
-		},
-		{
-			name: "deleting card",
-			sess: session.Info{ID: "deleting-id", Description: "s"},
-			want: 3,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := m.cardHeight(tt.sess); got != tt.want {
-				t.Errorf("cardHeight() = %d, want %d", got, tt.want)
+// TestSessionCardTop pins the line offsets the scroll and hit-test arithmetic
+// is built on: one row per session (sessionRowHeight), plus one row per fleet
+// header. The height is now state-independent — a deleting session occupies
+// the same single row as any other, which is what removed the old
+// cardHeight/renderSession hand-sync contract.
+func TestSessionCardTop(t *testing.T) {
+	t.Run("single fleet", func(t *testing.T) {
+		// Lines: 0 = fleet header, 1..3 = sessions 0..2.
+		m := cardListModel(3)
+		for idx, wantTop := range []int{1, 2, 3} {
+			top, height := m.sessionCardTop(idx)
+			if top != wantTop || height != sessionRowHeight {
+				t.Errorf("sessionCardTop(%d) = (%d, %d), want (%d, %d)", idx, top, height, wantTop, sessionRowHeight)
 			}
-		})
+		}
+	})
+
+	t.Run("deleting session occupies the same single row", func(t *testing.T) {
+		m := cardListModel(3)
+		m.deletingIDs["0"] = true
+		m.sessions[1].Status = session.StatusDeleting
+		for idx, wantTop := range []int{1, 2, 3} {
+			top, height := m.sessionCardTop(idx)
+			if top != wantTop || height != sessionRowHeight {
+				t.Errorf("sessionCardTop(%d) = (%d, %d), want (%d, %d)", idx, top, height, wantTop, sessionRowHeight)
+			}
+		}
+	})
+
+	t.Run("second fleet adds one header row", func(t *testing.T) {
+		// DefaultFleet always renders last, so the lines are:
+		// 0 = ALPHA, 1 = session 0, 2 = DEFAULT, 3 = session 1, 4 = session 2.
+		m := cardListModel(3)
+		m.sessions[0].Fleet = "alpha"
+		m.sessions[1].Fleet = session.DefaultFleet
+		m.sessions[2].Fleet = session.DefaultFleet
+		for idx, wantTop := range []int{1, 3, 4} {
+			top, _ := m.sessionCardTop(idx)
+			if top != wantTop {
+				t.Errorf("sessionCardTop(%d) top = %d, want %d", idx, top, wantTop)
+			}
+		}
+	})
+
+	t.Run("out of range", func(t *testing.T) {
+		m := cardListModel(3)
+		for _, idx := range []int{-1, 3} {
+			if top, height := m.sessionCardTop(idx); top != -1 || height != 0 {
+				t.Errorf("sessionCardTop(%d) = (%d, %d), want (-1, 0)", idx, top, height)
+			}
+		}
+	})
+}
+
+func TestTotalCardLines(t *testing.T) {
+	t.Run("empty list has no rows", func(t *testing.T) {
+		m := cardListModel(0)
+		if got := m.totalCardLines(); got != 0 {
+			t.Errorf("totalCardLines() = %d, want 0 (no sessions, no fleet header)", got)
+		}
+	})
+
+	t.Run("single fleet", func(t *testing.T) {
+		// 1 fleet header + 3 session rows.
+		m := cardListModel(3)
+		if got := m.totalCardLines(); got != 4 {
+			t.Errorf("totalCardLines() = %d, want 4", got)
+		}
+	})
+
+	t.Run("two fleets", func(t *testing.T) {
+		// 2 fleet headers + 3 session rows.
+		m := cardListModel(3)
+		m.sessions[0].Fleet = "alpha"
+		if got := m.totalCardLines(); got != 5 {
+			t.Errorf("totalCardLines() = %d, want 5", got)
+		}
+	})
+
+	t.Run("agrees with the last row's bottom", func(t *testing.T) {
+		m := cardListModel(6)
+		top, height := m.sessionCardTop(5)
+		if got := m.totalCardLines(); got != top+height {
+			t.Errorf("totalCardLines() = %d, want %d (bottom of the last row)", got, top+height)
+		}
+	})
+}
+
+// TestListAreaLines covers how contentAreaLines is split into the three
+// regions, and the D-3 boundary where the detail pane is dropped whole rather
+// than shrunk.
+//
+// Derivation, with no notices and a valid cursor:
+//
+//	contentAreaLines = max(m.height-1, 3)
+//	list             = contentAreaLines - listHeaderLines(2) - detailPaneLines(6)
+//	detail is drawn iff list >= minListLines(5), i.e. m.height >= 14
+func TestListAreaLines(t *testing.T) {
+	t.Run("detail pane appears at the height threshold", func(t *testing.T) {
+		threshold := 1 + listHeaderLines + detailPaneLines + minListLines // 14
+		tests := []struct {
+			height        int
+			wantDetail    int
+			wantListLines int
+		}{
+			// One row short: the detail pane goes away entirely and the list
+			// takes every row it leaves behind (12-2 = 10), rather than the
+			// detail pane shrinking to 5.
+			{height: threshold - 1, wantDetail: 0, wantListLines: 10},
+			{height: threshold, wantDetail: detailPaneLines, wantListLines: minListLines},
+			{height: threshold + 1, wantDetail: detailPaneLines, wantListLines: minListLines + 1},
+		}
+		for _, tt := range tests {
+			m := cardListModel(3)
+			m.height = tt.height
+			if got := m.detailLines(); got != tt.wantDetail {
+				t.Errorf("height %d: detailLines() = %d, want %d", tt.height, got, tt.wantDetail)
+			}
+			if got := m.listAreaLines(); got != tt.wantListLines {
+				t.Errorf("height %d: listAreaLines() = %d, want %d", tt.height, got, tt.wantListLines)
+			}
+		}
+	})
+
+	t.Run("notices shrink the same budget", func(t *testing.T) {
+		// An error notice costs 2 rows, so height 16 with a notice lands on
+		// exactly the same 13-row content area as height 14 without one.
+		m := cardListModel(3)
+		m.height = 16
+		m.err = errors.New("boom")
+		if got := m.listAreaLines(); got != minListLines {
+			t.Errorf("listAreaLines() with an error notice = %d, want %d", got, minListLines)
+		}
+		m.warning = "hook not allowlisted"
+		// Two notices (4 rows) drop the content area to 11: 11-2-6 = 3 < 5.
+		if got := m.detailLines(); got != 0 {
+			t.Errorf("detailLines() with two notices = %d, want 0", got)
+		}
+		if got := m.listAreaLines(); got != 9 {
+			t.Errorf("listAreaLines() with two notices = %d, want 9", got)
+		}
+	})
+
+	t.Run("regions add up to the content area", func(t *testing.T) {
+		m := cardListModel(3)
+		m.height = 30
+		if sum := m.headerLines() + m.listAreaLines() + m.detailLines(); sum != m.contentAreaLines() {
+			t.Errorf("header+list+detail = %d, want contentAreaLines() = %d", sum, m.contentAreaLines())
+		}
+	})
+
+	t.Run("empty list keeps the whole content area", func(t *testing.T) {
+		m := cardListModel(0)
+		m.height = 30
+		if got := m.headerLines(); got != 0 {
+			t.Errorf("headerLines() with no sessions = %d, want 0", got)
+		}
+		if got := m.detailLines(); got != 0 {
+			t.Errorf("detailLines() with no sessions = %d, want 0", got)
+		}
+		if got := m.listAreaLines(); got != m.contentAreaLines() {
+			t.Errorf("listAreaLines() with no sessions = %d, want %d", got, m.contentAreaLines())
+		}
+	})
+
+	t.Run("out-of-range cursor drops the detail pane", func(t *testing.T) {
+		// The pane describes the session under the cursor; with no such
+		// session there is nothing to draw, so the list gets the rows.
+		m := cardListModel(3)
+		m.height = 30
+		m.cursor = len(m.sessions)
+		if m.detailVisible() {
+			t.Error("detailVisible() = true with an out-of-range cursor, want false")
+		}
+		if got := m.listAreaLines(); got != m.contentAreaLines()-listHeaderLines {
+			t.Errorf("listAreaLines() = %d, want %d", got, m.contentAreaLines()-listHeaderLines)
+		}
+	})
+
+	t.Run("never reports a zero-height list", func(t *testing.T) {
+		for _, h := range []int{0, 1, 2, 3} {
+			m := cardListModel(3)
+			m.height = h
+			if got := m.listAreaLines(); got < 1 {
+				t.Errorf("height %d: listAreaLines() = %d, want >= 1", h, got)
+			}
+		}
+	})
+}
+
+// --- model fixtures ---
+
+// plainModel is the minimal Model the renderers need: no optimistic deletes
+// pending. deletingIDs is the only map they read, and every render helper is a
+// Model method so its answers can agree with the rows drawn beneath it (see
+// effectiveStatus).
+func plainModel() Model {
+	return Model{deletingIDs: map[string]bool{}}
+}
+
+// cardListModel builds a model holding n session rows. Every session renders
+// as exactly one line (sessionRowHeight), and the rendered list is one fleet
+// header row followed by the rows, so session i sits on line 1+i and the whole
+// list spans 1+n lines.
+//
+// Height 15+1: the pane holds 15 rows, of which the list header takes 2 and
+// the detail pane 6, leaving listAreaLines() = 7 — above the minListLines
+// threshold, so these models exercise the full three-region layout, and small
+// enough to watch the viewport move. Pane rows map to regions as:
+//
+//	rows 0..1  list header      (noticeLines() + headerLines() = 2)
+//	rows 2..8  list area        (listAreaLines() = 7)
+//	rows 9..14 detail pane      (detailPaneLines = 6)
+//
+// Every geometry test below is calibrated to those numbers — if the row height
+// or the region budget changes, the hand-computed constants move together.
+func cardListModel(n int) Model {
+	m := plainModel()
+	m.sessions = make([]session.Info, n)
+	for i := range m.sessions {
+		m.sessions[i] = session.Info{ID: string(rune('0' + i)), Description: "s"}
 	}
+	m.height = 16 // contentAreaLines() → 15; 15-2-6 = 7 list rows
+	return m
 }
 
 // --- viewport scroll ---
-
-// cardListModel builds a model holding n base cards (3 lines each). The
-// rendered layout is one fleet header row followed by the cards, so card i
-// spans lines [1+3i, 3+3i] and the whole list is 1+3n lines. The pane height
-// leaves 9 usable rows, small enough to watch the viewport move.
-//
-// Every card-geometry test below is calibrated to those numbers — if
-// cardHeight or the header layout changes, the hand-computed constants in
-// those tests move together.
-func cardListModel(n int) Model {
-	sessions := make([]session.Info, n)
-	for i := range sessions {
-		sessions[i] = session.Info{ID: string(rune('0' + i)), Description: "s"}
-	}
-	return Model{
-		sessions:    sessions,
-		height:      10, // contentAreaLines() → 10-1 = 9 usable
-		deletingIDs: map[string]bool{},
-	}
-}
 
 // TestAdjustScrollForCursor verifies the viewport follows the cursor.
 func TestAdjustScrollForCursor(t *testing.T) {
@@ -599,22 +792,22 @@ func TestAdjustScrollForCursor(t *testing.T) {
 	})
 
 	t.Run("cursor below viewport scrolls down", func(t *testing.T) {
-		m := newModel(4)
-		// Card 4 top = 1 (fleet header) + 4*3 = 13. avail = 9. Bottom = 16.
-		// Should scroll so bottom = scrollOffset + avail → scrollOffset = 7.
+		m := newModel(7)
+		// Row 7 top = 1 (fleet header) + 7 = 8, bottom = 9. avail = 7.
+		// Should scroll so bottom = scrollOffset + avail → scrollOffset = 2.
 		m.adjustScrollForCursor()
-		if m.scrollOffset != 7 {
-			t.Errorf("scrollOffset = %d, want 7 (cursor below fold)", m.scrollOffset)
+		if m.scrollOffset != 2 {
+			t.Errorf("scrollOffset = %d, want 2 (cursor below fold)", m.scrollOffset)
 		}
 	})
 
 	t.Run("cursor at end anchors scroll to last visible page", func(t *testing.T) {
 		m := newModel(9)
 		m.adjustScrollForCursor()
-		// Last card top = 1 + 9*3 = 28, height = 3, bottom = 31.
-		// scrollOffset = 31 - 9 = 22. clampScroll bounds by totalCardLines(31) - avail(9) = 22.
-		if m.scrollOffset != 22 {
-			t.Errorf("scrollOffset = %d, want 22 (cursor at end)", m.scrollOffset)
+		// Last row top = 1 + 9 = 10, height = 1, bottom = 11.
+		// scrollOffset = 11 - 7 = 4. clampScroll bounds by totalCardLines(11) - avail(7) = 4.
+		if m.scrollOffset != 4 {
+			t.Errorf("scrollOffset = %d, want 4 (cursor at end)", m.scrollOffset)
 		}
 	})
 
@@ -622,8 +815,8 @@ func TestAdjustScrollForCursor(t *testing.T) {
 		m := newModel(0)
 		m.scrollOffset = 999
 		m.clampScroll()
-		if m.scrollOffset != 22 {
-			t.Errorf("clampScroll from overshoot = %d, want 22", m.scrollOffset)
+		if m.scrollOffset != 4 {
+			t.Errorf("clampScroll from overshoot = %d, want 4", m.scrollOffset)
 		}
 		m.scrollOffset = -50
 		m.clampScroll()
@@ -646,11 +839,10 @@ func TestSessionIndexAtLine(t *testing.T) {
 	}{
 		{name: "negative line", line: -1, wantOK: false},
 		{name: "fleet header row", line: 0, wantOK: false},
-		{name: "first line of first card", line: 1, wantIdx: 0, wantOK: true},
-		{name: "trailing spacer belongs to its card", line: 3, wantIdx: 0, wantOK: true},
-		{name: "first line of second card", line: 4, wantIdx: 1, wantOK: true},
-		{name: "last card", line: 30, wantIdx: 9, wantOK: true},
-		{name: "past the last card", line: 31, wantOK: false},
+		{name: "first session row", line: 1, wantIdx: 0, wantOK: true},
+		{name: "second session row", line: 2, wantIdx: 1, wantOK: true},
+		{name: "last session row", line: 10, wantIdx: 9, wantOK: true},
+		{name: "past the last row", line: 11, wantOK: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -666,7 +858,9 @@ func TestSessionIndexAtLine(t *testing.T) {
 }
 
 func TestSessionIndexAtRow(t *testing.T) {
-	// contentAreaLines() → 9 rows, so rows 0..8 are live.
+	// Rows 0..1 are the list header, rows 2..8 the list area (7 rows), rows
+	// 9..14 the detail pane. Inside the list area, row 2 is the fleet header,
+	// so row 3 is session 0.
 	newModel := func() *Model {
 		m := cardListModel(10)
 		return &m
@@ -679,31 +873,43 @@ func TestSessionIndexAtRow(t *testing.T) {
 		}
 	})
 
-	t.Run("row below the content area misses", func(t *testing.T) {
+	t.Run("row in the list header misses", func(t *testing.T) {
+		m := newModel()
+		for _, y := range []int{0, 1} {
+			if _, ok := m.sessionIndexAtRow(y); ok {
+				t.Errorf("sessionIndexAtRow(%d) should miss: rows 0..1 are the list header", y)
+			}
+		}
+	})
+
+	t.Run("row in the detail pane misses", func(t *testing.T) {
 		m := newModel()
 		if _, ok := m.sessionIndexAtRow(9); ok {
-			t.Error("sessionIndexAtRow(9) should miss: content area is rows 0..8")
+			t.Error("sessionIndexAtRow(9) should miss: the list area ends at row 8")
 		}
 	})
 
 	t.Run("scroll offset shifts the mapping", func(t *testing.T) {
 		m := newModel()
-		m.scrollOffset = 7
-		// Row 0 → line 7, which is the first line of card 2.
-		if idx, ok := m.sessionIndexAtRow(0); !ok || idx != 2 {
-			t.Errorf("sessionIndexAtRow(0) at offset 7 = (%d, %v), want (2, true)", idx, ok)
+		m.scrollOffset = 4
+		// Row 2 (first list row) → line 4, which is session 3.
+		if idx, ok := m.sessionIndexAtRow(2); !ok || idx != 3 {
+			t.Errorf("sessionIndexAtRow(2) at offset 4 = (%d, %v), want (3, true)", idx, ok)
 		}
 	})
 
-	t.Run("error notice pushes the card area down", func(t *testing.T) {
+	t.Run("error notice pushes the list area down", func(t *testing.T) {
 		m := newModel()
 		m.err = errors.New("boom")
-		// Rows 0..1 are the error line + spacer; row 2 is the fleet header.
-		if _, ok := m.sessionIndexAtRow(1); ok {
-			t.Error("sessionIndexAtRow(1) should miss while an error notice is shown")
+		// Rows 0..1 are the error line + spacer, rows 2..3 the list header,
+		// row 4 the fleet header, so session 0 is on row 5.
+		for _, y := range []int{1, 3, 4} {
+			if _, ok := m.sessionIndexAtRow(y); ok {
+				t.Errorf("sessionIndexAtRow(%d) should miss while an error notice is shown", y)
+			}
 		}
-		if idx, ok := m.sessionIndexAtRow(3); !ok || idx != 0 {
-			t.Errorf("sessionIndexAtRow(3) with error = (%d, %v), want (0, true)", idx, ok)
+		if idx, ok := m.sessionIndexAtRow(5); !ok || idx != 0 {
+			t.Errorf("sessionIndexAtRow(5) with error = (%d, %v), want (0, true)", idx, ok)
 		}
 	})
 }
@@ -711,7 +917,7 @@ func TestSessionIndexAtRow(t *testing.T) {
 // --- mouse input ---
 
 func TestHandleMouseWheel(t *testing.T) {
-	newModel := func() Model { return cardListModel(10) } // 31 lines total, 9 visible
+	newModel := func() Model { return cardListModel(10) } // 11 lines total, 7 visible
 
 	wheel := func(m Model, button tea.MouseButton) Model {
 		got, _ := m.handleMouse(tea.MouseMsg{Y: 4, Button: button, Action: tea.MouseActionPress})
@@ -737,10 +943,10 @@ func TestHandleMouseWheel(t *testing.T) {
 
 	t.Run("wheel down at the bottom stays clamped", func(t *testing.T) {
 		m := newModel()
-		m.scrollOffset = 22 // totalCardLines(31) - contentAreaLines(9)
+		m.scrollOffset = 4 // totalCardLines(11) - listAreaLines(7)
 		m = wheel(m, tea.MouseButtonWheelDown)
-		if m.scrollOffset != 22 {
-			t.Errorf("scrollOffset = %d, want 22 (clamped at the last page)", m.scrollOffset)
+		if m.scrollOffset != 4 {
+			t.Errorf("scrollOffset = %d, want 4 (clamped at the last page)", m.scrollOffset)
 		}
 	})
 }
@@ -753,8 +959,8 @@ func TestHandleMouseLeftClick(t *testing.T) {
 
 	newModel := func() Model { return cardListModel(10) }
 
-	t.Run("click on a card moves the cursor there", func(t *testing.T) {
-		// Row 4 → line 4 → first line of card 1.
+	t.Run("click on a row moves the cursor there", func(t *testing.T) {
+		// Row 4 → line 2 (list header 2 rows, fleet header on row 2) → session 1.
 		if m := click(newModel(), 4); m.cursor != 1 {
 			t.Errorf("cursor = %d, want 1", m.cursor)
 		}
@@ -763,25 +969,43 @@ func TestHandleMouseLeftClick(t *testing.T) {
 	t.Run("click on the fleet header leaves the cursor alone", func(t *testing.T) {
 		m := newModel()
 		m.cursor = 3
-		if got := click(m, 0); got.cursor != 3 {
-			t.Errorf("cursor = %d, want 3 (header row is not selectable)", got.cursor)
+		if got := click(m, 2); got.cursor != 3 {
+			t.Errorf("cursor = %d, want 3 (fleet header row is not selectable)", got.cursor)
 		}
 	})
 
-	t.Run("click below the last card leaves the cursor alone", func(t *testing.T) {
+	t.Run("click on the list header leaves the cursor alone", func(t *testing.T) {
 		m := newModel()
-		m.sessions = cardListModel(1).sessions // header + 3 lines = 4 lines of content
+		m.cursor = 3
+		if got := click(m, 0); got.cursor != 3 {
+			t.Errorf("cursor = %d, want 3 (list header rows are not selectable)", got.cursor)
+		}
+	})
+
+	t.Run("click on the detail pane leaves the cursor alone", func(t *testing.T) {
+		// Row 9 is the first detail pane row. It describes the cursor's
+		// session; clicking it must not re-target anything.
+		m := newModel()
+		m.cursor = 3
+		if got := click(m, 9); got.cursor != 3 {
+			t.Errorf("cursor = %d, want 3 (the detail pane is not the list)", got.cursor)
+		}
+	})
+
+	t.Run("click below the last row leaves the cursor alone", func(t *testing.T) {
+		m := newModel()
+		m.sessions = cardListModel(1).sessions // fleet header + 1 row = 2 lines
 		m.cursor = 0
 		if got := click(m, 6); got.cursor != 0 {
 			t.Errorf("cursor = %d, want 0 (empty space is not selectable)", got.cursor)
 		}
 	})
 
-	t.Run("click on a deleting card is ignored", func(t *testing.T) {
+	t.Run("click on a deleting row is ignored", func(t *testing.T) {
 		m := newModel()
 		m.deletingIDs = map[string]bool{"1": true}
 		if got := click(m, 4); got.cursor != 0 {
-			t.Errorf("cursor = %d, want 0 (deleting cards are not selectable)", got.cursor)
+			t.Errorf("cursor = %d, want 0 (deleting rows are not selectable)", got.cursor)
 		}
 	})
 
@@ -798,9 +1022,9 @@ func TestHandleMouseLeftClick(t *testing.T) {
 	t.Run("click dismisses a transient warning", func(t *testing.T) {
 		m := newModel()
 		m.warning = "hook not allowlisted"
-		// The warning occupies rows 0..1, so the card area starts at row 2:
-		// row 3 is the first line of card 0.
-		got := click(m, 3)
+		// The warning occupies rows 0..1 and the list header rows 2..3, so
+		// row 4 is the fleet header and row 5 is session 0.
+		got := click(m, 5)
 		if got.warning != "" {
 			t.Errorf("warning = %q, want empty after a click", got.warning)
 		}
@@ -938,6 +1162,118 @@ func TestGroupSessionsByFleet(t *testing.T) {
 		groups := groupSessionsByFleet(nil)
 		if len(groups) != 0 {
 			t.Errorf("expected 0 groups, got %d", len(groups))
+		}
+	})
+}
+
+// --- deleting sessions are not actionable, whichever source says so ---
+
+// TestIsDeleting_BothSources pins the fix for a split this branch introduced.
+// Adding StatusDeleting to getStatusDisplay made a daemon-reported delete
+// render dim with the ⟳ icon, but every guard on the action paths still read
+// only m.deletingIDs — this TUI's own optimistic mark. A session the daemon
+// reports as deleting therefore looked like it was going away while still
+// answering to Enter, VS Code and the mouse.
+//
+// Both sources are reachable with an empty deletingIDs map: another client
+// issued the delete, or this TUI restarted while one was in flight (the map is
+// in-memory only, so a restart forgets it while the daemon keeps reporting).
+func TestIsDeleting_BothSources(t *testing.T) {
+	sessions := []session.Info{
+		{ID: "live", Description: "live", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "optimistic", Description: "optimistic", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "reported", Description: "reported", Status: session.StatusDeleting, Fleet: session.DefaultFleet},
+	}
+	newModel := func() Model {
+		m := plainModel()
+		m.sessions = sessions
+		m.height = 16
+		m.width = 40
+		m.deletingIDs = map[string]bool{"optimistic": true}
+		return m
+	}
+
+	t.Run("isDeleting sees both the mark and the reported status", func(t *testing.T) {
+		m := newModel()
+		for _, tc := range []struct {
+			idx  int
+			want bool
+		}{{0, false}, {1, true}, {2, true}} {
+			if got := m.isDeleting(sessions[tc.idx]); got != tc.want {
+				t.Errorf("isDeleting(%q) = %v, want %v", sessions[tc.idx].ID, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("sessionAt refuses every deleting session", func(t *testing.T) {
+		m := newModel()
+		if _, ok := m.sessionAt(0); !ok {
+			t.Error("sessionAt(0) refused a live session")
+		}
+		for _, idx := range []int{1, 2} {
+			if got, ok := m.sessionAt(idx); ok {
+				t.Errorf("sessionAt(%d) returned %q; a session on its way out is not actionable", idx, got.ID)
+			}
+		}
+	})
+
+	t.Run("select and vscode are no-ops on a daemon-reported delete", func(t *testing.T) {
+		// Index 2 is the case the old guard missed entirely. With no tmux
+		// client wired these would be no-ops anyway, so the assertion that
+		// carries weight is that neither records an error and neither reaches
+		// past the guard — verified by the absence of a nil-client panic.
+		m := newModel()
+		m.cursor = 2
+
+		next, cmd := m.handleSelectSession()
+		if cmd != nil {
+			t.Errorf("handleSelectSession returned a Cmd for a deleting session: %T", cmd)
+		}
+		if got := next.(Model); got.err != nil {
+			t.Errorf("handleSelectSession set err = %v, want a silent no-op", got.err)
+		}
+
+		next, cmd = m.handleVscode()
+		if cmd != nil {
+			t.Errorf("handleVscode returned a Cmd for a deleting session: %T", cmd)
+		}
+		if got := next.(Model); got.err != nil {
+			t.Errorf("handleVscode set err = %v, want a silent no-op", got.err)
+		}
+	})
+
+	t.Run("the cursor skips a daemon-reported delete", func(t *testing.T) {
+		// deletingIDs is empty here: only the reported status can move the
+		// cursor, which is exactly what the old code could not do.
+		m := plainModel()
+		m.sessions = []session.Info{
+			{ID: "a", Description: "a", Status: session.StatusIdle},
+			{ID: "b", Description: "b", Status: session.StatusDeleting},
+			{ID: "c", Description: "c", Status: session.StatusIdle},
+		}
+		m.height = 100
+		m.cursor = 1
+		m.skipDeletingSessions(1)
+		if m.cursor != 2 {
+			t.Errorf("cursor = %d, want 2 — the cursor must not rest on a session being removed", m.cursor)
+		}
+	})
+
+	t.Run("a mouse click on a deleting row selects nothing", func(t *testing.T) {
+		m := newModel()
+		// Row 2 of the pane is the first list row (notices 0 + header 2), and
+		// the fleet header takes it, so the sessions start at row 3.
+		listTop := m.noticeLines() + m.headerLines()
+		for idx, wantOK := range map[int]bool{0: true, 1: false, 2: false} {
+			top, _ := m.sessionCardTop(idx)
+			row := listTop + top - m.scrollOffset
+			gotIdx, ok := m.sessionIndexAtRow(row)
+			if !ok || gotIdx != idx {
+				t.Fatalf("row %d does not map back to session %d (%d, %v)", row, idx, gotIdx, ok)
+			}
+			if _, actionable := m.sessionAt(gotIdx); actionable != wantOK {
+				t.Errorf("clicking session %q: actionable = %v, want %v", m.sessions[idx].ID, actionable, wantOK)
+			}
 		}
 	})
 }
@@ -1139,12 +1475,879 @@ func TestPendingCursorRestore(t *testing.T) {
 	}
 }
 
+// --- list header ---
+
+// TestStatusCounts pins the three properties the header depends on: urgency
+// order (PERMISSION first, so a narrow pane drops the least urgent groups),
+// omission of empty statuses, and one trailing bucket for everything the
+// display vocabulary does not know.
+func TestStatusCounts(t *testing.T) {
+	t.Run("urgency order regardless of input order", func(t *testing.T) {
+		// Deliberately scrambled, and IDLE appears twice to prove counting.
+		sessions := []session.Info{
+			{ID: "1", Status: session.StatusIdle},
+			{ID: "2", Status: session.StatusDeleting},
+			{ID: "3", Status: session.StatusThinking},
+			{ID: "4", Status: session.StatusStopped},
+			{ID: "5", Status: session.StatusIdle},
+			{ID: "6", Status: session.StatusCreating},
+			{ID: "7", Status: session.StatusPermission},
+			{ID: "8", Status: session.StatusRunning},
+		}
+		want := []statusCount{
+			{session.StatusPermission, 1},
+			{session.StatusThinking, 1},
+			{session.StatusRunning, 1},
+			{session.StatusCreating, 1},
+			{session.StatusIdle, 2},
+			{session.StatusStopped, 1},
+			{session.StatusDeleting, 1},
+		}
+		got := plainModel().statusCounts(sessions)
+		if len(got) != len(want) {
+			t.Fatalf("statusCounts() = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("statusCounts()[%d] = %v, want %v", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("statuses with no sessions are omitted", func(t *testing.T) {
+		sessions := []session.Info{
+			{ID: "1", Status: session.StatusIdle},
+			{ID: "2", Status: session.StatusIdle},
+		}
+		got := plainModel().statusCounts(sessions)
+		want := []statusCount{{session.StatusIdle, 2}}
+		if len(got) != 1 || got[0] != want[0] {
+			t.Errorf("statusCounts() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("no sessions yields no groups", func(t *testing.T) {
+		if got := plainModel().statusCounts(nil); len(got) != 0 {
+			t.Errorf("statusCounts(nil) = %v, want empty", got)
+		}
+	})
+
+	t.Run("unrecognised statuses collapse into one trailing bucket", func(t *testing.T) {
+		sessions := []session.Info{
+			{ID: "1", Status: session.Status("zombie")},
+			{ID: "2", Status: session.Status("")},
+			{ID: "3", Status: session.StatusIdle},
+		}
+		got := plainModel().statusCounts(sessions)
+		if len(got) != 2 {
+			t.Fatalf("statusCounts() = %v, want 2 groups (idle + unknown bucket)", got)
+		}
+		if got[0].Status != session.StatusIdle {
+			t.Errorf("first group = %v, want the known status first", got[0])
+		}
+		bucket := got[1]
+		if bucket.N != 2 {
+			t.Errorf("unknown bucket N = %d, want 2 (both unrecognised statuses)", bucket.N)
+		}
+		// The bucket covers several distinct values, so the only thing defined
+		// for its Status is how getStatusDisplay renders it.
+		if _, label, _ := getStatusDisplay(bucket.Status); label != "UNKNOWN" {
+			t.Errorf("unknown bucket renders as %q, want UNKNOWN", label)
+		}
+	})
+}
+
+// TestRenderListHeader covers the count line: its shape at a comfortable
+// width, the singular wording, and what survives when the pane is too narrow
+// to hold every group.
+func TestRenderListHeader(t *testing.T) {
+	sessions := func(perStatus map[session.Status]int) []session.Info {
+		var out []session.Info
+		for _, status := range []session.Status{session.StatusPermission, session.StatusThinking, session.StatusIdle} {
+			for i := 0; i < perStatus[status]; i++ {
+				out = append(out, session.Info{ID: fmt.Sprintf("%s-%d", status, i), Status: status})
+			}
+		}
+		return out
+	}
+
+	t.Run("total plus one group per non-empty status", func(t *testing.T) {
+		got := plainModel().renderListHeader(sessions(map[session.Status]int{
+			session.StatusPermission: 1,
+			session.StatusThinking:   2,
+			session.StatusIdle:       4,
+		}), 40)
+		for _, want := range []string{"7 sessions", "? 1", "⚡ 2", "○ 4"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("renderListHeader() = %q, want it to contain %q", got, want)
+			}
+		}
+		if w := lipgloss.Width(got); w > 40 {
+			t.Errorf("rendered width = %d, want <= 40: %q", w, got)
+		}
+	})
+
+	t.Run("singular total", func(t *testing.T) {
+		got := plainModel().renderListHeader(sessions(map[session.Status]int{session.StatusIdle: 1}), 40)
+		if !strings.Contains(got, "1 session") || strings.Contains(got, "1 sessions") {
+			t.Errorf("renderListHeader() = %q, want the singular %q", got, "1 session")
+		}
+	})
+
+	t.Run("narrow pane drops groups from the least urgent end", func(t *testing.T) {
+		all := sessions(map[session.Status]int{
+			session.StatusPermission: 1,
+			session.StatusThinking:   2,
+			session.StatusIdle:       4,
+		})
+		// "7 sessions" (10) + gap 3 + "? 1" (3) = 16 fits; the next group
+		// would need 3 + 4 = 7 more.
+		const width = 18
+		got := plainModel().renderListHeader(all, width)
+		if w := lipgloss.Width(got); w > width {
+			t.Fatalf("rendered width = %d, want <= %d: %q", w, width, got)
+		}
+		// The total is never dropped: it is the one number always worth the
+		// space.
+		if !strings.Contains(got, "7 sessions") {
+			t.Errorf("renderListHeader() = %q, want the total to survive", got)
+		}
+		if !strings.Contains(got, "? 1") {
+			t.Errorf("renderListHeader() = %q, want PERMISSION to survive as the most urgent group", got)
+		}
+		for _, dropped := range []string{"⚡", "○"} {
+			if strings.Contains(got, dropped) {
+				t.Errorf("renderListHeader() = %q, want the less urgent %q dropped", got, dropped)
+			}
+		}
+	})
+
+	t.Run("a width that fits nothing but the total", func(t *testing.T) {
+		got := plainModel().renderListHeader(sessions(map[session.Status]int{session.StatusPermission: 3}), 10)
+		if got != helpStyle.Render("3 sessions") {
+			t.Errorf("renderListHeader() = %q, want the bare total", got)
+		}
+	})
+}
+
+// TestSessionsMsg_ClampsCursorOnEveryPath pins the invariant renderListContent
+// relies on: after a session list update the cursor indexes a real session.
+// The detail pane's subject is picked with displaySessions[m.cursor], so an
+// out-of-range cursor is a panic, not a blank pane. The pending-focus branch
+// returns early, so it has to be clamped before that fork, not after.
+func TestSessionsMsg_ClampsCursorOnEveryPath(t *testing.T) {
+	sessions := func(n int) []session.Info {
+		out := make([]session.Info, n)
+		for i := range out {
+			out[i] = session.Info{
+				ID:          fmt.Sprintf("id-%d", i),
+				Description: fmt.Sprintf("s%d", i),
+				Status:      session.StatusIdle,
+				Fleet:       session.DefaultFleet,
+			}
+		}
+		return out
+	}
+
+	cases := []struct {
+		name           string
+		focusSessionID string
+	}{
+		{name: "plain update"},
+		{name: "pending focus that cannot be resolved", focusSessionID: "ghost-id"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, remaining := range []int{0, 1, 3} {
+				m := Model{
+					sessions:       sessions(9),
+					cursor:         8, // valid before the shrink, past the end after
+					height:         16,
+					width:          40,
+					deletingIDs:    map[string]bool{},
+					focusSessionID: tc.focusSessionID,
+				}
+				next, _ := m.Update(sessionsMsg(sessions(remaining)))
+				got := next.(Model)
+
+				if got.cursor < 0 || (remaining > 0 && got.cursor >= remaining) {
+					t.Fatalf("remaining=%d: cursor = %d, out of range", remaining, got.cursor)
+				}
+				// The renderer must survive the same frame.
+				_ = got.renderListContent(38)
+			}
+		})
+	}
+}
+
+// --- one frame, one answer ---
+
+// TestEffectiveStatus_OneAnswerPerFrame pins the agreement between the three
+// places that draw a session's status. m.deletingIDs is the TUI's own
+// optimistic mark, set the moment a delete is accepted and before the daemon
+// reports StatusDeleting, so any renderer that reads sess.Status directly
+// disagrees with its neighbours for a whole poll interval.
+func TestEffectiveStatus_OneAnswerPerFrame(t *testing.T) {
+	sessions := []session.Info{
+		{ID: "going", Description: "going-away", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "staying", Description: "staying-put", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+	}
+	m := Model{
+		sessions:    sessions,
+		height:      16,
+		width:       40,
+		deletingIDs: map[string]bool{"going": true},
+	}
+
+	t.Run("the header counts the optimistic delete", func(t *testing.T) {
+		got := m.statusCounts(sessions)
+		want := []statusCount{{session.StatusIdle, 1}, {session.StatusDeleting, 1}}
+		if len(got) != len(want) {
+			t.Fatalf("statusCounts() = %v, want %v — the header still counts the session the list already shows as deleting", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("statusCounts()[%d] = %v, want %v", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("the row, the pane and the header show the same icon", func(t *testing.T) {
+		deletingIcon, _, _ := getStatusDisplay(session.StatusDeleting)
+
+		row := m.renderSession(sessions[0], true, false, 38)
+		if !strings.Contains(row, deletingIcon) {
+			t.Errorf("list row = %q, want the deleting icon %q", row, deletingIcon)
+		}
+		m.cursor = 0
+		pane := m.renderDetailPane(sessions[0], 38)
+		if !strings.Contains(pane, deletingIcon) {
+			t.Errorf("detail pane = %q, want the deleting icon %q", pane, deletingIcon)
+		}
+		if !strings.Contains(pane, "DELETING") {
+			t.Errorf("detail pane = %q, want the DELETING label", pane)
+		}
+		header := m.renderListHeader(sessions, 38)
+		if !strings.Contains(header, deletingIcon) {
+			t.Errorf("header = %q, want a group for the deleting session", header)
+		}
+	})
+
+	t.Run("the pane dims the name like the row does", func(t *testing.T) {
+		// deletingStyle's foreground is what "dim" means here; asserting on the
+		// rendered SGR keeps the test honest about what the user sees.
+		want := deletingStyle.Render("going-away")
+		pane := m.renderDetailPane(sessions[0], 38)
+		if !strings.Contains(pane, want) {
+			t.Errorf("detail pane does not dim the name of a deleting session: %q", pane)
+		}
+	})
+}
+
+// TestRenderDetailPane_NarrowWidths drives the pane below the width View()
+// ever hands it. The status line was the one line with no truncation of its
+// own, relying on a clamp several functions away; a line that outgrew the pane
+// would wrap and cost the fixed-height block a row.
+func TestRenderDetailPane_NarrowWidths(t *testing.T) {
+	m := plainModel()
+	sess := session.Info{
+		ID: "s", Description: "a session", Status: session.StatusPermission,
+		AgentKind: "claude", RepoName: "jind-ai", CurrentBranch: "feat/x",
+		LastUserMessage: "hello", LastAssistantMessage: "hi",
+	}
+	for width := 1; width <= 30; width++ {
+		got := m.renderDetailPane(sess, width)
+		if n := detailPaneLineCount(got); n != detailPaneLines {
+			t.Errorf("width %d: %d lines, want %d", width, n, detailPaneLines)
+		}
+		for i, line := range strings.Split(got, "\n") {
+			if w := lipgloss.Width(line); w > width {
+				t.Errorf("width %d: line %d is %d columns: %q", width, i, w, line)
+			}
+		}
+	}
+}
+
+// TestRenderSession_NarrowWidths is the list-row counterpart to
+// TestRenderDetailPane_NarrowWidths: one row must stay one row and stay inside
+// the pane no matter how little room there is, since sessionRowHeight is a
+// constant the scroll and hit-test arithmetic is built on.
+func TestRenderSession_NarrowWidths(t *testing.T) {
+	m := Model{deletingIDs: map[string]bool{"del": true}}
+	cases := []session.Info{
+		{ID: "s", Description: "a session", Status: session.StatusThinking},
+		{ID: "s", Description: strings.Repeat("全角", 20), Status: session.StatusPermission, DescriptionLocked: true},
+		{ID: "del", Description: "going away", Status: session.StatusIdle},
+		{ID: "s", Status: session.StatusIdle},
+	}
+	for _, sess := range cases {
+		for width := 1; width <= 30; width++ {
+			for _, selected := range []bool{false, true} {
+				got := m.renderSession(sess, selected, true, width)
+				if n := strings.Count(got, "\n"); n != 1 {
+					t.Fatalf("width %d selected=%v: %d newlines, want 1: %q", width, selected, n, got)
+				}
+				if w := lipgloss.Width(strings.TrimSuffix(got, "\n")); w > width {
+					t.Errorf("width %d selected=%v: row is %d columns: %q", width, selected, w, got)
+				}
+			}
+		}
+	}
+}
+
+// --- one ruler ---
+
+// TestOneRuler_TruncationBoundsRenderedWidth is the regression for the defect
+// that made the whole row geometry a lie: strings were cut with go-runewidth
+// but the composed line was measured with lipgloss, and the two disagree.
+//
+// Two independent ways they disagree, both reachable in production:
+//
+//   - Variation-Selector-16 emoji ("✔️", "⚠️" — how an agent routinely ends a
+//     message) are 1 cell to runewidth and 2 to lipgloss. A name cut to N
+//     runewidth cells could emit 2N real columns, wrap the row, and make one
+//     session occupy two physical rows.
+//   - go-runewidth reads the East-Asian ambiguous-width table from the process
+//     locale at init, so "○ ■ ▶" are 2 cells under LANG=ja_JP.UTF-8 and 1
+//     under C.UTF-8, while lipgloss never follows the locale.
+//
+// Asserting through lipgloss.Width is the point: it is the ruler that decides
+// whether a line fits the terminal, so it must be the ruler that bounds it.
+func TestOneRuler_TruncationBoundsRenderedWidth(t *testing.T) {
+	inputs := []struct {
+		name string
+		s    string
+	}{
+		{"VS16 emoji run", strings.Repeat("✔️", 40)},
+		{"VS16 emoji mixed with ASCII", strings.Repeat("done ✔️ ", 20)},
+		{"warning sign", strings.Repeat("⚠️ alert ", 20)},
+		{"locale-ambiguous glyphs", strings.Repeat("○■▶·", 30)},
+		{"full-width CJK", strings.Repeat("全角文字列", 30)},
+		{"CJK mixed with ASCII", strings.Repeat("全角abc", 30)},
+		{"plain ASCII", strings.Repeat("plain-ascii-", 30)},
+	}
+
+	for _, in := range inputs {
+		t.Run(in.name, func(t *testing.T) {
+			for width := 1; width <= 40; width++ {
+				if got := truncateString(in.s, width); lipgloss.Width(got) > width {
+					t.Errorf("truncateString(%s, %d) is %d columns wide: %q",
+						in.name, width, lipgloss.Width(got), got)
+				}
+				if got := truncateStringFromEnd(in.s, width); lipgloss.Width(got) > width {
+					t.Errorf("truncateStringFromEnd(%s, %d) is %d columns wide: %q",
+						in.name, width, lipgloss.Width(got), got)
+				}
+			}
+		})
+	}
+}
+
+// TestOneRuler_RowAndPaneSurviveWideGlyphs drives the two fixed-height
+// renderers with the same hostile strings, since a line that overflows there
+// wraps in the terminal and silently adds a physical row — breaking
+// sessionRowHeight / detailPaneLines and every offset computed from them.
+func TestOneRuler_RowAndPaneSurviveWideGlyphs(t *testing.T) {
+	hostile := []string{
+		strings.Repeat("✔️", 40),
+		strings.Repeat("⚠️ ", 30),
+		strings.Repeat("○■▶", 30),
+		strings.Repeat("絵文字と全角", 20),
+	}
+
+	m := plainModel()
+	for _, s := range hostile {
+		sess := session.Info{
+			ID: "s", Description: s, Status: session.StatusIdle, AgentKind: s,
+			RepoName: s, CurrentBranch: s, LastUserMessage: s, LastAssistantMessage: s,
+		}
+		for _, width := range []int{minTUIWidth - 2, 28, 38, maxTUIWidth - 2} {
+			row := m.renderSession(sess, true, true, width)
+			if w := lipgloss.Width(strings.TrimSuffix(row, "\n")); w > width {
+				t.Errorf("renderSession at width %d produced %d columns: %q", width, w, row)
+			}
+			if n := strings.Count(row, "\n"); n != 1 {
+				t.Errorf("renderSession at width %d produced %d newlines, want 1", width, n)
+			}
+
+			pane := m.renderDetailPane(sess, width)
+			if n := detailPaneLineCount(pane); n != detailPaneLines {
+				t.Errorf("renderDetailPane at width %d produced %d lines, want %d", width, n, detailPaneLines)
+			}
+			for i, line := range strings.Split(pane, "\n") {
+				if w := lipgloss.Width(line); w > width {
+					t.Errorf("renderDetailPane at width %d: line %d is %d columns: %q", width, i, w, line)
+				}
+			}
+		}
+	}
+}
+
+// --- renderDetailPane ---
+
+// detailPaneLineCount splits a rendered detail pane into its lines.
+func detailPaneLineCount(s string) int {
+	return len(strings.Split(s, "\n"))
+}
+
+// TestRenderDetailPane_FixedHeight is the load-bearing test for the detail
+// pane: listAreaLines(), every scroll clamp and every mouse hit-test subtract
+// detailPaneLines as a constant, so a pane that grew or shrank with its
+// session's contents would silently move the list out from under the cursor.
+func TestRenderDetailPane_FixedHeight(t *testing.T) {
+	m := plainModel()
+	const width = 38
+
+	long := strings.Repeat("absurdly-long-value-", 30)
+
+	tests := []struct {
+		name string
+		sess session.Info
+	}{
+		{
+			name: "fully populated",
+			sess: session.Info{
+				ID: "s", Description: "plugin registry の crawler を実装して",
+				Status: session.StatusThinking, AgentKind: "claude",
+				RepoName: "jind-ai", CurrentBranch: "feat/registry",
+				LastUserMessage: "次の task を進めて", LastAssistantMessage: "name 衝突ルールを整理しました",
+			},
+		},
+		{name: "entirely empty", sess: session.Info{ID: "s"}},
+		{name: "no messages", sess: session.Info{ID: "s", Description: "d", Status: session.StatusIdle, RepoName: "r", CurrentBranch: "b"}},
+		{name: "no branch", sess: session.Info{ID: "s", Description: "d", Status: session.StatusIdle, RepoName: "r"}},
+		{name: "no repo, falls back to workdir", sess: session.Info{ID: "s", Description: "d", Status: session.StatusIdle, WorkDir: "/tmp/somewhere", CurrentBranch: "b"}},
+		{name: "no repo and no branch", sess: session.Info{ID: "s", Description: "d", Status: session.StatusIdle, WorkDir: "/tmp/somewhere"}},
+		{name: "locked description", sess: session.Info{ID: "s", Description: "d", DescriptionLocked: true, Status: session.StatusIdle}},
+		{
+			name: "absurdly long everything",
+			sess: session.Info{
+				ID: "s", Description: long, Status: session.StatusPermission, AgentKind: long,
+				RepoName: long, CurrentBranch: long, LastUserMessage: long, LastAssistantMessage: long,
+			},
+		},
+		{
+			name: "full-width CJK everywhere",
+			sess: session.Info{
+				ID: "s", Description: strings.Repeat("セッション", 20), Status: session.StatusRunning,
+				RepoName: strings.Repeat("リポジトリ", 10), CurrentBranch: strings.Repeat("ブランチ", 10),
+				LastUserMessage: strings.Repeat("質問", 40), LastAssistantMessage: strings.Repeat("回答", 40),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := m.renderDetailPane(tt.sess, width)
+			if n := detailPaneLineCount(got); n != detailPaneLines {
+				t.Errorf("renderDetailPane() produced %d lines, want exactly %d", n, detailPaneLines)
+			}
+			for i, line := range strings.Split(got, "\n") {
+				if w := lipgloss.Width(line); w > width {
+					t.Errorf("line %d is %d columns wide, want <= %d: %q", i, w, width, line)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderDetailPane_BranchPriority pins the width fight on line 4: several
+// sessions on one repo is the main use, and there the repo name is identical on
+// every row while the branch is the only thing telling them apart.
+func TestRenderDetailPane_BranchPriority(t *testing.T) {
+	m := plainModel()
+	sess := session.Info{
+		ID: "s", Description: "d", Status: session.StatusIdle,
+		RepoName: "jind-ai", CurrentBranch: "feat/plugin-multi-action-dispatch",
+	}
+
+	repoBranchLine := func(width int) string {
+		return strings.Split(m.renderDetailPane(sess, width), "\n")[3]
+	}
+
+	t.Run("wide enough for both", func(t *testing.T) {
+		got := repoBranchLine(60)
+		if !strings.Contains(got, "jind-ai") {
+			t.Errorf("line = %q, want the repo present at a comfortable width", got)
+		}
+		if !strings.Contains(got, "feat/plugin-multi-action-dispatch") {
+			t.Errorf("line = %q, want the branch present in full", got)
+		}
+	})
+
+	t.Run("narrow keeps the branch tail and sacrifices the repo", func(t *testing.T) {
+		const width = 30
+		got := repoBranchLine(width)
+		if w := lipgloss.Width(got); w > width {
+			t.Fatalf("line is %d columns wide, want <= %d: %q", w, width, got)
+		}
+		// Truncated from the END, so the identifying tail survives: "feat/" is
+		// shared by half the branches in the repo and carries nothing.
+		if !strings.Contains(got, "multi-action-dispatch") {
+			t.Errorf("line = %q, want the branch tail %q to survive", got, "multi-action-dispatch")
+		}
+		if strings.Contains(got, "jind-ai") {
+			t.Errorf("line = %q, want the repo cut back to make room for the branch", got)
+		}
+	})
+
+	t.Run("a repo that would only fit truncated is dropped whole", func(t *testing.T) {
+		// avail 39, branch 33 columns, so the repo is offered 5 — enough for
+		// "ji..." and nothing more. A truncated repo name disambiguates
+		// nothing (it fits jind-ai and jind-ai-notifier alike) and this pane
+		// is the only place it appears, so the columns go to the branch.
+		got := repoBranchLine(40)
+		if !strings.Contains(got, "feat/plugin-multi-action-dispatch") {
+			t.Fatalf("line = %q, want the branch in full at this width", got)
+		}
+		// Check for the stub the old truncating behaviour produced rather
+		// than a bare "ji", which also matches text inside the branch.
+		for _, stub := range []string{"ji...", "jind-...", "jind-ai"} {
+			if strings.Contains(got, stub) {
+				t.Errorf("line = %q, want no repo fragment; found %q", got, stub)
+			}
+		}
+	})
+
+	t.Run("the workdir fallback keeps its tail", func(t *testing.T) {
+		// A path is the one thing here worth truncating: its tail identifies
+		// it, while its head is shared with everything under the same root.
+		noRepo := session.Info{
+			ID: "s", Description: "d", Status: session.StatusIdle,
+			WorkDir: "/var/opt/some/deeply/nested/place/notes", CurrentBranch: "main",
+		}
+		got := strings.Split(m.renderDetailPane(noRepo, 30), "\n")[3]
+		if !strings.Contains(got, "notes") {
+			t.Errorf("line = %q, want the path tail %q to survive", got, "notes")
+		}
+	})
+
+	t.Run("no branch leaves the repo the whole line", func(t *testing.T) {
+		noBranch := sess
+		noBranch.CurrentBranch = ""
+		got := strings.Split(m.renderDetailPane(noBranch, 30), "\n")[3]
+		if !strings.Contains(got, "jind-ai") {
+			t.Errorf("line = %q, want the repo shown when there is no branch to compete with", got)
+		}
+	})
+}
+
+// TestRenderDetailPane_FollowsCursor is the spec's headline requirement: the
+// detail pane describes the session under the CURSOR, while the tmux pane on
+// the right keeps showing whatever the user last attached to. The two notions
+// of "current" are deliberately orthogonal, and being able to read a session
+// without switching to it is the entire point of the pane.
+func TestRenderDetailPane_FollowsCursor(t *testing.T) {
+	sessions := []session.Info{
+		{ID: "a", Description: "alpha-session", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "b", Description: "bravo-session", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "c", Description: "charlie-session", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+	}
+	newModel := func() Model {
+		return Model{sessions: sessions, height: 16, width: 40, deletingIDs: map[string]bool{}}
+	}
+
+	t.Run("moving the cursor changes the described session", func(t *testing.T) {
+		m := newModel()
+		for i, want := range []string{"alpha-session", "bravo-session", "charlie-session"} {
+			m.cursor = i
+			got := m.renderListContent(38)
+			if !strings.Contains(got, want) {
+				t.Errorf("cursor %d: rendered content does not mention %q", i, want)
+			}
+			// The name appears once in its list row and once in the detail
+			// pane; the other two sessions appear only in their rows.
+			if n := strings.Count(got, want); n != 2 {
+				t.Errorf("cursor %d: %q appears %d times, want 2 (list row + detail pane)", i, want, n)
+			}
+		}
+	})
+
+	t.Run("the displayed session does not steer the pane", func(t *testing.T) {
+		m := newModel()
+		m.cursor = 0
+		// The user is attached to "charlie" on the right while the cursor sits
+		// on "alpha". The pane must describe alpha.
+		m.currentSessionID = "c"
+		got := m.renderListContent(38)
+		if n := strings.Count(got, "alpha-session"); n != 2 {
+			t.Errorf("%q appears %d times, want 2 — the detail pane must follow the cursor", "alpha-session", n)
+		}
+		if n := strings.Count(got, "charlie-session"); n != 1 {
+			t.Errorf("%q appears %d times, want 1 — the viewed session gets no detail block", "charlie-session", n)
+		}
+	})
+}
+
+// --- renderListContent ---
+
+// TestRenderListContent_MatchesGeometry is the test the whole design rests on:
+// it checks that what renderListContent actually EMITS agrees, row for row,
+// with what the geometry functions claim. Everything else — scroll clamping,
+// PageUp/PageDown, mouse hit-testing — is arithmetic derived from those
+// functions, so if the renderer and the arithmetic disagree by even one row,
+// every click below the disagreement lands on the wrong session.
+//
+// The old code kept that agreement by hand ("keep cardHeight in sync with
+// renderSession"); this change replaces the contract with constants, and this
+// test is what makes the replacement real rather than asserted.
+func TestRenderListContent_MatchesGeometry(t *testing.T) {
+	build := func(n int, fleets []string) []session.Info {
+		out := make([]session.Info, n)
+		for i := range out {
+			out[i] = session.Info{
+				ID:          fmt.Sprintf("id-%02d", i),
+				Description: fmt.Sprintf("session-%02d", i),
+				Status:      session.StatusIdle,
+				Fleet:       fleets[i%len(fleets)],
+			}
+		}
+		return out
+	}
+
+	for _, fleets := range [][]string{{session.DefaultFleet}, {"backend", session.DefaultFleet}} {
+		for _, n := range []int{1, 2, 3, 8, 20} {
+			for height := 6; height <= 26; height++ {
+				for _, withNotice := range []bool{false, true} {
+					for _, scroll := range []int{0, 1, 5, 999} {
+						m := Model{
+							sessions:     build(n, fleets),
+							height:       height,
+							width:        40,
+							deletingIDs:  map[string]bool{},
+							scrollOffset: scroll,
+						}
+						if withNotice {
+							m.warning = "heads up"
+						}
+						m.cursor = min(n-1, 3)
+						m.clampScroll()
+
+						lines := strings.Split(m.renderListContent(38), "\n")
+						budget := m.noticeLines() + m.headerLines() + m.listAreaLines() + m.detailLines()
+						label := fmt.Sprintf("fleets=%d n=%d height=%d notice=%v scroll=%d",
+							len(fleets), n, height, withNotice, scroll)
+
+						// Never exceed the budget: an extra row pushes the
+						// bottom of the content past the pane, which MaxHeight
+						// then clips — silently, and from the wrong end.
+						if len(lines) > budget {
+							t.Fatalf("%s: rendered %d lines, geometry budgets %d (notices %d + header %d + list %d + detail %d)",
+								label, len(lines), budget,
+								m.noticeLines(), m.headerLines(), m.listAreaLines(), m.detailLines())
+						}
+						// When the detail pane is drawn the total must be
+						// exact, because that is what pins the pane to the
+						// bottom edge. With no detail pane the trailing blanks
+						// are the pane style's job, so a short list is fine.
+						if m.detailVisible() && len(lines) != budget {
+							t.Fatalf("%s: detail pane visible but rendered %d lines, want exactly %d — the pane is not on the bottom edge",
+								label, len(lines), budget)
+						}
+
+						// The list window must start exactly where the mouse
+						// hit-test believes it starts.
+						listTop := m.noticeLines() + m.headerLines()
+						for idx := range m.sessions {
+							top, _ := m.sessionCardTop(idx)
+							row := listTop + top - m.scrollOffset
+							if row < listTop || row >= listTop+m.listAreaLines() {
+								continue // scrolled out of view
+							}
+							if !strings.Contains(lines[row], m.sessions[idx].Description) {
+								t.Fatalf("%s: session %d should be drawn on row %d, got %q",
+									label, idx, row, lines[row])
+							}
+							if got, ok := m.sessionIndexAtRow(row); !ok || got != idx {
+								t.Fatalf("%s: sessionIndexAtRow(%d) = (%d, %v), want (%d, true)",
+									label, row, got, ok, idx)
+							}
+						}
+
+						// The detail pane must begin on the first row after the
+						// list area, so it sits on the pane's bottom edge.
+						if m.detailVisible() {
+							ruleRow := listTop + m.listAreaLines()
+							if !strings.Contains(lines[ruleRow], "─") {
+								t.Fatalf("%s: detail pane rule should be on row %d, got %q",
+									label, ruleRow, lines[ruleRow])
+							}
+							if !strings.Contains(lines[ruleRow+1], m.sessions[m.cursor].Description) {
+								t.Fatalf("%s: detail pane should name the cursor's session on row %d, got %q",
+									label, ruleRow+1, lines[ruleRow+1])
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestRenderListContent_NoLineExceedsWidth guards the geometry from the one
+// failure it cannot see: a line wider than the pane wraps in the terminal, so
+// one rendered row becomes two physical rows and every scroll and hit-test
+// offset below it is off by one.
+func TestRenderListContent_NoLineExceedsWidth(t *testing.T) {
+	long := strings.Repeat("wide-", 40)
+	cjk := strings.Repeat("全角文字列", 20)
+
+	sessions := []session.Info{
+		{ID: "a", Description: long, Status: session.StatusThinking, Fleet: "backend", RepoName: long, CurrentBranch: long, AgentKind: "claude", LastUserMessage: long, LastAssistantMessage: long},
+		{ID: "b", Description: cjk, Status: session.StatusPermission, Fleet: "backend", RepoName: cjk, CurrentBranch: cjk, LastUserMessage: cjk, LastAssistantMessage: cjk},
+		{ID: "c", Description: "short", DescriptionLocked: true, Status: session.Status("bogus"), Fleet: session.DefaultFleet},
+		{ID: "d", Description: "deleting", Status: session.StatusDeleting, Fleet: session.DefaultFleet},
+	}
+
+	// minTUIWidth and maxTUIWidth bound the pane the outer tmux gives us; the
+	// content sits inside one column of padding on each side.
+	for _, paneWidth := range []int{minTUIWidth, 40, maxTUIWidth} {
+		for _, height := range []int{8, 14, 16, 30} {
+			for cursor := range sessions {
+				m := Model{
+					sessions:         sessions,
+					cursor:           cursor,
+					width:            paneWidth,
+					height:           height,
+					deletingIDs:      map[string]bool{"d": true},
+					currentSessionID: "b",
+					warning:          "a warning that pushes everything down",
+				}
+				contentWidth := paneWidth - 2
+				for i, line := range strings.Split(m.renderListContent(contentWidth), "\n") {
+					if w := lipgloss.Width(line); w > contentWidth {
+						t.Fatalf("pane %dx%d cursor %d: line %d is %d columns wide, want <= %d: %q",
+							paneWidth, height, cursor, i, w, contentWidth, line)
+					}
+				}
+			}
+		}
+	}
+}
+
 // --- renderSession ---
 
+// TestRenderSession_OneLine pins the invariant the whole list geometry rests
+// on: a session row is exactly one line, whatever the session carries. It
+// replaces the old hand-maintained "cardHeight matches renderSession" contract
+// — there is nothing left to keep in sync, only this to keep true.
+func TestRenderSession_OneLine(t *testing.T) {
+	longName := strings.Repeat("very-long-session-name-", 20)
+	cjkName := strings.Repeat("セッション名前", 10) // full-width: 2 columns per rune
+
+	tests := []struct {
+		name string
+		m    Model
+		sess session.Info
+	}{
+		{
+			name: "plain",
+			m:    plainModel(),
+			sess: session.Info{ID: "s", Description: "plain", Status: session.StatusIdle},
+		},
+		{
+			name: "empty description",
+			m:    plainModel(),
+			sess: session.Info{ID: "s", Status: session.StatusIdle},
+		},
+		{
+			name: "deleting via the TUI's optimistic mark",
+			m:    Model{deletingIDs: map[string]bool{"s": true}},
+			sess: session.Info{ID: "s", Description: "going away", Status: session.StatusIdle},
+		},
+		{
+			name: "deleting via the daemon-reported status",
+			m:    plainModel(),
+			sess: session.Info{ID: "s", Description: "going away", Status: session.StatusDeleting},
+		},
+		{
+			name: "very long name",
+			m:    plainModel(),
+			sess: session.Info{ID: "s", Description: longName, Status: session.StatusThinking},
+		},
+		{
+			name: "full-width name",
+			m:    plainModel(),
+			sess: session.Info{ID: "s", Description: cjkName, Status: session.StatusThinking},
+		},
+		{
+			name: "locked description",
+			m:    plainModel(),
+			sess: session.Info{ID: "s", Description: longName, DescriptionLocked: true, Status: session.StatusIdle},
+		},
+		{
+			name: "message fields no longer render (they moved to the detail pane)",
+			m:    plainModel(),
+			sess: session.Info{
+				ID: "s", Description: "chatty", Status: session.StatusIdle,
+				CurrentBranch: "feat/x", LastUserMessage: "hi", LastAssistantMessage: "yo",
+			},
+		},
+	}
+
+	// minTUIWidth (30) is the narrowest pane the TUI allows; 40 is typical.
+	for _, width := range []int{30, 40} {
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%s/width=%d", tt.name, width), func(t *testing.T) {
+				got := tt.m.renderSession(tt.sess, false, false, width)
+				if n := strings.Count(got, "\n"); n != 1 {
+					t.Errorf("renderSession() has %d newlines, want 1: %q", n, got)
+				}
+				if !strings.HasSuffix(got, "\n") {
+					t.Errorf("renderSession() must end with a newline: %q", got)
+				}
+				// Overflowing by even one column wraps the row in the
+				// terminal, which would break the geometry on screen while
+				// the returned string still looked like one line.
+				if w := lipgloss.Width(strings.TrimSuffix(got, "\n")); w > width {
+					t.Errorf("rendered width = %d, want <= %d: %q", w, width, got)
+				}
+			})
+		}
+	}
+}
+
+// TestRenderSession_Layout pins the fixed column layout: the name always
+// starts at sessionRowLead so the list reads as a table, and a locked
+// description keeps its '*' marker.
+func TestRenderSession_Layout(t *testing.T) {
+	m := plainModel()
+	const width = 40
+
+	t.Run("name starts at the same column whatever the icon width", func(t *testing.T) {
+		// "⚡" (THINKING) is 2 columns, "○" (IDLE) is 1; padIcon absorbs the
+		// difference.
+		for _, status := range []session.Status{session.StatusIdle, session.StatusThinking, session.StatusPermission} {
+			sess := session.Info{ID: "s", Description: "name", Status: status}
+			line := strings.TrimSuffix(m.renderSession(sess, false, false, width), "\n")
+			if idx := strings.Index(line, "name"); idx < 0 {
+				t.Fatalf("status %q: name missing from %q", status, line)
+			} else if col := lipgloss.Width(line[:idx]); col != sessionRowLead {
+				t.Errorf("status %q: name starts at column %d, want %d", status, col, sessionRowLead)
+			}
+		}
+	})
+
+	t.Run("locked description keeps its marker", func(t *testing.T) {
+		sess := session.Info{ID: "s", Description: "locked", DescriptionLocked: true, Status: session.StatusIdle}
+		if got := m.renderSession(sess, false, false, width); !strings.Contains(got, "locked*") {
+			t.Errorf("renderSession() = %q, want the lock marker after the name", got)
+		}
+	})
+
+	t.Run("empty description gets no lock marker", func(t *testing.T) {
+		sess := session.Info{ID: "s", DescriptionLocked: true, Status: session.StatusIdle}
+		if got := m.renderSession(sess, false, false, width); strings.Contains(got, "*") {
+			t.Errorf("renderSession() = %q, want no lock marker on an empty name", got)
+		}
+	})
+}
+
 // TestRenderSession_Indicators verifies the two orthogonal indicators:
-//   - selected → blue '▎' cursor bar on every card line
-//   - viewed   → subdued row background across every card line (detectable
-//     via presence of an ANSI SGR bg code in the rendered output)
+//   - selected → blue '▎' cursor bar in the row's first column
+//   - viewed   → subdued row background (detectable via presence of an ANSI
+//     SGR bg code in the rendered output)
 func TestRenderSession_Indicators(t *testing.T) {
 	sess := session.Info{
 		ID:          "test-id",
@@ -1174,19 +2377,23 @@ func TestRenderSession_Indicators(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := m.renderSession(sess, tt.selected, tt.viewed, width)
-			lines := strings.Split(result, "\n")
-			if len(lines) == 0 {
-				t.Fatal("renderSession returned empty string")
+			row := strings.TrimSuffix(m.renderSession(sess, tt.selected, tt.viewed, width), "\n")
+			if row == "" {
+				t.Fatal("renderSession returned an empty row")
 			}
-			firstLine := lines[0]
-			hasBar := strings.Contains(firstLine, "▎")
+			hasBar := strings.Contains(row, "▎")
 			if hasBar != tt.wantBar {
-				t.Errorf("cursor bar present = %v, want %v (line: %q)", hasBar, tt.wantBar, firstLine)
+				t.Errorf("cursor bar present = %v, want %v (row: %q)", hasBar, tt.wantBar, row)
 			}
-			hasViewBg := strings.Contains(firstLine, bgSGR)
+			hasViewBg := strings.Contains(row, bgSGR)
 			if hasViewBg != tt.wantViewBg {
-				t.Errorf("viewed background present = %v, want %v (line: %q)", hasViewBg, tt.wantViewBg, firstLine)
+				t.Errorf("viewed background present = %v, want %v (row: %q)", hasViewBg, tt.wantViewBg, row)
+			}
+			// The background must reach the end of the row: with the blank
+			// spacer between cards gone, a short background would leave a
+			// ragged right edge instead of a continuous band.
+			if tt.wantViewBg && !strings.HasSuffix(row, "\x1b[0m") {
+				t.Errorf("viewed row does not end in a styled segment: %q", row)
 			}
 		})
 	}

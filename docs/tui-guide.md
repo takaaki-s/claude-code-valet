@@ -30,6 +30,20 @@ cmd/jin/cmd/
 - tmux.Client (for popup launch and pane control)
 - Polling timer (tickMsg)
 
+The left pane is a master-detail layout drawn entirely with lipgloss (no tmux
+split — a split would mean a second process and IPC). It has three regions with
+fixed budgets: a count header (`listHeaderLines`), the scrollable session list
+(one row per session, `sessionRowHeight`), and a detail pane for the session
+under the cursor (`detailPaneLines`). `contentAreaLines()` is the parent budget
+and `listAreaLines()` is what every scroll clamp and mouse hit-test measures
+against — not `contentAreaLines()`. The detail pane is dropped whole rather
+than shrunk when the list would fall below `minListLines`, which is what keeps
+those heights constant and the geometry testable.
+
+The detail pane follows the **cursor**, while the right-hand tmux pane follows
+`currentSessionID`; the two are deliberately orthogonal, so moving the cursor
+never switches panes.
+
 ## Update/View Pattern
 
 ```go

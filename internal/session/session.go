@@ -105,6 +105,13 @@ type Session struct {
 	CurrentBranch  string `json:"-"`                          // Current git branch
 	IsGitRepo      bool   `json:"-"`                          // Whether CurrentWorkDir is inside a git repository
 	IsWorktree     bool   `json:"-"`                          // Whether CurrentWorkDir is a git worktree (not the main repo)
+	// RepoName is the human-facing repository name (ResolveRepoName): for a
+	// worktree it is the main repo's name, not the worktree directory's.
+	// Runtime-only for the same reason as CurrentBranch — it describes where
+	// the agent currently is, which the next poll re-derives — but unlike the
+	// branch it is also seeded at create, provision and load time so stopped
+	// and freshly-restored sessions still have one.
+	RepoName string `json:"-"`
 }
 
 // Info returns session information for display
@@ -126,6 +133,7 @@ type Info struct {
 	// Tracked fields (dynamic, from daemon polling)
 	CurrentWorkDir string `json:"current_work_dir,omitempty"` // Current working directory
 	CurrentBranch  string `json:"current_branch,omitempty"`   // Current git branch
+	RepoName       string `json:"repo_name,omitempty"`        // Repository name; the main repo's for a worktree (see Session.RepoName)
 	IsWorktree     bool   `json:"is_worktree,omitempty"`      // Whether WorkDir is a git worktree
 
 	// Last messages from transcript
@@ -171,6 +179,7 @@ func (s *Session) ToInfo() Info {
 		Fleet:             s.Fleet,
 		CurrentWorkDir:    s.CurrentWorkDir,
 		CurrentBranch:     s.CurrentBranch,
+		RepoName:          s.RepoName,
 		IsWorktree:        s.IsWorktree,
 	}
 }

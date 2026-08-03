@@ -186,6 +186,69 @@ func TestManager_CreateWithOptions_Success(t *testing.T) {
 	}
 }
 
+// TestManager_RepoNameReachesInfo covers the whole path the TUI's detail pane
+// reads: a session records the repo it lives in at create time, a worktree
+// reports the repo it was cut from rather than its own "jin-xxxxxxxx"
+// directory, and both survive the daemon restart that clears the json:"-"
+// runtime fields.
+func TestManager_RepoNameReachesInfo(t *testing.T) {
+	mainRepoDir, worktreeDir := repoFixtures(t)
+	wantRepo := filepath.Base(mainRepoDir)
+
+	stateDir := t.TempDir()
+	configDir := t.TempDir()
+	configMgr, err := config.NewManager(configDir)
+	if err != nil {
+		t.Fatalf("config.NewManager failed: %v", err)
+	}
+	mgr, err := NewManager(stateDir, configDir, configMgr)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	mgr.SetTmuxClient(newMockTmuxRunner())
+	mgr.SetHookRunner(newMockHookRunner())
+	mgr.SetAgentResolver(newFakeAgentResolver())
+
+	plain, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: mainRepoDir, Description: "plain"})
+	if err != nil {
+		t.Fatalf("CreateWithOptions(main repo) failed: %v", err)
+	}
+	if plain.RepoName != wantRepo {
+		t.Errorf("main repo session RepoName = %q, want %q", plain.RepoName, wantRepo)
+	}
+
+	wt, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: worktreeDir, Description: "wt"})
+	if err != nil {
+		t.Fatalf("CreateWithOptions(worktree) failed: %v", err)
+	}
+	if wt.RepoName != wantRepo {
+		t.Errorf("worktree session RepoName = %q, want the main repo %q (not the worktree dir)", wt.RepoName, wantRepo)
+	}
+
+	for _, info := range mgr.List() {
+		if info.RepoName != wantRepo {
+			t.Errorf("List() Info for %q has RepoName %q, want %q", info.Description, info.RepoName, wantRepo)
+		}
+	}
+
+	// Restart: RepoName is json:"-", so only the load-time recovery can put it
+	// back. Stopped sessions never reach captureOutputTmux, which is why the
+	// poll cannot be relied on here.
+	restarted, err := NewManager(stateDir, configDir, configMgr)
+	if err != nil {
+		t.Fatalf("NewManager (restart) failed: %v", err)
+	}
+	infos := restarted.List()
+	if len(infos) != 2 {
+		t.Fatalf("after restart List() returned %d sessions, want 2", len(infos))
+	}
+	for _, info := range infos {
+		if info.RepoName != wantRepo {
+			t.Errorf("after restart, Info for %q has RepoName %q, want %q", info.Description, info.RepoName, wantRepo)
+		}
+	}
+}
+
 func TestManager_CreateWithOptions_DefaultFleet(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 
@@ -2703,6 +2766,160 @@ func setupTestWorktree(t *testing.T) (string, string) {
 	runGit("worktree", "add", worktreeDir, "-b", "test-branch")
 
 	return repoDir, worktreeDir
+}
+
+// TestManager_RepoName_ProvisionAsync covers the write the whole RepoName
+// feature was built for: `jin new --worktree` puts the session in a directory
+// named after the session ("jin-b63188fe"), and the detail pane must show the
+// repo that worktree was cut from instead.
+//
+// ReserveCreation cannot cover it — at that point WorkDir is still the repo
+// root, so it would resolve correctly by accident. Only ProvisionAsync sees
+// the final worktree path.
+func TestManager_RepoName_ProvisionAsync(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	mgr, _, _ := newTestManager(t)
+
+	stateDir := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateDir)
+
+	repoDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	// `worktree add` is mocked, but it has to leave behind the thing
+	// ResolveRepoName reads: a directory whose .git is a FILE pointing back
+	// into <main-repo>/.git/worktrees/<name>. Without that the test would pass
+	// against a broken implementation, since a missing dir resolves to "".
+	var createdWorktree string
+	runner := &scriptedGitRunner{
+		handler: func(dir string, args []string) ([]byte, error) {
+			joined := strings.Join(args, " ")
+			switch {
+			case joined == "symbolic-ref refs/remotes/origin/HEAD":
+				return []byte("refs/remotes/origin/main\n"), nil
+			case len(args) >= 1 && args[0] == "fetch":
+				return nil, nil
+			case len(args) >= 2 && args[0] == "worktree" && args[1] == "prune":
+				return nil, nil
+			case len(args) >= 1 && args[0] == "rev-parse":
+				return nil, errors.New("exit status 1")
+			case len(args) >= 5 && args[0] == "worktree" && args[1] == "add":
+				createdWorktree = args[4]
+				name := filepath.Base(createdWorktree)
+				if err := os.MkdirAll(createdWorktree, 0o755); err != nil {
+					return nil, err
+				}
+				if err := os.MkdirAll(filepath.Join(repoDir, ".git", "worktrees", name), 0o755); err != nil {
+					return nil, err
+				}
+				gitFile := "gitdir: " + filepath.Join(repoDir, ".git", "worktrees", name) + "\n"
+				return nil, os.WriteFile(filepath.Join(createdWorktree, ".git"), []byte(gitFile), 0o644)
+			}
+			return nil, fmt.Errorf("unexpected git call: %s", joined)
+		},
+	}
+	mgr.gitClient = git.NewClientWithRunner(runner)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{
+		WorkDir:     repoDir,
+		Description: "wt-provision",
+		Worktree:    true,
+	})
+	if err != nil {
+		t.Fatalf("CreateWithOptions: %v", err)
+	}
+	if createdWorktree == "" {
+		t.Fatal("the worktree add mock never ran")
+	}
+
+	info, ok := mgr.GetInfo(sess.ID)
+	if !ok {
+		t.Fatal("GetInfo missed the session")
+	}
+	if info.WorkDir != createdWorktree {
+		t.Fatalf("WorkDir = %q, want the provisioned worktree %q", info.WorkDir, createdWorktree)
+	}
+	if info.RepoName != filepath.Base(repoDir) {
+		t.Errorf("after provisioning, Info.RepoName = %q, want the main repo %q", info.RepoName, filepath.Base(repoDir))
+	}
+	if info.RepoName == filepath.Base(createdWorktree) {
+		t.Errorf("Info.RepoName = %q — that is the worktree directory, which is exactly what this feature exists to avoid", info.RepoName)
+	}
+	// The contract ProvisionAsync's write actually maintains: RepoName always
+	// describes the session's current WorkDir. It happens to be satisfied
+	// already by the value ReserveCreation seeded (a worktree resolves to the
+	// repo it was cut from, which is the same repo root the reservation saw),
+	// so this pairing — not the individual assignment — is what is worth
+	// pinning. It catches the two ways it could break later: WorkDir moving
+	// without RepoName following, and the reserve-time seed diverging.
+	if want := ResolveRepoName(info.WorkDir); info.RepoName != want {
+		t.Errorf("Info.RepoName = %q but its WorkDir %q resolves to %q — the two have drifted apart",
+			info.RepoName, info.WorkDir, want)
+	}
+}
+
+// TestManager_RepoName_UpdateGitBranch covers the poll-time write: the agent
+// can cd anywhere, and the pane must describe where it actually is.
+func TestManager_RepoName_UpdateGitBranch(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	repoDir, worktreeDir := setupTestWorktree(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: repoDir, Description: "cd-follow"})
+	if err != nil {
+		t.Fatalf("CreateWithOptions: %v", err)
+	}
+	live, ok := mgr.Get(sess.ID)
+	if !ok {
+		t.Fatal("session vanished after create")
+	}
+
+	read := func() (string, string) {
+		mgr.mu.RLock()
+		defer mgr.mu.RUnlock()
+		return live.RepoName, live.CurrentBranch
+	}
+
+	t.Run("follows a cd into a different repo", func(t *testing.T) {
+		// A different repo, not another worktree of the same one: the value
+		// seeded at create time must actually be replaced, otherwise the test
+		// would pass against an implementation that never writes here.
+		otherRepo, _ := setupTestWorktree(t)
+		mgr.updateGitBranch(live, otherRepo, repoDir)
+		gotRepo, _ := read()
+		if gotRepo != filepath.Base(otherRepo) {
+			t.Errorf("RepoName = %q, want the repo the agent moved into, %q", gotRepo, filepath.Base(otherRepo))
+		}
+		if gotRepo == filepath.Base(repoDir) {
+			t.Errorf("RepoName is still the create-time repo %q — the poll never followed the cd", gotRepo)
+		}
+	})
+
+	t.Run("follows a cd into a worktree, reporting the main repo", func(t *testing.T) {
+		mgr.updateGitBranch(live, worktreeDir, repoDir)
+		gotRepo, gotBranch := read()
+		if gotRepo != filepath.Base(repoDir) {
+			t.Errorf("RepoName = %q, want the main repo %q", gotRepo, filepath.Base(repoDir))
+		}
+		if gotBranch != "test-branch" {
+			t.Errorf("CurrentBranch = %q, want %q", gotBranch, "test-branch")
+		}
+	})
+
+	t.Run("clears on a cd out of any repo", func(t *testing.T) {
+		nonGit := t.TempDir()
+		mgr.updateGitBranch(live, nonGit, worktreeDir)
+		gotRepo, gotBranch := read()
+		if gotRepo != "" {
+			t.Errorf("RepoName = %q, want empty outside a repo — a stale repo name is worse than none", gotRepo)
+		}
+		if gotBranch != "" {
+			t.Errorf("CurrentBranch = %q, want empty", gotBranch)
+		}
+	})
 }
 
 func TestManager_Delete_RemovesWorktree(t *testing.T) {

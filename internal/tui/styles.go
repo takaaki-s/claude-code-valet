@@ -1,6 +1,23 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
+)
+
+// go-runewidth reads the East-Asian ambiguous-width table from the process
+// locale when it initialises, so "○", "■" and "▶" measure 2 cells under
+// LANG=ja_JP.UTF-8 and 1 under C.UTF-8. Nothing that actually draws follows
+// the locale — lipgloss and the terminals we target treat them as 1 — so a
+// layout measured with the locale-sensitive table comes out misaligned for
+// exactly the users whose locale is East Asian.
+//
+// model.go measures with x/ansi (the ruler lipgloss itself uses) and does not
+// depend on this. The sibling popup models still measure with runewidth, so
+// pinning the table here keeps the whole package on one answer.
+func init() {
+	runewidth.DefaultCondition.EastAsianWidth = false
+}
 
 var (
 	// Colors - Tokyo Night inspired palette
@@ -17,14 +34,14 @@ var (
 	helpStyle = lipgloss.NewStyle().
 			Foreground(secondaryColor)
 
-	// Selected item style: the "cursor" — a bold, blue vertical bar '▎'
-	// spanning every line of the card, and a bold, blue name on line 1.
+	// Selected item style: the "cursor" — a bold, blue vertical bar '▎' in the
+	// row's first column, and a bold, blue name beside it.
 	selectedItemStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(primaryColor)
 
 	// Viewed background: the session currently shown in the display pane
-	// gets a subtle full-row background reverse across every card line.
+	// gets a subtle background across the full width of its row.
 	// AdaptiveColor auto-picks a subdued shade for light and dark terminal
 	// themes (lipgloss queries the terminal background via OSC 11 on start).
 	// Chosen to be perceptibly present without stealing attention from the
