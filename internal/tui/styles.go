@@ -1,6 +1,23 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
+)
+
+// go-runewidth reads the East-Asian ambiguous-width table from the process
+// locale when it initialises, so "○", "■" and "▶" measure 2 cells under
+// LANG=ja_JP.UTF-8 and 1 under C.UTF-8. Nothing that actually draws follows
+// the locale — lipgloss and the terminals we target treat them as 1 — so a
+// layout measured with the locale-sensitive table comes out misaligned for
+// exactly the users whose locale is East Asian.
+//
+// model.go measures with x/ansi (the ruler lipgloss itself uses) and does not
+// depend on this. The sibling popup models still measure with runewidth, so
+// pinning the table here keeps the whole package on one answer.
+func init() {
+	runewidth.DefaultCondition.EastAsianWidth = false
+}
 
 var (
 	// Colors - Tokyo Night inspired palette
