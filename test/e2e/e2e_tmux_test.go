@@ -72,7 +72,15 @@ func hasTmuxSession(name string) bool {
 // This is the barrier for session *creation*, the mirror of waitForSessionGone
 // for deletion. `new` returns a StatusCreating reservation and the daemon
 // provisions and starts the session in a goroutine, so anything a test wants to
-// observe about a Start:true session has to be waited for. StatusRunning is the
+// observe about a Start:true session has to be waited for.
+//
+// Every client.NewWithOptions in this package must be followed by this call
+// before any assertion about the session's status — including assertions made
+// after some other operation, because the creation goroutine's final write
+// races that operation rather than preceding it. Start:true settles on
+// StatusRunning, Start:false on StatusStopped. Skipping it is how
+// TestE2E_HookEventFlow came to fail CI on an unrelated PR: its hook set
+// "thinking" and the goroutine then wrote "stopped" over it. StatusRunning is the
 // useful barrier: startSessionTmux creates the inner tmux session first and only
 // then flips the status, so "running" implies the tmux session exists — while
 // still leaving a following hasTmuxSession check meaningful rather than
@@ -464,6 +472,13 @@ func TestE2E_HookCWDUpdateOnStartedSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWithOptions: %v", err)
 	}
+
+	// Same barrier as TestE2E_HookEventFlow, for the Start:true shape: the
+	// creation goroutine ends in StartBackground, which drives the status to
+	// running. Hooking before that lands lets the start overwrite the
+	// "thinking" asserted below. Found by auditing every NewWithOptions in
+	// this package rather than by a CI failure — it had not been hit yet.
+	waitForStatus(t, client, info.ID, session.StatusRunning, 10*time.Second)
 
 	// Send hook with CWD
 	newCWD := t.TempDir()
