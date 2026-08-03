@@ -1166,6 +1166,118 @@ func TestGroupSessionsByFleet(t *testing.T) {
 	})
 }
 
+// --- deleting sessions are not actionable, whichever source says so ---
+
+// TestIsDeleting_BothSources pins the fix for a split this branch introduced.
+// Adding StatusDeleting to getStatusDisplay made a daemon-reported delete
+// render dim with the ⟳ icon, but every guard on the action paths still read
+// only m.deletingIDs — this TUI's own optimistic mark. A session the daemon
+// reports as deleting therefore looked like it was going away while still
+// answering to Enter, VS Code and the mouse.
+//
+// Both sources are reachable with an empty deletingIDs map: another client
+// issued the delete, or this TUI restarted while one was in flight (the map is
+// in-memory only, so a restart forgets it while the daemon keeps reporting).
+func TestIsDeleting_BothSources(t *testing.T) {
+	sessions := []session.Info{
+		{ID: "live", Description: "live", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "optimistic", Description: "optimistic", Status: session.StatusIdle, Fleet: session.DefaultFleet},
+		{ID: "reported", Description: "reported", Status: session.StatusDeleting, Fleet: session.DefaultFleet},
+	}
+	newModel := func() Model {
+		m := plainModel()
+		m.sessions = sessions
+		m.height = 16
+		m.width = 40
+		m.deletingIDs = map[string]bool{"optimistic": true}
+		return m
+	}
+
+	t.Run("isDeleting sees both the mark and the reported status", func(t *testing.T) {
+		m := newModel()
+		for _, tc := range []struct {
+			idx  int
+			want bool
+		}{{0, false}, {1, true}, {2, true}} {
+			if got := m.isDeleting(sessions[tc.idx]); got != tc.want {
+				t.Errorf("isDeleting(%q) = %v, want %v", sessions[tc.idx].ID, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("sessionAt refuses every deleting session", func(t *testing.T) {
+		m := newModel()
+		if _, ok := m.sessionAt(0); !ok {
+			t.Error("sessionAt(0) refused a live session")
+		}
+		for _, idx := range []int{1, 2} {
+			if got, ok := m.sessionAt(idx); ok {
+				t.Errorf("sessionAt(%d) returned %q; a session on its way out is not actionable", idx, got.ID)
+			}
+		}
+	})
+
+	t.Run("select and vscode are no-ops on a daemon-reported delete", func(t *testing.T) {
+		// Index 2 is the case the old guard missed entirely. With no tmux
+		// client wired these would be no-ops anyway, so the assertion that
+		// carries weight is that neither records an error and neither reaches
+		// past the guard — verified by the absence of a nil-client panic.
+		m := newModel()
+		m.cursor = 2
+
+		next, cmd := m.handleSelectSession()
+		if cmd != nil {
+			t.Errorf("handleSelectSession returned a Cmd for a deleting session: %T", cmd)
+		}
+		if got := next.(Model); got.err != nil {
+			t.Errorf("handleSelectSession set err = %v, want a silent no-op", got.err)
+		}
+
+		next, cmd = m.handleVscode()
+		if cmd != nil {
+			t.Errorf("handleVscode returned a Cmd for a deleting session: %T", cmd)
+		}
+		if got := next.(Model); got.err != nil {
+			t.Errorf("handleVscode set err = %v, want a silent no-op", got.err)
+		}
+	})
+
+	t.Run("the cursor skips a daemon-reported delete", func(t *testing.T) {
+		// deletingIDs is empty here: only the reported status can move the
+		// cursor, which is exactly what the old code could not do.
+		m := plainModel()
+		m.sessions = []session.Info{
+			{ID: "a", Description: "a", Status: session.StatusIdle},
+			{ID: "b", Description: "b", Status: session.StatusDeleting},
+			{ID: "c", Description: "c", Status: session.StatusIdle},
+		}
+		m.height = 100
+		m.cursor = 1
+		m.skipDeletingSessions(1)
+		if m.cursor != 2 {
+			t.Errorf("cursor = %d, want 2 — the cursor must not rest on a session being removed", m.cursor)
+		}
+	})
+
+	t.Run("a mouse click on a deleting row selects nothing", func(t *testing.T) {
+		m := newModel()
+		// Row 2 of the pane is the first list row (notices 0 + header 2), and
+		// the fleet header takes it, so the sessions start at row 3.
+		listTop := m.noticeLines() + m.headerLines()
+		for idx, wantOK := range map[int]bool{0: true, 1: false, 2: false} {
+			top, _ := m.sessionCardTop(idx)
+			row := listTop + top - m.scrollOffset
+			gotIdx, ok := m.sessionIndexAtRow(row)
+			if !ok || gotIdx != idx {
+				t.Fatalf("row %d does not map back to session %d (%d, %v)", row, idx, gotIdx, ok)
+			}
+			if _, actionable := m.sessionAt(gotIdx); actionable != wantOK {
+				t.Errorf("clicking session %q: actionable = %v, want %v", m.sessions[idx].ID, actionable, wantOK)
+			}
+		}
+	})
+}
+
 // --- skipDeletingSessions ---
 
 func TestSkipDeletingSessions(t *testing.T) {

@@ -916,7 +916,7 @@ func (m Model) handleSelectSession() (tea.Model, tea.Cmd) {
 		m.err = fmt.Errorf("cannot select creating session")
 		return m, nil
 	}
-	if m.deletingIDs[sess.ID] {
+	if m.isDeleting(sess) {
 		return m, nil
 	}
 
@@ -1002,7 +1002,7 @@ func (m Model) sessionAt(idx int) (session.Info, bool) {
 		return session.Info{}, false
 	}
 	sess := ps[idx]
-	if m.deletingIDs[sess.ID] {
+	if m.isDeleting(sess) {
 		return session.Info{}, false
 	}
 	return sess, true
@@ -1380,7 +1380,7 @@ func (m Model) handleVscode() (tea.Model, tea.Cmd) {
 	pageSessions := m.getDisplaySessions()
 	if len(pageSessions) > 0 && m.cursor < len(pageSessions) {
 		sess := pageSessions[m.cursor]
-		if m.deletingIDs[sess.ID] {
+		if m.isDeleting(sess) {
 			return m, nil
 		}
 		go m.openVSCode(&sess)
@@ -1925,11 +1925,11 @@ func (m Model) renderProcessingView() string {
 // skipDeletingSessions adjusts cursor to skip over sessions being deleted.
 // dir: -1 for up, +1 for down.
 func (m *Model) skipDeletingSessions(dir int) {
-	if len(m.deletingIDs) == 0 {
-		return
-	}
 	pageSessions := m.getDisplaySessions()
-	for m.cursor >= 0 && m.cursor < len(pageSessions) && m.deletingIDs[pageSessions[m.cursor].ID] {
+	deleting := func(i int) bool {
+		return i >= 0 && i < len(pageSessions) && m.isDeleting(pageSessions[i])
+	}
+	for deleting(m.cursor) {
 		m.cursor += dir
 	}
 	// Clamp
@@ -1940,9 +1940,9 @@ func (m *Model) skipDeletingSessions(dir int) {
 		m.cursor = len(pageSessions) - 1
 	}
 	// Fallback: if still on a deleting session, scan the opposite direction
-	if m.cursor >= 0 && m.cursor < len(pageSessions) && m.deletingIDs[pageSessions[m.cursor].ID] {
+	if deleting(m.cursor) {
 		for i := m.cursor - dir; i >= 0 && i < len(pageSessions); i -= dir {
-			if !m.deletingIDs[pageSessions[i].ID] {
+			if !deleting(i) {
 				m.cursor = i
 				return
 			}
@@ -2063,6 +2063,19 @@ func (m Model) effectiveStatus(sess session.Info) session.Status {
 		return session.StatusDeleting
 	}
 	return sess.Status
+}
+
+// isDeleting reports whether a session is on its way out, from either source:
+// this TUI's own optimistic mark or the daemon's reported status.
+//
+// Both halves matter. m.deletingIDs alone misses a session another client
+// deleted, and one whose delete was still running when this TUI last started —
+// deletingIDs lives only in memory, so a restart forgets it while the daemon
+// keeps reporting StatusDeleting. Those sessions render dim with the ⟳ icon,
+// and anything that reads only the optimistic mark would still let a keypress
+// attach to, start, or open an editor on a session that is being removed.
+func (m Model) isDeleting(sess session.Info) bool {
+	return m.effectiveStatus(sess) == session.StatusDeleting
 }
 
 // statusCount pairs a status with how many sessions currently carry it.
@@ -2199,7 +2212,7 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 	// Deleting sessions are dim and not selectable, but keep the row shape:
 	// the geometry must not depend on a session's state.
 	status := m.effectiveStatus(sess)
-	deleting := status == session.StatusDeleting
+	deleting := m.isDeleting(sess)
 	statusIcon, _, statusStyle := getStatusDisplay(status)
 
 	// withBg composes any inline style with the viewed row background when
@@ -2314,7 +2327,7 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	// they resolve "is this being deleted" the same way. Anything else lets
 	// the two blocks describing one session disagree in front of the user.
 	status := m.effectiveStatus(sess)
-	deleting := status == session.StatusDeleting
+	deleting := m.isDeleting(sess)
 
 	// --- Line 1: rule ---
 	lines = append(lines, rule)
