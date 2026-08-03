@@ -68,6 +68,19 @@ func hasTmuxSession(name string) bool {
 }
 
 // waitForStatus polls client.List until the session reaches the expected status or times out.
+//
+// This is the barrier for session *creation*, the mirror of waitForSessionGone
+// for deletion. `new` returns a StatusCreating reservation and the daemon
+// provisions and starts the session in a goroutine, so anything a test wants to
+// observe about a Start:true session has to be waited for. StatusRunning is the
+// useful barrier: startSessionTmux creates the inner tmux session first and only
+// then flips the status, so "running" implies the tmux session exists — while
+// still leaving a following hasTmuxSession check meaningful rather than
+// tautological. The status holds for at least captureOutputTmux's 10s tick, so
+// a poll cannot miss the window.
+//
+// Do not wait with time.Sleep instead. A fixed 500ms was what made the
+// tmux-backed tests fail on any machine where provisioning takes longer.
 func waitForStatus(t *testing.T, client *daemon.Client, sessionID string, want session.Status, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -144,10 +157,10 @@ func TestE2E_TmuxSessionCreation(t *testing.T) {
 
 	innerName := tmux.InnerSessionName(info.ID)
 
-	// tmux session should exist on the jin socket
-	// Wait briefly for async session creation
-	time.Sleep(500 * time.Millisecond)
+	// Creation is async; wait for the daemon to report the session up.
+	waitForStatus(t, client, info.ID, session.StatusRunning, 10*time.Second)
 
+	// tmux session should exist on the jin socket
 	if !hasTmuxSession(innerName) {
 		t.Fatalf("tmux session %q should exist after Start:true", innerName)
 	}
@@ -171,7 +184,7 @@ func TestE2E_KillWithTmuxCleanup(t *testing.T) {
 	}
 
 	innerName := tmux.InnerSessionName(info.ID)
-	time.Sleep(500 * time.Millisecond)
+	waitForStatus(t, client, info.ID, session.StatusRunning, 10*time.Second)
 
 	if !hasTmuxSession(innerName) {
 		t.Fatal("tmux session should exist before Kill")
@@ -186,6 +199,12 @@ func TestE2E_KillWithTmuxCleanup(t *testing.T) {
 	// the window standing, so whatever else the user had open in it survives
 	// and a later start revives the agent in place. Releasing it is delete's
 	// job (TestE2E_DeleteWithTmuxCleanup).
+	//
+	// Kill is synchronous, so this sleep is not waiting for it to finish —
+	// there is nothing to poll for when the assertion is that nothing happens.
+	// It is a grace window in which a stray teardown (the pane-died hook
+	// reaping the window after the agent exits) would have a chance to show
+	// itself instead of the check passing before it could run.
 	time.Sleep(200 * time.Millisecond)
 	if !hasTmuxSession(innerName) {
 		t.Error("tmux session should outlive Kill")
@@ -217,7 +236,7 @@ func TestE2E_DeleteWithTmuxCleanup(t *testing.T) {
 	}
 
 	innerName := tmux.InnerSessionName(info.ID)
-	time.Sleep(500 * time.Millisecond)
+	waitForStatus(t, client, info.ID, session.StatusRunning, 10*time.Second)
 
 	if !hasTmuxSession(innerName) {
 		t.Fatal("tmux session should exist before Delete")
@@ -318,7 +337,7 @@ func TestE2E_SessionRecovery(t *testing.T) {
 	}
 
 	innerName := tmux.InnerSessionName(info.ID)
-	time.Sleep(500 * time.Millisecond)
+	waitForStatus(t, client, info.ID, session.StatusRunning, 10*time.Second)
 
 	if !hasTmuxSession(innerName) {
 		t.Fatal("tmux session should exist after Start")
@@ -383,9 +402,11 @@ func TestE2E_MultipleSessionsTmux(t *testing.T) {
 			t.Fatalf("NewWithOptions(%d): %v", i, err)
 		}
 		sessions[i] = sess{id: info.ID, innerName: tmux.InnerSessionName(info.ID)}
+		// Wait per session rather than once after the loop: the daemon
+		// serializes creation anyway, so this costs nothing and keeps each
+		// check close to its own start.
+		waitForStatus(t, client, info.ID, session.StatusRunning, 10*time.Second)
 	}
-
-	time.Sleep(500 * time.Millisecond)
 
 	// All 3 tmux sessions should exist
 	for i, s := range sessions {
@@ -398,6 +419,9 @@ func TestE2E_MultipleSessionsTmux(t *testing.T) {
 	if err := client.Kill(sessions[1].id); err != nil {
 		t.Fatalf("Kill: %v", err)
 	}
+	// Kill is synchronous; this is the same deliberate grace window as in
+	// TestE2E_KillWithTmuxCleanup, giving a wrong teardown room to happen
+	// before the negative assertion below runs.
 	time.Sleep(200 * time.Millisecond)
 
 	// Every inner session is still there — the killed one because a kill
