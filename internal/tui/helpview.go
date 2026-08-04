@@ -74,7 +74,28 @@ func (m HelpModel) View() string {
 	writeBinding(&b, keyStyle, descStyle, k.Down)
 	writeBinding(&b, keyStyle, descStyle, k.PrevPage)
 	writeBinding(&b, keyStyle, descStyle, k.NextPage)
-	writeShortcut(&b, keyStyle, descStyle, "click", "select session")
+	// Two lines because the pointer takes two taps (see handleMouse), and
+	// "nothing happened" on the first one is the most surprising thing the list
+	// does. This popup is where a user goes to ask why, so the reason the
+	// second tap exists is named here rather than left to the README.
+	//
+	// The second line names the cursor rather than promising a second tap, and
+	// that is the honest phrasing rather than the terse one: what a tap does is
+	// move the CURSOR, so a tap on the row it already sits on attaches straight
+	// away. Since the cursor starts on the first session, that row's behaviour
+	// is the first thing a new user meets — "click twice" would be wrong there.
+	// Spelling the condition out inside 22 columns only produced text that had
+	// to be decoded, so this pair stays readable at a glance and the rule in
+	// full is written down where the behaviour is — handleMouse in model.go.
+	//
+	// Both lines are kept inside the longest description already in this view.
+	// The popup is sized as a percentage of the terminal, so a wider line wraps
+	// on the small terminals the two-tap click was added for — and height is
+	// spent the same way, only more steeply: this view has no scrolling and
+	// altscreen clips whatever runs past the bottom, so the one line this pair
+	// added raised the terminal height the popup needs from 47 rows to 49.
+	writeShortcut(&b, keyStyle, descStyle, "click", "move cursor (preview)")
+	writeShortcut(&b, keyStyle, descStyle, "click again", "attach the cursor row")
 	writeShortcut(&b, keyStyle, descStyle, "wheel", "scroll list")
 	b.WriteString("\n")
 

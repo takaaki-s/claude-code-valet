@@ -447,7 +447,7 @@ Worktree creation itself is **offline** — the new branch is cut from your loca
 | `?` | Show help |
 | `q` | Quit |
 
-The session list also takes mouse input: left-click a session to select and attach to it (same as `Enter`), and use the wheel to scroll the list without moving the cursor. While the list has the mouse, hold `Shift` to drag-select text in that pane with your terminal.
+The session list also takes mouse input. Switching sessions takes two clicks: the first moves the cursor onto that session, so the detail pane below previews it without switching, and a second click switches (same as `Enter`) — a mis-aimed tap costs you a look at the wrong session rather than a switch to it. Use the wheel to scroll the list without moving the cursor, and hold `Shift` while the list has the mouse to drag-select text in that pane with your terminal.
 
 ### Session creation form
 

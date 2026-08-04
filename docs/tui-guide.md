@@ -33,8 +33,9 @@ cmd/jin/cmd/
 The left pane is a master-detail layout drawn entirely with lipgloss (no tmux
 split — a split would mean a second process and IPC). It has three regions with
 fixed budgets: a count header (`listHeaderLines`), the scrollable session list
-(one row per session, `sessionRowHeight`), and a detail pane for the session
-under the cursor (`detailPaneLines`). `contentAreaLines()` is the parent budget
+(`sessionRowHeight` rows per session — the name on the first, repo and branch
+on the second), and a detail pane for the session under the cursor
+(`detailPaneLines`). `contentAreaLines()` is the parent budget
 and `listAreaLines()` is what every scroll clamp and mouse hit-test measures
 against — not `contentAreaLines()`. The detail pane is dropped whole rather
 than shrunk when the list would fall below `minListLines`, which is what keeps
@@ -43,6 +44,16 @@ those heights constant and the geometry testable.
 The detail pane follows the **cursor**, while the right-hand tmux pane follows
 `currentSessionID`; the two are deliberately orthogonal, so moving the cursor
 never switches panes.
+
+Scrolling comes in two kinds and they align differently. Scroll-only input
+(wheel, PageUp/PageDown) goes through `scrollBy`, which pulls the landing back
+to the top of the session row it fell inside, so the list never opens on a
+row's second line. Cursor-driven scrolling (`adjustScrollForCursor`) does
+**not** align: it owes the cursor's row whole, and pulling back to a row top
+would push that row's last line off the fold — the cursor's row wins. The two
+exceptions where `scrollBy` also leaves the offset alone are the last page
+(aligning there would put the final row out of reach for good) and a step
+short enough that the pull-back would cancel it.
 
 ## Update/View Pattern
 
@@ -61,7 +72,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
     // processingMsg != "" → renderProcessingView()
-    // Normal → renderListContent() + help line
+    // Normal → renderListContent() + the chrome below it (`helpChromeLines`:
+    //          a rule, then the help line)
 }
 ```
 
