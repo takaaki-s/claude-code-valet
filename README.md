@@ -4,8 +4,13 @@
 
 **Ten agent sessions. One screen.**
 
-jind-ai runs each coding-agent session in its own tmux pane and puts the whole
-fleet in a single list — status, repository and branch for all of them.
+- Never miss the agent that's waiting on you
+- A git worktree of its own for every session
+- Reboot the machine, pick up the conversation
+- Agents can drive agents
+
+Runs on tmux, so your config carries over — and over SSH you come back to the
+same screen.
 
 https://github.com/user-attachments/assets/68778af9-07eb-412e-8b11-0e6ec916010b
 
@@ -36,6 +41,39 @@ cd jind-ai
 make build    # Build to bin/jin
 make install  # Install to $GOPATH/bin
 ```
+
+## What you can do
+
+**Know which one needs you.** Status is reported by the agent itself — thinking,
+idle, or stopped waiting for your permission — rather than guessed by reading
+the screen.
+
+**Keep agents out of each other's way.** `--worktree` cuts a git worktree and a
+branch as the session starts, so agents running in parallel never share a
+working tree.
+
+**Come back to it.** A session outlives the daemon, the agent, and a reboot.
+Reopening one resumes the conversation where it stopped.
+
+**Get around quickly.** `Ctrl+]` detaches; `M-f` opens a fuzzy search over every
+session's name, directory, branch, fleet and agent kind.
+
+**Mix agents.** Claude Code, Codex and opencode run side by side, chosen per
+session.
+
+**Drive it from a script — or from another agent.** Create, send, wait and read
+the result back, all with `--json`.
+
+**Extend it.** Plugins run on a status change or on demand; desktop
+notifications are one you can install today.
+
+All the logic lives in the daemon and the TUI is a thin client over a Unix
+socket, so another front end can drive the same IPC — see
+[architecture](docs/architecture.md) and [IPC protocol](docs/ipc-protocol.md).
+
+How to do each of these is further down: [CLI commands](#cli-commands),
+[configuration](#configuration), [TUI keybindings](#tui-keybindings),
+[plugins](#plugins).
 
 ## Project status
 
@@ -75,17 +113,6 @@ The TUI create form includes an **agent picker step** whenever more than one ada
 ```bash
 jin ui --agent codex   # transient default; ends when TUI exits
 ```
-
-## Features
-
-- **Multi-session management**: Run multiple Claude Code sessions in the background simultaneously
-- **tmux-native**: Each session runs in its own tmux pane, so your existing `~/.tmux.conf`, custom keybindings, status bar, and copy-mode setup work as-is
-- **Decoupled UI / logic architecture**: All session management, state transitions, and hook handling live in the daemon. The TUI is a thin client that talks to the daemon over a Unix socket and holds no session-management logic. In principle any alternate UI (web, editor extension, ...) can drive the same IPC (see [docs/architecture.md](docs/architecture.md) / [docs/ipc-protocol.md](docs/ipc-protocol.md))
-- **TUI**: Interactive terminal UI for listing, monitoring, and operating sessions
-- **Attach/Detach**: Quickly switch between sessions (`Ctrl+]` to detach)
-- **Real-time status tracking**: Live display of working directory, branch, and latest message
-- **Switch session & Paging**: `/` opens a fuzzy-search popup over session name, directory, branch, fleet, and agent kind
-- **Plugins**: Run your own shell-executable plugins on session status changes or on demand — for example, desktop notifications via `jin plugin install jind-ai-notifier` (registry name; git URLs and local `--link` paths are also supported)
 
 ## Quick Start
 
