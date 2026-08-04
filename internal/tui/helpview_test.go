@@ -87,6 +87,32 @@ func TestHelpModel_View(t *testing.T) {
 	}
 }
 
+// TestHelpModel_View_ClickTakesTwoTaps pins that this view describes the
+// two-tap pointer rather than the one-tap click it replaced (see handleMouse).
+// The first tap doing nothing visible but moving the cursor is the list's most
+// surprising behaviour, and this popup is the screen a user opens to ask about
+// it — a stale line here sends them away with the wrong answer, which is a
+// failure no rendering test would catch.
+func TestHelpModel_View_ClickTakesTwoTaps(t *testing.T) {
+	view := NewHelpModel(NewKeyMap(config.DefaultKeybindings()), "Ctrl+]", "M-p", "/", nil).View()
+
+	var second string
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, "click again") {
+			second = line
+		}
+	}
+	if second == "" {
+		t.Fatalf("View() never mentions a second click; the pointer takes two taps to switch sessions:\n%s", view)
+	}
+	// Checked against that line rather than the whole view: "attach" is also
+	// the Enter binding's description, so a view-wide search would pass on a
+	// second-click line that says nothing at all.
+	if !strings.Contains(second, "attach") {
+		t.Errorf("the second-click line = %q, want it to say that this is the click that switches", second)
+	}
+}
+
 func TestHelpModel_View_KeyLabels(t *testing.T) {
 	cfg := config.DefaultKeybindings()
 	keys := NewKeyMap(cfg)
