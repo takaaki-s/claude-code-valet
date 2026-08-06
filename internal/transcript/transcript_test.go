@@ -1,7 +1,9 @@
 package transcript
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -848,6 +850,106 @@ func TestReader_ReadEntries_LargeLine(t *testing.T) {
 	}
 	if len(got[0].Blocks) != 1 || len(got[0].Blocks[0].Output) != len(huge) {
 		t.Errorf("large tool_result not preserved: blocks=%d outLen=%d", len(got[0].Blocks), len(got[0].Blocks[0].Output))
+	}
+}
+
+// --- Oversized lines: the message readers must not stop mid-file ---
+
+// hugeToolResultEntry builds a user entry whose tool_result payload is `size`
+// bytes, i.e. one JSONL line far longer than the 1 MiB the message readers
+// used to allow.
+func hugeToolResultEntry(size int, ts string) transcriptEntry {
+	return transcriptEntry{
+		Type: "user",
+		Message: msgObject{
+			Role: "user",
+			Content: []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "tu_h", "content": strings.Repeat("A", size)},
+			},
+		},
+		Timestamp: ts,
+	}
+}
+
+func TestReaders_SeePastOversizedLine(t *testing.T) {
+	// A 2 MiB tool_result sits between the first and last exchange. The
+	// readers carried a 1 MiB scanner limit and never checked scanner.Err(),
+	// so everything after this line silently vanished — the transcript looked
+	// like it ended early. Observed on a real 2913-line transcript where 8
+	// trailing messages (including the newest reply) went missing.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/oversized/test"
+	sessionID := "sess-oversized"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: "early question"}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "early answer"}}}, Timestamp: "2024-01-01T00:00:01Z"},
+		hugeToolResultEntry(2*1024*1024, "2024-01-01T00:00:02Z"),
+		{Type: "user", Message: msgObject{Role: "user", Content: "late question"}, Timestamp: "2024-01-01T00:00:03Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "late answer"}}}, Timestamp: "2024-01-01T00:00:04Z"},
+	})
+
+	t.Run("GetLastMessage", func(t *testing.T) {
+		msg, err := r.GetLastMessage(workDir, sessionID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if msg == nil || msg.Content != "late answer" {
+			t.Fatalf("expected the message after the oversized line, got %+v", msg)
+		}
+	})
+
+	t.Run("GetLastMessages", func(t *testing.T) {
+		msgs, err := r.GetLastMessages(workDir, sessionID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if msgs == nil || msgs.Assistant == nil || msgs.Assistant.Content != "late answer" {
+			t.Fatalf("expected the assistant message after the oversized line, got %+v", msgs)
+		}
+		if msgs.User == nil || msgs.User.Content != "late question" {
+			t.Fatalf("expected the user message after the oversized line, got %+v", msgs)
+		}
+	})
+
+	t.Run("GetConversation", func(t *testing.T) {
+		msgs, err := r.GetConversation(workDir, sessionID, 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(msgs) == 0 {
+			t.Fatal("expected messages, got none")
+		}
+		if got := msgs[len(msgs)-1].Content; got != "late answer" {
+			t.Errorf("last message = %q, want %q", got, "late answer")
+		}
+	})
+}
+
+func TestReaders_ReportLineOverLimitInsteadOfTruncating(t *testing.T) {
+	// Past maxTranscriptLineBytes there is nothing to do but fail — and
+	// failing is the point. Returning the messages read so far would hand the
+	// caller a plausible-looking prefix of the conversation with no signal
+	// that the rest was dropped.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/toolong/test"
+	sessionID := "sess-toolong"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: "question"}, Timestamp: "2024-01-01T00:00:00Z"},
+		hugeToolResultEntry(maxTranscriptLineBytes+1, "2024-01-01T00:00:01Z"),
+	})
+
+	if _, err := r.GetConversation(workDir, sessionID, 1); !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("GetConversation: expected bufio.ErrTooLong, got %v", err)
+	}
+	if _, err := r.GetLastMessage(workDir, sessionID); !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("GetLastMessage: expected bufio.ErrTooLong, got %v", err)
+	}
+	if _, err := r.GetLastMessages(workDir, sessionID); !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("GetLastMessages: expected bufio.ErrTooLong, got %v", err)
 	}
 }
 

@@ -9,6 +9,14 @@ import (
 	"strings"
 )
 
+// maxTranscriptLineBytes bounds a single JSONL line. Claude Code writes a
+// whole tool_result payload on one line, so the ceiling has to be generous.
+// Every reader in this package shares it: the message readers used to carry
+// their own 1 MiB limit, which stopped bufio.Scanner mid-file on real
+// transcripts, and — because none of them checked scanner.Err() — the
+// truncation was indistinguishable from the end of the conversation.
+const maxTranscriptLineBytes = 16 * 1024 * 1024
+
 // Message represents a message from the transcript
 type Message struct {
 	Type      string // "user" or "assistant"
@@ -136,7 +144,7 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 	var allMessages []Message
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -165,6 +173,10 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 		})
 	}
 
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
 	// Return last N*2 messages
 	maxMessages := lastN * 2
 	if len(allMessages) > maxMessages {
@@ -188,9 +200,8 @@ func (r *Reader) readLastMessages(filePath string) (*LastMessages, error) {
 	var lastUser *Message
 	var lastAssistant *Message
 	scanner := bufio.NewScanner(file)
-	// Increase buffer size for long lines
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -224,6 +235,10 @@ func (r *Reader) readLastMessages(filePath string) (*LastMessages, error) {
 		} else {
 			lastAssistant = msg
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 
 	if lastUser == nil && lastAssistant == nil {
@@ -280,9 +295,8 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 
 	var lastMessage *Message
 	scanner := bufio.NewScanner(file)
-	// Increase buffer size for long lines
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -310,6 +324,10 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 			Content:   content,
 			Timestamp: entry.Timestamp,
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 
 	return lastMessage, nil
@@ -573,9 +591,8 @@ func (r *Reader) TurnState(workDir, sessionID string) TurnState {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	// Allow lines up to 16 MiB to accommodate large tool_result payloads.
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 16*1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	var last *transcriptEntry
 	for scanner.Scan() {
@@ -656,7 +673,7 @@ func (r *Reader) ReadAITitle(workDir, sessionID string) (string, bool) {
 	var latest string
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -694,9 +711,8 @@ func readEntries(filePath, since string) ([]Entry, error) {
 
 	var entries []Entry
 	scanner := bufio.NewScanner(file)
-	// Allow lines up to 16 MiB to accommodate large tool_result payloads.
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 16*1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
