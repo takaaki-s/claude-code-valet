@@ -4,10 +4,20 @@ package transcript
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// ErrNoTranscript reports that no JSONL file could be located for a session.
+// It is deliberately distinct from a transcript that exists but holds no
+// readable messages: the first means the caller is looking in the wrong
+// place (or too early), while the second is a normal state every session
+// passes through before it says anything. Collapsing the two into an empty
+// result is what let `session output --last N` stay silent about a missing
+// transcript.
+var ErrNoTranscript = errors.New("no transcript file for session")
 
 // maxTranscriptLineBytes bounds a single JSONL line. Claude Code writes a
 // whole tool_result payload on one line, so the ceiling has to be generous.
@@ -76,17 +86,11 @@ func NewReader() *Reader {
 // GetLastMessage returns the last user or assistant message from the transcript
 // workDir: the working directory of the session (may be empty; a glob fallback locates the JSONL by sessionID)
 // sessionID: the Claude Code session ID (UUID format)
-// Returns (nil, nil) when no transcript file exists (yet).
+// Returns ErrNoTranscript when no transcript file exists (yet), and (nil, nil)
+// when one exists but carries no plain-text message.
 func (r *Reader) GetLastMessage(workDir, sessionID string) (*Message, error) {
-	if sessionID == "" {
-		return nil, nil
-	}
-
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	return r.readLastMessage(path)
@@ -95,17 +99,11 @@ func (r *Reader) GetLastMessage(workDir, sessionID string) (*Message, error) {
 // GetLastMessages returns the last user and assistant messages from the transcript
 // workDir: the working directory of the session (may be empty; a glob fallback locates the JSONL by sessionID)
 // sessionID: the Claude Code session ID (UUID format)
-// Returns (nil, nil) when no transcript file exists (yet).
+// Returns ErrNoTranscript when no transcript file exists (yet), and (nil, nil)
+// when one exists but carries no plain-text message.
 func (r *Reader) GetLastMessages(workDir, sessionID string) (*LastMessages, error) {
-	if sessionID == "" {
-		return nil, nil
-	}
-
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	return r.readLastMessages(path)
@@ -114,17 +112,11 @@ func (r *Reader) GetLastMessages(workDir, sessionID string) (*LastMessages, erro
 // GetConversation returns the last N user/assistant message pairs from the transcript.
 // workDir may be empty: a glob fallback locates the JSONL by sessionID.
 // lastN specifies the number of message pairs to return.
-// Returns (nil, nil) when no transcript file exists (yet).
+// Returns ErrNoTranscript when no transcript file exists (yet), and an empty
+// slice when one exists but carries no plain-text message.
 func (r *Reader) GetConversation(workDir, sessionID string, lastN int) ([]Message, error) {
-	if sessionID == "" {
-		return nil, nil
-	}
-
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	return r.readConversation(path, lastN)
@@ -441,10 +433,10 @@ func TruncateMessageFromEnd(s string, maxLen int) string {
 
 // findTranscriptPath locates the JSONL file for a given workDir/sessionID.
 // It tries the canonical path first, then falls back to a glob over all
-// project directories (sessionID is unique). Returns os.ErrNotExist if not found.
+// project directories (sessionID is unique). Returns ErrNoTranscript if not found.
 func (r *Reader) findTranscriptPath(workDir, sessionID string) (string, error) {
 	if sessionID == "" {
-		return "", os.ErrNotExist
+		return "", ErrNoTranscript
 	}
 	if workDir != "" {
 		p := r.getTranscriptPath(workDir, sessionID)
@@ -456,7 +448,7 @@ func (r *Reader) findTranscriptPath(workDir, sessionID string) (string, error) {
 	if len(matches) > 0 {
 		return matches[0], nil
 	}
-	return "", os.ErrNotExist
+	return "", ErrNoTranscript
 }
 
 // ReadEntries returns transcript entries with Timestamp strictly greater than `since`.
@@ -466,12 +458,11 @@ func (r *Reader) findTranscriptPath(workDir, sessionID string) (string, error) {
 // If `since` is empty, returns all entries. workDir may be empty: a glob fallback locates
 // the JSONL by sessionID. Returns (nil, nil) if no transcript file exists yet.
 func (r *Reader) ReadEntries(workDir, sessionID, since string) ([]Entry, error) {
-	if sessionID == "" {
-		return nil, nil
-	}
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// `session result` treats "not started yet" as an empty result rather
+		// than a failure; only genuine read errors propagate.
+		if errors.Is(err, ErrNoTranscript) {
 			return nil, nil
 		}
 		return nil, err

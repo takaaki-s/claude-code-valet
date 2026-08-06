@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,14 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/transcript"
 )
+
+// The two ways `session output` can come up empty. They used to share one
+// message on the default path and no message at all on the --last path;
+// separating them lets a caller tell "I am looking at the wrong session" from
+// "the agent has not spoken yet".
+var errNoTranscriptFound = errors.New("no transcript file found for this session; it may not have started yet, or its agent session ID may be stale")
+
+const noReadableMessagesHint = "no plain-text messages found; the session may not have produced any text yet — try 'jin session result --json' to inspect tool_use / tool_result activity"
 
 var outputCmd = &cobra.Command{
 	Use:   "output <selector>",
@@ -51,7 +60,18 @@ Examples:
 		if lastN > 0 {
 			msgs, err := reader.GetConversation(workDir, info.AgentSessionID, lastN)
 			if err != nil {
+				if errors.Is(err, transcript.ErrNoTranscript) {
+					return errNoTranscriptFound
+				}
 				return fmt.Errorf("failed to read conversation: %w", err)
+			}
+
+			// A transcript that exists but holds nothing readable is a state
+			// every session passes through, so it stays a success — but it
+			// used to be indistinguishable from a missing transcript, which
+			// is why an empty `--last` read as "the agent said nothing".
+			if len(msgs) == 0 {
+				fmt.Fprintln(os.Stderr, noReadableMessagesHint)
 			}
 
 			if jsonOutput {
@@ -71,15 +91,17 @@ Examples:
 		// Default: last assistant/user message with plain text.
 		msg, err := reader.GetLastMessage(workDir, info.AgentSessionID)
 		if err != nil {
+			if errors.Is(err, transcript.ErrNoTranscript) {
+				return errNoTranscriptFound
+			}
 			return fmt.Errorf("failed to read transcript: %w", err)
 		}
 		if msg == nil {
-			// GetLastMessage returns nil either because no transcript file exists
-			// yet, or because the file exists but every user/assistant entry so
-			// far consists only of tool_use / thinking blocks with no plain text.
-			// The old error ("no messages found in transcript") conflated the two
-			// and misled callers when the session had, in fact, done real work.
-			return fmt.Errorf("no plain-text messages found; the session may not have produced any text yet — try 'jin session result --json' to inspect tool_use / tool_result activity")
+			// The transcript exists but every user/assistant entry so far
+			// consists only of tool_use / thinking blocks with no plain text.
+			// A missing transcript is now a separate error, so this message no
+			// longer has to cover both.
+			return errors.New(noReadableMessagesHint)
 		}
 
 		if jsonOutput {

@@ -376,17 +376,19 @@ func TestReader_EmptySessionID(t *testing.T) {
 	tmpDir := t.TempDir()
 	r := &Reader{claudeDir: tmpDir}
 
+	// An empty sessionID cannot name a transcript, so it reports the same
+	// ErrNoTranscript as a session whose JSONL is missing.
 	msg, err := r.GetLastMessage("/some/dir", "")
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Fatalf("expected ErrNoTranscript, got %v", err)
 	}
 	if msg != nil {
 		t.Errorf("expected nil message for empty sessionID, got %+v", msg)
 	}
 
 	msgs, err := r.GetLastMessages("/some/dir", "")
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Fatalf("expected ErrNoTranscript, got %v", err)
 	}
 	if msgs != nil {
 		t.Errorf("expected nil LastMessages for empty sessionID, got %+v", msgs)
@@ -546,8 +548,8 @@ func TestGetConversation(t *testing.T) {
 
 	t.Run("empty session ID", func(t *testing.T) {
 		msgs, err := r.GetConversation(workDir, "", 1)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		if !errors.Is(err, ErrNoTranscript) {
+			t.Fatalf("expected ErrNoTranscript, got %v", err)
 		}
 		if msgs != nil {
 			t.Errorf("expected nil, got %v", msgs)
@@ -1095,14 +1097,14 @@ func TestReader_FindTranscriptPath(t *testing.T) {
 
 	// 3. Not found.
 	_, err = r.findTranscriptPath("/wrong", "no-such")
-	if !os.IsNotExist(err) {
-		t.Errorf("expected ErrNotExist, got %v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Errorf("expected ErrNoTranscript, got %v", err)
 	}
 
 	// 4. Empty sessionID.
 	_, err = r.findTranscriptPath("/wrong", "")
-	if !os.IsNotExist(err) {
-		t.Errorf("expected ErrNotExist for empty sessionID, got %v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Errorf("expected ErrNoTranscript for empty sessionID, got %v", err)
 	}
 }
 
@@ -1498,15 +1500,16 @@ func TestGetConversation_GlobFallback_WhenWorkDirMismatches(t *testing.T) {
 	}
 }
 
-func TestGetLastMessage_ReturnsNilWhenTruelyMissing(t *testing.T) {
-	// When no transcript file exists anywhere, GetLastMessage should return
-	// (nil, nil) — this is the contract output_cmd relies on to produce its
-	// "no plain-text messages yet" error.
+func TestGetLastMessage_ReturnsErrNoTranscriptWhenTrulyMissing(t *testing.T) {
+	// When no transcript file exists anywhere, GetLastMessage reports
+	// ErrNoTranscript. output_cmd relies on that to tell "wrong/too-early
+	// session" apart from "transcript exists but says nothing yet"; the two
+	// used to collapse into one silent empty result.
 	tmpDir := t.TempDir()
 	r := &Reader{claudeDir: tmpDir}
 	msg, err := r.GetLastMessage("/nowhere", "no-such-session")
-	if err != nil {
-		t.Fatalf("expected (nil, nil), got err=%v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Fatalf("expected ErrNoTranscript, got err=%v", err)
 	}
 	if msg != nil {
 		t.Fatalf("expected nil message, got %+v", msg)
