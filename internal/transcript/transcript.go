@@ -149,7 +149,7 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 			continue
 		}
 
-		if entry.Type != "user" && entry.Type != "assistant" {
+		if !isConversationEntry(&entry) {
 			continue
 		}
 
@@ -207,7 +207,7 @@ func (r *Reader) readLastMessages(filePath string) (*LastMessages, error) {
 		}
 
 		// Only process user and assistant messages
-		if entry.Type != "user" && entry.Type != "assistant" {
+		if !isConversationEntry(&entry) {
 			continue
 		}
 
@@ -302,7 +302,7 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 		}
 
 		// Only process user and assistant messages
-		if entry.Type != "user" && entry.Type != "assistant" {
+		if !isConversationEntry(&entry) {
 			continue
 		}
 
@@ -325,72 +325,78 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 	return lastMessage, nil
 }
 
-// extractContent extracts the text content from a transcript entry
-func extractContent(entry *transcriptEntry) string {
-	if entry.Message.Content == nil {
-		return ""
+// isConversationEntry reports whether an entry belongs to the conversation
+// between the user and the agent, as opposed to the machinery around it.
+//
+// Only user and assistant entries qualify. Sidechain entries are a subagent's
+// own turns — treating them as the main thread makes a subagent's prompt look
+// like the user's. Meta entries are context Claude Code injects on the user's
+// behalf: the body of an invoked skill, environment reminders, command
+// caveats. They are stored as user messages but nobody said them, and a
+// single injected skill body runs to thousands of lines, so admitting them
+// drowns the conversation it is supposed to show.
+//
+// TurnState applies the same two exclusions for the same reason.
+func isConversationEntry(entry *transcriptEntry) bool {
+	if entry.Type != "user" && entry.Type != "assistant" {
+		return false
 	}
-
-	// User messages: content is a string
-	if entry.Type == "user" {
-		if str, ok := entry.Message.Content.(string); ok {
-			return cleanContent(str)
-		}
-	}
-
-	// Assistant messages: content is an array of content blocks
-	if entry.Type == "assistant" {
-		if arr, ok := entry.Message.Content.([]any); ok {
-			var texts []string
-			for _, item := range arr {
-				if block, ok := item.(map[string]any); ok {
-					if blockType, ok := block["type"].(string); ok && blockType == "text" {
-						if text, ok := block["text"].(string); ok {
-							texts = append(texts, text)
-						}
-					}
-				}
-			}
-			if len(texts) > 0 {
-				return cleanContent(strings.Join(texts, " "))
-			}
-		}
-	}
-
-	return ""
+	return !entry.IsSidechain && !entry.IsMeta
 }
 
-// extractFullContent extracts the text content without cleaning (preserves newlines).
-func extractFullContent(entry *transcriptEntry) string {
-	if entry.Message.Content == nil {
+// collectTextBlocks pulls the conversation text out of an entry's content.
+// Content is a bare string on some entries and an array of blocks on others,
+// and either shape can appear for either role — user prompts in particular
+// arrive as arrays often enough that reading only the string form dropped
+// them from the conversation entirely.
+//
+// tool_result blocks are skipped on purpose. They ride along inside user
+// entries but are what a tool wrote back, not something the user said, and
+// letting them through buries every real message under tool output.
+func collectTextBlocks(content any) []string {
+	switch c := content.(type) {
+	case string:
+		if strings.TrimSpace(c) == "" {
+			return nil
+		}
+		return []string{c}
+	case []any:
+		var texts []string
+		for _, item := range c {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if kind, _ := block["type"].(string); kind != "text" {
+				continue
+			}
+			if text, ok := block["text"].(string); ok && text != "" {
+				texts = append(texts, text)
+			}
+		}
+		return texts
+	}
+	return nil
+}
+
+// extractContent extracts an entry's text collapsed onto a single line, for
+// display in list rows and detail panes.
+func extractContent(entry *transcriptEntry) string {
+	texts := collectTextBlocks(entry.Message.Content)
+	if len(texts) == 0 {
 		return ""
 	}
+	return cleanContent(strings.Join(texts, " "))
+}
 
-	if entry.Type == "user" {
-		if str, ok := entry.Message.Content.(string); ok {
-			return strings.TrimSpace(str)
-		}
+// extractFullContent extracts an entry's text with its line structure intact,
+// for callers that render the message as the agent wrote it.
+func extractFullContent(entry *transcriptEntry) string {
+	texts := collectTextBlocks(entry.Message.Content)
+	if len(texts) == 0 {
+		return ""
 	}
-
-	if entry.Type == "assistant" {
-		if arr, ok := entry.Message.Content.([]any); ok {
-			var texts []string
-			for _, item := range arr {
-				if block, ok := item.(map[string]any); ok {
-					if blockType, ok := block["type"].(string); ok && blockType == "text" {
-						if text, ok := block["text"].(string); ok {
-							texts = append(texts, text)
-						}
-					}
-				}
-			}
-			if len(texts) > 0 {
-				return strings.Join(texts, "\n")
-			}
-		}
-	}
-
-	return ""
+	return strings.TrimSpace(strings.Join(texts, "\n"))
 }
 
 // cleanContent cleans up the content string for display

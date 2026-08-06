@@ -855,6 +855,120 @@ func TestReader_ReadEntries_LargeLine(t *testing.T) {
 	}
 }
 
+// --- Array-shaped user content ---
+
+func textBlock(s string) map[string]any {
+	return map[string]any{"type": "text", "text": s}
+}
+
+func TestExtractContent_UserArrayBlocks(t *testing.T) {
+	// Claude Code writes most user prompts as a block array, not a bare
+	// string. Reading only the string form dropped them, which is why
+	// `--last N` came back as a run of assistant messages with no prompt.
+	entry := &transcriptEntry{
+		Type:    "user",
+		Message: msgObject{Role: "user", Content: []any{textBlock("what changed?")}},
+	}
+	if got := extractContent(entry); got != "what changed?" {
+		t.Errorf("extractContent = %q, want %q", got, "what changed?")
+	}
+	if got := extractFullContent(entry); got != "what changed?" {
+		t.Errorf("extractFullContent = %q, want %q", got, "what changed?")
+	}
+}
+
+func TestExtractContent_UserToolResultOnlyIsNotConversation(t *testing.T) {
+	// A tool_result is what a tool wrote back, not something the user said.
+	// Admitting it would bury every real message under tool output.
+	entry := &transcriptEntry{
+		Type: "user",
+		Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "content": "exit status 0"},
+		}},
+	}
+	if got := extractContent(entry); got != "" {
+		t.Errorf("extractContent = %q, want empty", got)
+	}
+	if got := extractFullContent(entry); got != "" {
+		t.Errorf("extractFullContent = %q, want empty", got)
+	}
+}
+
+func TestExtractContent_UserMixedBlocksKeepsOnlyText(t *testing.T) {
+	entry := &transcriptEntry{
+		Type: "user",
+		Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "content": "noise"},
+			textBlock("and here is the real question"),
+		}},
+	}
+	if got := extractFullContent(entry); got != "and here is the real question" {
+		t.Errorf("extractFullContent = %q, want the text block only", got)
+	}
+}
+
+func TestGetConversation_SkipsInjectedAndSidechainEntries(t *testing.T) {
+	// Once array-shaped user content became readable, two kinds of entry that
+	// are stored as user messages but nobody said started showing up: the
+	// body Claude Code injects when a skill is invoked (isMeta), and a
+	// subagent's own turns (isSidechain). The injected skill body alone runs
+	// to thousands of lines and buried the conversation it was meant to show.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/filtered/test"
+	sessionID := "sess-filtered"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{textBlock("real prompt")}}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "user", IsMeta: true, Message: msgObject{Role: "user", Content: []any{textBlock("Base directory for this skill: …")}}, Timestamp: "2024-01-01T00:00:01Z"},
+		{Type: "user", IsSidechain: true, Message: msgObject{Role: "user", Content: []any{textBlock("subagent task brief")}}, Timestamp: "2024-01-01T00:00:02Z"},
+		{Type: "assistant", IsSidechain: true, Message: msgObject{Role: "assistant", Content: []any{textBlock("subagent reply")}}, Timestamp: "2024-01-01T00:00:03Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("real answer")}}, Timestamp: "2024-01-01T00:00:04Z"},
+	})
+
+	msgs, err := r.GetConversation(workDir, sessionID, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertContents(t, msgs, []string{"real prompt", "real answer"})
+
+	last, err := r.GetLastMessage(workDir, sessionID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if last == nil || last.Content != "real answer" {
+		t.Errorf("GetLastMessage = %+v, want the main-thread answer", last)
+	}
+
+	pair, err := r.GetLastMessages(workDir, sessionID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pair == nil || pair.User == nil || pair.User.Content != "real prompt" {
+		t.Errorf("GetLastMessages.User = %+v, want the main-thread prompt", pair)
+	}
+}
+
+func assertContents(t *testing.T, got []Message, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d messages %v, want %d %v", len(got), contents(got), len(want), want)
+	}
+	for i := range want {
+		if got[i].Content != want[i] {
+			t.Errorf("message %d = %q, want %q", i, got[i].Content, want[i])
+		}
+	}
+}
+
+func contents(msgs []Message) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.Content)
+	}
+	return out
+}
+
 // --- Oversized lines: the message readers must not stop mid-file ---
 
 // hugeToolResultEntry builds a user entry whose tool_result payload is `size`
