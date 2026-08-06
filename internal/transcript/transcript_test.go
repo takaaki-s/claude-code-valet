@@ -949,6 +949,68 @@ func TestGetConversation_SkipsInjectedAndSidechainEntries(t *testing.T) {
 	}
 }
 
+// --- Exchange counting ---
+
+func TestLastExchanges(t *testing.T) {
+	// Turns are deliberately uneven: the second exchange has two assistant
+	// messages, which is exactly the shape the old fixed 2n slice mishandled.
+	msgs := []Message{
+		{Type: "user", Content: "q1"},
+		{Type: "assistant", Content: "a1"},
+		{Type: "user", Content: "q2"},
+		{Type: "assistant", Content: "a2a"},
+		{Type: "assistant", Content: "a2b"},
+	}
+
+	t.Run("one exchange keeps the prompt with its full reply", func(t *testing.T) {
+		got := lastExchanges(msgs, 1)
+		want := []string{"q2", "a2a", "a2b"}
+		assertContents(t, got, want)
+	})
+
+	t.Run("two exchanges reach further back", func(t *testing.T) {
+		assertContents(t, lastExchanges(msgs, 2), []string{"q1", "a1", "q2", "a2a", "a2b"})
+	})
+
+	t.Run("more exchanges than exist returns everything", func(t *testing.T) {
+		assertContents(t, lastExchanges(msgs, 100), []string{"q1", "a1", "q2", "a2a", "a2b"})
+	})
+
+	t.Run("consecutive user messages are one exchange", func(t *testing.T) {
+		run := []Message{
+			{Type: "user", Content: "q1"},
+			{Type: "assistant", Content: "a1"},
+			{Type: "user", Content: "q2a"},
+			{Type: "user", Content: "q2b"},
+			{Type: "assistant", Content: "a2"},
+		}
+		assertContents(t, lastExchanges(run, 1), []string{"q2a", "q2b", "a2"})
+	})
+
+	t.Run("trailing prompt with no reply yet is an exchange", func(t *testing.T) {
+		pending := []Message{
+			{Type: "user", Content: "q1"},
+			{Type: "assistant", Content: "a1"},
+			{Type: "user", Content: "q2"},
+		}
+		assertContents(t, lastExchanges(pending, 1), []string{"q2"})
+	})
+
+	t.Run("no user messages at all returns everything", func(t *testing.T) {
+		assistantOnly := []Message{
+			{Type: "assistant", Content: "a1"},
+			{Type: "assistant", Content: "a2"},
+		}
+		assertContents(t, lastExchanges(assistantOnly, 1), []string{"a1", "a2"})
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		if got := lastExchanges(nil, 1); len(got) != 0 {
+			t.Errorf("expected no messages, got %+v", got)
+		}
+	})
+}
+
 func assertContents(t *testing.T, got []Message, want []string) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -967,6 +1029,37 @@ func contents(msgs []Message) []string {
 		out = append(out, m.Content)
 	}
 	return out
+}
+
+func TestGetConversation_ArrayUserPromptsFormExchanges(t *testing.T) {
+	// End to end on the shape a real transcript has: array-form prompts, and
+	// an agent that answers in two messages. Before the fix this returned two
+	// assistant messages and no prompt.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/exchange/test"
+	sessionID := "sess-exchange"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{textBlock("first question")}}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("first answer")}}, Timestamp: "2024-01-01T00:00:01Z"},
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{textBlock("second question")}}, Timestamp: "2024-01-01T00:00:02Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "name": "Bash", "id": "tu_1"}}}, Timestamp: "2024-01-01T00:00:03Z"},
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"}}}, Timestamp: "2024-01-01T00:00:04Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("second answer")}}, Timestamp: "2024-01-01T00:00:05Z"},
+	})
+
+	msgs, err := r.GetConversation(workDir, sessionID, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertContents(t, msgs, []string{"second question", "second answer"})
+
+	msgs, err = r.GetConversation(workDir, sessionID, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertContents(t, msgs, []string{"first question", "first answer", "second question", "second answer"})
 }
 
 // --- Oversized lines: the message readers must not stop mid-file ---

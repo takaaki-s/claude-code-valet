@@ -10,6 +10,14 @@ import (
 	"strings"
 )
 
+// maxTranscriptLineBytes bounds a single JSONL line. Claude Code writes a
+// whole tool_result payload on one line, so the ceiling has to be generous.
+// Every reader in this package shares it: the message readers used to carry
+// their own 1 MiB limit, which stopped bufio.Scanner mid-file on real
+// transcripts, and — because none of them checked scanner.Err() — the
+// truncation was indistinguishable from the end of the conversation.
+const maxTranscriptLineBytes = 16 * 1024 * 1024
+
 // ErrNoTranscript reports that no JSONL file could be located for a session.
 // It is deliberately distinct from a transcript that exists but holds no
 // readable messages: the first means the caller is looking in the wrong
@@ -18,14 +26,6 @@ import (
 // result is what let `session output --last N` stay silent about a missing
 // transcript.
 var ErrNoTranscript = errors.New("no transcript file for session")
-
-// maxTranscriptLineBytes bounds a single JSONL line. Claude Code writes a
-// whole tool_result payload on one line, so the ceiling has to be generous.
-// Every reader in this package shares it: the message readers used to carry
-// their own 1 MiB limit, which stopped bufio.Scanner mid-file on real
-// transcripts, and — because none of them checked scanner.Err() — the
-// truncation was indistinguishable from the end of the conversation.
-const maxTranscriptLineBytes = 16 * 1024 * 1024
 
 // Message represents a message from the transcript
 type Message struct {
@@ -109,9 +109,10 @@ func (r *Reader) GetLastMessages(workDir, sessionID string) (*LastMessages, erro
 	return r.readLastMessages(path)
 }
 
-// GetConversation returns the last N user/assistant message pairs from the transcript.
+// GetConversation returns the last N exchanges from the transcript, where an
+// exchange is a user prompt plus the assistant's reply to it (see lastExchanges).
 // workDir may be empty: a glob fallback locates the JSONL by sessionID.
-// lastN specifies the number of message pairs to return.
+// lastN specifies the number of exchanges to return.
 // Returns ErrNoTranscript when no transcript file exists (yet), and an empty
 // slice when one exists but carries no plain-text message.
 func (r *Reader) GetConversation(workDir, sessionID string, lastN int) ([]Message, error) {
@@ -122,7 +123,8 @@ func (r *Reader) GetConversation(workDir, sessionID string, lastN int) ([]Messag
 	return r.readConversation(path, lastN)
 }
 
-// readConversation reads the transcript and returns the last N*2 user/assistant messages.
+// readConversation reads the transcript and returns the user/assistant
+// messages making up the last lastN exchanges.
 func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -169,13 +171,41 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 		return nil, err
 	}
 
-	// Return last N*2 messages
-	maxMessages := lastN * 2
-	if len(allMessages) > maxMessages {
-		allMessages = allMessages[len(allMessages)-maxMessages:]
-	}
+	return lastExchanges(allMessages, lastN), nil
+}
 
-	return allMessages, nil
+// lastExchanges returns the tail of msgs covering the last n exchanges.
+//
+// An exchange starts at a user message that either opens the transcript or
+// follows an assistant reply, and runs until the next such message — so one
+// exchange is a prompt plus everything the agent said in response, however
+// many entries that took. A trailing run of user messages with no reply yet
+// counts as an exchange of its own, which is what makes `--last 1` show the
+// question the agent is still working on.
+//
+// Slicing a fixed 2n messages instead, as this used to, only lines up with
+// exchanges when every turn happens to be exactly one message; in practice it
+// returned two consecutive assistant messages and no prompt at all. Fewer
+// than n boundaries — or none, as in a transcript that is all assistant
+// text — returns everything rather than guessing at a cut point.
+func lastExchanges(msgs []Message, n int) []Message {
+	if n <= 0 {
+		return msgs
+	}
+	seen := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Type != "user" {
+			continue
+		}
+		if i > 0 && msgs[i-1].Type == "user" {
+			continue // still inside one user run, not a new exchange
+		}
+		seen++
+		if seen == n {
+			return msgs[i:]
+		}
+	}
+	return msgs
 }
 
 // readLastMessages reads the transcript file and returns the last user and assistant messages
