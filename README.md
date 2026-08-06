@@ -89,19 +89,36 @@ jin ui --agent codex   # transient default; ends when TUI exits
 
 ## Quick Start
 
-### 1. Start the daemon
+### 1. Set up
+
+```bash
+jin init
+```
+
+Writes a default `config.yaml`, then offers to install the **jin skill** for
+whichever agents it finds on your `PATH` (`claude`, `codex`, `opencode`). The
+skill is a short document that teaches an agent to drive jin by reading
+`jin docs`.
+
+Installing it is opt-in: the full text and every destination are printed
+before you are asked, the prompt defaults to no, existing files are never
+replaced without `--force`, and nothing is written when stdin is not a
+terminal. Use `--dry-run` to see what it would do, `--no-skill` to skip it, or
+`--skill-dir` to choose the location yourself.
+
+### 2. Start the daemon
 
 ```bash
 jin daemon start
 ```
 
-### 2. Launch the TUI
+### 3. Launch the TUI
 
 ```bash
 jin ui
 ```
 
-### 3. Create and attach to a session
+### 4. Create and attach to a session
 
 Press `n` in the TUI to create a session, then `Enter` to attach.
 
@@ -177,6 +194,21 @@ jin cleanup stopped --dry-run   # Preview what will be deleted
 
 > **Aliases**: `session` can be shortened to `sess` (e.g., `jin sess list`). `list` to `ls`, `delete` to `rm`.
 
+### Agent-facing documentation
+
+jin ships the reference material its own agents need, compiled into the binary
+so it always matches the version you are running.
+
+```bash
+jin docs list             # available topics, with a summary of each
+jin docs show <name>      # read one
+```
+
+Both work without the daemon. Topics cover the delegation loop, selector
+resolution, exit codes, and the traps an orchestrating agent hits. Agents that
+installed the skill via `jin init` are pointed here automatically, and every
+session jin starts is told these commands exist.
+
 ### LLM API (scripting / automation)
 
 The following commands support `--json` for structured output, enabling integration with scripts and other LLM agents.
@@ -235,10 +267,17 @@ jin session result my-session --errors-only --json
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | General error |
+| 1 | General error — including a failure to reach the daemon |
 | 2 | Session not found |
-| 3 | Daemon not running |
+| 3 | Reserved (daemon not running); **not currently emitted** |
 | 4 | Timeout (`session wait`) |
+| 5 | Worktree dirty |
+| 6 | Ambiguous selector |
+
+Do not branch on 3 to detect a stopped daemon — check first instead, with
+`jin daemon status >/dev/null 2>&1 || jin daemon start`.
+
+For what to do about each code, see `jin docs show exit-codes`.
 
 ### Utilities
 

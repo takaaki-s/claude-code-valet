@@ -522,7 +522,11 @@ func TestClientSend_DistinguishesNotRunningFromUnresponsive(t *testing.T) {
 	if notRunningErr == nil {
 		t.Fatal("expected an error when nothing is listening, got nil")
 	}
-	if notRunningErr.Error() != "daemon not running. Start with: jin daemon" {
+	// The remedy names the full command — `jin daemon` on its own only prints
+	// the subcommand help, and tui.go already spells out `jin daemon start` —
+	// and points at the docs, because this is the failure an orchestrating
+	// agent hits first.
+	if notRunningErr.Error() != "daemon not running. Start with: jin daemon start (details: jin docs show gotchas)" {
 		t.Errorf("error = %q, want the unchanged not-running wording", notRunningErr.Error())
 	}
 

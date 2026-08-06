@@ -45,7 +45,7 @@ func TestHookArgs_Golden(t *testing.T) {
 	args := HookArgs("/usr/local/bin/jin")
 	got := strings.Join(args, " ")
 	want := "--enable hooks" +
-		` -c 'hooks.SessionStart=[{hooks=[{type="command",command="/usr/local/bin/jin hook",timeout=10000}]}]'` +
+		` -c 'hooks.SessionStart=[{hooks=[{type="command",command="/usr/local/bin/jin hook --emit-context",timeout=10000}]}]'` +
 		` -c 'hooks.UserPromptSubmit=[{hooks=[{type="command",command="/usr/local/bin/jin hook",timeout=10000}]}]'` +
 		` -c 'hooks.PreToolUse=[{hooks=[{type="command",command="/usr/local/bin/jin hook",timeout=10000}]}]'` +
 		` -c 'hooks.PostToolUse=[{hooks=[{type="command",command="/usr/local/bin/jin hook",timeout=10000}]}]'` +
@@ -53,6 +53,57 @@ func TestHookArgs_Golden(t *testing.T) {
 		` -c 'hooks.Stop=[{hooks=[{type="command",command="/usr/local/bin/jin hook",timeout=10000}]}]'`
 	if got != want {
 		t.Errorf("HookArgs joined mismatch:\nwant: %s\n got: %s", want, got)
+	}
+}
+
+// TestHookArgs_ContextFlagOnSessionStartOnly guards the blast radius of the
+// --emit-context addition. Only SessionStart's stdout is read by Codex; the
+// flag appearing on any other event would print JSON into a channel nothing
+// parses, and its absence from SessionStart would silently stop injecting the
+// context. The golden test above pins the exact strings, but it would also
+// pass if a future edit moved the flag and updated the golden to match — this
+// states the rule itself.
+func TestHookArgs_ContextFlagOnSessionStartOnly(t *testing.T) {
+	args := HookArgs("/usr/local/bin/jin")
+
+	seen := 0
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "-c" {
+			continue
+		}
+		val := args[i+1]
+		seen++
+		isSessionStart := strings.Contains(val, "hooks."+sessionStartEvent+"=")
+		hasFlag := strings.Contains(val, "--emit-context")
+		if isSessionStart && !hasFlag {
+			t.Errorf("%s carries no --emit-context; children would never learn about `jin docs`:\n%s", sessionStartEvent, val)
+		}
+		if !isSessionStart && hasFlag {
+			t.Errorf("--emit-context leaked onto a non-SessionStart event:\n%s", val)
+		}
+	}
+	if seen != len(managedEvents) {
+		t.Fatalf("inspected %d -c values, expected %d", seen, len(managedEvents))
+	}
+}
+
+// TestHookArgs_NonSessionStartEventsUnchanged states the other half of the
+// same rule as a shape assertion: every event but SessionStart must still
+// produce exactly the pre-flag command string. A quoting mistake in the
+// SessionStart branch that spilled into the shared format string would show
+// up here.
+func TestHookArgs_NonSessionStartEventsUnchanged(t *testing.T) {
+	const path = "/usr/local/bin/jin"
+	args := HookArgs(path)
+
+	for _, ev := range managedEvents {
+		if ev == sessionStartEvent {
+			continue
+		}
+		want := `-c 'hooks.` + ev + `=[{hooks=[{type="command",command="` + path + ` hook",timeout=10000}]}]'`
+		if joined := strings.Join(args, " "); !strings.Contains(joined, want) {
+			t.Errorf("event %q is not in its expected pre-flag form; want substring:\n%s", ev, want)
+		}
 	}
 }
 

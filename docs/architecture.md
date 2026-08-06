@@ -228,8 +228,12 @@ internal/agent/codex/   Codex CLI adapter: SpawnCommand appends `--enable hooks
                          files), Description (Layer C-transcript enhancer over
                          $CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<UUID>.jsonl)
 internal/agent/opencode/ opencode adapter: Setup materialises an embedded
-                         TypeScript plugin at <StateDir>/opencode/plugin/jin.ts
-                         and SpawnCommand points opencode at it via
+                         TypeScript plugin at <StateDir>/opencode/plugin/jin.ts,
+                         plus opencode.json + jin-agent.md in the same directory
+                         (an `instructions` entry carrying the agent-facing
+                         context — opencode's plugin discards `jin hook` stdout,
+                         so the hook route the other adapters use cannot reach
+                         it). SpawnCommand points opencode at the directory via
                          OPENCODE_CONFIG_DIR. No Description enhancer.
 internal/agent/textutil.go  Cross-adapter helper — currently `SmartTruncate`
                          shared by claude and codex description enhancers.
@@ -290,6 +294,7 @@ The `Name` field was retired in favour of `Description` + `DescriptionLocked`. E
 
 ```
 cmd/jin/cmd/       → daemon (client), config, session (types only), tui, tmux, plugin,
+                       agentdocs,
                        _ agent/register (blank import so kinds are registered)
                       │
 daemon/            → session, config, tmux, agent (registry Lookup), plugin
@@ -297,10 +302,16 @@ daemon/            → session, config, tmux, agent (registry Lookup), plugin
 session/           → config, tmux, transcript, plugin (Dispatcher seam only)
                       │
 agent/             → session (borrows Agent + supporting types via aliases)
-agent/claude/      → agent, session, transcript, debug   (CC-specific adapter)
-agent/codex/       → agent, session                       (Codex-specific adapter)
-agent/opencode/    → agent, session, debug                (opencode-specific adapter)
+agent/claude/      → agent, session, transcript, debug, agentdocs   (CC-specific adapter)
+agent/codex/       → agent, session, agentdocs            (Codex-specific adapter)
+agent/opencode/    → agent, session, debug, agentdocs     (opencode-specific adapter)
 agent/register/    → agent, agent/claude, agent/codex, agent/opencode  (init-time Register)
+                      │
+agentdocs/         → (embedded content only; no internal deps)
+                      Being a leaf is what lets cmd/ and every adapter share it:
+                      the docs served by `jin docs`, the skill `jin init` offers,
+                      the context injected into child sessions, and HookCommand —
+                      the single owner of the `--emit-context` hook flag.
                       │
 plugin/            → config (PluginsConfig), debug   (no import of tmux/ or session/)
                       │

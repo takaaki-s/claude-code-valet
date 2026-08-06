@@ -179,7 +179,11 @@ func (c *Client) sendWithTimeout(req Request, timeout time.Duration) (*Response,
 				dialTimeout,
 			)
 		}
-		return nil, fmt.Errorf("daemon not running. Start with: jin daemon")
+		// The docs pointer is here and nowhere else among the exit paths: a
+		// stopped daemon is the failure an orchestrating agent hits first, and
+		// the context injected into every child session points at `jin docs`,
+		// so this is where the two have to meet.
+		return nil, fmt.Errorf("daemon not running. Start with: jin daemon start (details: jin docs show gotchas)")
 	}
 	defer conn.Close()
 

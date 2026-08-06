@@ -237,7 +237,7 @@ func runPluginInstallBySource(cmd *cobra.Command, arg string) error {
 	m := plan.Manifest()
 	printPluginPlan(out, m, src.Raw, plan.CommitSHA())
 
-	if yes, _ := cmd.Flags().GetBool("yes"); !yes && !confirmPlugin(cmd, "Install? [y/N]: ") {
+	if yes, _ := cmd.Flags().GetBool("yes"); !yes && !confirmYN(cmd, "Install? [y/N]: ") {
 		fmt.Fprintln(out, "aborted")
 		return nil
 	}
@@ -308,7 +308,7 @@ func runPluginInstallByName(cmd *cobra.Command, name string) error {
 	if plan.CompatErr() != nil && !force {
 		return fmt.Errorf("%v (pass --force to override)", plan.CompatErr())
 	}
-	if !yes && !confirmPlugin(cmd, "Continue? [y/N]: ") {
+	if !yes && !confirmYN(cmd, "Continue? [y/N]: ") {
 		fmt.Fprintln(out, "aborted")
 		return nil
 	}
@@ -376,7 +376,7 @@ func runPluginUpdate(cmd *cobra.Command, args []string) error {
 	printPluginPlan(out, m, entry.Source, plan.CommitSHA())
 	fmt.Fprintf(out, "Update: %s -> %s\n", shortSHA(plan.PrevCommitSHA()), shortSHA(plan.CommitSHA()))
 
-	if yes, _ := cmd.Flags().GetBool("yes"); !yes && !confirmPlugin(cmd, "Update? [y/N]: ") {
+	if yes, _ := cmd.Flags().GetBool("yes"); !yes && !confirmYN(cmd, "Update? [y/N]: ") {
 		fmt.Fprintln(out, "aborted")
 		return nil
 	}
@@ -526,7 +526,13 @@ func printPluginPlan(out io.Writer, m *manifest.Manifest, source, commitSHA stri
 	}
 }
 
-func confirmPlugin(cmd *cobra.Command, prompt string) bool {
+// confirmYN asks prompt and reports whether the answer was an explicit yes.
+// Anything else — including a bare Enter — is a no, so a caller can default to
+// the safe branch by wording the prompt "[y/N]".
+//
+// Shared by the plugin and init commands; keep it that way rather than
+// rederiving the reader, per the atomicfile note in docs/conventions.md.
+func confirmYN(cmd *cobra.Command, prompt string) bool {
 	fmt.Fprint(cmd.OutOrStdout(), prompt)
 	line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
 	answer := strings.ToLower(strings.TrimSpace(line))

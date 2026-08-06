@@ -19,9 +19,11 @@ import (
 var jsonOutput bool
 
 var rootCmd = &cobra.Command{
-	Use:     "jin",
-	Short:   "LLM session manager for Claude Code",
-	Long:    `A CLI tool to manage multiple Claude Code sessions with attach/detach support.`,
+	Use:   "jin",
+	Short: "LLM session manager for Claude Code",
+	Long: `A CLI tool to manage multiple Claude Code sessions with attach/detach support.
+
+Driving jin from an agent? Run 'jin docs list'.`,
 	Version: version.Version,
 	// Runtime failures must not print the usage block. A command that reaches
 	// its RunE body was invoked correctly, so "no session matches selector"

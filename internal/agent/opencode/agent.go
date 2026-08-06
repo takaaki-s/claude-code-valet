@@ -77,6 +77,13 @@ func (a *Agent) Setup(ctx agent.SetupContext) error {
 		opencodeLog("[OPENCODE] Warning: failed to write plugin: %v", err)
 		return nil
 	}
+	// Fail-open, and separately from the plugin: status reporting is what
+	// makes the session usable at all, whereas the context is a convenience
+	// for the agent inside it. A session that starts without knowing about
+	// `jin docs` is far better than one that does not start.
+	if err := WriteAgentContext(dir); err != nil {
+		opencodeLog("[OPENCODE] Warning: failed to write agent context: %v", err)
+	}
 	a.setupMu.Lock()
 	defer a.setupMu.Unlock()
 	a.configDir = dir
