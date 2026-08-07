@@ -541,7 +541,7 @@ func runTUIInner() error {
 		_ = tc.TagManagedPane(tuiPaneID)
 		// Rebind detach key to focus TUI pane by ID (works from any pane)
 		_ = tc.BindKey(detachTmuxKey, "run-shell",
-			fmt.Sprintf("tmux -L %s select-pane -t %s", tmux.MgrSocketName, tuiPaneID))
+			fmt.Sprintf("tmux -L %s select-pane -t %s", tc.GetSocketName(), tuiPaneID))
 	}
 
 	// Get display pane ID: find the pane in the UI window that is NOT the TUI pane.

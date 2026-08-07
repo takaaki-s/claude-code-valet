@@ -176,6 +176,23 @@ func TestDefaultSocketName(t *testing.T) {
 	})
 }
 
+func TestDefaultMgrSocketName(t *testing.T) {
+	// An empty env var is treated as unset by DefaultMgrSocketName, matching
+	// what os.Getenv returns for an actually-unset variable.
+	t.Run("empty falls back to MgrSocketName", func(t *testing.T) {
+		t.Setenv("JIN_TMUX_MGR_SOCKET", "")
+		if got := DefaultMgrSocketName(); got != MgrSocketName {
+			t.Errorf("DefaultMgrSocketName() with env empty = %q, want %q", got, MgrSocketName)
+		}
+	})
+	t.Run("env value wins", func(t *testing.T) {
+		t.Setenv("JIN_TMUX_MGR_SOCKET", "jin-mgr-test-abcd1234")
+		if got := DefaultMgrSocketName(); got != "jin-mgr-test-abcd1234" {
+			t.Errorf("DefaultMgrSocketName() with env set = %q, want %q", got, "jin-mgr-test-abcd1234")
+		}
+	})
+}
+
 func TestNewClientWithSocket_NoTmux(t *testing.T) {
 	origPath := os.Getenv("PATH")
 	t.Cleanup(func() {

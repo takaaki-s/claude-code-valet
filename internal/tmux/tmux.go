@@ -15,7 +15,9 @@ const (
 	// SocketName is the dedicated tmux socket name for jin (inner tmux for CC sessions)
 	SocketName = "jin"
 
-	// MgrSocketName is the tmux socket name for the outer layout manager
+	// MgrSocketName is the built-in default tmux socket name for the outer
+	// layout manager. Callers that need the effective name (honoring an
+	// override) should use DefaultMgrSocketName instead.
 	MgrSocketName = "jin-mgr"
 
 	// SessionName is the tmux session name (used for the outer tmux session)
@@ -157,15 +159,32 @@ func DefaultSocketName() string {
 	return SocketName
 }
 
-// NewMgrClient creates a tmux client for the outer layout manager socket.
-// Uses -f /dev/null to prevent loading user's ~/.tmux.conf, ensuring
-// user key bindings (e.g., Shift+Arrow) pass through to the inner tmux.
+// DefaultMgrSocketName returns the socket name NewMgrClient targets, honoring
+// JIN_TMUX_MGR_SOCKET the same way DefaultSocketName honors JIN_TMUX_SOCKET
+// for the inner socket — lets `jin ui`/`jin tui` point at a throwaway outer
+// tmux server during manual verification instead of the real "jin-mgr".
+//
+// Resolved via a live os.Getenv read rather than cached in a package var, for
+// the same reason as DefaultSocketName: NewMgrClient() is already called
+// fresh per CLI invocation, so a live read costs nothing extra and keeps the
+// two env vars behaviorally identical.
+func DefaultMgrSocketName() string {
+	if v := os.Getenv("JIN_TMUX_MGR_SOCKET"); v != "" {
+		return v
+	}
+	return MgrSocketName
+}
+
+// NewMgrClient creates a tmux client for the outer layout manager socket,
+// resolved via DefaultMgrSocketName. Uses -f /dev/null to prevent loading
+// user's ~/.tmux.conf, ensuring user key bindings (e.g., Shift+Arrow) pass
+// through to the inner tmux.
 func NewMgrClient() (*Client, error) {
 	path, err := exec.LookPath("tmux")
 	if err != nil {
 		return nil, fmt.Errorf("tmux not found: %w", err)
 	}
-	return &Client{tmuxPath: path, socketName: MgrSocketName, configFile: "/dev/null"}, nil
+	return &Client{tmuxPath: path, socketName: DefaultMgrSocketName(), configFile: "/dev/null"}, nil
 }
 
 // HasTmux returns true if tmux is available on the system.
