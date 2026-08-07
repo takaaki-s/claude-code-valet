@@ -11,7 +11,7 @@
 
 tmux の上で動くので、既存の設定はそのまま。SSH 越しでも同じ画面に戻れます。
 
-https://github.com/user-attachments/assets/68778af9-07eb-412e-8b11-0e6ec916010b
+![8 つのエージェントセッションが 1 つの一覧に並ぶ。カーソルを下へ動かすと下のペインが追随して各セッションを説明し、切り替えは起きない。許可待ちのセッションには印が付き、その許可ダイアログが右に開いている。](https://github.com/takaaki-s/jind-ai/releases/download/v0.9.0/demo.gif)
 
 ## インストール
 
