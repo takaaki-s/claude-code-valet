@@ -72,6 +72,10 @@ func newAsyncTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("session.NewManager: %v", err)
 	}
+	// Mirrors NewServer: handlers that read a transcript through the manager
+	// (handleGet) resolve the adapter from here, not from agent.Lookup, so a
+	// fixture without it stops standing in for the server it claims to build.
+	mgr.SetAgentResolver(agentResolverAdapter{})
 	return &Server{
 		manager:   mgr,
 		configMgr: configMgr,

@@ -62,6 +62,10 @@ type fakeAgent struct {
 	// silently return every session to the pre-fix behaviour while the
 	// adapter's own table tests stayed green.
 	dismissFn func(string) []string
+	// transcriptSrc is what Transcript() hands back. Nil (the default) means
+	// this adapter cannot read a conversation, which is what the list rows
+	// must tolerate silently.
+	transcriptSrc TranscriptSource
 }
 
 func (a *fakeAgent) Kind() string                        { return "claude" }
@@ -83,10 +87,7 @@ func (a *fakeAgent) DismissOverlayKeys(prompt string) []string {
 	return a.dismissFn(prompt)
 }
 
-// Transcript returns nil: nothing in this file reads a conversation log, and
-// the Manager never calls this — `jin session result` resolves the adapter
-// itself in the daemon.
-func (a *fakeAgent) Transcript() TranscriptSource { return nil }
+func (a *fakeAgent) Transcript() TranscriptSource { return a.transcriptSrc }
 
 type fakeStatusSource struct{}
 

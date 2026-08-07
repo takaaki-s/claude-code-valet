@@ -1329,6 +1329,13 @@ func TestReaders_ReportLineOverLimitInsteadOfTruncating(t *testing.T) {
 	if _, err := r.GetLastMessages(workDir, sessionID); !errors.Is(err, bufio.ErrTooLong) {
 		t.Errorf("GetLastMessages: expected bufio.ErrTooLong, got %v", err)
 	}
+	// ReadEntries is asserted directly rather than left to the reader above:
+	// it is the TranscriptSource method every adapter implements and the one
+	// the session previews now take, so it has to carry the guarantee on its
+	// own rather than inherit it from a caller that could stop using it.
+	if _, err := r.ReadEntries(workDir, sessionID, ""); !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("ReadEntries: expected bufio.ErrTooLong, got %v", err)
+	}
 }
 
 // --- Structured API: LastToolUse / LastToolResult ---

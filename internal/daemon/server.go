@@ -524,18 +524,10 @@ func (s *Server) handleGet(data json.RawMessage) Response {
 		return Response{Success: false, Error: fmt.Sprintf("session not found: %s", req.ID)}
 	}
 
-	// Enrich with transcript data
-	reader := transcript.NewReader()
-	if info.AgentSessionID != "" && info.WorkDir != "" {
-		if msgs, err := reader.GetLastMessages(info.WorkDir, info.AgentSessionID); err == nil && msgs != nil {
-			if msgs.User != nil {
-				info.LastUserMessage = transcript.TruncateMessage(msgs.User.Content, 500)
-			}
-			if msgs.Assistant != nil {
-				info.LastAssistantMessage = transcript.TruncateMessageFromEnd(msgs.Assistant.Content, 500)
-			}
-		}
-	}
+	// Enrich with transcript data, through the adapter that owns the session —
+	// see Manager.AttachLastMessages for why the previews were blank on every
+	// non-Claude kind before.
+	s.manager.AttachLastMessages(&info)
 
 	respData, _ := json.Marshal(info)
 	return Response{Success: true, Data: respData}

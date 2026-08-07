@@ -21,6 +21,18 @@ log.
   [docs/gotchas.md](docs/gotchas.md#session-result), or `jin docs show gotchas`
   for the orchestration-facing version.
 
+- **Session rows and `jin session info` show a codex session's last messages.**
+  The two message previews — the TUI's second line, the `session list` rows,
+  and `last_user_message` / `last_assistant_message` in
+  `jin session info --json` — were read with the Claude Code transcript reader
+  whatever agent the session ran, so on codex and opencode they were blank
+  permanently. They now go through the session's own adapter, like
+  `jin session result` already did. Claude Code sessions show exactly what they
+  showed before. These stay a preview rather than a result: an unreadable
+  transcript leaves them empty and the command still succeeds, so an empty
+  preview is not evidence a child said nothing — use `jin session result` for
+  that. `jin session output` is unchanged and still reads Claude Code only.
+
 ### Behaviour change
 
 - **Breaking: `jin session result` on an opencode session now fails** instead
