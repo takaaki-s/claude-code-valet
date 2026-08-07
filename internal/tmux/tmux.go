@@ -12,12 +12,16 @@ import (
 )
 
 const (
-	// SocketName is the dedicated tmux socket name for jin (inner tmux for CC sessions)
+	// SocketName is the built-in default tmux socket name for jin (inner tmux
+	// for CC sessions). Use it only to mean "the default itself"; anything
+	// that actually talks to a server — including a socket name interpolated
+	// into a shell command — must go through DefaultSocketName so
+	// JIN_TMUX_SOCKET is honored.
 	SocketName = "jin"
 
 	// MgrSocketName is the built-in default tmux socket name for the outer
-	// layout manager. Callers that need the effective name (honoring an
-	// override) should use DefaultMgrSocketName instead.
+	// layout manager. Same rule as SocketName: use DefaultMgrSocketName for
+	// the effective name, so JIN_TMUX_MGR_SOCKET is honored.
 	MgrSocketName = "jin-mgr"
 
 	// SessionName is the tmux session name (used for the outer tmux session)

@@ -127,7 +127,10 @@ func NewServer(socketPath, sessionsDir, configDir, stateDir string) (*Server, er
 	if tc, err := tmux.NewClient(); err == nil {
 		mgr.SetTmuxClient(tc)
 		mgr.RecoverTmuxSessions()
-		debugLog("tmux client initialized (socket: %s)", tmux.SocketName)
+		// Report the socket the client actually bound to, not the built-in
+		// default: under JIN_TMUX_SOCKET these differ, and this line is the
+		// primary evidence that an isolated run is talking to its own server.
+		debugLog("tmux client initialized (socket: %s)", tc.GetSocketName())
 	}
 
 	hookRunner, err := worktreehook.NewRunner(stateDir)

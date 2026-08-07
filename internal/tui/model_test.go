@@ -5471,3 +5471,37 @@ func TestPollAttachedSessionCmd_Guards(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildInnerAttachCmd_UsesResolvedSocket pins the display pane's attach
+// command to the *resolved* inner socket. This regressed once: the command was
+// built from the tmux.SocketName constant, so a run that redirected every
+// Client with JIN_TMUX_SOCKET still sent the pane to the real "jin" server the
+// moment a session was displayed.
+func TestBuildInnerAttachCmd_UsesResolvedSocket(t *testing.T) {
+	t.Run("env value reaches the attach command", func(t *testing.T) {
+		t.Setenv("JIN_TMUX_SOCKET", "jin-test-abcd1234")
+		got := buildInnerAttachCmd(tmux.DefaultSocketName(), "sess-x")
+		if !strings.Contains(got, "-L jin-test-abcd1234 ") {
+			t.Errorf("attach command %q does not target the overridden socket", got)
+		}
+		if strings.Contains(got, "-L "+tmux.SocketName+" ") {
+			t.Errorf("attach command %q still targets the built-in default socket", got)
+		}
+	})
+
+	t.Run("unset falls back to the built-in default", func(t *testing.T) {
+		t.Setenv("JIN_TMUX_SOCKET", "")
+		got := buildInnerAttachCmd(tmux.DefaultSocketName(), "sess-x")
+		if !strings.Contains(got, "-L "+tmux.SocketName+" ") {
+			t.Errorf("attach command %q does not target the default socket %q", got, tmux.SocketName)
+		}
+	})
+
+	t.Run("keeps the nesting guard and the tail keepalive", func(t *testing.T) {
+		got := buildInnerAttachCmd("sock", "sess-x")
+		want := "env -u TMUX tmux -L sock attach -t sess-x; tail -f /dev/null"
+		if got != want {
+			t.Errorf("buildInnerAttachCmd() = %q, want %q", got, want)
+		}
+	})
+}
