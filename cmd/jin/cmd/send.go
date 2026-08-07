@@ -51,7 +51,9 @@ Use "-" as the prompt to read from stdin:
 
 Use --wait-running to confirm the agent picked the prompt up. Without it, send
 reports delivery only: it verifies the keystrokes reached the input buffer
-before pressing Enter, but not that the agent started a turn on them. With it,
+before pressing Enter, but nothing observes what that Enter did. A prompt the
+agent never submitted still exits 0, and the session stays idle — so a
+"jin session wait" behind it returns at once, on the previous turn. With it,
 send polls the session status until it leaves idle for running / thinking /
 permission (up to --wait-timeout seconds), and exits non-zero on timeout so
 callers can escalate.`,
@@ -181,7 +183,7 @@ func pollSendAccepted(ctx context.Context, g statusGetter, sessionID string, tim
 			}
 			if time.Now().After(deadline) {
 				return nil, exitcode.Errorf(exitcode.Timeout,
-					"timeout waiting for session to leave idle after send (last status: %s); the prompt was verified in the input buffer and Enter was sent, but nothing confirms the agent took it — attach the session and look before resending",
+					"timeout waiting for session to leave idle after send (last status: %s); the prompt was verified in the input buffer and Enter was sent, but nothing confirms it was submitted — the input buffer may still hold it; attach the session and look before resending",
 					info.Status)
 			}
 		}
@@ -195,7 +197,7 @@ func renderSendResultJSON(w io.Writer, result sendResult) error {
 func init() {
 	sessionCmd.AddCommand(sendCmd)
 	sendCmd.Flags().Bool("wait-running", false,
-		"After send, poll status until the session leaves idle (running/thinking/permission); exits with timeout code on failure.")
+		"After send, poll status until the session leaves idle (running/thinking/permission) — the only confirmation that the prompt was submitted rather than merely delivered; exits with timeout code on failure.")
 	sendCmd.Flags().Int("wait-timeout", 10,
 		"Seconds to wait for the session to leave idle when --wait-running is set.")
 }

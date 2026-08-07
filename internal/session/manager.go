@@ -1112,6 +1112,24 @@ var (
 	// full retry chain. Skipped entirely when the resolved adapter returns
 	// nil / empty keys (opt-out) or the resolver could not produce one.
 	sendClearSettleDelay = 20 * time.Millisecond
+	// sendDismissSettleDelay is how long we wait after the adapter's
+	// DismissOverlayKeys sequence before re-capturing to confirm the prompt
+	// survived it.
+	//
+	// This one cannot be sized by analogy with sendClearSettleDelay above.
+	// That delay guards a step whose effect is never checked, so being short
+	// only risks a wasted keypress. Here the delay is the check: capture too
+	// early and the pane still shows the pre-dismiss state, where the prompt
+	// is present by definition — so the re-check passes no matter what the
+	// keys did, which is the failure it exists to catch.
+	//
+	// Measured against Claude Code 2.1.224 by sending the destructive case
+	// (C-u, which empties the input) and polling capture-pane until the
+	// change showed: 54, 83, 93, 116 and 161ms over five runs. 250ms clears
+	// the slowest of those with margin. It is paid only by prompts an
+	// adapter flagged as able to open an overlay, and only once per send —
+	// not per attempt — so the cost does not scale with anything.
+	sendDismissSettleDelay = 250 * time.Millisecond
 
 	// sendVerifyLooks is how many times one attempt re-checks the pane
 	// before giving up and re-sending, and sendVerifyLookDelay is the gap
@@ -1176,13 +1194,24 @@ var (
 	// became visible after roughly 20 `Down` presses. `C-End`, `NPage` and
 	// `C-e` did nothing.
 	//
-	// Safe to send unconditionally, which is why this stays one constant
-	// instead of an adapter capability. Measured on Claude and Codex: five
-	// presses against an empty input changed the pane not at all — no history
-	// recall dropping text into the field, which would be the worst outcome
-	// available, since it would commit something nobody sent — and twenty
-	// presses against a filled input preserved every byte. Both still verify
-	// a 16KB prompt with it.
+	// This stays one constant instead of an adapter capability, but NOT for
+	// the reason originally recorded here. That reason was "safe to send
+	// unconditionally", resting on measurements against an empty input (five
+	// presses left the pane byte-identical — no history recall dropping text
+	// into the field) and against a filled one (twenty presses preserved
+	// every byte). Both still hold, and both were taken on inputs with no
+	// completion overlay open. On an input that has one, `Down` is not inert:
+	// it walks the overlay's selection. Measured on Claude Code 2.1.224,
+	// `/my-0` ran /my-03-work without the nudge and /my-01-spec with it, 3/3
+	// each — a different command from the one the caller sent.
+	//
+	// It stays a constant because the fix belongs at the other end. The
+	// adapter's DismissOverlayKeys closes the overlay before Enter, which
+	// discards the selection the nudge moved, so the same `/my-0` submits as
+	// `/my-0` (3/3). Making the nudge itself conditional would instead cost
+	// the thing it exists for: the look count scales with the prompt because
+	// each look nudges, and on OpenCode those nudges are what walk a tall
+	// input's tail into view at all.
 	sendNudgeKey = "Down"
 	// sendPasteBufferName is the tmux buffer the paste transport reuses.
 	// A fixed name keeps the buffer stack from growing; PasteBuffer's `-d`
@@ -1423,10 +1452,25 @@ func sendVerifyAppeared(beforeNorm, afterNorm, needle string) bool {
 // sendVerifyBudget elapses. Enter is only pressed after verify succeeds,
 // so fully-dropped prompts never get committed.
 //
+// That last guarantee does not invert. "Verify failed" does mean nothing was
+// committed; "verify passed" does NOT mean the prompt will be. Verify can
+// only see what the pane renders, and a rendered input line says nothing
+// about what the TUI will do with the next keypress — an agent holding a
+// completion overlay open consumes Enter to accept a candidate instead,
+// rewriting the input and submitting nothing. Closing that overlay is the
+// adapter's job (DismissOverlayKeys), and the step after it re-checks that
+// the prompt survived; beyond those two, a send that returns nil has
+// delivered keystrokes and pressed Enter, not proven a turn began. Callers
+// that need the stronger fact poll for it (`send --wait-running`).
+//
 // One attempt is:
 //
 //	clear x sendClearRepeats -> capture before -> chunked literal sends
 //	-> (nudge -> settle -> capture after -> verify) x sendVerifyLooks
+//
+// and once an attempt lands, before Enter:
+//
+//	dismiss overlay keys -> settle -> capture -> verify again
 //
 // The inner loop looks repeatedly before the outer one re-sends, because
 // re-sending discards whatever the TUI had rendered — see the comment on
@@ -1478,10 +1522,11 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 	// answer changes across the retry loop. A missing or misconfigured
 	// resolver falls through to the defaults — no clearing, keystrokes —
 	// because the transport layer must never refuse a send over it.
-	var clearKeys []string
+	var clearKeys, dismissKeys []string
 	var placeholder string
 	if ag := m.resolveAgent(agentKind); ag != nil {
 		clearKeys, placeholder = ag.ClearInputKeys(), ag.PastePlaceholder(prompt)
+		dismissKeys = ag.DismissOverlayKeys(prompt)
 	}
 	pasting := placeholder != ""
 
@@ -1519,6 +1564,20 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 	foldNeedle := normalizeForVerify(placeholder)
 	budget := sendVerifyBudget(len(chunks), clearRepeats*len(clearKeys), looks)
 
+	// The post-clear baseline the whole attempt compares against. Declared
+	// out here because the overlay-dismiss step below runs after the loop
+	// and re-checks against the same baseline and needles.
+	var beforeNorm string
+	// landedIn folds the two-needle comparison the paste path needs into one
+	// call, so the look loop and the post-dismiss re-check cannot drift into
+	// judging "did the prompt arrive?" by different rules.
+	landedIn := func(afterNorm string) bool {
+		if sendVerifyAppeared(beforeNorm, afterNorm, tail) {
+			return true
+		}
+		return pasting && sendVerifyAppeared(beforeNorm, afterNorm, foldNeedle)
+	}
+
 	deadline := time.Now().Add(budget)
 	attempts := 0
 	for {
@@ -1545,7 +1604,7 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		if err != nil {
 			return fmt.Errorf("capture-pane before failed: %w", err)
 		}
-		beforeNorm := normalizeForVerify(before)
+		beforeNorm = normalizeForVerify(before)
 
 		if pasting {
 			// One atomic bracketed paste. No chunking, so the split-boundary
@@ -1607,12 +1666,7 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 			// stands in for it — but a small paste the TUI declined to fold
 			// still shows its tail, so accept whichever appears rather than
 			// depending on where that fold threshold sits.
-			afterNorm := normalizeForVerify(after)
-			ok := sendVerifyAppeared(beforeNorm, afterNorm, tail)
-			if !ok && pasting {
-				ok = sendVerifyAppeared(beforeNorm, afterNorm, foldNeedle)
-			}
-			if ok {
+			if landedIn(normalizeForVerify(after)) {
 				landed = true
 				break
 			}
@@ -1631,6 +1685,44 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 				budget, attempts)
 		}
 		time.Sleep(sendVerifyBackoff)
+	}
+
+	// Close any completion overlay the prompt opened, then prove the prompt
+	// is still there.
+	//
+	// Verify above establishes that the text is rendered in the input area.
+	// It does NOT establish that Enter will submit that text: an agent whose
+	// completion overlay is open consumes Enter to accept a candidate,
+	// rewriting the input in place and submitting nothing, while everything
+	// this function checks still reads as success. Measured on Claude Code
+	// 2.1.224, `list @internal/agent` was rewritten to
+	// `list @internal/agentdocs/` and left unsent 3/3 — with or without the
+	// nudge, so the nudge is not what causes it.
+	//
+	// The re-check is what makes sending a key here safe rather than
+	// hopeful. Escape was measured to leave the input untouched on Claude
+	// Code (3/3), but that is one agent at one version, and the failure it
+	// could produce — an emptied input followed by an Enter that commits
+	// whatever remains — is worse than the bug being fixed. So: only the
+	// adapter decides whether keys go out, and if the prompt is gone
+	// afterwards, Enter is not pressed at all.
+	if len(dismissKeys) > 0 {
+		for _, k := range dismissKeys {
+			if err := m.tmuxClient.SendKeys(paneID, k); err != nil {
+				return fmt.Errorf("failed to send overlay-dismiss key %q: %w", k, err)
+			}
+		}
+		time.Sleep(sendDismissSettleDelay)
+
+		after, err := m.tmuxClient.CapturePane(paneID, false)
+		if err != nil {
+			return fmt.Errorf("capture-pane after overlay dismiss failed: %w", err)
+		}
+		if !landedIn(normalizeForVerify(after)) {
+			return fmt.Errorf(
+				"send verify: the prompt left the input area after the overlay-dismiss keys %v; "+
+					"Enter was not pressed, so nothing was committed", dismissKeys)
+		}
 	}
 
 	if err := m.tmuxClient.SendKeys(paneID, "Enter"); err != nil {

@@ -26,6 +26,10 @@ type StubAgent struct {
 	// session.Agent.PastePlaceholder. Nil (the default) keeps the
 	// keystroke path, which is what most tests want.
 	PasteFn func(prompt string) string
+	// DismissFn decides the overlay-dismiss keys per prompt; see
+	// session.Agent.DismissOverlayKeys. Nil (the default) opts out, so a
+	// stub sends no extra keys before Enter unless a test asks for them.
+	DismissFn func(prompt string) []string
 }
 
 func (s *StubAgent) Kind() string {
@@ -62,6 +66,20 @@ func (s *StubAgent) PastePlaceholder(prompt string) string {
 		return ""
 	}
 	return s.PasteFn(prompt)
+}
+
+// DismissOverlayKeys returns nil by default, so stubs press Enter straight
+// after verify unless a test opts into the overlay-dismiss step via DismissFn.
+//
+// The default is load-bearing: every test that does not mention the dismissal
+// is asserting the pre-fix key sequence, so a stub that quietly started
+// returning keys would make those assertions describe something else.
+// TestStubDefaultsOptOut pins it.
+func (s *StubAgent) DismissOverlayKeys(prompt string) []string {
+	if s.DismissFn == nil {
+		return nil
+	}
+	return s.DismissFn(prompt)
 }
 
 type statusSourceFn func(session.StatusSignal) (session.StatusUpdate, bool)

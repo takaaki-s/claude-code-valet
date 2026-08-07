@@ -211,6 +211,33 @@ type Agent interface {
 	// so it need not account for line wrapping or the box-drawing a TUI
 	// paints around its input.
 	PastePlaceholder(prompt string) string
+	// DismissOverlayKeys returns the tmux key names that close any completion
+	// overlay this adapter's TUI leaves open once prompt has been typed in
+	// full, or nil when prompt cannot open one.
+	//
+	// This exists because SendPrompt's verify proves the wrong thing. It
+	// proves the prompt's tail is rendered in the input area — which is NOT
+	// the same as "Enter will submit it". Measured on Claude Code 2.1.224, a
+	// prompt ending in an in-progress completion token leaves an overlay
+	// open, and Enter is then consumed to accept a candidate: the prompt is
+	// rewritten in place, never submitted, and SendPrompt still returns nil
+	// (3/3). SendPrompt sends these keys after verify succeeds and before
+	// Enter, then re-checks that the prompt survived.
+	//
+	// The prompt is a parameter because the answer depends on it, and
+	// because the key is not free: on Claude Code, Escape also interrupts a
+	// running turn (2/3 — the third run's turn ended first). An adapter
+	// should return keys only for prompts that can actually open an overlay,
+	// so the side effect never reaches prompts that had no overlay to close.
+	//
+	// Return nil (or an empty slice) to opt out. That is the correct answer
+	// for an adapter whose overlay behaviour has not been measured: sending a
+	// key on a guess is how this class of bug gets introduced, not fixed.
+	//
+	// On Agent rather than a side interface for the same reason as
+	// ClearInputKeys — an adapter that forgets this should fail to compile,
+	// because the failure it reintroduces is silent.
+	DismissOverlayKeys(prompt string) []string
 }
 
 // AgentResolver bridges the Manager to the process-global agent registry

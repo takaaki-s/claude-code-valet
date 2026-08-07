@@ -56,6 +56,12 @@ type fakeAgent struct {
 	enhancer  DescriptionEnhancer
 	clearKeys []string            // returned from ClearInputKeys; nil = opt-out (matches production default)
 	pasteFn   func(string) string // non-nil opts into the paste transport
+	// dismissFn answers DismissOverlayKeys. It takes the prompt rather than
+	// being a fixed slice so that a test can pin the wiring: production
+	// claude decides per prompt, and a manager that passed "" instead would
+	// silently return every session to the pre-fix behaviour while the
+	// adapter's own table tests stayed green.
+	dismissFn func(string) []string
 }
 
 func (a *fakeAgent) Kind() string                        { return "claude" }
@@ -69,6 +75,12 @@ func (a *fakeAgent) PastePlaceholder(prompt string) string {
 		return ""
 	}
 	return a.pasteFn(prompt)
+}
+func (a *fakeAgent) DismissOverlayKeys(prompt string) []string {
+	if a.dismissFn == nil {
+		return nil
+	}
+	return a.dismissFn(prompt)
 }
 
 type fakeStatusSource struct{}
@@ -153,6 +165,25 @@ func installEnhancer(t *testing.T, mgr *Manager, enh DescriptionEnhancer) {
 func installClearKeys(t *testing.T, mgr *Manager, keys []string) {
 	t.Helper()
 	fakeClaudeAgent(t, mgr).clearKeys = keys
+}
+
+// installDismissKeys mutates the resolver's "claude" adapter so
+// DismissOverlayKeys returns the given keys for every prompt. The baseline
+// fakeAgent leaves them nil, which is the production opt-out — so every test
+// that does not call this exercises the pre-fix key sequence, and a
+// regression there shows up as a failure in the existing send tests rather
+// than only in the new ones.
+func installDismissKeys(t *testing.T, mgr *Manager, keys []string) {
+	t.Helper()
+	fakeClaudeAgent(t, mgr).dismissFn = func(string) []string { return keys }
+}
+
+// installDismissFn is installDismissKeys for tests that need the answer to
+// depend on the prompt — the only way to prove SendPrompt hands the real
+// prompt to the adapter rather than something it made up.
+func installDismissFn(t *testing.T, mgr *Manager, fn func(string) []string) {
+	t.Helper()
+	fakeClaudeAgent(t, mgr).dismissFn = fn
 }
 
 // ---------------------------------------------------------------------------
@@ -5010,6 +5041,481 @@ func TestSendPrompt_DelaysBetweenChunks(t *testing.T) {
 		if gap < delay {
 			t.Errorf("gap between chunk %d and %d was %v, want at least %v", i, i+1, gap, delay)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Overlay dismissal before Enter
+//
+// Verify proves the prompt is rendered in the input area. It does not prove
+// Enter will submit it: an agent holding a completion overlay open consumes
+// Enter to accept a candidate instead, rewriting the input and committing
+// nothing while every check here still reads as success. These tests pin the
+// step that closes the overlay first, and the re-check that keeps that step
+// from becoming a new way to commit the wrong thing.
+// ---------------------------------------------------------------------------
+
+// withShortSendDismiss shortens the post-dismiss settle so these tests don't
+// pay the production delay. Same package-var-rewrite caveat as
+// withShortSendVerify — not t.Parallel-safe.
+func withShortSendDismiss(t *testing.T, settle time.Duration) {
+	t.Helper()
+	setForTest(t, &sendDismissSettleDelay, settle)
+}
+
+func TestSendPrompt_DismissesOverlayBeforeEnter(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	const pane = "%dm1"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss", "dm1", pane)
+
+	mock.capturedSequence[pane] = []string{
+		"$ ",                     // before — empty
+		"$ list @internal/agent", // after the literal — prompt landed
+		"$ list @internal/agent", // after Escape — prompt survived
+	}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Escape"); got != 1 {
+		t.Errorf("Escape sent %d times, want 1", got)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 1 {
+		t.Errorf("Enter sent %d times, want 1", got)
+	}
+	// Ordering is the whole point: an Escape after Enter would dismiss an
+	// overlay that had already eaten the commit.
+	litIdx := mock.firstCallIndex("SendKeysLiteral", pane, prompt)
+	escIdx := mock.firstCallIndex("SendKeys", pane, "Escape")
+	enterIdx := mock.firstCallIndex("SendKeys", pane, "Enter")
+	if litIdx < 0 || escIdx < 0 || enterIdx < 0 {
+		t.Fatalf("missing calls: literal=%d escape=%d enter=%d", litIdx, escIdx, enterIdx)
+	}
+	if !(litIdx < escIdx && escIdx < enterIdx) {
+		t.Errorf("call order violated: literal@%d < Escape@%d < Enter@%d expected", litIdx, escIdx, enterIdx)
+	}
+	// before + verify + post-dismiss re-check.
+	if got := countCalls(mock, "CapturePane", pane); got != 3 {
+		t.Errorf("CapturePane called %d times, want 3 (before + verify + post-dismiss)", got)
+	}
+	// And that third capture has to come AFTER the keys. Reading the pane
+	// first would show the pre-dismiss state, so the re-check would pass
+	// whatever the keys did to the input — the count above cannot see that,
+	// because the mock advances its sequence by call count, not by time.
+	recapIdx := mock.lastCallIndex("CapturePane", pane)
+	if !(escIdx < recapIdx && recapIdx < enterIdx) {
+		t.Errorf("re-check out of order: Escape@%d < recapture@%d < Enter@%d expected",
+			escIdx, recapIdx, enterIdx)
+	}
+}
+
+// TestSendPrompt_DismissRecheckComparesAgainstBaseline pins the rule the
+// re-check shares with the verify loop: the prompt counts as present only if
+// it appears MORE often than it did at the baseline, not merely somewhere on
+// screen.
+//
+// The distinction has teeth whenever the pane already carries the prompt —
+// re-sending the same text, or a transcript that still shows the previous
+// turn. A presence test would then be satisfied by that old copy, so a
+// dismiss key that emptied the input would sail through and Enter would
+// commit nothing.
+func TestSendPrompt_DismissRecheckComparesAgainstBaseline(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	const pane = "%dm8"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-baseline", "dm8", pane)
+
+	mock.capturedSequence[pane] = []string{
+		// Baseline already holds the needle once — the previous turn.
+		"prev: list @internal/agent",
+		// Verify: now twice, so 2 > 1 and the attempt lands.
+		"prev: list @internal/agent\n$ list @internal/agent",
+		// After the dismiss key the input is empty again: back to once.
+		// 1 > 1 is false, so this must abort — while "is it on screen at
+		// all?" would say yes and press Enter on an empty input.
+		"prev: list @internal/agent\n$ ",
+	}
+
+	err := mgr.SendPrompt(sess.ID, prompt)
+	if err == nil {
+		t.Fatalf("SendPrompt returned nil; want abort (the dismiss key emptied the input)")
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times, want 0", got)
+	}
+}
+
+// TestSendPrompt_VerifyComparesAgainstBaseline is the same rule one step
+// earlier, in the look loop. Both call sites read it from landedIn, so both
+// need a case where presence and delta disagree — otherwise the shared helper
+// could be reduced to a presence test and every test would stay green.
+func TestSendPrompt_VerifyComparesAgainstBaseline(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 300*time.Millisecond, time.Millisecond, time.Millisecond)
+
+	const pane = "%dm9"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-verify-baseline", "dm9", pane)
+
+	// The needle is on screen the whole time and never gains an occurrence:
+	// the prompt never reached the input. Verify must time out rather than
+	// vouch for the copy that was already there.
+	mock.capturedSequence[pane] = []string{"prev: list @internal/agent"}
+
+	err := mgr.SendPrompt(sess.ID, prompt)
+	if err == nil {
+		t.Fatalf("SendPrompt returned nil; want a verify timeout (the needle never gained an occurrence)")
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times, want 0", got)
+	}
+}
+
+// TestSendPrompt_DismissKeysAskedForThisPrompt pins the wiring between
+// SendPrompt and the adapter. Production claude decides per prompt, so a
+// manager that passed "" — or any other stand-in — would put every session
+// back on the pre-fix path while the adapter's own table tests stayed green.
+func TestSendPrompt_DismissKeysAskedForThisPrompt(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+
+	const pane = "%dm10"
+	const prompt = "list @internal/agent"
+	var seen []string
+	installDismissFn(t, mgr, func(p string) []string {
+		seen = append(seen, p)
+		if p == prompt {
+			return []string{"Escape"}
+		}
+		return nil
+	})
+
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-wiring", "dm10", pane)
+	mock.capturedSequence[pane] = []string{"$ ", "$ list @internal/agent", "$ list @internal/agent"}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+	if len(seen) != 1 || seen[0] != prompt {
+		t.Errorf("adapter was asked with %q, want exactly [%q]", seen, prompt)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Escape"); got != 1 {
+		t.Errorf("Escape sent %d times, want 1 (the adapter said yes for this prompt)", got)
+	}
+}
+
+// TestSendPrompt_DismissEmptySliceOptsOut covers the other way an adapter can
+// decline. The interface doc says nil opts out; an empty slice has to mean the
+// same thing, matching ClearInputKeys, or `!= nil` and `len() > 0` drift apart
+// and one of them silently starts sending keys nobody asked for.
+func TestSendPrompt_DismissEmptySliceOptsOut(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	installDismissKeys(t, mgr, []string{})
+
+	const pane = "%dm11"
+	const prompt = "say pong only"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-empty", "dm11", pane)
+	mock.capturedSequence[pane] = []string{"$ ", "$ say pong only"}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+	if got := countCalls(mock, "SendKeys", pane); got != 2 {
+		t.Errorf("SendKeys called %d times, want 2 (nudge + Enter)", got)
+	}
+	if got := countCalls(mock, "CapturePane", pane); got != 2 {
+		t.Errorf("CapturePane called %d times, want 2 (no re-check on the opt-out path)", got)
+	}
+}
+
+// TestSendPrompt_DismissAfterRetry wires the dismissal to the retry loop.
+// beforeNorm now outlives one iteration, so the re-check must read the
+// baseline of the attempt that actually landed — not the first attempt's.
+func TestSendPrompt_DismissAfterRetry(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	const pane = "%dm12"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-retry", "dm12", pane)
+
+	mock.capturedSequence[pane] = []string{
+		"$ ",                         // attempt 1 baseline
+		"$ ",                         // attempt 1 verify — nothing landed
+		"prev: list @internal/agent", // attempt 2 baseline, needle already once
+		"prev: list @internal/agent\n$ list @internal/agent", // attempt 2 lands: 2 > 1
+		"prev: list @internal/agent\n$ list @internal/agent", // post-dismiss: still 2 > 1
+	}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Escape"); got != 1 {
+		t.Errorf("Escape sent %d times, want 1 (once, after the attempt that landed)", got)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 1 {
+		t.Errorf("Enter sent %d times, want 1", got)
+	}
+}
+
+// TestSendPrompt_RecheckUsesTheLandingAttemptsBaseline pins which baseline the
+// re-check reads. beforeNorm now outlives an iteration, so a refactor that
+// captured it once — on the first attempt — would leave the comparison running
+// against a stale, emptier pane and quietly pass sends it should reject.
+//
+// The sequence is built so the two baselines disagree: attempt 1's has the
+// needle zero times, attempt 2's has it once, and the pane after the dismiss
+// key has it once. Against the right baseline that is 1 > 1, false, abort.
+// Against attempt 1's it is 1 > 0, true, and Enter goes out.
+func TestSendPrompt_RecheckUsesTheLandingAttemptsBaseline(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	const pane = "%dm13"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-stale-baseline", "dm13", pane)
+
+	mock.capturedSequence[pane] = []string{
+		"$ ",                         // attempt 1 baseline — needle absent
+		"$ ",                         // attempt 1 verify — nothing landed, retry
+		"prev: list @internal/agent", // attempt 2 baseline — needle once
+		"prev: list @internal/agent\n$ list @internal/agent", // attempt 2 lands: 2 > 1
+		"prev: list @internal/agent",                         // after the dismiss key: back to once
+	}
+
+	err := mgr.SendPrompt(sess.ID, prompt)
+	if err == nil {
+		t.Fatalf("SendPrompt returned nil; want abort (the input lost the prompt on the landing attempt)")
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times, want 0", got)
+	}
+}
+
+// TestSendPrompt_WaitsBeforeReadingTheDismissResult pins the settle between
+// the dismiss keys and the re-check.
+//
+// Without it the re-check reads a pane that has not repainted, which still
+// shows the prompt — so it passes regardless of what the keys did, and the
+// guard becomes decoration. Nothing else can catch that: this mock advances
+// its recorded content by call count, so every ordering and content assertion
+// stays satisfied. Measured on Claude Code 2.1.224, a destructive key took
+// 54-161ms over five runs to show up in capture-pane.
+func TestSendPrompt_WaitsBeforeReadingTheDismissResult(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	const settle = 40 * time.Millisecond
+	withShortSendDismiss(t, settle)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	const pane = "%dm14"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-settle", "dm14", pane)
+
+	// Abort on the re-check, so the last SendKeys is the dismiss key rather
+	// than Enter and the gap measures the settle we care about.
+	mock.capturedSequence[pane] = []string{"$ ", "$ list @internal/agent", "$ "}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err == nil {
+		t.Fatalf("SendPrompt returned nil; want abort")
+	}
+	if got := mock.dismissSettleGap(pane); got < settle {
+		t.Errorf("waited %v between the dismiss key and the re-check, want at least %v", got, settle)
+	}
+}
+
+func TestSendPrompt_NoDismissWhenAdapterOptsOut(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	// No installDismissKeys: the adapter opts out, which is the production
+	// default for every adapter but claude, and for claude on every prompt
+	// that cannot open an overlay.
+
+	const pane = "%dm2"
+	const prompt = "say pong only"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-optout", "dm2", pane)
+
+	mock.capturedSequence[pane] = []string{"$ ", "$ say pong only"}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Escape"); got != 0 {
+		t.Errorf("Escape sent %d times on the opt-out path, want 0", got)
+	}
+	// Exactly the pre-fix key sequence: nudge + Enter, nothing else.
+	if got := countCalls(mock, "SendKeys", pane); got != 2 {
+		t.Errorf("SendKeys called %d times, want 2 (nudge + Enter)", got)
+	}
+	// And no extra capture: the re-check is paid only when keys went out.
+	if got := countCalls(mock, "CapturePane", pane); got != 2 {
+		t.Errorf("CapturePane called %d times, want 2 (before + verify)", got)
+	}
+}
+
+func TestSendPrompt_DismissKeyErrorDoesNotPressEnter(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	const pane = "%dm3"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-err", "dm3", pane)
+
+	mock.capturedSequence[pane] = []string{"$ ", "$ list @internal/agent"}
+	mock.sendKeysErr["Escape"] = errors.New("tmux disconnected")
+
+	err := mgr.SendPrompt(sess.ID, prompt)
+	if err == nil {
+		t.Fatalf("SendPrompt returned nil, want error")
+	}
+	if !strings.Contains(err.Error(), "overlay-dismiss key") {
+		t.Errorf("error %q missing 'overlay-dismiss key'", err.Error())
+	}
+	// The overlay may still be open, so committing would submit whatever the
+	// TUI decides — not what we were asked to send.
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times after a dismiss failure, want 0", got)
+	}
+}
+
+func TestSendPrompt_DismissThatClearsInputAbortsSend(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	const pane = "%dm4"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-ate-input", "dm4", pane)
+
+	// The failure this guard exists for: the dismiss key turns out to clear
+	// the input on some agent or version. Pressing Enter then commits an
+	// empty line — or worse, whatever was left behind.
+	mock.capturedSequence[pane] = []string{
+		"$ ",                     // before
+		"$ list @internal/agent", // verify passes
+		"$ ",                     // after Escape — the prompt is gone
+	}
+
+	err := mgr.SendPrompt(sess.ID, prompt)
+	if err == nil {
+		t.Fatalf("SendPrompt returned nil, want error")
+	}
+	if !strings.Contains(err.Error(), "left the input area") {
+		t.Errorf("error %q missing 'left the input area'", err.Error())
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times after the prompt vanished, want 0", got)
+	}
+}
+
+func TestSendPrompt_DismissRecaptureErrorDoesNotPressEnter(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	const pane = "%dm5"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-recap-err", "dm5", pane)
+
+	mock.capturedSequence[pane] = []string{"$ ", "$ list @internal/agent", "$ list @internal/agent"}
+	// Fail the third capture only — the post-dismiss one. captureErrAfter
+	// would take out the verify capture first and never reach this branch.
+	mock.captureErrAtCall[pane] = captureFailure{nth: 3, err: errors.New("pane died after dismiss")}
+
+	err := mgr.SendPrompt(sess.ID, prompt)
+	if err == nil {
+		t.Fatalf("SendPrompt returned nil, want error")
+	}
+	if !strings.Contains(err.Error(), "after overlay dismiss") {
+		t.Errorf("error %q missing 'after overlay dismiss'", err.Error())
+	}
+	// Unknown state is not a reason to commit.
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 0 {
+		t.Errorf("Enter sent %d times when the re-check could not be made, want 0", got)
+	}
+}
+
+func TestSendPrompt_UnresolvableAgentStillSends(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+
+	const pane = "%dm7"
+	const prompt = "list @internal/agent"
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{
+		WorkDir:     "/tmp/send-dismiss-unknown-kind",
+		Description: "dm7",
+		AgentKind:   "not-registered",
+	})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	mgr.mu.Lock()
+	sess.Status = StatusIdle
+	sess.TmuxPaneID = pane
+	mgr.mu.Unlock()
+
+	mock.capturedSequence[pane] = []string{"$ ", "$ list @internal/agent"}
+
+	// Every capability SendPrompt reads is best-effort: a resolver that
+	// cannot name the kind must degrade the send, never refuse it. The
+	// dismissal is one more of those, so it must not become the first
+	// capability whose absence turns into an error.
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil (unresolvable adapter must not block a send)", err)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Escape"); got != 0 {
+		t.Errorf("Escape sent %d times with no adapter to ask, want 0", got)
+	}
+	if got := mock.countCallsWithArgs("SendKeys", pane, "Enter"); got != 1 {
+		t.Errorf("Enter sent %d times, want 1", got)
+	}
+}
+
+func TestSendPrompt_DismissKeysAllSentInOrder(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape", "C-g"})
+
+	const pane = "%dm6"
+	const prompt = "list @internal/agent"
+	sess := newIdleSessionWithPane(t, mgr, "/tmp/send-dismiss-multi", "dm6", pane)
+
+	mock.capturedSequence[pane] = []string{"$ ", "$ list @internal/agent", "$ list @internal/agent"}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+
+	escIdx := mock.firstCallIndex("SendKeys", pane, "Escape")
+	cgIdx := mock.firstCallIndex("SendKeys", pane, "C-g")
+	enterIdx := mock.firstCallIndex("SendKeys", pane, "Enter")
+	if escIdx < 0 || cgIdx < 0 || enterIdx < 0 {
+		t.Fatalf("missing calls: Escape=%d C-g=%d Enter=%d", escIdx, cgIdx, enterIdx)
+	}
+	if !(escIdx < cgIdx && cgIdx < enterIdx) {
+		t.Errorf("dismiss keys out of order: Escape@%d < C-g@%d < Enter@%d expected", escIdx, cgIdx, enterIdx)
 	}
 }
 
