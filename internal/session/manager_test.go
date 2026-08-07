@@ -83,6 +83,11 @@ func (a *fakeAgent) DismissOverlayKeys(prompt string) []string {
 	return a.dismissFn(prompt)
 }
 
+// Transcript returns nil: nothing in this file reads a conversation log, and
+// the Manager never calls this — `jin session result` resolves the adapter
+// itself in the daemon.
+func (a *fakeAgent) Transcript() TranscriptSource { return nil }
+
 type fakeStatusSource struct{}
 
 func (fakeStatusSource) Interpret(sig StatusSignal) (StatusUpdate, bool) {

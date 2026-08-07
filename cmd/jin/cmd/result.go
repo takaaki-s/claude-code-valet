@@ -16,9 +16,19 @@ var resultCmd = &cobra.Command{
 	Use:   "result <selector>",
 	Short: "Fetch structured transcript entries for a session (orchestration)",
 	Long: `Fetch structured transcript entries (text/thinking/tool_use/tool_result)
-for a Claude Code session. Designed for orchestration scripts that need to
-inspect what a child session actually did, not just the final assistant text.
+by reading the agent's own conversation log. Designed for orchestration scripts
+that need to inspect what a child session actually did, not just the final
+assistant text.
 The selector may be an ID prefix or a description substring (case-insensitive).
+
+How much comes back depends on the agent kind. Claude Code sessions return
+everything. Codex sessions return the conversation and the tool calls, but
+--errors-only cannot see a command that merely exited non-zero and --tool
+barely discriminates, because Codex records neither an exit code nor a
+distinct name per tool. opencode sessions are not supported: the command
+fails rather than answering with an empty result, so an unreadable session
+is never mistaken for a child that did nothing. Run 'jin docs show gotchas'
+before acting on what an empty answer means.
 
 Examples:
   # Show a summary of recent activity

@@ -608,6 +608,164 @@ Common pitfalls and caveats that agents tend to fall into.
   "everything I sent is present" cannot be confirmed from the pane at all —
   only "the tail arrived".
 
+## Session result
+
+- **A nil `Agent.Transcript()` is an error, not an empty result.**
+  `handleResult` used to call `transcript.NewReader()` — the Claude Code
+  reader — for every session whatever its kind, so a codex or opencode session
+  came back `entries: []` with `success: true`. That is the same answer a
+  Claude Code session gives when the agent genuinely said nothing, so a caller
+  could not tell "this kind cannot be read" from "the child did no work". The
+  handler now resolves the adapter (`agent.Lookup(info.AgentKind)`, which the
+  daemon already uses elsewhere) and refuses when the adapter has no reader,
+  naming the kind in the error. The failure shape it replaces is the one from
+  Session send above: an answer that is wrong and looks fine.
+
+  **`AgentSessionID == ""` is the case that stays empty and successful.** A
+  session whose agent has not started yet has no log to read, and that is a
+  state every session passes through rather than a read failure — the same
+  distinction `transcript.Reader` already draws by turning `ErrNoTranscript`
+  into `(nil, nil)`. `TranscriptSource` requires that of every implementation,
+  so an adapter cannot make "too early" look like an error either.
+
+  This is a breaking change for opencode, which has no reader: `session result`
+  on an opencode session exits non-zero where it used to exit 0 with nothing.
+  See [CHANGELOG.md](../CHANGELOG.md).
+
+  **`AgentSessionID != ""` does not prove the ID is the agent's own, and on
+  codex it usually is not yet.** `ReserveCreation` pre-mints a UUID for every
+  kind, and the Codex adapter deliberately ignores it — Codex has no
+  `--session-id`, so it picks its own and jin learns it from the SessionStart
+  hook write-back. Between spawn and that write-back, `Locator.Find` looks up a
+  UUID no rollout carries, misses, and the handler answers empty and
+  successful; if the session was launched without hooks (`SpawnCommand` falls
+  back to a hook-less `codex` when `Setup` never captured an exec path) the
+  window never closes. `AgentSessionStarted` does **not** discriminate — it is
+  set at spawn (`manager.go`, "commit the started-once invariant"), not on
+  hook arrival, so moving the early return onto it relocates the window rather
+  than closing it. Closing it properly means recording whether the ID has been
+  re-keyed, which is a persisted-field change; until then the ambiguity is
+  stated in the agent-facing `gotchas` doc so an orchestrator does not read
+  empty-and-successful as "the child did nothing".
+
+- **The Codex reader groups rollout rows by role, because Codex writes one
+  block per row.** A rollout is one `response_item` per block — measured over
+  14 real sessions / 501 lines, 252 of those lines are `response_item` — so a
+  1:1 mapping to `transcript.Entry` would make `--last 5` mean five *blocks*
+  on codex and five *messages* on Claude Code: the same flag with a different
+  meaning per kind. Consecutive rows are therefore accumulated into one Entry
+  until `Entry.Type` changes, which reproduces the shape Claude Code's own
+  transcript has:
+
+  ```
+  user prompt                          → Entry{user,      [text]}
+  reasoning, assistant message, call   → Entry{assistant, [thinking, text, tool_use]}
+  tool call output                     → Entry{user,      [tool_result]}
+  ```
+
+  Every one of the 501 lines carries a top-level `timestamp`, in the same
+  24-character shape Claude Code emits and non-decreasing across all 14 files,
+  so the lexical `since` comparison carries over unchanged. `Entry.Timestamp`
+  is the group's **last** line rather than its first, which is what keeps an
+  incremental read exact: `since` is exclusive, so every line already folded
+  into the entry a caller last saw has to compare as "at or before" the
+  timestamp that caller passes back. Stamping the first line would leave the
+  group's later lines above the bound and return them again inside a partial
+  duplicate.
+
+  **A bare timestamp is not a unique cursor, and `--since` loses an entry when
+  it collides.** If the entry following the caller's cursor carries the same
+  timestamp as the cursor itself, the exclusive comparison drops it — and no
+  later poll brings it back. This is a property of the protocol rather than of
+  either reader: measured, adjacent entries collide on 1 of 112 pairs across
+  the 14 codex rollouts and on 42 of 51,681 pairs across 242 Claude Code
+  transcripts, where the same comparison has always been in use. Grouping makes
+  a collision slightly likelier on codex, since a whole group collapses to one
+  timestamp. Diverging here — making codex inclusive while Claude Code stays
+  exclusive — would trade a rare silent loss for `--since` meaning two
+  different things per kind, which is the failure grouping exists to avoid;
+  fixing it properly means changing what the cursor is, which is an IPC change.
+  `TestReadEntries_SinceDropsAnEntrySharingTheBoundaryTimestamp` pins the
+  behaviour so it reads as known rather than as an oversight.
+
+  **Grouping closes at the end of a read, so polling splits it.** An assistant
+  group still being written comes back as one entry now and another entry on
+  the next `--since` read, where a single full read would have returned one
+  entry holding all of it. Nothing is lost or repeated — the blocks stay typed
+  and ordered — but the entry count differs between an incremental and a whole
+  read, and an assistant entry holding only a `tool_use` can read as "the child
+  said nothing". Claude Code has no equivalent, since one line is one entry
+  there. Read whole when completeness matters.
+
+  **Known degeneration:** a human turn arriving directly after a tool result
+  would land in the same `user` Entry as that result. The measured corpus never
+  produces that ordering (an assistant turn always sits between them), and the
+  blocks stay individually typed and ordered if it ever does, so it is a
+  coarser grouping rather than lost information.
+
+- **Rows that are deliberately not conversation.** `message` rows with
+  `role: "developer"` are injected system text (43/43 in the corpus) and never
+  reach the caller; nor do `response_item/agent_message` rows, which are
+  inter-agent RPC. No `event_msg` row is copied in as an utterance either — the
+  `event_msg` stream restates what `response_item` already carries, and reading
+  both would double-count the same utterance in 12 of the 14 sessions. Codex
+  also injects context under `role: "user"`, so user text is filtered block by
+  block with the same `isPseudoUser` test the description enhancer uses — one
+  item can hold an injection and the operator's own words side by side.
+
+  **`event_msg/task_complete` is read for one thing: a turn that died.** When
+  it carries an error the reader emits a standalone `system` entry holding
+  Codex's own `info` and `message`. That is the only record of the failure —
+  3 of the 14 sessions end with the agent having said nothing because the turn
+  hit a usage limit, and from `response_item` lines alone that is
+  indistinguishable from a turn still being worked on. An orchestrator would
+  wait out its whole timeout on it.
+
+- **Codex records no `is_error`, so `--errors-only` is structurally
+  incomplete.** `custom_tool_call.status` is `"completed"` on all 41 of them,
+  failed patches included, and there is no other flag. Two signals are
+  recoverable from the output text — a first line starting with `Script
+  failed` (1/41) and a JSON output carrying `"timed_out": true` (2
+  occurrences) — and they are what sets `Block.IsError`.
+
+  **A shell command exiting non-zero is not among them:** Codex writes
+  `Script completed` and the exit code appears nowhere in the file. The whole
+  class of "the build broke, the tests failed" is therefore undetectable, which
+  makes an empty `--errors-only` on codex uninformative rather than reassuring.
+  That limit is stated in the agent-facing `gotchas` doc
+  (`internal/agentdocs/docs/gotchas.md`) because an orchestrator is who gets
+  misled by it; keep the two in step. Reporting the gap in the response itself
+  would change the IPC payload, which is a follow-up rather than part of this
+  change.
+
+  `event_msg/patch_apply_end.success` is a third signal and is not used: it
+  carries no `call_id`, so there is nothing to attach it to.
+
+- **Two more things a codex result cannot carry.** Token usage lives in
+  `event_msg/token_count` rows with no id linking them to a message, so
+  attaching it would mean pairing by position — an assumption, not a
+  measurement — and `Entry.Usage` is left empty on codex until that pairing is
+  verified. Reasoning summaries are empty in 53/53 rows (the content is
+  encrypted), so no `thinking` block is emitted for them; 53 blank blocks would
+  only crowd out real content under `--last N`.
+
+- **`--tool` cannot discriminate on codex.** All 41 `custom_tool_call` rows in
+  the corpus declare the name `exec` — 41 of the 46 tool calls it contains —
+  with the actual operation inside the call body; the 5 `function_call` rows
+  carry a name of their own, which is passed through the same way. The reader
+  passes the declared name through rather than parsing the body:
+  reading the harness-generated source to guess at `apply_patch` versus
+  `web__run` would couple jind-ai to undocumented internals, and getting it
+  wrong would attribute an operation the agent never named.
+
+- **What the 14-session corpus does not cover.** No sample of `codex resume`
+  exists, so whether a resumed session appends to its existing rollout or
+  starts a new file is unverified — `--since` correctness depends directly on
+  that. Neither is there any sample of a permission/approval wait, of
+  `history_mode` other than `legacy`, of MCP tools, or of a custom tool other
+  than `exec`. A full-corpus count says what the corpus contains, not what
+  Codex can emit; treat those paths as unmeasured rather than absent.
+
 ## Hook
 
 - **Session identification uses the `JIN_SESSION_ID` environment variable** (most reliable).
@@ -780,7 +938,7 @@ Common pitfalls and caveats that agents tend to fall into.
   tracking. The trust hash is persisted to `~/.codex/config.toml` under
   `[hooks.state]`, so subsequent spawns skip the dialog as long as the
   command path stays the same. `--dangerously-bypass-hook-trust` is not
-  used by jind-ai on purpose (see 02_design.md §3.3).
+  used by jind-ai on purpose.
 
 - **30s poll fallback during the trust dialog is harmless for status
   tracking, but not for sends.** Between session spawn and the user's trust
@@ -822,6 +980,11 @@ Common pitfalls and caveats that agents tend to fall into.
   extracts the first `role: "user"` message that is not a
   `<environment_context>` pseudo-user injection. See
   `internal/agent/codex/rollout.go`.
+
+- **`session result` reads the same rollout files, through a separate
+  reader.** `Locator.Find` is shared; the entry mapping is not. What that
+  format can and cannot express — and why `--errors-only` and `--tool` are
+  weak on codex — is under "Session result" above.
 
 ## opencode adapter
 
@@ -925,6 +1088,12 @@ Common pitfalls and caveats that agents tend to fall into.
   one thing verify watches. A completion overlay takes the Enter and lets the
   keystrokes through, and that one reports success — see the
   completion-overlay entry under Session send.
+
+- **`session result` is unsupported here, and says so.** The adapter returns
+  nil from `Transcript()`: opencode keeps its conversation in a SQLite
+  database rather than a JSONL log, so it needs a reader neither shipped one
+  provides. The command fails instead of answering empty — see "Session
+  result" above for why an error is the better wrong answer.
 
 - **The plugin is a pure observer.** It subscribes via the `event` hook,
   not the `permission.ask` hook. Note that `permission.ask` (a `Hooks`

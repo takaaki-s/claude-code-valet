@@ -42,7 +42,7 @@ jin session send fix-login "run go test ./... and fix what fails" --wait-running
 #    the turn never started — see below.
 jin session wait fix-login --until idle,permission --timeout 600 --json
 
-# 5. Collect.
+# 5. Collect. How much of this works depends on the agent kind — see below.
 jin session output fix-login --last 1 --json     # the final assistant text
 jin session result fix-login --json              # what it actually did
 
@@ -101,14 +101,31 @@ jin session result fix-login --tool Bash --json
 jin session result fix-login --errors-only --json
 ```
 
-**`session output` and `session result` only work for Claude Code sessions.**
-For `codex` and `opencode` they return empty rather than an error. See the
-`gotchas` doc.
+**What comes back depends on the agent kind.** For `claude`, all of it. For
+`codex`, the conversation and the tool calls — but the two filters above are
+weak there: `--errors-only` cannot see a command that merely exited non-zero,
+and every codex tool call is named `exec`. For `opencode`, `session result`
+**fails** rather than answering empty, because jin cannot read that agent's
+log; judge an opencode child by `git diff` and its tests instead.
+
+`session output` reads Claude Code's transcript only, whatever the kind.
+
+Read the `gotchas` doc before acting on a codex result: the limits decide what
+an empty answer is allowed to mean.
 
 ### Incremental collection
 
 `--since` is strictly exclusive: pass the last entry's timestamp to get only
 what came after it, with no duplicates.
+
+**It can also skip an entry, so do not use it as your only read.** A timestamp
+is not a unique key, and when the next entry carries the same one as the entry
+you passed, that entry is dropped and never appears in any later poll either.
+It is rare — measured at 1 of 112 adjacent entry pairs across 14 codex
+sessions, and 42 of 51,681 across 242 Claude Code transcripts — but it is
+silent, and it applies to every agent kind. When completeness matters more
+than volume (deciding whether a child finished, collecting a final answer),
+read the whole result rather than the tail.
 
 ```bash
 T1=$(jin session result work --json | jq -r '.entries[-1].timestamp')
@@ -117,6 +134,10 @@ jin session send work "now also run go vet" --wait-running
 jin session wait work --until idle,permission
 jin session result work --since "$T1" --json
 ```
+
+On a `codex` session that has been resumed, read the whole result instead:
+whether a resume keeps writing to the same log was never measured, and
+`--since` is only as complete as that assumption.
 
 ## Statuses
 

@@ -5,30 +5,117 @@ description: The failures that look like bugs but are not — per-agent limits o
 
 # Traps an orchestrating agent will hit
 
-## `session output` and `session result` only work for Claude Code
+## What `session result` answers depends on the agent kind
 
-Both read Claude Code's transcript files. For a `codex` or `opencode` session
-they return **empty, not an error** — the same thing an idle Claude Code
-session with no output yet returns. So a child that did substantial work looks
-identical to one that did nothing.
+| kind | `jin session result` |
+|---|---|
+| `claude` | everything — text, thinking, tool calls, tool results, errors |
+| `codex` | the conversation and the tool calls, with the limits below |
+| `opencode` | **an error** — jin cannot read that agent's conversation log |
 
-Check the session's kind before you trust an empty result:
+Check the kind before you decide what an answer means:
 
 ```bash
 jin session info work --json | jq -r '.agent_kind'
 ```
 
-What still works for every kind: `new`, `send`, `wait`, `kill`, `delete`,
-`list`, `info`, and status (`idle` / `thinking` / `permission`). Only the two
-transcript-reading commands are Claude-Code-only.
+The `opencode` failure is deliberate. That case used to answer zero entries
+and exit 0, which reads exactly like a child that ran and said nothing — a
+wrong answer delivered quietly. It now exits non-zero and names the kind.
+It exits 1, the same code as any other general failure, so there is no code
+that means "unreadable kind" — decide from `agent_kind` up front rather than
+from the message text.
 
-To check a non-Claude child's work, go to the artifacts instead:
+**An empty result that exits 0 is still ambiguous, and on codex it can be
+wrong for longer than you expect.** It normally means the agent has not
+started, so no conversation exists yet. But a codex session carries an ID jin
+minted before launch, and Codex picks its own instead; until Codex's first
+hook reports the real one back, jin looks up a session that does not exist and
+answers empty and successful. If hooks are not wired for that session, it
+never stops doing so. Do not read empty-and-successful as "the child did
+nothing" on a codex session — check `git diff` and the tests, or
+`jin pane capture` if you need to see that it is alive at all.
+
+`session output` is a different command and unchanged: it reads Claude Code's
+transcript only, and on a `codex` or `opencode` session it reports that no
+transcript was found. For a codex child use `session result` instead.
+
+What works for every kind: `new`, `send`, `wait`, `kill`, `delete`, `list`,
+`info`, and status (`idle` / `thinking` / `permission`).
+
+For a child jin cannot read, go to the artifacts:
 
 ```bash
 git -C <workdir> diff              # what actually changed
 cd <workdir> && <test command>     # whether it holds up
 jin pane capture work              # last resort — see below
 ```
+
+## On Codex, `--errors-only` misses the failures you care about
+
+**An empty `--errors-only` on a `codex` session is not evidence that nothing
+failed.** Codex's log carries no error flag: a tool call that failed is
+recorded exactly like one that succeeded — measured over 14 real sessions,
+every one of the 41 calls that carry a status say `completed`, failed patches
+included. jin can raise only two signals, both read out of the output text:
+
+- the output's first line starts with `Script failed` (1/41 in that corpus)
+- the output's JSON carries `"timed_out": true` (2 occurrences)
+
+**A command that merely exits non-zero is neither.** Codex records
+`Script completed` and the exit code appears nowhere in the file, so a broken
+build, a failing test run, a rejected lint — the failures you delegate work in
+order to find — cannot be detected at all.
+
+So on codex, use `--errors-only` to find *some* failures quickly, never to
+conclude there were none. Read the tool results, and run the check yourself:
+
+```bash
+jin session result work --json \
+  | jq -r '.entries[].blocks[]? | select(.kind=="tool_result") | .output' | tail -50
+cd <workdir> && <test command>
+```
+
+One codex failure *is* recorded, and it is worth checking for: a turn that died
+outright (a usage limit, say) comes back as an entry of type `system` carrying
+the reason. 3 of the 14 measured sessions end that way with the agent having
+said nothing at all, which otherwise looks exactly like a child still working.
+
+**`--errors-only` does not return it.** That filter keeps entries holding a
+failed tool result, and a dead turn is not one — so the single failure Codex
+does record is the one thing the failure filter drops. Run this alongside
+`--errors-only` every time, not instead of it:
+
+```bash
+jin session result work --json | jq -r '.entries[] | select(.type=="system")'
+```
+
+## On Codex, `--tool` cannot tell one tool from another
+
+Codex declares one tool name for nearly everything it runs: 41 of the 46 calls
+in the measured corpus are named `exec`, and what actually happened — editing a
+file, searching the web, running a command — lives inside the call body. jin
+reports the name Codex declared, so `--tool exec` matches almost every call and
+almost nothing else matches at all. Filter the blocks yourself instead.
+
+## A Codex result carries no usage and no thinking
+
+Token usage is recorded separately from the messages in Codex's log with
+nothing tying the two together, so `usage` is always absent on codex entries.
+Reasoning summaries are empty (53/53 in the corpus — the real content is
+encrypted), so jin emits no `thinking` blocks rather than padding the result
+with blank ones. Neither is missing data you can recover by asking again.
+
+## Two Codex paths nobody has measured
+
+- **`--since` after a `codex resume`.** Whether a resumed session appends to
+  the same log file or starts a new one was not measured. Incremental
+  collection depends on that, so after a resume prefer a full read over
+  trusting `--since` to be complete.
+- **Waiting on an approval.** No sample of how Codex records a pending
+  permission prompt exists, so do not expect a result to show that the child
+  is blocked on one. The session's status is what tells you that — wait with
+  `--until idle,permission`.
 
 ## Send after `new` needs a wait
 
@@ -81,14 +168,16 @@ tool output that ran off the top is simply absent, and the capture looks like
 a complete picture of a session that did far more than it shows.
 
 Never conclude "the child did nothing" or "the child finished" from a capture.
-Use `session result` (Claude Code), or check the artifacts directly.
+Use `session result` (within the per-kind limits above), or check the
+artifacts directly.
 
 ## A child's report is not a result
 
 An agent that says "fixed and tested" may have edited nothing. For code
 changes, look at `git diff` and run the tests yourself. `session result
 --tool Bash --json` and `--errors-only` exist for exactly this check on
-Claude Code sessions.
+Claude Code sessions; on codex both filters are weak, so read the entries and
+run the tests rather than filtering.
 
 ## Everything except `jin docs` needs the daemon
 

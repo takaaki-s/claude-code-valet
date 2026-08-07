@@ -619,6 +619,10 @@ func (s *Server) handleResult(data json.RawMessage) Response {
 		Entries:        []transcript.Entry{},
 	}
 
+	// No agent session ID yet means the agent has not been launched, which is
+	// a state every session starts in rather than a failure. Empty + success
+	// is the right answer here and stays the right answer below only when a
+	// reader actually looked.
 	if info.AgentSessionID == "" {
 		respData, _ := json.Marshal(resp)
 		return Response{Success: true, Data: respData}
@@ -629,8 +633,21 @@ func (s *Server) handleResult(data json.RawMessage) Response {
 		workDir = info.WorkDir
 	}
 
-	reader := transcript.NewReader()
-	entries, err := reader.ReadEntries(workDir, info.AgentSessionID, req.Since)
+	// Ask the session's own adapter for its transcript. This used to call the
+	// Claude Code reader unconditionally, so a Codex or opencode session got
+	// zero entries and success — the same answer as a child agent that ran
+	// and produced nothing. An orchestrator has no way to tell those apart,
+	// so it reads "no output" and moves on.
+	ag, err := agent.Lookup(info.AgentKind)
+	if err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+	src := ag.Transcript()
+	if src == nil {
+		return Response{Success: false, Error: fmt.Sprintf(
+			"cannot read a transcript for agent kind %q: this adapter has no transcript reader", info.AgentKind)}
+	}
+	entries, err := src.ReadEntries(workDir, info.AgentSessionID, req.Since)
 	if err != nil {
 		return Response{Success: false, Error: err.Error()}
 	}

@@ -1,0 +1,16 @@
+{"timestamp":"2026-07-11T07:00:00.000Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-0000000000e1","cwd":"/tmp/example"}}
+{"timestamp":"2026-07-11T07:00:01.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"REDACTED-DEVELOPER-INSTRUCTIONS-PLACEHOLDER"}]}}
+{"timestamp":"2026-07-11T07:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/tmp/example</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-07-11T07:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>\n  none\n</recommended_plugins>"},{"type":"input_text","text":"print the date"},{"type":"input_text","text":"and say ok"}]}}
+{"timestamp":"2026-07-11T07:00:04.000Z","type":"event_msg","payload":{"type":"user_message","turn_id":"01900000-0000-7000-8000-0000000000f1"}}
+{"timestamp":"2026-07-11T07:00:05.000Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"REDACTED"}}
+{"timestamp":"2026-07-11T07:00:06.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'll run it."}]}}
+{"timestamp":"2026-07-11T07:00:07.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_1","id":"ctc_1","status":"completed","input":"tools.exec_command({cmd: 'date'})"}}
+{"timestamp":"2026-07-11T07:00:08.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_1","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"2026-07-11\n"}]}}
+{"timestamp":"2026-07-11T07:00:09.000Z","type":"response_item","payload":{"type":"function_call","name":"wait","call_id":"call_2","id":"fc_1","namespace":"collaboration","arguments":"{\"seconds\":5}"}}
+{"timestamp":"2026-07-11T07:00:10.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_2","output":"{\"waited\":true}"}}
+{"timestamp":"2026-07-11T07:00:11.000Z","type":"response_item","payload":{"type":"agent_message","author":"child","recipient":"parent","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER"}]}}
+{"timestamp":"2026-07-11T07:00:12.000Z","type":"event_msg","payload":{"type":"agent_message","message":"duplicate of the assistant item above"}}
+{"timestamp":"2026-07-11T07:00:13.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"the command succeeded"}],"encrypted_content":"REDACTED"}}
+{"timestamp":"2026-07-11T07:00:14.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The date is 2026-07-11."}]}}
+{"timestamp":"2026-07-11T07:00:15.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"01900000-0000-7000-8000-0000000000f1","last_agent_message":"The date is 2026-07-11."}}

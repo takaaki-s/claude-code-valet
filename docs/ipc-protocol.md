@@ -119,7 +119,7 @@ it alone.
 | `delete` | `DeleteRequest` | Delete session (async; poll via `get`, optionally with worktree) |
 | `stop` | (none) | Stop daemon |
 | `hook` | `HookRequest` | Claude Code hook event |
-| `result` | `ResultRequest` | Fetch structured transcript entries (orchestration) |
+| `result` | `ResultRequest` | Fetch structured transcript entries from the session's own agent adapter (orchestration; fails for a kind with no reader) |
 | `set-description` | `SetDescriptionRequest` | Update session description (empty resets to auto-generated) |
 | `agent-signal` | `AgentSignalRequest` | Deliver an out-of-band status signal from an agent adapter (currently only `kind="hook"` is wired) |
 | `pane-popup` | `PanePopupRequest` | Open a tmux popup over a session's pane, running a command |
@@ -213,13 +213,26 @@ type SendRequest struct {
 // ResultRequest fetches structured transcript entries (text/thinking/tool_use/
 // tool_result) for orchestration. It supports incremental reads (Since), output
 // truncation (Last), and tool/error filtering.
+//
+// The entries come from the adapter that owns the session, resolved by its
+// agent kind, not from a fixed reader. **Breaking change:** the handler used
+// to call the Claude Code reader for every kind, so a session whose adapter
+// cannot be read answered `entries: []` with `Success=true` — indistinguishable
+// from a child that ran and produced nothing. It now returns Success=false
+// when the kind is unknown to the registry, or when its adapter has no
+// transcript reader (opencode today). `AgentSessionID == ""` is not one of
+// those cases: it still returns `entries: []` with Success=true, because an
+// agent that has not started is not a read failure.
 type ResultRequest struct {
     ID string `json:"id"`
     // Since: ISO8601. Only entries with Timestamp strictly greater than Since are returned;
     // an entry whose Timestamp equals Since is excluded. This lets a caller pass the
     // timestamp of the last entry it has already seen to receive only what came after,
-    // without duplicates. String comparison is used (Claude Code emits lexicographically
-    // sortable RFC3339 timestamps with millisecond precision, e.g. "2026-04-09T13:23:10.456Z").
+    // without duplicates. String comparison is used; every adapter is required to emit
+    // lexicographically sortable RFC3339 timestamps with millisecond precision (e.g.
+    // "2026-04-09T13:23:10.456Z") — see session.TranscriptSource for the full contract.
+    // A timestamp is not a unique key, so an entry sharing the boundary timestamp is
+    // dropped rather than repeated; see docs/gotchas.md "Session result".
     Since      string `json:"since,omitempty"`
     Last       int    `json:"last,omitempty"`         // Truncate to last N entries (0 = no truncation)
     Tool       string `json:"tool,omitempty"`         // Filter by tool name (matches tool_use and its tool_result)

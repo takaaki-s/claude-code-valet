@@ -1,7 +1,7 @@
 // Package codex implements the Agent adapter for the OpenAI Codex CLI.
 // See internal/agent/claude for the reference implementation the layout
-// mirrors; the Codex-specific mapping is documented in
-// .tasks/feat/additional-agent-adapters/02_design.md §3.
+// mirrors; the Codex-specific rollout mapping is documented under "Codex
+// adapter" and "Session result" in docs/gotchas.md.
 package codex
 
 import (
@@ -92,8 +92,7 @@ func (l *Locator) Find(uuid string) (string, bool) {
 }
 
 // rolloutRow is the union of every rollout line shape the parser inspects.
-// Fields not decoded by json.Unmarshal (there are many — see 02_design.md
-// §3.7 / f0.3-codex-runtime-notes.md) are silently ignored.
+// Fields not decoded by json.Unmarshal (there are many) are silently ignored.
 type rolloutRow struct {
 	Type    string `json:"type"`
 	Payload struct {
@@ -149,9 +148,8 @@ func ReadMeta(path string) (Meta, error) {
 // Layer C-transcript enhancer must step past them to find the first prompt
 // the user actually typed.
 //
-// See f0.3-codex-runtime-notes.md item 10 for what these look like in
-// practice; the `<system` / `<instructions` prefixes are defensive against
-// future Codex builds adding similar wrappers.
+// The `<system` / `<instructions` prefixes are defensive against future Codex
+// builds adding similar wrappers.
 // Measured against 14 real rollouts (35 `role: "user"` items, ground-truthed
 // against the 20 `event_msg/user_message` lines those files carry): with these
 // prefixes the check rejects every injection and passes every human prompt.

@@ -1,5 +1,7 @@
 package session
 
+import "github.com/takaaki-s/jind-ai/internal/transcript"
+
 // Package session owns the interface + supporting types that describe how
 // jind-ai talks to an interactive agent (Claude Code, Codex CLI, ...). The
 // concrete implementations live under internal/agent/<kind>/; the session
@@ -130,6 +132,29 @@ const (
 	NotifyPermission NotifyKind = "permission"
 )
 
+// TranscriptSource reads an agent's own on-disk conversation log and returns
+// it as jind-ai's shared transcript.Entry form, which is what `jin session
+// result` serialises. Each adapter's log format is its own — Claude Code
+// writes one JSONL per session under ~/.claude/projects, Codex writes a
+// date-sharded rollout — so the translation into Entry/Block lives with the
+// adapter and only the result shape is common.
+//
+// Contract, matching what transcript.Reader already does:
+//
+//   - since is an exclusive lower bound compared as a string. An entry whose
+//     Timestamp is <= since is dropped, so passing the last timestamp already
+//     seen yields only what came after it.
+//   - A session that has no log file yet returns (nil, nil), not an error.
+//     "The agent has not written anything" is a state every session passes
+//     through, and it is not a failure.
+//   - Errors are for genuine read failures only.
+//
+// workDir is a hint, not a key: an implementation is free to ignore it if it
+// locates the log by session ID alone.
+type TranscriptSource interface {
+	ReadEntries(workDir, sessionID, since string) ([]transcript.Entry, error)
+}
+
 // StatusSource translates raw StatusSignals into StatusUpdates. Adapters
 // return (StatusUpdate{}, false) when a signal is meaningful but does not
 // warrant a Status change (Manager still applies side effects such as CWD
@@ -172,6 +197,23 @@ type Agent interface {
 	// Description returns the adapter's Layer C description enhancer, or
 	// nil if the adapter cannot produce structured descriptions.
 	Description() DescriptionEnhancer
+	// Transcript returns the adapter's reader for the agent's own on-disk
+	// conversation log, or nil when this adapter cannot read one.
+	//
+	// nil means "cannot read", and callers must report it as a failure
+	// rather than as an empty conversation. The two are not the same thing
+	// and the difference is the whole point: `jin session result` used to
+	// call the Claude Code reader unconditionally, so every non-Claude
+	// session answered with zero entries and success — indistinguishable
+	// from a child agent that ran and said nothing. An orchestrator reading
+	// that concludes the work produced no output, which is a wrong answer
+	// delivered quietly. An error is a wrong answer delivered loudly, and
+	// loudly is recoverable.
+	//
+	// On Agent rather than a side interface for the same reason as
+	// ClearInputKeys: an adapter that forgets this should fail to compile,
+	// because what it reintroduces is silence.
+	Transcript() TranscriptSource
 	// ClearInputKeys returns the tmux key names (SendKeys form — e.g.
 	// "C-u", "C-a", "BSpace" — not literal text) that clear this adapter's
 	// TUI input line to empty. Manager.SendPrompt sends these before each
