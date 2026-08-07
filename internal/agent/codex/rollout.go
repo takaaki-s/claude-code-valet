@@ -16,13 +16,21 @@ import (
 	"strings"
 )
 
-// scannerMaxLine caps a single rollout line at 4 MiB. Real sessions peak around
-// 17 KiB (session_meta with git metadata + base_instructions), so this is pure
-// defense-in-depth: bufio.Scanner's default 64 KiB buffer would silently error
-// on outsized lines if some future Codex build embeds a larger system prompt,
-// and losing the whole file to that would kill Layer C-transcript for the
-// affected session.
-const scannerMaxLine = 4 << 20
+// scannerMaxLine caps a single rollout line at 16 MiB, matching
+// maxTranscriptLineBytes in internal/transcript.
+//
+// The ceiling used to be 4 MiB, which was defensible while the only readers
+// stopped early — ReadMeta reads one line and FirstUserPrompt stops at the
+// first prompt, so neither had to get past a large tool output. The transcript
+// reader walks every line, and one line over the limit fails the whole read.
+// A rollout only grows, so that failure would be permanent for the session:
+// `jin session result` would report an error from then on, and everything read
+// before the oversized line would be discarded on every attempt.
+//
+// A tool output holding a build or test log reaches this range without being
+// unusual, which is exactly the output an orchestrator is reading the
+// transcript to see. Real sessions still peak around 17 KiB.
+const scannerMaxLine = 16 << 20
 
 // Meta is the parsed form of the first line of a rollout JSONL (`type:
 // "session_meta"`). Only the fields jind-ai actually consumes are kept.
@@ -112,6 +120,16 @@ type contentBlock struct {
 	Text string `json:"text"`
 }
 
+// newRolloutScanner returns a line scanner sized for rollout JSONL. The buffer
+// ceiling is the reason this is shared: three readers in this package walk the
+// same file, and a limit raised in one of them but not the others would make
+// the same rollout parse for one caller and truncate for another.
+func newRolloutScanner(r io.Reader) *bufio.Scanner {
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, 0, 64*1024), scannerMaxLine)
+	return s
+}
+
 // ReadMeta parses the first line of the rollout at path and returns the Meta
 // fields jind-ai cares about. Returns an error when the file is empty, the
 // first line cannot be parsed as JSON, or the first line is not a
@@ -124,8 +142,7 @@ func ReadMeta(path string) (Meta, error) {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxLine)
+	scanner := newRolloutScanner(f)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
 			return Meta{}, fmt.Errorf("read rollout meta: %w", err)
@@ -184,8 +201,7 @@ func FirstUserPrompt(path string) (string, bool) {
 }
 
 func firstUserPromptFrom(r io.Reader) (string, bool) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxLine)
+	scanner := newRolloutScanner(r)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -217,16 +233,34 @@ func firstUserPromptFrom(r io.Reader) (string, bool) {
 	return "", false
 }
 
+// genuineBlocks returns the text of the content blocks the operator actually
+// wrote — everything that is neither one of Codex's injections nor blank.
+//
+// One rule, two readers. The description enhancer wants the first of these and
+// the transcript reader wants all of them joined, but "which blocks did the
+// operator write" has to be the same question for both: a prefix added here
+// would otherwise reach one caller and not the other, and the two would answer
+// differently for the same item.
+func genuineBlocks(content []contentBlock) []string {
+	var out []string
+	for _, c := range content {
+		if isPseudoUser(c.Text) || strings.TrimSpace(c.Text) == "" {
+			continue
+		}
+		out = append(out, c.Text)
+	}
+	return out
+}
+
 // firstGenuineBlock returns the text of the first content block that is not
 // one of Codex's injections, and whether there was one. An item made entirely
 // of injections has nothing the operator said in it.
 func firstGenuineBlock(content []contentBlock) (string, bool) {
-	for _, c := range content {
-		if !isPseudoUser(c.Text) {
-			return c.Text, true
-		}
+	blocks := genuineBlocks(content)
+	if len(blocks) == 0 {
+		return "", false
 	}
-	return "", false
+	return blocks[0], true
 }
 
 func isPseudoUser(text string) bool {

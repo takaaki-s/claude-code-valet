@@ -84,6 +84,12 @@ func (a *Agent) Description() agent.DescriptionSource { return a.enhancer }
 // Code's reader gives — Codex records no token usage per message, no error
 // flag on a tool result, and one tool name for every call — and transcript.go
 // documents each gap where the mapping loses something.
+//
+// Built per call, unlike enhancer and statusSrc above. Those are cached
+// because hooks call them constantly; this has one non-test caller, reached
+// once per `jin session result`, and constructing it measured at 240ns against
+// a read that takes milliseconds. Caching it would also freeze CODEX_HOME for
+// the daemon's lifetime for no gain worth having.
 func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader(a.home) }
 
 // ClearInputKeys returns the tmux key sequence Manager.SendPrompt sends

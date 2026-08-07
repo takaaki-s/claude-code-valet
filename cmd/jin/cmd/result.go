@@ -21,14 +21,11 @@ that need to inspect what a child session actually did, not just the final
 assistant text.
 The selector may be an ID prefix or a description substring (case-insensitive).
 
-How much comes back depends on the agent kind. Claude Code sessions return
-everything. Codex sessions return the conversation and the tool calls, but
---errors-only cannot see a command that merely exited non-zero and --tool
-barely discriminates, because Codex records neither an exit code nor a
-distinct name per tool. opencode sessions are not supported: the command
-fails rather than answering with an empty result, so an unreadable session
-is never mistaken for a child that did nothing. Run 'jin docs show gotchas'
-before acting on what an empty answer means.
+How much comes back depends on the agent kind, and on codex the --tool and
+--errors-only filters are weaker than they look. opencode is unsupported: the
+command fails rather than answering with an empty result, so an unreadable
+session is never mistaken for a child that did nothing. Run 'jin docs show
+gotchas' for what an empty answer is allowed to mean per kind.
 
 Examples:
   # Show a summary of recent activity

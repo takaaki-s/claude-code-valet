@@ -49,6 +49,21 @@ func shape(entries []transcript.Entry) []string {
 	return out
 }
 
+// blocksOf flattens entries to their blocks, optionally to one kind. shape()
+// is the entry-axis view; this is the block-axis one, and having it keeps the
+// nested range loops out of the assertions themselves.
+func blocksOf(entries []transcript.Entry, kind string) []transcript.Block {
+	var out []transcript.Block
+	for _, e := range entries {
+		for _, b := range e.Blocks {
+			if kind == "" || b.Kind == kind {
+				out = append(out, b)
+			}
+		}
+	}
+	return out
+}
+
 func TestReadEntries_MapsEachPayloadType(t *testing.T) {
 	got := entriesFrom(t, fixtureEntries, "")
 
@@ -107,16 +122,16 @@ func TestReadEntries_MapsEachPayloadType(t *testing.T) {
 }
 
 func TestReadEntries_DropsInjectedAndInterAgentItems(t *testing.T) {
-	for _, e := range entriesFrom(t, fixtureEntries, "") {
-		for _, b := range e.Blocks {
-			switch {
-			case strings.Contains(b.Text, "REDACTED-DEVELOPER-INSTRUCTIONS"):
-				t.Errorf("role=developer item leaked into the conversation: %q", b.Text)
-			case strings.Contains(b.Text, "<environment_context>"):
-				t.Errorf("injected role=user item leaked into the conversation: %q", b.Text)
-			case strings.Contains(b.Text, "Message Type: FINAL_ANSWER"):
-				t.Errorf("response_item/agent_message leaked into the conversation: %q", b.Text)
-			}
+	for _, b := range blocksOf(entriesFrom(t, fixtureEntries, ""), "") {
+		switch {
+		case strings.Contains(b.Text, "REDACTED-DEVELOPER-INSTRUCTIONS"):
+			t.Errorf("role=developer item leaked into the conversation: %q", b.Text)
+		case strings.Contains(b.Text, "<environment_context>"):
+			t.Errorf("injected role=user item leaked into the conversation: %q", b.Text)
+		case strings.Contains(b.Text, "<recommended_plugins>"):
+			t.Errorf("injected block leaked into the conversation: %q", b.Text)
+		case strings.Contains(b.Text, "Message Type: FINAL_ANSWER"):
+			t.Errorf("response_item/agent_message leaked into the conversation: %q", b.Text)
 		}
 	}
 }
@@ -124,21 +139,14 @@ func TestReadEntries_DropsInjectedAndInterAgentItems(t *testing.T) {
 func TestReadEntries_IgnoresEventMsgContent(t *testing.T) {
 	// event_msg repeats what response_item already carries. Reading it for
 	// content would return each utterance twice.
-	got := entriesFrom(t, fixtureEntries, "")
-	for _, e := range got {
-		for _, b := range e.Blocks {
-			if strings.Contains(b.Text, "duplicate of the assistant item above") {
-				t.Fatalf("event_msg/agent_message was read as content: %q", b.Text)
-			}
-		}
-	}
-	// The user's prompt appears on both streams; it must appear once.
 	n := 0
-	for _, e := range got {
-		for _, b := range e.Blocks {
-			if strings.Contains(b.Text, "print the date") {
-				n++
-			}
+	for _, b := range blocksOf(entriesFrom(t, fixtureEntries, ""), "") {
+		if strings.Contains(b.Text, "duplicate of the assistant item above") {
+			t.Fatalf("event_msg/agent_message was read as content: %q", b.Text)
+		}
+		// The user's prompt appears on both streams; it must appear once.
+		if strings.Contains(b.Text, "print the date") {
+			n++
 		}
 	}
 	if n != 1 {
@@ -175,22 +183,15 @@ func TestReadEntries_EntryTimestampIsTheGroupsLastLine(t *testing.T) {
 }
 
 func TestReadEntries_SkipsEmptyReasoning(t *testing.T) {
-	got := entriesFrom(t, fixtureEntries, "")
-	thinking := 0
-	for _, e := range got {
-		for _, b := range e.Blocks {
-			if b.Kind != "thinking" {
-				continue
-			}
-			thinking++
-			if b.Text == "" {
-				t.Error("emitted a thinking block with no text")
-			}
+	thinking := blocksOf(entriesFrom(t, fixtureEntries, ""), "thinking")
+	for _, b := range thinking {
+		if b.Text == "" {
+			t.Error("emitted a thinking block with no text")
 		}
 	}
 	// The fixture has two reasoning items; only the one with a summary counts.
-	if thinking != 1 {
-		t.Fatalf("got %d thinking blocks, want 1", thinking)
+	if len(thinking) != 1 {
+		t.Fatalf("got %d thinking blocks, want 1", len(thinking))
 	}
 }
 
@@ -266,14 +267,7 @@ func TestReadEntries_SinceDropsAnEntrySharingTheBoundaryTimestamp(t *testing.T) 
 func TestReadEntries_ToolUseCarriesCallIDAndStringInput(t *testing.T) {
 	got := entriesFrom(t, fixtureEntries, "")
 
-	var uses []transcript.Block
-	for _, e := range got {
-		for _, b := range e.Blocks {
-			if b.Kind == "tool_use" {
-				uses = append(uses, b)
-			}
-		}
-	}
+	uses := blocksOf(got, "tool_use")
 	if len(uses) != 2 {
 		t.Fatalf("got %d tool_use blocks, want 2", len(uses))
 	}
@@ -291,14 +285,7 @@ func TestReadEntries_ToolUseCarriesCallIDAndStringInput(t *testing.T) {
 	}
 	// The pairing has to survive into the result blocks, which is what makes
 	// `--tool` filtering possible at all.
-	var results []transcript.Block
-	for _, e := range got {
-		for _, b := range e.Blocks {
-			if b.Kind == "tool_result" {
-				results = append(results, b)
-			}
-		}
-	}
+	results := blocksOf(got, "tool_result")
 	if len(results) != 2 {
 		t.Fatalf("got %d tool_result blocks, want 2", len(results))
 	}
@@ -313,10 +300,8 @@ func TestReadEntries_ToolOutputShapes(t *testing.T) {
 	got := entriesFrom(t, fixtureOutShapes, "")
 
 	outputs := map[string]string{}
-	for _, e := range got {
-		for _, b := range e.Blocks {
-			outputs[b.ToolUseID] = b.Output
-		}
+	for _, b := range blocksOf(got, "tool_result") {
+		outputs[b.ToolUseID] = b.Output
 	}
 	want := map[string]string{
 		// Array elements are consecutive slices of one stream: joining them
@@ -338,12 +323,8 @@ func TestReadEntries_IsErrorSignals(t *testing.T) {
 	got := entriesFrom(t, fixtureToolErrors, "")
 
 	isErr := map[string]bool{}
-	for _, e := range got {
-		for _, b := range e.Blocks {
-			if b.Kind == "tool_result" {
-				isErr[b.ToolUseID] = b.IsError
-			}
-		}
+	for _, b := range blocksOf(got, "tool_result") {
+		isErr[b.ToolUseID] = b.IsError
 	}
 	want := map[string]bool{
 		// The documented gap, pinned deliberately: a command that ran and
@@ -406,11 +387,11 @@ func TestReadEntries_BrokenLinesAndEmptyFile(t *testing.T) {
 		body string
 		want []string
 	}{
-		{name: "empty file", body: "", want: nil},
+		{name: "empty file", body: "", want: []string{}},
 		{
 			name: "meta only",
 			body: `{"timestamp":"2026-07-11T12:00:00.000Z","type":"session_meta","payload":{"id":"x"}}` + "\n",
-			want: nil,
+			want: []string{},
 		},
 		{
 			name: "unparsable line between good ones",
@@ -435,7 +416,7 @@ func TestReadEntries_BrokenLinesAndEmptyFile(t *testing.T) {
 		{
 			name: "unknown line type",
 			body: `{"timestamp":"2026-07-11T12:00:01.000Z","type":"some_future_line","payload":{"type":"message","role":"user","content":[{"text":"nope"}]}}` + "\n",
-			want: nil,
+			want: []string{},
 		},
 	}
 	for _, tt := range tests {
@@ -443,9 +424,6 @@ func TestReadEntries_BrokenLinesAndEmptyFile(t *testing.T) {
 			got, err := readEntriesFrom(strings.NewReader(tt.body), "")
 			if err != nil {
 				t.Fatalf("readEntriesFrom: %v", err)
-			}
-			if len(got) == 0 && tt.want == nil {
-				return
 			}
 			if !reflect.DeepEqual(shape(got), tt.want) {
 				t.Fatalf("got %v, want %v", shape(got), tt.want)
@@ -639,4 +617,82 @@ func TestReadEntries_DefensiveGuardsAgainstFormatDrift(t *testing.T) {
 			t.Errorf("Input = %s, want nil", got[0].Blocks[0].Input)
 		}
 	})
+}
+
+// TestReadEntries_NonTextOutputElementSurvives covers an element shape the
+// corpus does not contain but the decoder cannot distinguish from one it does.
+//
+// Decoding an element into a one-field struct succeeds for any JSON object, so
+// an element carrying no text at all reads back as the empty string. Without a
+// check the element disappears from the output with nothing to show it was
+// ever there — a tool result that silently shrinks is the same class of wrong
+// answer as a session that silently returns nothing.
+func TestReadEntries_NonTextOutputElementSurvives(t *testing.T) {
+	body := `{"timestamp":"2026-07-11T16:00:00.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1",` +
+		`"output":[{"type":"image","image_url":"data:image/png;base64,AAA"},{"type":"input_text","text":"after"}]}}` + "\n"
+	got, err := readEntriesFrom(strings.NewReader(body), "")
+	if err != nil {
+		t.Fatalf("readEntriesFrom: %v", err)
+	}
+	out := got[0].Blocks[0].Output
+	if !strings.Contains(out, "after") {
+		t.Errorf("output %q lost the text element", out)
+	}
+	if !strings.Contains(out, "image") {
+		t.Errorf("output %q dropped the non-text element without a trace", out)
+	}
+}
+
+// TestGenuineBlocks_OneRuleForBothReaders pins that the description enhancer
+// and the transcript reader answer the same question the same way.
+//
+// They ask it for different reasons — one wants the first thing the operator
+// said, the other wants all of it — so the rule has to be shared rather than
+// written twice. It was written twice, and the two disagreed: a blank block
+// after an injection became the session's description while the transcript
+// skipped past it to the real words.
+func TestGenuineBlocks_OneRuleForBothReaders(t *testing.T) {
+	content := []contentBlock{
+		{Text: "<environment_context>\n  <cwd>/tmp/example</cwd>\n</environment_context>"},
+		{Text: "   "},
+		{Text: "first line"},
+		{Text: "second line"},
+	}
+	first, ok := firstGenuineBlock(content)
+	if !ok || first != "first line" {
+		t.Errorf("firstGenuineBlock = %q (ok=%v), want %q — a blank block is not what the operator said",
+			first, ok, "first line")
+	}
+	if got, want := joinBlockText(content, true), "first line\nsecond line"; got != want {
+		t.Errorf("joinBlockText = %q, want %q", got, want)
+	}
+}
+
+// TestReadEntries_SurvivesABuildLogSizedToolOutput pins the line ceiling by
+// its consequence rather than by its number.
+//
+// A Codex tool output holds whatever the command printed, and a build or test
+// log in the multi-megabyte range is ordinary — it is also exactly the output
+// an orchestrator reads the transcript to see. One line over the limit fails
+// the entire read, and because a rollout only ever grows, that failure is
+// permanent for the session: every later `jin session result` returns the same
+// error and discards everything read before the oversized line.
+//
+// The size here is above the ceiling this reader started with and below the
+// one it shares with the Claude Code reader, so lowering the constant back
+// fails this test.
+func TestReadEntries_SurvivesABuildLogSizedToolOutput(t *testing.T) {
+	const outputBytes = 5 << 20
+	body := `{"timestamp":"2026-07-11T17:00:00.000Z","type":"response_item","payload":` +
+		`{"type":"custom_tool_call_output","call_id":"c1","output":"` +
+		strings.Repeat("a", outputBytes) + `"}}` + "\n"
+
+	got, err := readEntriesFrom(strings.NewReader(body), "")
+	if err != nil {
+		t.Fatalf("a %d-byte tool output failed the read: %v", outputBytes, err)
+	}
+	if len(got) != 1 || len(got[0].Blocks[0].Output) != outputBytes {
+		t.Fatalf("got %d entries, output %d bytes; want the whole output intact",
+			len(got), len(got[0].Blocks[0].Output))
+	}
 }

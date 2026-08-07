@@ -151,6 +151,23 @@ const (
 //
 // workDir is a hint, not a key: an implementation is free to ignore it if it
 // locates the log by session ID alone.
+//
+// What belongs in an Entry: the conversation as an operator would read it.
+// Context the agent injected on the operator's behalf is not conversation —
+// environment blocks, skill bodies, system prompts — and neither are a
+// subagent's own turns, nor the agent's internal bookkeeping. The Codex reader
+// applies that rule. **The Claude Code reader does not yet**: it copies every
+// line, so injected and sidechain entries reach the caller along with
+// blockless "system" bookkeeping entries. That divergence is known and
+// deliberate here only because narrowing it would change what every existing
+// Claude Code session returns. It is written down so the next adapter learns
+// the rule from this contract rather than from whichever reader it copies.
+//
+// One method, deliberately. Views over a conversation — last message, last N
+// exchanges, truncation — are kind-independent policy and belong in shared
+// functions over []Entry, not here. Adding them would make every adapter
+// re-implement exchange boundaries, which is how the same flag ends up meaning
+// different things per agent kind.
 type TranscriptSource interface {
 	ReadEntries(workDir, sessionID, since string) ([]transcript.Entry, error)
 }

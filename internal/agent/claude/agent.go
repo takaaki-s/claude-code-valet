@@ -62,6 +62,9 @@ func (a *Agent) Description() agent.DescriptionSource { return a.enhancer }
 // implementation of the interface — transcript.Reader's ReadEntries already
 // has the signature TranscriptSource declares, so this hands it over as-is
 // rather than wrapping it.
+//
+// Built per call, unlike enhancer and statusSrc above; see the same method on
+// the Codex adapter for why caching it buys nothing.
 func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader() }
 
 // Setup writes the process-wide hooks-settings.json (exactly once) and the

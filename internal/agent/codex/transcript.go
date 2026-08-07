@@ -1,7 +1,7 @@
 package codex
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -10,7 +10,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/transcript"
 )
 
-// Reader turns a Codex rollout JSONL into jind-ai's shared transcript.Entry
+// TranscriptReader turns a Codex rollout JSONL into jind-ai's shared transcript.Entry
 // form, which is what `jin session result` serialises. It satisfies
 // session.TranscriptSource.
 //
@@ -18,14 +18,14 @@ import (
 // lines); the counts quoted in the comments below are from that corpus. The
 // format is undocumented, so a rule with no measurement behind it is a guess,
 // and the numbers are recorded so a later reader can tell which is which.
-type Reader struct {
+type TranscriptReader struct {
 	locator *Locator
 }
 
-// NewTranscriptReader returns a Reader that locates rollouts the same way the
+// NewTranscriptReader returns a reader that locates rollouts the same way the
 // description enhancer does — CODEX_HOME when set, else <home>/.codex/sessions.
-func NewTranscriptReader(home string) *Reader {
-	return &Reader{locator: NewLocator(home)}
+func NewTranscriptReader(home string) *TranscriptReader {
+	return &TranscriptReader{locator: NewLocator(home)}
 }
 
 // ReadEntries returns the conversation recorded for sessionID, keeping only
@@ -39,7 +39,7 @@ func NewTranscriptReader(home string) *Reader {
 // A session with no rollout on disk yet returns (nil, nil): Codex writes the
 // file when the agent starts, so an empty result here means "too early", not
 // "broken". That matches what transcript.Reader does with ErrNoTranscript.
-func (r *Reader) ReadEntries(_, sessionID, since string) ([]transcript.Entry, error) {
+func (r *TranscriptReader) ReadEntries(_, sessionID, since string) ([]transcript.Entry, error) {
 	path, ok := r.locator.Find(sessionID)
 	if !ok {
 		return nil, nil
@@ -60,11 +60,11 @@ func (r *Reader) ReadEntries(_, sessionID, since string) ([]transcript.Entry, er
 // It is deliberately a second decoder alongside rolloutRow rather than an
 // extension of it. The two read the same file for different things —
 // rolloutRow answers "which session is this and what did the operator first
-// say", this one answers "what happened in the conversation" — and the field
-// names collide across those questions (`payload.id` is the session UUID on a
-// session_meta line and a per-item identifier on a response_item). One struct
-// covering both would need names that mean different things depending on the
-// line, which is how a parser starts reading the wrong field.
+// say", this one answers "what happened in the conversation" — and each
+// declares exactly the fields its own question needs. Merging them would put
+// ten conversation fields into the struct FirstUserPrompt decodes on every
+// line of every rollout, and would leave neither parser's dependencies
+// readable from its own type.
 type entryRow struct {
 	Timestamp string `json:"timestamp"`
 	Type      string `json:"type"`
@@ -108,8 +108,7 @@ type taskError struct {
 // matching transcript.Reader — a truncated read that looks like a short
 // conversation is the failure mode worth being loud about.
 func readEntriesFrom(r io.Reader, since string) ([]transcript.Entry, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxLine)
+	scanner := newRolloutScanner(r)
 
 	var b entryBuilder
 	for scanner.Scan() {
@@ -117,14 +116,30 @@ func readEntriesFrom(r io.Reader, since string) ([]transcript.Entry, error) {
 		if len(line) == 0 {
 			continue
 		}
+		// Top-level timestamps are present on 501/501 lines, fixed-width and
+		// lexicographically ordered exactly like Claude Code's, so the shared
+		// rule applies unchanged.
+		//
+		// On an incremental read the bound is checked before the payload is
+		// decoded, because entryRow holds the tool output as json.RawMessage
+		// and decoding it copies every byte. A poll that finds nothing new
+		// would otherwise copy the whole file to throw it away — measured at
+		// 52 MB allocated to return zero entries from a 49 MB rollout, against
+		// 4 MB with the bound checked first. A full read skips the extra pass
+		// entirely, so it pays nothing for this.
+		if since != "" {
+			var head struct {
+				Timestamp string `json:"timestamp"`
+			}
+			if err := json.Unmarshal(line, &head); err != nil {
+				continue
+			}
+			if !transcript.Newer(head.Timestamp, since) {
+				continue
+			}
+		}
 		var row entryRow
 		if err := json.Unmarshal(line, &row); err != nil {
-			continue
-		}
-		// Top-level timestamps are present on 501/501 lines, fixed-width and
-		// lexicographically ordered exactly like Claude Code's, so the same
-		// string comparison works.
-		if since != "" && row.Timestamp != "" && row.Timestamp <= since {
 			continue
 		}
 
@@ -155,7 +170,8 @@ func readEntriesFrom(r io.Reader, since string) ([]transcript.Entry, error) {
 // entryBuilder groups consecutive blocks into entries at role boundaries.
 //
 // Codex writes one block per line, so copying lines to entries 1:1 would turn
-// a 252-line corpus into 252 single-block entries and make `--last 5` mean
+// the corpus's 252 response_item lines into 252 single-block entries and make
+// `--last 5` mean
 // "five blocks" for Codex while it means "five messages" for Claude Code —
 // the same flag doing different things per agent kind. Grouping restores the
 // shape Claude Code already has: an assistant entry holding its thinking,
@@ -216,17 +232,9 @@ func conversationBlock(row *entryRow) (string, transcript.Block, bool) {
 			// event_msg/user_message lines the corpus carries. Filtering is
 			// per block because one item can hold an injection and real words
 			// side by side.
-			text := joinBlockText(p.Content, true)
-			if text == "" {
-				return "", transcript.Block{}, false
-			}
-			return "user", transcript.Block{Kind: "text", Text: text}, true
+			return textBlock("user", "text", joinBlockText(p.Content, true))
 		case "assistant":
-			text := joinBlockText(p.Content, false)
-			if text == "" {
-				return "", transcript.Block{}, false
-			}
-			return "assistant", transcript.Block{Kind: "text", Text: text}, true
+			return textBlock("assistant", "text", joinBlockText(p.Content, false))
 		}
 		// role "developer" is Codex's system-prompt channel: all 43 items in
 		// the corpus are injected instructions, one of them 17,885 characters
@@ -239,11 +247,7 @@ func conversationBlock(row *entryRow) (string, transcript.Block, bool) {
 		// lives in encrypted_content and cannot be read. An empty thinking
 		// block carries nothing and would still consume a slot in `--last N`,
 		// so items with no readable summary contribute nothing.
-		text := joinBlockText(p.Summary, false)
-		if text == "" {
-			return "", transcript.Block{}, false
-		}
-		return "assistant", transcript.Block{Kind: "thinking", Text: text}, true
+		return textBlock("assistant", "thinking", joinBlockText(p.Summary, false))
 
 	case "custom_tool_call":
 		return "assistant", toolUseBlock(p.Name, p.CallID, p.Input), true
@@ -256,10 +260,17 @@ func conversationBlock(row *entryRow) (string, transcript.Block, bool) {
 			Kind:      "tool_result",
 			ToolUseID: p.CallID,
 			Output:    out,
-			IsError:   looksLikeToolError(out),
+			// False here means "no failure signal was found", not "the call
+			// succeeded" — the format has no flag to read. See
+			// looksLikeToolError for what the two signals cover.
+			IsError: looksLikeToolError(out),
 		}, true
 
 	case "agent_message":
+		// Enumerated rather than left to the fallthrough: this is the payload
+		// type a reader comes here to check, and finding no case for it reads
+		// as an oversight.
+		//
 		// Not the assistant speaking: these carry author/recipient fields and
 		// a routing envelope in the body. They are messages between agents,
 		// and the assistant's own words for the same turn are already on a
@@ -267,6 +278,17 @@ func conversationBlock(row *entryRow) (string, transcript.Block, bool) {
 		return "", transcript.Block{}, false
 	}
 	return "", transcript.Block{}, false
+}
+
+// textBlock is the shared exit for the payload types that contribute prose.
+// All three drop the item when there is nothing left to say — an empty block
+// carries no information and still takes a slot in `--last N` — and having one
+// place to say so means a fourth prose type cannot quietly disagree.
+func textBlock(role, kind, text string) (string, transcript.Block, bool) {
+	if text == "" {
+		return "", transcript.Block{}, false
+	}
+	return role, transcript.Block{Kind: kind, Text: text}, true
 }
 
 // toolUseBlock records a tool call. Codex's tool input is a bare string — the
@@ -291,22 +313,54 @@ func toolUseBlock(name, callID, input string) transcript.Block {
 // custom, 4/5 function), and absent/null.
 //
 // Array elements are joined with no separator because they are consecutive
-// slices of one stream — the harness header ends in its own newline and the
+// slices of one stream — the opposite of joinBlockText above, and of the
+// Claude Code reader's equivalent, both of which join with a newline because
+// their blocks are separate lines of one message — the harness header ends in its own newline and the
 // command's output follows directly. Inserting a separator would add a blank
 // line that was never in the output.
 func stringifyOutput(raw json.RawMessage) string {
-	if len(raw) == 0 {
+	// An absent output stops here rather than falling through. The raw
+	// fallback below would also return "", but it is documented as being for
+	// shapes nobody has seen, and "the field was not there" is not one.
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) == 0 {
 		return ""
 	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+	// Dispatch on the opening byte rather than trying each decode in turn. The
+	// array shape is the common one (40/41 custom outputs), and attempting a
+	// string decode on it is not a cheap miss: the parser validates the whole
+	// payload and then walks the array again to skip it, which measured at
+	// roughly a fifth of all CPU spent reading a real rollout.
+	switch trimmed[0] {
+	case 'n': // null, i.e. recorded but empty
+		return ""
+	case '"':
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err == nil {
+			return s
+		}
+		return string(raw)
+	case '[':
+		break
+	default:
+		return string(raw)
 	}
-	var blocks []contentBlock
-	if err := json.Unmarshal(raw, &blocks); err == nil {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(trimmed, &elems); err == nil {
 		var sb strings.Builder
-		for _, c := range blocks {
-			sb.WriteString(c.Text)
+		for _, e := range elems {
+			// An element is decoded for its text, but decoding into a struct
+			// with one field succeeds for any object — so an element carrying
+			// no text at all would come back as the empty string and vanish
+			// without trace. Every element in the corpus is a text block; one
+			// that is not (an image reference, say) is kept as its own JSON,
+			// which is what the Claude Code reader does with the same shape.
+			var c contentBlock
+			if err := json.Unmarshal(e, &c); err == nil && c.Text != "" {
+				sb.WriteString(c.Text)
+				continue
+			}
+			sb.Write(e)
 		}
 		return sb.String()
 	}
@@ -331,6 +385,15 @@ func stringifyOutput(raw json.RawMessage) string {
 func looksLikeToolError(output string) bool {
 	if strings.HasPrefix(output, "Script failed") {
 		return true
+	}
+	// Only a JSON object can carry the flag, and the check is worth making
+	// before the parse: json.Unmarshal takes []byte, so handing it a string
+	// copies the whole output first. Tool output here is command output —
+	// measured at 1.6ms per call on a 4 MiB build log, against 17ns once the
+	// prefix rules it out, and 39 of the 41 outputs in the corpus begin with
+	// the exec harness's own header rather than a brace.
+	if !strings.HasPrefix(strings.TrimLeft(output, " \t\r\n"), "{") {
+		return false
 	}
 	var probe struct {
 		TimedOut bool `json:"timed_out"`
@@ -357,12 +420,14 @@ func turnFailureEntry(row *entryRow) (transcript.Entry, bool) {
 		return transcript.Entry{}, false
 	}
 	e := row.Payload.Error
-	text := e.Message
+	var text string
 	switch {
-	case e.Info != "" && text != "":
-		text = e.Info + ": " + text
-	case text == "":
+	case e.Info == "":
+		text = e.Message
+	case e.Message == "":
 		text = e.Info
+	default:
+		text = e.Info + ": " + e.Message
 	}
 	if text == "" {
 		return transcript.Entry{}, false
@@ -375,14 +440,18 @@ func turnFailureEntry(row *entryRow) (transcript.Entry, bool) {
 }
 
 // joinBlockText concatenates a content array's text. Blocks are separate lines
-// of one item, so they join with a newline. When skipPseudo is set, blocks
-// Codex injected rather than the operator wrote are left out.
+// of one item, so they join with a newline — unlike a tool output's array,
+// whose elements are consecutive slices of one stream and join with nothing.
+//
+// When skipPseudo is set the operator's own blocks are selected by
+// genuineBlocks, the same rule the description enhancer reads, so a prefix
+// added to the injection list reaches both.
 func joinBlockText(blocks []contentBlock, skipPseudo bool) string {
+	if skipPseudo {
+		return strings.Join(genuineBlocks(blocks), "\n")
+	}
 	var parts []string
 	for _, c := range blocks {
-		if skipPseudo && isPseudoUser(c.Text) {
-			continue
-		}
 		if strings.TrimSpace(c.Text) == "" {
 			continue
 		}

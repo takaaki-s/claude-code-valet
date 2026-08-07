@@ -544,6 +544,21 @@ func (r *Reader) findTranscriptPath(workDir, sessionID string) (string, error) {
 	return "", ErrNoTranscript
 }
 
+// Newer reports whether an entry stamped ts should be returned for a read
+// bounded by since. It is the whole of the `--since` rule, in one place:
+// exclusive, compared as a string, and permissive about a missing stamp — an
+// entry with no timestamp would compare as "at or before" every bound and
+// disappear the moment a caller read incrementally.
+//
+// Exported because it is protocol rather than implementation. Every
+// session.TranscriptSource promises these semantics, and the promise is only
+// worth making if the adapters share the sentence that defines it: a fix to
+// the cursor has to land for all of them at once, or `--since` starts meaning
+// different things per agent kind.
+func Newer(ts, since string) bool {
+	return since == "" || ts == "" || ts > since
+}
+
 // ReadEntries returns transcript entries with Timestamp strictly greater than `since`.
 // An entry whose Timestamp equals `since` is excluded — pass the timestamp of the last
 // entry already seen to receive only what came after it (no duplicates). String
@@ -807,7 +822,7 @@ func readEntries(filePath, since string) ([]Entry, error) {
 		if err := json.Unmarshal(line, &raw); err != nil {
 			continue
 		}
-		if since != "" && raw.Timestamp != "" && raw.Timestamp <= since {
+		if !Newer(raw.Timestamp, since) {
 			continue
 		}
 		entries = append(entries, Entry{
