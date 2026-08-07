@@ -76,6 +76,10 @@ If a new package needs debug logging, duplicate the same pattern.
 - Lock ordering: session.Manager.mu is the central lock; auxiliary locks
   (`tmuxInitMu`, `paneSlotMu`) are always acquired BEFORE `mu` and never
   while holding it
+  - Exception: `claude.trustMu` is taken under `mu`, because the adapter's
+    `Setup()` is called from `startSessionTmux` and cannot see the lock. It is
+    safe only because it is a leaf — nothing beneath it re-enters
+    session.Manager. Anything else added there must keep that property
 - Perform I/O operations (Store.Save, transcript reads) outside the lock
   - Example: `List()` takes a snapshot under RLock, then reads transcripts after releasing the lock
 

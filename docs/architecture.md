@@ -221,7 +221,8 @@ internal/session/       owns Agent + AgentResolver interfaces (no import of agen
 internal/agent/         re-exports the same types as aliases; hosts registry
 internal/agent/register blank-import → wires every kind into the registry at init()
 internal/agent/claude/  Claude Code adapter: SpawnCommand / StatusSource / Setup
-                         (hooks-settings.json + trust-dialog files), Description
+                         (hooks-settings.json + the ~/.claude.json trust entry),
+                         Description
                          (Layer C enhancer over ~/.claude/sessions/<PID>.json)
 internal/agent/codex/   Codex CLI adapter: SpawnCommand appends `--enable hooks
                          + -c 'hooks.X=[...]'` per invocation (Setup writes no
@@ -239,16 +240,30 @@ internal/agent/textutil.go  Cross-adapter helper — currently `SmartTruncate`
                          shared by claude and codex description enhancers.
 ```
 
-Design principle: **adapters must not write to user-global config**. The
-Codex adapter injects hooks per-invocation via `-c` overrides rather than
-touching `~/.codex/hooks.json` or `~/.codex/config.toml`. This keeps
-uninstalls automatic (no residue) and guarantees the user's own hooks are
-never accidentally clobbered by a stale merge. The Claude Code adapter's
-generated `hooks-settings.json` lives under jind-ai's own state directory
-for the same reason. The opencode adapter follows it too: its plugin goes
-under jind-ai state and is reached through `OPENCODE_CONFIG_DIR`, which
-opencode *appends* to its config search path — the user's
-`~/.config/opencode` and any project `.opencode` keep loading untouched.
+Design principle: **adapters must not write to user-global config where the
+agent gives them any other channel**. The Codex adapter injects hooks
+per-invocation via `-c` overrides rather than touching `~/.codex/hooks.json`
+or `~/.codex/config.toml`. This keeps uninstalls automatic (no residue) and
+guarantees the user's own hooks are never accidentally clobbered by a stale
+merge. The Claude Code adapter's generated `hooks-settings.json` lives under
+jind-ai's own state directory for the same reason. The opencode adapter
+follows it too: its plugin goes under jind-ai state and is reached through
+`OPENCODE_CONFIG_DIR`, which opencode *appends* to its config search path —
+the user's `~/.config/opencode` and any project `.opencode` keep loading
+untouched.
+
+The qualifier is load-bearing, and there is exactly one place it applies:
+Claude Code's workspace trust flag, which the CLI reads only from
+`projects[<dir>].hasTrustDialogAccepted` in `~/.claude.json`. No settings
+file carries it and `--settings` injection cannot supply it, so the choice
+is between writing there and leaving every session stuck on a trust dialog
+in a pane nobody is watching. That write is deliberately the narrowest thing
+that works — one boolean, merged into a file decoded as raw JSON so no other
+key is touched, skipped entirely when a trusted ancestor already covers the
+directory. **Do not read this as licence for the next adapter.** Reach for
+it only after establishing that the agent offers no per-invocation or
+injected channel, and record how you established it. See the Claude Code
+adapter section of [gotchas.md](gotchas.md) for what that write costs.
 
 ### Adapter kind resolution
 

@@ -94,9 +94,12 @@ Legacy `Name` field is migrated on daemon startup: `store.Load()` reads the raw 
 ## Creation Flow
 
 1. `Manager.CreateWithOptions()` creates a Session and persists it via Store
-2. `Manager.StartBackground()` → `startSession()` → `startSessionTmux()`
+2. `Manager.StartBackground()` → `startSessionTmux()` (under `m.mu`)
 3. `ensureTmuxClient()` initializes the inner tmux (`-L jin`)
-4. `ensureClaudeTrustState()` sets trust config in `~/.claude/settings.local.json`
+4. The adapter's `Setup()` runs — for Claude Code that is
+   `EnsureHooksSettingsFile()` (once per daemon) plus `EnsureTrustState()`,
+   which sets `projects[<workDir>].hasTrustDialogAccepted` in `~/.claude.json`
+   (not a settings file — see docs/gotchas.md)
 5. Creates an inner tmux session and runs `claude --session-id {ID}`
 6. `TagManagedPane()` tags the pane for remain-on-exit
 7. Starts `captureOutputTmux()` goroutine for polling

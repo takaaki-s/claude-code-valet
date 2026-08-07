@@ -72,12 +72,13 @@ $XDG_RUNTIME_DIR/jind-ai/      (fallback $TMPDIR/jind-ai-<uid>/)
 
 ## Claude Code Hooks
 
-Configured in `~/.claude/settings.json`:
+Generated into `~/.local/state/jind-ai/hooks-settings.json` (see Data Directories) and passed
+to the CLI with `claude --settings` — jind-ai never writes `~/.claude/settings.json`:
 - `UserPromptSubmit` → Set session to "thinking"
 - `Stop` → Set to "idle" + task completion notification
 - `Notification` → Set to "permission" + permission-waiting notification
 
-See the "Claude Code Hooks Setup" section in README.md for details.
+See the "Claude Code Hooks" section in README.md for details.
 
 ## Commit Convention
 
