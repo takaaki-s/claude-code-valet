@@ -276,7 +276,7 @@ func TestFirstUserPrompt_SkipsInjectionsFoundInRealRollouts(t *testing.T) {
 		injected string
 	}{
 		{"recommended_plugins", "<recommended_plugins>\nHere is a list of plugins that are available but not installed"},
-		{"skill", "<skill>\n<name>my-03-work</name>\n<path>/home/x/SKILL.md</path>"},
+		{"skill", "<skill>\n<name>example-skill</name>\n<path>/skills/example/SKILL.md</path>"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
