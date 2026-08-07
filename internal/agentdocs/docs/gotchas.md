@@ -51,6 +51,34 @@ cd <workdir> && <test command>     # whether it holds up
 jin pane capture work              # last resort — see below
 ```
 
+## `session info`'s last-message fields are a preview, not a result
+
+`jin session info --json` carries `last_user_message` and
+`last_assistant_message`. They are what the session list and the TUI row show,
+and they now come from the session's own adapter — so a `codex` child fills
+them in where it used to leave them blank forever.
+
+Do not collect a child's work from them:
+
+- **Empty means nothing in particular.** These decorate a row that has to
+  render either way, so every failure is silent — no reader for that kind, an
+  unreadable log, or an agent that genuinely has not spoken all produce the
+  same two empty strings, and the command still exits 0. `session result` is
+  the call that tells those apart.
+- **They are truncated to 500 bytes**, the user preview from the start and the
+  assistant preview from the end.
+- **They are one message each**, not a turn: tool calls, tool results, and
+  thinking are not in them.
+- **Injected text is excluded on purpose** — environment blocks, the body of an
+  invoked skill, a subagent's own turn. `last_user_message` is what the
+  operator typed, which is usually what you want and is not the raw last user
+  entry.
+
+```bash
+jin session info work --json | jq -r '.last_assistant_message'   # a glance
+jin session result work --last 5                                  # the answer
+```
+
 ## On Codex, `--errors-only` misses the failures you care about
 
 **An empty `--errors-only` on a `codex` session is not evidence that nothing

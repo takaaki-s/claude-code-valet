@@ -111,7 +111,7 @@ it alone.
 | Action | Data Type | Description |
 |--------|-----------|-------------|
 | `new` | `NewRequest` | Create session (async; poll via `get`) |
-| `list` | (none) | List all sessions |
+| `list` | (none) | List all sessions (with last-message enrichment) |
 | `get` | `IDRequest` | Get a single session (with last-message enrichment) |
 | `send` | `SendRequest` | Send a prompt to a session (alias `prompt` on the CLI) |
 | `start` | `IDRequest` | Start session |
@@ -128,6 +128,13 @@ it alone.
 | `pane-capture` | `PaneCaptureRequest` | Capture the visible contents of a session's pane |
 | `pane-send-keys` | `PaneSendKeysRequest` | Send keys to a session's pane (literal text or tmux key names) |
 | `plugin-run` | `PluginRunRequest` | Run a plugin on demand for a session (bypasses matcher/debounce; async) |
+
+**Last-message enrichment** fills `Info.last_user_message` and
+`Info.last_assistant_message` by reading the conversation through the session's
+own agent adapter (`Manager.AttachLastMessages`). Unlike `result`, it never
+fails the response: an adapter with no reader, a read error, and an agent that
+has said nothing all leave the two fields empty and `success: true`. Clients
+that need to distinguish those must use `result`.
 
 ## Async completion
 

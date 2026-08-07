@@ -155,13 +155,28 @@ const (
 // What belongs in an Entry: the conversation as an operator would read it.
 // Context the agent injected on the operator's behalf is not conversation —
 // environment blocks, skill bodies, system prompts — and neither are a
-// subagent's own turns, nor the agent's internal bookkeeping. The Codex reader
-// applies that rule. **The Claude Code reader does not yet**: it copies every
-// line, so injected and sidechain entries reach the caller along with
-// blockless "system" bookkeeping entries. That divergence is known and
-// deliberate here only because narrowing it would change what every existing
-// Claude Code session returns. It is written down so the next adapter learns
-// the rule from this contract rather than from whichever reader it copies.
+// subagent's own turns, nor the agent's internal bookkeeping.
+//
+// A reader has two lawful ways to honour that, and which one it picks is its
+// own business:
+//
+//   - Drop them while reading. The Codex reader does this, so its entries are
+//     conversation by construction and it leaves Entry.Injected /
+//     Entry.Sidechain false.
+//   - Emit them with Entry.Injected / Entry.Sidechain set. The Claude Code
+//     reader does this, because it also feeds `jin session result`, which has
+//     always returned every line — narrowing it would change what every
+//     existing Claude Code session reports. Shared views over []Entry skip
+//     flagged entries, so the operator-facing answer is the same either way.
+//
+// **A reader that cannot classify an entry must drop it, never emit it
+// unflagged.** Injected == false is read everywhere as "checked, and this is
+// the operator's", not as "unknown" — emitting an unclassified injection puts
+// it straight into the caller's view of what the operator said. That failure
+// was measured: deriving the previews without provenance surfaced the body of
+// an invoked skill as the last user message on 55 of 231 real transcripts.
+// The flags are a conclusion a reader reached, so declining to reach one means
+// leaving the entry out, not defaulting it.
 //
 // One method, deliberately. Views over a conversation — last message, last N
 // exchanges, truncation — are kind-independent policy and belong in shared
@@ -217,15 +232,24 @@ type Agent interface {
 	// Transcript returns the adapter's reader for the agent's own on-disk
 	// conversation log, or nil when this adapter cannot read one.
 	//
-	// nil means "cannot read", and callers must report it as a failure
-	// rather than as an empty conversation. The two are not the same thing
-	// and the difference is the whole point: `jin session result` used to
-	// call the Claude Code reader unconditionally, so every non-Claude
-	// session answered with zero entries and success — indistinguishable
-	// from a child agent that ran and said nothing. An orchestrator reading
-	// that concludes the work produced no output, which is a wrong answer
-	// delivered quietly. An error is a wrong answer delivered loudly, and
-	// loudly is recoverable.
+	// nil means "cannot read", never "the conversation is empty". The two
+	// are not the same thing and the difference is the whole point: `jin
+	// session result` used to call the Claude Code reader unconditionally,
+	// so every non-Claude session answered with zero entries and success —
+	// indistinguishable from a child agent that ran and said nothing. An
+	// orchestrator reading that concludes the work produced no output,
+	// which is a wrong answer delivered quietly. An error is a wrong answer
+	// delivered loudly, and loudly is recoverable.
+	//
+	// A caller answering *with* the conversation must therefore fail on nil
+	// — that is `session result`. A caller merely decorating something it
+	// has to render anyway may stay silent, which is what
+	// Manager.AttachLastMessages does for the list rows and `session info`:
+	// failing a whole `session list` because one session's log is
+	// unreadable would be worse than a row with a blank second line. The
+	// obligation that survives in both cases is never to dress nil up as an
+	// empty conversation, so a silent caller must not be the only way an
+	// operator can ask.
 	//
 	// On Agent rather than a side interface for the same reason as
 	// ClearInputKeys: an adapter that forgets this should fail to compile,

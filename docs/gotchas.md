@@ -766,6 +766,104 @@ Common pitfalls and caveats that agents tend to fall into.
   than `exec`. A full-corpus count says what the corpus contains, not what
   Codex can emit; treat those paths as unmeasured rather than absent.
 
+## Session previews (`info`, `list`, TUI rows)
+
+- **The two message previews go through the session's adapter too, and for
+  the same reason `session result` does.** `handleGet` and `Manager.List` both
+  built `transcript.NewReader()` — the Claude Code reader — whatever kind the
+  session ran, so a codex or opencode row's second line was blank forever, and
+  because the read error was discarded, blank was indistinguishable from a
+  session that had not spoken. Both now call `Manager.AttachLastMessages`,
+  which resolves the adapter through `m.resolveAgent(info.AgentKind)`.
+
+  `Manager` cannot use `agent.Lookup` the way `handleResult` does —
+  `internal/session` must not import `internal/agent` — but it already carried
+  an `agentResolver` for the same purpose, so no new wiring was needed. The two
+  call sites therefore resolve adapters two different ways, which is the
+  dependency direction showing through rather than an inconsistency.
+
+- **Here an unreadable transcript is silent, unlike `session result`.** These
+  decorate a row that has to render either way, so every failure — no adapter,
+  no reader, a read error, nothing said yet — leaves the previews empty and the
+  command succeeds. A `session list` that failed because one session's
+  transcript was unreadable would be worse than a row with an empty second
+  line. The consequence is that **an empty preview still means nothing in
+  particular**; `session result` is the call that distinguishes the cases.
+
+- **`Entry` carries provenance so the shared view can filter it, and the flags
+  hold a conclusion rather than the evidence for one.** `Injected` means the
+  agent wrote the entry in the operator's voice (an environment block, the body
+  of an invoked skill, an interruption notice); `Sidechain` means it belongs to
+  a subagent's thread. `transcript.LastMessagesFrom` skips both.
+
+  Deriving the flags per reader is what makes them portable. Claude Code marks
+  injections with `isMeta` and with the absence of a `promptSource` stamp; a
+  shared field holding "promptSource was missing" would be a Claude Code fact
+  wearing a neutral name, and applying it to Codex — which stamps nothing and
+  whose user entries are text-only — would discard every prompt the operator
+  typed. The Codex reader filters injected rows while reading, so it leaves
+  both flags false, which is correct: there is nothing left to warn a view
+  about.
+
+  Measured on 231 real Claude Code transcripts, deriving the previews from
+  entries *without* the flags put the body of an invoked skill where the
+  operator's last words belong on 55 of them — and those bodies carry absolute
+  filesystem paths, straight onto the session list. With the flags the same
+  231 match the previous output exactly (user 0/231 mismatched, assistant
+  0/231).
+
+- **The flags mark entries; they do not remove them.** `session result` has
+  always returned every line, and narrowing that would change what every
+  existing session reports. `readEntries` therefore sets `Injected` /
+  `Sidechain` and still appends the entry; only the view drops them.
+
+  Marking and dropping are both lawful for a reader — see the `TranscriptSource`
+  contract in `internal/session/agent_types.go`, which now states both — but a
+  reader that *cannot* classify an entry must drop it rather than emit it
+  unflagged. Every view reads `Injected == false` as "checked, this is the
+  operator's", never as "unknown", so an unclassified injection goes straight
+  into what the operator is told they said.
+
+- **`readLastMessages` is now a delegation, not a second implementation.**
+  `Reader.GetLastMessages` walks `readEntries` + `LastMessagesFrom` like
+  everything else. It used to reach the same answer through its own vocabulary
+  (`isConversationEntry` / `extractContent`), which meant the injection rule —
+  the load-bearing decision in this package — existed twice, and the copy with
+  no production caller was the one most of the package's tests pinned. The two
+  were verified equal over 246 real transcripts before the collapse.
+
+- **Reading per row costs more than the streaming reader it replaced, so
+  `Manager.List` runs the rows concurrently.** The old path streamed a
+  transcript and kept only the last two messages; the new one materializes
+  `[]Entry` and reduces it, which is what lets every kind share the view.
+  Measured over 40 transcripts: +22% per read (763ms → 934ms serial, ~19ms →
+  ~23ms per session).
+
+  That matters because the TUI refetches the whole list every two seconds. The
+  rows are independent, `List` holds no lock past its phase-1 `RUnlock`, and
+  every adapter's `Transcript()` is constructed per call rather than shared —
+  which is precisely what makes parallel reads safe — so phase 2 runs across
+  `GOMAXPROCS` workers: 248ms → 133ms on the same 40 (1.87x, 3 runs each). The
+  semaphore is what bounds peak memory to that many live `[]Entry` instead of
+  one per session.
+
+  `LastMessagesFrom` also builds a `Message` only for the two entries that
+  survive rather than for every match. Over 685 real transcripts, 8,055 entries
+  qualify and 1,370 survive, so 83% of the joins and whitespace rewrites were
+  being discarded: 1.55ms → 0.22ms and 1,128 → 57 allocations over 40
+  transcripts.
+
+  **Pushing `--last` down into `TranscriptSource` is worth less than it looks.**
+  Decoding `message.content` as `json.RawMessage` instead of `any` was measured
+  at 243ms → 213ms (12%), though it does halve allocations — `encoding/json`'s
+  validity scan is byte-proportional and does not go away without a different
+  parser. Worth knowing before ordering that follow-up against anything else.
+
+- **`session output` is still Claude-Code-only.** It builds
+  `transcript.NewReader()` in the CLI process (`cmd/jin/cmd/output_cmd.go`),
+  not through the daemon, so the adapter is never consulted. On a codex session
+  it returns nothing. Routing it is a separate change with a separate transport.
+
 ## Hook
 
 - **Session identification uses the `JIN_SESSION_ID` environment variable** (most reliable).

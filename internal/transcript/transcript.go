@@ -49,6 +49,28 @@ type Entry struct {
 	Timestamp string  `json:"timestamp,omitempty"` // ISO8601
 	Blocks    []Block `json:"blocks,omitempty"`
 	Usage     *Usage  `json:"usage,omitempty"` // assistant only
+
+	// Injected reports that the agent produced this entry on the operator's
+	// behalf rather than the operator writing it — an environment block, the
+	// body of an invoked skill, an interruption notice the agent files in the
+	// user's voice.
+	//
+	// Sidechain reports that the entry belongs to a subagent's own thread
+	// rather than the main conversation.
+	//
+	// Both carry a reader's *conclusion*, not the evidence it reached that
+	// conclusion from, and that distinction is the whole point. Claude Code
+	// marks injections with an isMeta flag and with the absence of a
+	// promptSource stamp; Codex writes them under a `developer` role and
+	// behind recognisable prefixes. A shared field holding "promptSource was
+	// missing" would be a Claude Code fact wearing a neutral name, and
+	// applying it to Codex — which stamps nothing and whose user entries are
+	// text-only — would silently discard every prompt the operator typed.
+	//
+	// A reader that filters injections while reading leaves both false, which
+	// is correct: there is nothing left to warn a view about.
+	Injected  bool `json:"injected,omitempty"`
+	Sidechain bool `json:"sidechain,omitempty"`
 }
 
 // Block is a single content block within a transcript entry.
@@ -212,69 +234,30 @@ func lastExchanges(msgs []Message, n int) []Message {
 	return msgs
 }
 
-// readLastMessages reads the transcript file and returns the last user and assistant messages
+// readLastMessages reads the transcript file and returns the last user and
+// assistant messages, as the shared view over Entry sees them.
+//
+// It used to walk the file itself and reach the same answer through different
+// vocabulary — isConversationEntry and extractContent where LastMessagesFrom
+// uses the Injected/Sidechain flags. Two implementations of "what counts as
+// the operator's words" is one too many: that rule is the load-bearing
+// decision in this package, and the copy nothing called was the one most of
+// the package's tests pinned. Delegating makes the parity structural instead
+// of asserted, and points those tests at the path production actually takes.
+//
+// Verified equal before the collapse: over 246 real Claude Code transcripts
+// the two agreed on user content, assistant content, timestamps and nil-ness
+// with no exceptions.
+//
+// The cost is that this materializes every entry where it used to stream. That
+// is the same trade Manager.AttachLastMessages already makes on the list path,
+// which is where the previews are actually read.
 func (r *Reader) readLastMessages(filePath string) (*LastMessages, error) {
-	file, err := os.Open(filePath)
+	entries, err := readEntries(filePath, "")
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	defer file.Close()
-
-	var lastUser *Message
-	var lastAssistant *Message
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, maxTranscriptLineBytes)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
-		var entry transcriptEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
-			continue
-		}
-
-		// Only process user and assistant messages
-		if !isConversationEntry(&entry) {
-			continue
-		}
-
-		content := extractContent(&entry)
-		if content == "" {
-			continue
-		}
-
-		msg := &Message{
-			Type:      entry.Type,
-			Content:   content,
-			Timestamp: entry.Timestamp,
-		}
-
-		if entry.Type == "user" {
-			lastUser = msg
-		} else {
-			lastAssistant = msg
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	if lastUser == nil && lastAssistant == nil {
-		return nil, nil
-	}
-
-	return &LastMessages{
-		User:      lastUser,
-		Assistant: lastAssistant,
-	}, nil
+	return LastMessagesFrom(entries), nil
 }
 
 // encodePathForClaude converts a path to Claude Code's directory name format
@@ -578,6 +561,42 @@ func (r *Reader) ReadEntries(workDir, sessionID, since string) ([]Entry, error) 
 	return readEntries(path, since)
 }
 
+// isInjected reports whether Claude Code wrote this entry in the user's voice
+// rather than the operator supplying it. blocks is what parseBlocks already
+// produced for raw, so the text is read back off it rather than collected a
+// second time.
+//
+// Two shapes qualify, and they are the same two the message readers already
+// exclude — this is that decision named, so a view working from Entry can
+// reach it without re-deriving it from fields Entry does not carry. isMeta is
+// the explicit marker: skill bodies, environment reminders, command caveats.
+// The second is the rule conversationTextBlocks applies, restated: a user
+// entry that carries text but that conversationTextBlocks refuses is one with
+// no promptSource stamp and nothing but text in it, which on real transcripts
+// is always the agent filing a notice on the user's behalf. The stamp test
+// stays inside conversationTextBlocks rather than being repeated here, so the
+// Claude-Code-specific rule lives in one function.
+//
+// Why the conclusion is stored rather than promptSource itself: see the
+// Injected field on Entry.
+func isInjected(raw *transcriptEntry, blocks []Block) bool {
+	if raw.IsMeta {
+		return true
+	}
+	if len(conversationTextBlocks(raw)) > 0 {
+		return false
+	}
+	// Reaching here means conversationTextBlocks refused the entry, which it
+	// only does for a text-only content array — so parseBlocks turned that
+	// same array into text blocks and asking it is asking the same question.
+	for _, b := range blocks {
+		if b.Kind == "text" && b.Text != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // LastToolUse returns the last tool_use block. If toolName is non-empty,
 // only blocks matching that tool name are considered. Returns (nil, nil)
 // if no matching block is found.
@@ -825,11 +844,19 @@ func readEntries(filePath, since string) ([]Entry, error) {
 		if !Newer(raw.Timestamp, since) {
 			continue
 		}
+		blocks := parseBlocks(&raw)
 		entries = append(entries, Entry{
 			Type:      raw.Type,
 			Timestamp: raw.Timestamp,
-			Blocks:    parseBlocks(&raw),
+			Blocks:    blocks,
 			Usage:     raw.Message.Usage,
+			// The flags are set here rather than the entry being dropped:
+			// `session result` has always returned every line, and narrowing
+			// that would change what every existing session reports. Marking
+			// them lets a view exclude what it must without the raw stream
+			// losing anything.
+			Injected:  isInjected(&raw, blocks),
+			Sidechain: raw.IsSidechain,
 		})
 	}
 	if err := scanner.Err(); err != nil {
