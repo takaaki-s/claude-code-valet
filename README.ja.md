@@ -750,7 +750,7 @@ tail -f ~/.local/state/jind-ai/daemon-debug.log
 ## 必要要件
 
 - Go 1.26+
-- tmux 3.3+
+- tmux 3.5+（3.3a はセッションに再アタッチできません。3.6a と 3.7a にはそれぞれ表示バグがあります — 詳細は [docs/gotchas.md](docs/gotchas.md) を参照）
 - Claude Code CLI がインストールされていること
 
 ## ライセンス

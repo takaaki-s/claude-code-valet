@@ -841,7 +841,7 @@ Common pitfalls and caveats that agents tend to fall into.
   `tmux display-popup -E`. On tmux 3.1 or older,
   `display-popup` doesn't exist, so the outer-tmux `bind-key` for `/` fires
   but the popup command errors out instead of opening. jind-ai's documented
-  minimum is tmux 3.3+ (see README's Requirements section), which already
+  minimum is tmux 3.5+ (see README's Requirements section), which already
   covers this.
 
 ## Display pane (TUI)
