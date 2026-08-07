@@ -20,7 +20,7 @@ var confirmPopupCmd = &cobra.Command{
 		tc, err := tmux.NewMgrClient()
 		if err != nil {
 			// No tmux, so no confirm request to answer. Exiting quietly keeps
-			// non-tmux invocations non-fatal (V-014).
+			// non-tmux invocations non-fatal.
 			return nil
 		}
 		// One tmux call for the whole request: this runs on the popup's cold

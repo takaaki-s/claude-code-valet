@@ -130,9 +130,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// TestE2E_KillKeepsWindowAndOtherPanes is V-001 and V-002 together: the panes
-// the session was carrying have to survive the kill, and the restart has to
-// put the agent back in its own pane rather than rebuild the window.
+// TestE2E_KillKeepsWindowAndOtherPanes verifies that the panes the session
+// was carrying survive the kill, and that the restart puts the agent back
+// in its own pane rather than rebuilding the window.
 func TestE2E_KillKeepsWindowAndOtherPanes(t *testing.T) {
 	mgr, tc, _, _ := killFixture(t)
 	socket := tc.GetSocketName()
@@ -148,7 +148,7 @@ func TestE2E_KillKeepsWindowAndOtherPanes(t *testing.T) {
 		t.Fatalf("Kill: %v", err)
 	}
 
-	// V-001
+	// after Kill
 	if !tc.HasSession(window) {
 		t.Fatal("inner tmux session died with the kill; the session's other panes went with it")
 	}
@@ -176,7 +176,7 @@ func TestE2E_KillKeepsWindowAndOtherPanes(t *testing.T) {
 		t.Errorf("tmux refs = %q/%q, want them kept as %q/%q", killed.TmuxWindowName, killed.TmuxPaneID, window, agentPane)
 	}
 
-	// V-002
+	// after restart
 	if err := mgr.StartBackground(sess.ID); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
@@ -193,9 +193,9 @@ func TestE2E_KillKeepsWindowAndOtherPanes(t *testing.T) {
 	}
 }
 
-// TestE2E_KillRightAfterStartStaysStopped is V-009: a session killed inside
-// the quick-resume window must not be handed back by the monitor's retry. The
-// wait covers the monitor's first tick.
+// TestE2E_KillRightAfterStartStaysStopped verifies that a session killed
+// inside the quick-resume window is not handed back by the monitor's retry.
+// The wait covers the monitor's first tick.
 func TestE2E_KillRightAfterStartStaysStopped(t *testing.T) {
 	mgr, tc, _, _ := killFixture(t)
 
@@ -217,8 +217,9 @@ func TestE2E_KillRightAfterStartStaysStopped(t *testing.T) {
 	}
 }
 
-// TestE2E_KillThenDeleteReclaimsWindow is V-012: kill hands the tmux resources
-// to delete rather than releasing them, so delete has to actually get them.
+// TestE2E_KillThenDeleteReclaimsWindow verifies that kill hands the tmux
+// resources to delete rather than releasing them, so delete has to actually
+// get them.
 func TestE2E_KillThenDeleteReclaimsWindow(t *testing.T) {
 	mgr, tc, _, _ := killFixture(t)
 
@@ -237,9 +238,10 @@ func TestE2E_KillThenDeleteReclaimsWindow(t *testing.T) {
 	waitFor(t, "the inner session to be reclaimed", func() bool { return !tc.HasSession(window) })
 }
 
-// TestE2E_KilledSessionSurvivesDaemonRestart is V-014: a new Manager over the
-// same state directory is what a daemon restart looks like from here. The
-// killed session has to come back stopped but still revivable in place.
+// TestE2E_KilledSessionSurvivesDaemonRestart verifies that a new Manager
+// over the same state directory — what a daemon restart looks like from
+// here — brings the killed session back stopped but still revivable in
+// place.
 func TestE2E_KilledSessionSurvivesDaemonRestart(t *testing.T) {
 	mgr, tc, stateDir, configDir := killFixture(t)
 

@@ -32,8 +32,8 @@ func TestSessionFilterPopupCmd_Hidden(t *testing.T) {
 
 // TestSessionFilterPopupCmd_RunE confirms RunE is wired. Without it, cobra
 // would silently print help text on invocation instead of running the
-// picker. Testing the closure body itself needs interface-ification of
-// daemon.Client / tea.Program (design §11.3 says out of scope for this PR).
+// picker. Testing the closure body itself would need interface-ification
+// of daemon.Client / tea.Program, deliberately left out of scope here.
 func TestSessionFilterPopupCmd_RunE(t *testing.T) {
 	if sessionFilterPopupCmd.RunE == nil {
 		t.Errorf("session-filter-popup.RunE = nil, want a runner")
