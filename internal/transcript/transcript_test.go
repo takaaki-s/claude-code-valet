@@ -1,7 +1,9 @@
 package transcript
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,21 +131,29 @@ func TestCleanContent(t *testing.T) {
 // --- extractContent ---
 
 func TestExtractContent_UserString(t *testing.T) {
+	// The fixture carries a newline and a tab because collapsing to one line is
+	// the whole point of extractContent, not an incidental effect of
+	// cleanContent: its result lands in `jin session info`'s tabwriter row and
+	// in the TUI detail pane, and neither of those splits on "\n".
 	entry := &transcriptEntry{
 		Type: "user",
 		Message: msgObject{
 			Role:    "user",
-			Content: "hello world",
+			Content: "hello\nworld\tand  more",
 		},
 	}
 	got := extractContent(entry)
-	if got != "hello world" {
-		t.Errorf("expected %q, got %q", "hello world", got)
+	want := "hello world and more"
+	if got != want {
+		t.Errorf("expected %q, got %q", want, got)
 	}
 }
 
 func TestExtractContent_AssistantBlocks(t *testing.T) {
-	// Simulate what json.Unmarshal produces for []contentBlock
+	// Simulate what json.Unmarshal produces for []contentBlock.
+	// This also holds the other side of the role split: a text-only array is
+	// the assistant's ordinary shape and stays conversation, while the same
+	// shape on a user entry does not (TestExtractContent_UserTextOnlyArrayIsNotConversation).
 	blocks := []any{
 		map[string]any{"type": "text", "text": "first"},
 		map[string]any{"type": "text", "text": "second"},
@@ -374,17 +384,19 @@ func TestReader_EmptySessionID(t *testing.T) {
 	tmpDir := t.TempDir()
 	r := &Reader{claudeDir: tmpDir}
 
+	// An empty sessionID cannot name a transcript, so it reports the same
+	// ErrNoTranscript as a session whose JSONL is missing.
 	msg, err := r.GetLastMessage("/some/dir", "")
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Fatalf("expected ErrNoTranscript, got %v", err)
 	}
 	if msg != nil {
 		t.Errorf("expected nil message for empty sessionID, got %+v", msg)
 	}
 
 	msgs, err := r.GetLastMessages("/some/dir", "")
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Fatalf("expected ErrNoTranscript, got %v", err)
 	}
 	if msgs != nil {
 		t.Errorf("expected nil LastMessages for empty sessionID, got %+v", msgs)
@@ -500,36 +512,40 @@ func TestGetConversation(t *testing.T) {
 			},
 			Timestamp: "2024-01-01T00:00:05Z",
 		},
+		// The last turn deliberately runs to two assistant messages: with
+		// every turn one message long, a fixed 2n tail slice and exchange
+		// counting return the same thing and the test proves neither.
+		{
+			Type: "assistant",
+			Message: msgObject{
+				Role:    "assistant",
+				Content: []any{map[string]any{"type": "text", "text": "third answer, continued"}},
+			},
+			Timestamp: "2024-01-01T00:00:06Z",
+		},
 	}
 	writeJSONL(t, transcriptPath, entries)
 
-	t.Run("last 1 pair", func(t *testing.T) {
+	t.Run("last 1 exchange", func(t *testing.T) {
 		msgs, err := r.GetConversation(workDir, sessionID, 1)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(msgs) != 2 {
-			t.Fatalf("expected 2 messages, got %d", len(msgs))
-		}
-		if msgs[0].Type != "user" || msgs[0].Content != "third question" {
-			t.Errorf("unexpected first message: %+v", msgs[0])
-		}
-		if msgs[1].Type != "assistant" || msgs[1].Content != "third answer" {
-			t.Errorf("unexpected second message: %+v", msgs[1])
+		assertContents(t, msgs, []string{"third question", "third answer", "third answer, continued"})
+		if msgs[0].Type != "user" {
+			t.Errorf("first message type = %q, want %q", msgs[0].Type, "user")
 		}
 	})
 
-	t.Run("last 2 pairs", func(t *testing.T) {
+	t.Run("last 2 exchanges", func(t *testing.T) {
 		msgs, err := r.GetConversation(workDir, sessionID, 2)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(msgs) != 4 {
-			t.Fatalf("expected 4 messages, got %d", len(msgs))
-		}
-		if msgs[0].Content != "second question" {
-			t.Errorf("expected %q, got %q", "second question", msgs[0].Content)
-		}
+		assertContents(t, msgs, []string{
+			"second question", "second answer",
+			"third question", "third answer", "third answer, continued",
+		})
 	})
 
 	t.Run("last N exceeds total", func(t *testing.T) {
@@ -537,15 +553,29 @@ func TestGetConversation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(msgs) != 6 {
-			t.Fatalf("expected 6 messages, got %d", len(msgs))
+		if len(msgs) != 7 {
+			t.Fatalf("expected 7 messages, got %d", len(msgs))
+		}
+	})
+
+	t.Run("lastN below 1 is refused", func(t *testing.T) {
+		// Asking for no exchanges used to return the whole conversation —
+		// hundreds of messages into whatever the caller was piping into.
+		for _, n := range []int{0, -1} {
+			msgs, err := r.GetConversation(workDir, sessionID, n)
+			if err == nil {
+				t.Errorf("lastN=%d: expected an error, got %d messages", n, len(msgs))
+			}
+			if msgs != nil {
+				t.Errorf("lastN=%d: expected no messages, got %+v", n, msgs)
+			}
 		}
 	})
 
 	t.Run("empty session ID", func(t *testing.T) {
 		msgs, err := r.GetConversation(workDir, "", 1)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		if !errors.Is(err, ErrNoTranscript) {
+			t.Fatalf("expected ErrNoTranscript, got %v", err)
 		}
 		if msgs != nil {
 			t.Errorf("expected nil, got %v", msgs)
@@ -851,6 +881,456 @@ func TestReader_ReadEntries_LargeLine(t *testing.T) {
 	}
 }
 
+// --- Array-shaped user content ---
+
+func textBlock(s string) map[string]any {
+	return map[string]any{"type": "text", "text": s}
+}
+
+func TestExtractContent_UserTextOnlyArrayIsNotConversation(t *testing.T) {
+	// No promptSource means Claude Code was handed this by nobody, so a
+	// text-only array here is the agent writing in the user's voice. On real
+	// transcripts every one of them was an interruption notice like the fixture
+	// below — the rule keys on the missing field and the shape, not on this
+	// wording.
+	entry := &transcriptEntry{
+		Type:    "user",
+		Message: msgObject{Role: "user", Content: []any{textBlock("[Request interrupted by user]")}},
+	}
+	if got := extractContent(entry); got != "" {
+		t.Errorf("extractContent = %q, want empty", got)
+	}
+	if got := extractFullContent(entry); got != "" {
+		t.Errorf("extractFullContent = %q, want empty", got)
+	}
+}
+
+func TestExtractContent_UserArrayWithAttachmentKeepsText(t *testing.T) {
+	// Words plus a pasted image. The entry is admitted on shape alone — it is
+	// not a text-only array — which is what keeps an attachment prompt readable
+	// on a Claude Code too old to write promptSource.
+	entry := &transcriptEntry{
+		Type: "user",
+		Message: msgObject{Role: "user", Content: []any{
+			textBlock("this is what it looks like now"),
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "data": "…"}},
+		}},
+	}
+	if got := extractContent(entry); got != "this is what it looks like now" {
+		t.Errorf("extractContent = %q, want the text block", got)
+	}
+	if got := extractFullContent(entry); got != "this is what it looks like now" {
+		t.Errorf("extractFullContent = %q, want the text block", got)
+	}
+}
+
+func TestExtractContent_UserToolResultOnlyIsNotConversation(t *testing.T) {
+	// A tool_result is what a tool wrote back, not something the user said.
+	// Admitting it would bury every real message under tool output. The block
+	// carries a top-level "text" key it does not have in the wild, so that
+	// dropping the block-kind check makes this fail instead of passing on the
+	// technicality that the key was missing.
+	entry := &transcriptEntry{
+		Type: "user",
+		Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "text": "exit status 0", "content": "exit status 0"},
+		}},
+	}
+	if got := extractContent(entry); got != "" {
+		t.Errorf("extractContent = %q, want empty", got)
+	}
+	if got := extractFullContent(entry); got != "" {
+		t.Errorf("extractFullContent = %q, want empty", got)
+	}
+}
+
+func TestExtractContent_UserMixedBlocksKeepsOnlyText(t *testing.T) {
+	entry := &transcriptEntry{
+		Type: "user",
+		Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "text": "noise", "content": "noise"},
+			textBlock("and here is the real question"),
+		}},
+	}
+	if got := extractFullContent(entry); got != "and here is the real question" {
+		t.Errorf("extractFullContent = %q, want the text block only", got)
+	}
+}
+
+func TestGetConversation_SkipsInjectedAndSidechainEntries(t *testing.T) {
+	// Once array-shaped user content became readable, two kinds of entry that
+	// are stored as user messages but nobody said started showing up: the
+	// body Claude Code injects when a skill is invoked (isMeta), and a
+	// subagent's own turns (isSidechain). The injected skill body alone runs
+	// to thousands of lines and buried the conversation it was meant to show.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/filtered/test"
+	sessionID := "sess-filtered"
+
+	// The two excluded user entries carry string content on purpose: a
+	// text-only user array is dropped by conversationTextBlocks whatever its
+	// flags say, so writing them as arrays would let this test pass with the
+	// flag checks removed.
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: "real prompt"}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "user", IsMeta: true, Message: msgObject{Role: "user", Content: "Base directory for this skill: …"}, Timestamp: "2024-01-01T00:00:01Z"},
+		{Type: "user", IsSidechain: true, Message: msgObject{Role: "user", Content: "subagent task brief"}, Timestamp: "2024-01-01T00:00:02Z"},
+		{Type: "assistant", IsSidechain: true, Message: msgObject{Role: "assistant", Content: []any{textBlock("subagent reply")}}, Timestamp: "2024-01-01T00:00:03Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("real answer")}}, Timestamp: "2024-01-01T00:00:04Z"},
+	})
+
+	msgs, err := r.GetConversation(workDir, sessionID, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertContents(t, msgs, []string{"real prompt", "real answer"})
+
+	last, err := r.GetLastMessage(workDir, sessionID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if last == nil || last.Content != "real answer" {
+		t.Errorf("GetLastMessage = %+v, want the main-thread answer", last)
+	}
+
+	pair, err := r.GetLastMessages(workDir, sessionID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pair == nil || pair.User == nil || pair.User.Content != "real prompt" {
+		t.Errorf("GetLastMessages.User = %+v, want the main-thread prompt", pair)
+	}
+}
+
+// --- Exchange counting ---
+
+func TestLastExchanges(t *testing.T) {
+	// Turns are deliberately uneven: the second exchange has two assistant
+	// messages, which is exactly the shape the old fixed 2n slice mishandled.
+	msgs := []Message{
+		{Type: "user", Content: "q1"},
+		{Type: "assistant", Content: "a1"},
+		{Type: "user", Content: "q2"},
+		{Type: "assistant", Content: "a2a"},
+		{Type: "assistant", Content: "a2b"},
+	}
+
+	t.Run("one exchange keeps the prompt with its full reply", func(t *testing.T) {
+		got := lastExchanges(msgs, 1)
+		want := []string{"q2", "a2a", "a2b"}
+		assertContents(t, got, want)
+	})
+
+	t.Run("two exchanges reach further back", func(t *testing.T) {
+		assertContents(t, lastExchanges(msgs, 2), []string{"q1", "a1", "q2", "a2a", "a2b"})
+	})
+
+	t.Run("more exchanges than exist returns everything", func(t *testing.T) {
+		assertContents(t, lastExchanges(msgs, 100), []string{"q1", "a1", "q2", "a2a", "a2b"})
+	})
+
+	t.Run("consecutive user messages are one exchange", func(t *testing.T) {
+		run := []Message{
+			{Type: "user", Content: "q1"},
+			{Type: "assistant", Content: "a1"},
+			{Type: "user", Content: "q2a"},
+			{Type: "user", Content: "q2b"},
+			{Type: "assistant", Content: "a2"},
+		}
+		assertContents(t, lastExchanges(run, 1), []string{"q2a", "q2b", "a2"})
+	})
+
+	t.Run("trailing prompt with no reply yet is an exchange", func(t *testing.T) {
+		pending := []Message{
+			{Type: "user", Content: "q1"},
+			{Type: "assistant", Content: "a1"},
+			{Type: "user", Content: "q2"},
+		}
+		assertContents(t, lastExchanges(pending, 1), []string{"q2"})
+	})
+
+	t.Run("no user messages at all returns everything", func(t *testing.T) {
+		assistantOnly := []Message{
+			{Type: "assistant", Content: "a1"},
+			{Type: "assistant", Content: "a2"},
+		}
+		assertContents(t, lastExchanges(assistantOnly, 1), []string{"a1", "a2"})
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		if got := lastExchanges(nil, 1); len(got) != 0 {
+			t.Errorf("expected no messages, got %+v", got)
+		}
+	})
+}
+
+func assertContents(t *testing.T, got []Message, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d messages %v, want %d %v", len(got), contents(got), len(want), want)
+	}
+	for i := range want {
+		if got[i].Content != want[i] {
+			t.Errorf("message %d = %q, want %q", i, got[i].Content, want[i])
+		}
+	}
+}
+
+func contents(msgs []Message) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.Content)
+	}
+	return out
+}
+
+func TestGetConversation_ExchangesSpanUnevenTurns(t *testing.T) {
+	// End to end on the shape a real transcript has: a tool round trip in the
+	// middle of a turn, and an agent that answers in two messages. The last
+	// exchange is three messages on purpose — leave it that way. A fixture
+	// that alternates user/assistant perfectly is returned identically by a
+	// fixed 2n tail slice, so it cannot tell lastExchanges from the
+	// implementation it replaced.
+	//
+	// One reply is deliberately multi-line: --last output is piped into another
+	// agent's context, so this path reads through extractFullContent rather
+	// than the single-line extractContent the display paths use. Keep the "\n"
+	// in the expectations — it is what pins that choice.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/exchange/test"
+	sessionID := "sess-exchange"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: "first question"}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("first answer")}}, Timestamp: "2024-01-01T00:00:01Z"},
+		{Type: "user", Message: msgObject{Role: "user", Content: "second question"}, Timestamp: "2024-01-01T00:00:02Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "name": "Bash", "id": "tu_1"}}}, Timestamp: "2024-01-01T00:00:03Z"},
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"}}}, Timestamp: "2024-01-01T00:00:04Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("second answer:\n- one\n- two")}}, Timestamp: "2024-01-01T00:00:05Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("and one more thing")}}, Timestamp: "2024-01-01T00:00:06Z"},
+	})
+
+	msgs, err := r.GetConversation(workDir, sessionID, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertContents(t, msgs, []string{"second question", "second answer:\n- one\n- two", "and one more thing"})
+
+	msgs, err = r.GetConversation(workDir, sessionID, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertContents(t, msgs, []string{"first question", "first answer", "second question", "second answer:\n- one\n- two", "and one more thing"})
+}
+
+func TestReaders_UserTextOnlyArrayIsNobodySpeaking(t *testing.T) {
+	// Every reader has to agree on this, so it is asserted through the API the
+	// CLI and the TUI actually call. The agent-written user entry must not
+	// become the last thing "the user said", and it must not open an exchange
+	// either — doing so pushed the reply before it out of `--last 1`.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/interrupt/test"
+	sessionID := "sess-interrupt"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: "typed prompt"}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("first half of the answer")}}, Timestamp: "2024-01-01T00:00:01Z"},
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{textBlock("[Request interrupted by user]")}}, Timestamp: "2024-01-01T00:00:02Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("second half of the answer")}}, Timestamp: "2024-01-01T00:00:03Z"},
+	})
+
+	t.Run("GetLastMessage keeps returning the reply", func(t *testing.T) {
+		msg, err := r.GetLastMessage(workDir, sessionID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if msg == nil || msg.Content != "second half of the answer" {
+			t.Fatalf("GetLastMessage = %+v, want the assistant reply", msg)
+		}
+	})
+
+	t.Run("GetLastMessages attributes only the typed prompt to the user", func(t *testing.T) {
+		msgs, err := r.GetLastMessages(workDir, sessionID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if msgs == nil || msgs.User == nil || msgs.User.Content != "typed prompt" {
+			t.Fatalf("GetLastMessages.User = %+v, want the typed prompt", msgs)
+		}
+	})
+
+	t.Run("no exchange boundary", func(t *testing.T) {
+		msgs, err := r.GetConversation(workDir, sessionID, 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertContents(t, msgs, []string{"typed prompt", "first half of the answer", "second half of the answer"})
+	})
+}
+
+func TestReaders_TextOnlyUserArrayWithPromptSourceIsAPrompt(t *testing.T) {
+	// `claude -p --input-format stream-json` writes a real prompt as a
+	// text-only array — the same shape an interruption marker has. promptSource
+	// is what separates them: Claude Code stamps it on everything it received
+	// as input. Keying on the shape alone dropped this prompt outright, leaving
+	// `--last 1` showing a reply to a question nobody appeared to ask.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/sdk/test"
+	sessionID := "sess-sdk"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", PromptSource: "sdk", Message: msgObject{Role: "user", Content: []any{textBlock("run the migration")}}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("migration applied")}}, Timestamp: "2024-01-01T00:00:01Z"},
+	})
+
+	t.Run("GetLastMessages attributes it to the user", func(t *testing.T) {
+		msgs, err := r.GetLastMessages(workDir, sessionID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if msgs == nil || msgs.User == nil || msgs.User.Content != "run the migration" {
+			t.Fatalf("GetLastMessages.User = %+v, want the SDK-supplied prompt", msgs)
+		}
+	})
+
+	t.Run("GetConversation opens an exchange on it", func(t *testing.T) {
+		msgs, err := r.GetConversation(workDir, sessionID, 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertContents(t, msgs, []string{"run the migration", "migration applied"})
+	})
+}
+
+func TestGetConversation_UserArrayWithAttachmentOpensAnExchange(t *testing.T) {
+	// The other side of the rule: words plus a pasted image is a real prompt,
+	// and it is the case the array-reading was added for.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/attachment/test"
+	sessionID := "sess-attachment"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: "earlier question"}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("earlier answer")}}, Timestamp: "2024-01-01T00:00:01Z"},
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{
+			textBlock("this is what it looks like now"),
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "data": "…"}},
+		}}, Timestamp: "2024-01-01T00:00:02Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("i see the problem")}}, Timestamp: "2024-01-01T00:00:03Z"},
+	})
+
+	msgs, err := r.GetConversation(workDir, sessionID, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertContents(t, msgs, []string{"this is what it looks like now", "i see the problem"})
+}
+
+// --- Oversized lines: the message readers must not stop mid-file ---
+
+// hugeToolResultEntry builds a user entry whose tool_result payload is `size`
+// bytes, i.e. one JSONL line far longer than the 1 MiB the message readers
+// used to allow.
+func hugeToolResultEntry(size int, ts string) transcriptEntry {
+	return transcriptEntry{
+		Type: "user",
+		Message: msgObject{
+			Role: "user",
+			Content: []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "tu_h", "content": strings.Repeat("A", size)},
+			},
+		},
+		Timestamp: ts,
+	}
+}
+
+func TestReaders_SeePastOversizedLine(t *testing.T) {
+	// A 2 MiB tool_result sits between the first and last exchange. The
+	// readers carried a 1 MiB scanner limit and never checked scanner.Err(),
+	// so everything after this line silently vanished — the transcript looked
+	// like it ended early. Observed on a real 2913-line transcript where 8
+	// trailing messages (including the newest reply) went missing.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/oversized/test"
+	sessionID := "sess-oversized"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: "early question"}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "early answer"}}}, Timestamp: "2024-01-01T00:00:01Z"},
+		hugeToolResultEntry(2*1024*1024, "2024-01-01T00:00:02Z"),
+		{Type: "user", Message: msgObject{Role: "user", Content: "late question"}, Timestamp: "2024-01-01T00:00:03Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "late answer"}}}, Timestamp: "2024-01-01T00:00:04Z"},
+	})
+
+	t.Run("GetLastMessage", func(t *testing.T) {
+		msg, err := r.GetLastMessage(workDir, sessionID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if msg == nil || msg.Content != "late answer" {
+			t.Fatalf("expected the message after the oversized line, got %+v", msg)
+		}
+	})
+
+	t.Run("GetLastMessages", func(t *testing.T) {
+		msgs, err := r.GetLastMessages(workDir, sessionID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if msgs == nil || msgs.Assistant == nil || msgs.Assistant.Content != "late answer" {
+			t.Fatalf("expected the assistant message after the oversized line, got %+v", msgs)
+		}
+		if msgs.User == nil || msgs.User.Content != "late question" {
+			t.Fatalf("expected the user message after the oversized line, got %+v", msgs)
+		}
+	})
+
+	t.Run("GetConversation", func(t *testing.T) {
+		msgs, err := r.GetConversation(workDir, sessionID, 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(msgs) == 0 {
+			t.Fatal("expected messages, got none")
+		}
+		if got := msgs[len(msgs)-1].Content; got != "late answer" {
+			t.Errorf("last message = %q, want %q", got, "late answer")
+		}
+	})
+}
+
+func TestReaders_ReportLineOverLimitInsteadOfTruncating(t *testing.T) {
+	// Past maxTranscriptLineBytes there is nothing to do but fail — and
+	// failing is the point. Returning the messages read so far would hand the
+	// caller a plausible-looking prefix of the conversation with no signal
+	// that the rest was dropped.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/toolong/test"
+	sessionID := "sess-toolong"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", Message: msgObject{Role: "user", Content: "question"}, Timestamp: "2024-01-01T00:00:00Z"},
+		hugeToolResultEntry(maxTranscriptLineBytes+1, "2024-01-01T00:00:01Z"),
+	})
+
+	if _, err := r.GetConversation(workDir, sessionID, 1); !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("GetConversation: expected bufio.ErrTooLong, got %v", err)
+	}
+	if _, err := r.GetLastMessage(workDir, sessionID); !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("GetLastMessage: expected bufio.ErrTooLong, got %v", err)
+	}
+	if _, err := r.GetLastMessages(workDir, sessionID); !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("GetLastMessages: expected bufio.ErrTooLong, got %v", err)
+	}
+}
+
 // --- Structured API: LastToolUse / LastToolResult ---
 
 func TestReader_LastToolUseAndResult(t *testing.T) {
@@ -993,14 +1473,14 @@ func TestReader_FindTranscriptPath(t *testing.T) {
 
 	// 3. Not found.
 	_, err = r.findTranscriptPath("/wrong", "no-such")
-	if !os.IsNotExist(err) {
-		t.Errorf("expected ErrNotExist, got %v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Errorf("expected ErrNoTranscript, got %v", err)
 	}
 
 	// 4. Empty sessionID.
 	_, err = r.findTranscriptPath("/wrong", "")
-	if !os.IsNotExist(err) {
-		t.Errorf("expected ErrNotExist for empty sessionID, got %v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Errorf("expected ErrNoTranscript for empty sessionID, got %v", err)
 	}
 }
 
@@ -1174,6 +1654,13 @@ func TestTurnState(t *testing.T) {
 		Timestamp: "2024-01-01T00:00:02Z",
 		IsMeta:    true,
 	}
+	interruptMarkerUser := transcriptEntry{
+		Type: "user",
+		Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "text", "text": "[Request interrupted by user]"},
+		}},
+		Timestamp: "2024-01-01T00:00:02Z",
+	}
 
 	cases := []struct {
 		name    string
@@ -1216,6 +1703,20 @@ func TestTurnState(t *testing.T) {
 			name:    "meta user tail is skipped, prior assistant decides",
 			entries: []transcriptEntry{userText, assistantText, metaUser},
 			want:    TurnStateComplete,
+		},
+		{
+			// Deliberate split, not an oversight: every message reader drops
+			// this entry (conversationTextBlocks — a text-only user array with
+			// no promptSource is nobody speaking), and TurnState must not.
+			// Status is re-derived from which role spoke last, so it stays on
+			// the entry's type and block kinds and never asks whether the words
+			// count as conversation. The price is visible and accepted: a
+			// transcript ending on an interruption marker reports UserPending,
+			// which the Claude adapter renders as "thinking" on daemon
+			// recovery.
+			name:    "text-only user array still counts as the user speaking",
+			entries: []transcriptEntry{userText, assistantText, interruptMarkerUser},
+			want:    TurnStateUserPending,
 		},
 		{
 			name:    "thinking-only assistant tail is still in flight",
@@ -1396,17 +1897,51 @@ func TestGetConversation_GlobFallback_WhenWorkDirMismatches(t *testing.T) {
 	}
 }
 
-func TestGetLastMessage_ReturnsNilWhenTruelyMissing(t *testing.T) {
-	// When no transcript file exists anywhere, GetLastMessage should return
-	// (nil, nil) — this is the contract output_cmd relies on to produce its
-	// "no plain-text messages yet" error.
+func TestGetLastMessage_ReturnsErrNoTranscriptWhenTrulyMissing(t *testing.T) {
+	// When no transcript file exists anywhere, GetLastMessage reports
+	// ErrNoTranscript. output_cmd relies on that to tell "wrong/too-early
+	// session" apart from "transcript exists but says nothing yet"; the two
+	// used to collapse into one silent empty result.
 	tmpDir := t.TempDir()
 	r := &Reader{claudeDir: tmpDir}
 	msg, err := r.GetLastMessage("/nowhere", "no-such-session")
-	if err != nil {
-		t.Fatalf("expected (nil, nil), got err=%v", err)
+	if !errors.Is(err, ErrNoTranscript) {
+		t.Fatalf("expected ErrNoTranscript, got err=%v", err)
 	}
 	if msg != nil {
 		t.Fatalf("expected nil message, got %+v", msg)
+	}
+}
+
+func TestGetLastMessage_ToolOnlyTranscriptHasNothingToSay(t *testing.T) {
+	// A session that has so far only called tools has a transcript, but no
+	// message to print. GetLastMessage reports that as (nil, nil), which
+	// output_cmd turns into the "no plain-text messages" hint. Returning the
+	// empty text of a tool_use entry instead would make `jin session output`
+	// print a blank line and exit 0 — indistinguishable from the missing
+	// transcript this pair of states was split apart to expose.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/toolonly/test"
+	sessionID := "sess-toolonly"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{
+			map[string]any{"type": "tool_use", "name": "Bash", "id": "tu_1", "input": map[string]any{"command": "echo hi"}},
+		}}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "content": "hi"},
+		}}, Timestamp: "2024-01-01T00:00:01Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{
+			map[string]any{"type": "thinking", "thinking": "let me see"},
+		}}, Timestamp: "2024-01-01T00:00:02Z"},
+	})
+
+	msg, err := r.GetLastMessage(workDir, sessionID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg != nil {
+		t.Fatalf("GetLastMessage = %+v, want nil: none of these entries carries plain text", msg)
 	}
 }

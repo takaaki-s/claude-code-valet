@@ -4,10 +4,28 @@ package transcript
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// maxTranscriptLineBytes bounds a single JSONL line. Claude Code writes a
+// whole tool_result payload on one line, so the ceiling has to be generous.
+// Every reader in this package shares it: the message readers used to carry
+// their own 1 MiB limit, which stopped bufio.Scanner mid-file on real
+// transcripts, and — because none of them checked scanner.Err() — the
+// truncation was indistinguishable from the end of the conversation.
+const maxTranscriptLineBytes = 16 * 1024 * 1024
+
+// ErrNoTranscript reports that no JSONL file could be located for a session.
+// It is deliberately distinct from a transcript that exists but holds no
+// readable messages: the first means the caller is looking in the wrong
+// place (or too early), while the second is a normal state every session
+// passes through before it says anything. Collapsing the two into an empty
+// result is what let `session output --last N` stay silent about a missing
+// transcript.
+var ErrNoTranscript = errors.New("no transcript file for session")
 
 // Message represents a message from the transcript
 type Message struct {
@@ -68,17 +86,11 @@ func NewReader() *Reader {
 // GetLastMessage returns the last user or assistant message from the transcript
 // workDir: the working directory of the session (may be empty; a glob fallback locates the JSONL by sessionID)
 // sessionID: the Claude Code session ID (UUID format)
-// Returns (nil, nil) when no transcript file exists (yet).
+// Returns ErrNoTranscript when no transcript file exists (yet), and (nil, nil)
+// when one exists but carries no plain-text message.
 func (r *Reader) GetLastMessage(workDir, sessionID string) (*Message, error) {
-	if sessionID == "" {
-		return nil, nil
-	}
-
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	return r.readLastMessage(path)
@@ -87,42 +99,38 @@ func (r *Reader) GetLastMessage(workDir, sessionID string) (*Message, error) {
 // GetLastMessages returns the last user and assistant messages from the transcript
 // workDir: the working directory of the session (may be empty; a glob fallback locates the JSONL by sessionID)
 // sessionID: the Claude Code session ID (UUID format)
-// Returns (nil, nil) when no transcript file exists (yet).
+// Returns ErrNoTranscript when no transcript file exists (yet), and (nil, nil)
+// when one exists but carries no plain-text message.
 func (r *Reader) GetLastMessages(workDir, sessionID string) (*LastMessages, error) {
-	if sessionID == "" {
-		return nil, nil
-	}
-
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	return r.readLastMessages(path)
 }
 
-// GetConversation returns the last N user/assistant message pairs from the transcript.
+// GetConversation returns the last N exchanges from the transcript, where an
+// exchange is a user prompt plus the assistant's reply to it (see lastExchanges).
 // workDir may be empty: a glob fallback locates the JSONL by sessionID.
-// lastN specifies the number of message pairs to return.
-// Returns (nil, nil) when no transcript file exists (yet).
+// lastN is the number of exchanges to return and must be at least 1: "no
+// exchanges asked for" is rejected rather than answered with the whole
+// conversation, which is the direction of failure that hurts — callers pipe
+// this into another agent's context.
+// Returns ErrNoTranscript when no transcript file exists (yet), and an empty
+// slice when one exists but carries no plain-text message.
 func (r *Reader) GetConversation(workDir, sessionID string, lastN int) ([]Message, error) {
-	if sessionID == "" {
-		return nil, nil
+	if lastN < 1 {
+		return nil, errors.New("lastN must be >= 1")
 	}
-
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	return r.readConversation(path, lastN)
 }
 
-// readConversation reads the transcript and returns the last N*2 user/assistant messages.
+// readConversation reads the transcript and returns the user/assistant
+// messages making up the last lastN exchanges.
 func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -136,7 +144,7 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 	var allMessages []Message
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -149,7 +157,7 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 			continue
 		}
 
-		if entry.Type != "user" && entry.Type != "assistant" {
+		if !isConversationEntry(&entry) {
 			continue
 		}
 
@@ -165,13 +173,43 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 		})
 	}
 
-	// Return last N*2 messages
-	maxMessages := lastN * 2
-	if len(allMessages) > maxMessages {
-		allMessages = allMessages[len(allMessages)-maxMessages:]
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 
-	return allMessages, nil
+	return lastExchanges(allMessages, lastN), nil
+}
+
+// lastExchanges returns the tail of msgs covering the last n exchanges.
+//
+// An exchange starts at a user message that either opens the transcript or
+// follows an assistant reply, and runs until the next such message — so one
+// exchange is a prompt plus everything the agent said in response, however
+// many entries that took. A trailing run of user messages with no reply yet
+// counts as an exchange of its own, which is what makes `--last 1` show the
+// question the agent is still working on.
+//
+// Slicing a fixed 2n messages instead, as this used to, only lines up with
+// exchanges when every turn happens to be exactly one message; in practice it
+// returned two consecutive assistant messages and no prompt at all. Fewer
+// than n boundaries — or none, as in a transcript that is all assistant
+// text — returns everything rather than guessing at a cut point. n comes from
+// GetConversation, which refuses anything below 1.
+func lastExchanges(msgs []Message, n int) []Message {
+	seen := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Type != "user" {
+			continue
+		}
+		if i > 0 && msgs[i-1].Type == "user" {
+			continue // still inside one user run, not a new exchange
+		}
+		seen++
+		if seen == n {
+			return msgs[i:]
+		}
+	}
+	return msgs
 }
 
 // readLastMessages reads the transcript file and returns the last user and assistant messages
@@ -188,9 +226,8 @@ func (r *Reader) readLastMessages(filePath string) (*LastMessages, error) {
 	var lastUser *Message
 	var lastAssistant *Message
 	scanner := bufio.NewScanner(file)
-	// Increase buffer size for long lines
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -204,7 +241,7 @@ func (r *Reader) readLastMessages(filePath string) (*LastMessages, error) {
 		}
 
 		// Only process user and assistant messages
-		if entry.Type != "user" && entry.Type != "assistant" {
+		if !isConversationEntry(&entry) {
 			continue
 		}
 
@@ -224,6 +261,10 @@ func (r *Reader) readLastMessages(filePath string) (*LastMessages, error) {
 		} else {
 			lastAssistant = msg
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 
 	if lastUser == nil && lastAssistant == nil {
@@ -253,11 +294,15 @@ func (r *Reader) getTranscriptPath(workDir, sessionID string) string {
 
 // transcriptEntry represents a single entry in the JSONL file
 type transcriptEntry struct {
-	Type        string    `json:"type"`
-	Message     msgObject `json:"message"`
-	Timestamp   string    `json:"timestamp"`
-	IsSidechain bool      `json:"isSidechain"`
-	IsMeta      bool      `json:"isMeta"`
+	Type      string    `json:"type"`
+	Message   msgObject `json:"message"`
+	Timestamp string    `json:"timestamp"`
+	// PromptSource records how Claude Code received a user entry ("typed" from
+	// the terminal, "sdk" from a stream-json caller). Its absence on a user
+	// entry means nobody supplied it — see conversationTextBlocks.
+	PromptSource string `json:"promptSource"`
+	IsSidechain  bool   `json:"isSidechain"`
+	IsMeta       bool   `json:"isMeta"`
 }
 
 // msgObject represents the message field which can have different structures
@@ -280,9 +325,8 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 
 	var lastMessage *Message
 	scanner := bufio.NewScanner(file)
-	// Increase buffer size for long lines
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -296,7 +340,7 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 		}
 
 		// Only process user and assistant messages
-		if entry.Type != "user" && entry.Type != "assistant" {
+		if !isConversationEntry(&entry) {
 			continue
 		}
 
@@ -312,75 +356,134 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
 	return lastMessage, nil
 }
 
-// extractContent extracts the text content from a transcript entry
-func extractContent(entry *transcriptEntry) string {
-	if entry.Message.Content == nil {
-		return ""
+// isConversationEntry reports whether an entry belongs to the conversation
+// between the user and the agent, as opposed to the machinery around it.
+//
+// Only user and assistant entries qualify. Sidechain entries are a subagent's
+// own turns — treating them as the main thread makes a subagent's prompt look
+// like the user's. Meta entries are context Claude Code injects on the user's
+// behalf: the body of an invoked skill, environment reminders, command
+// caveats. They are stored as user messages but nobody said them, and a
+// single injected skill body runs to thousands of lines, so admitting them
+// drowns the conversation it is supposed to show.
+//
+// TurnState calls this for the same reason, which is why the test is made of
+// nothing but the flags the transcript itself sets: a session's live status is
+// re-derived from which role spoke last, and that classification must not move
+// because of what an entry happens to say. Exclusions that depend on the
+// content live in conversationTextBlocks instead.
+func isConversationEntry(entry *transcriptEntry) bool {
+	if entry.Type != "user" && entry.Type != "assistant" {
+		return false
 	}
-
-	// User messages: content is a string
-	if entry.Type == "user" {
-		if str, ok := entry.Message.Content.(string); ok {
-			return cleanContent(str)
-		}
-	}
-
-	// Assistant messages: content is an array of content blocks
-	if entry.Type == "assistant" {
-		if arr, ok := entry.Message.Content.([]any); ok {
-			var texts []string
-			for _, item := range arr {
-				if block, ok := item.(map[string]any); ok {
-					if blockType, ok := block["type"].(string); ok && blockType == "text" {
-						if text, ok := block["text"].(string); ok {
-							texts = append(texts, text)
-						}
-					}
-				}
-			}
-			if len(texts) > 0 {
-				return cleanContent(strings.Join(texts, " "))
-			}
-		}
-	}
-
-	return ""
+	return !entry.IsSidechain && !entry.IsMeta
 }
 
-// extractFullContent extracts the text content without cleaning (preserves newlines).
-func extractFullContent(entry *transcriptEntry) string {
-	if entry.Message.Content == nil {
+// collectTextBlocks pulls the text out of an entry's content. Content is a
+// bare string on some entries and an array of blocks on others, and either
+// shape can appear for either role, so this stays role-agnostic — which of
+// those texts count as conversation is conversationTextBlocks' decision.
+//
+// Blocks other than text are skipped on purpose. A tool_result rides along
+// inside a user entry but is what a tool wrote back, not something the user
+// said, and letting them through buries every real message under tool output.
+func collectTextBlocks(content any) []string {
+	switch c := content.(type) {
+	case string:
+		if strings.TrimSpace(c) == "" {
+			return nil
+		}
+		return []string{c}
+	case []any:
+		var texts []string
+		for _, item := range c {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if kind, _ := block["type"].(string); kind != "text" {
+				continue
+			}
+			if text, ok := block["text"].(string); ok && text != "" {
+				texts = append(texts, text)
+			}
+		}
+		return texts
+	}
+	return nil
+}
+
+// conversationTextBlocks returns the text of an entry that should be read as
+// something its author actually said.
+//
+// Claude Code stamps a promptSource on every user entry it was handed as input:
+// "typed" for a terminal prompt, "sdk" for one fed to `claude -p
+// --input-format stream-json`. A user entry with no promptSource was supplied
+// by nobody, and when its content is an array of nothing but text it is the
+// agent writing in the user's voice — on real transcripts, always an
+// interruption notice. That is the same class of entry as isMeta (see
+// isConversationEntry), and admitting it puts the agent's own bookkeeping where
+// the last real reply belongs on the default `session output` path.
+//
+// The promptSource half of the test is what keeps a genuine prompt out of the
+// rule: the shape alone does not separate them, because stream-json input
+// arrives as a text-only array too. On a Claude Code old enough not to write
+// promptSource the field is absent everywhere and this falls back to the
+// shape-only behaviour it replaced.
+//
+// Assistant entries are the opposite case — a text-only array is their normal
+// shape — so the rule is deliberately scoped to one role.
+func conversationTextBlocks(entry *transcriptEntry) []string {
+	if entry.Type == "user" && entry.PromptSource == "" && isTextOnlyArray(entry.Message.Content) {
+		return nil
+	}
+	return collectTextBlocks(entry.Message.Content)
+}
+
+// isTextOnlyArray reports whether content is a block array carrying no block
+// kind other than "text". String content is not an array and never qualifies.
+func isTextOnlyArray(content any) bool {
+	blocks, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range blocks {
+		block, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if kind, _ := block["type"].(string); kind != "text" {
+			return false
+		}
+	}
+	return true
+}
+
+// extractContent extracts an entry's text collapsed onto a single line, for
+// display in list rows and detail panes.
+func extractContent(entry *transcriptEntry) string {
+	texts := conversationTextBlocks(entry)
+	if len(texts) == 0 {
 		return ""
 	}
+	return cleanContent(strings.Join(texts, " "))
+}
 
-	if entry.Type == "user" {
-		if str, ok := entry.Message.Content.(string); ok {
-			return strings.TrimSpace(str)
-		}
+// extractFullContent extracts an entry's text with its line structure intact,
+// for callers that render the message as the agent wrote it.
+func extractFullContent(entry *transcriptEntry) string {
+	texts := conversationTextBlocks(entry)
+	if len(texts) == 0 {
+		return ""
 	}
-
-	if entry.Type == "assistant" {
-		if arr, ok := entry.Message.Content.([]any); ok {
-			var texts []string
-			for _, item := range arr {
-				if block, ok := item.(map[string]any); ok {
-					if blockType, ok := block["type"].(string); ok && blockType == "text" {
-						if text, ok := block["text"].(string); ok {
-							texts = append(texts, text)
-						}
-					}
-				}
-			}
-			if len(texts) > 0 {
-				return strings.Join(texts, "\n")
-			}
-		}
-	}
-
-	return ""
+	return strings.TrimSpace(strings.Join(texts, "\n"))
 }
 
 // cleanContent cleans up the content string for display
@@ -423,10 +526,10 @@ func TruncateMessageFromEnd(s string, maxLen int) string {
 
 // findTranscriptPath locates the JSONL file for a given workDir/sessionID.
 // It tries the canonical path first, then falls back to a glob over all
-// project directories (sessionID is unique). Returns os.ErrNotExist if not found.
+// project directories (sessionID is unique). Returns ErrNoTranscript if not found.
 func (r *Reader) findTranscriptPath(workDir, sessionID string) (string, error) {
 	if sessionID == "" {
-		return "", os.ErrNotExist
+		return "", ErrNoTranscript
 	}
 	if workDir != "" {
 		p := r.getTranscriptPath(workDir, sessionID)
@@ -438,7 +541,7 @@ func (r *Reader) findTranscriptPath(workDir, sessionID string) (string, error) {
 	if len(matches) > 0 {
 		return matches[0], nil
 	}
-	return "", os.ErrNotExist
+	return "", ErrNoTranscript
 }
 
 // ReadEntries returns transcript entries with Timestamp strictly greater than `since`.
@@ -448,12 +551,11 @@ func (r *Reader) findTranscriptPath(workDir, sessionID string) (string, error) {
 // If `since` is empty, returns all entries. workDir may be empty: a glob fallback locates
 // the JSONL by sessionID. Returns (nil, nil) if no transcript file exists yet.
 func (r *Reader) ReadEntries(workDir, sessionID, since string) ([]Entry, error) {
-	if sessionID == "" {
-		return nil, nil
-	}
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// `session result` treats "not started yet" as an empty result rather
+		// than a failure; only genuine read errors propagate.
+		if errors.Is(err, ErrNoTranscript) {
 			return nil, nil
 		}
 		return nil, err
@@ -551,12 +653,15 @@ const (
 )
 
 // TurnState returns the classification of the last conversational turn.
-// Entries that are not part of the main conversation are ignored:
-// system/summary types, sidechain entries (a subagent's turns would
-// otherwise read as the main thread finishing), and meta messages. Any
-// failure (missing file, empty transcript, read error) folds into
-// TurnStateUnknown, so callers can treat it as "cannot determine" without
-// guard code.
+// Entries outside the main conversation are ignored on isConversationEntry's
+// flag terms and those alone: system/summary types, sidechain entries (a
+// subagent's turns would otherwise read as the main thread finishing), and meta
+// messages. The content-based exclusion the message readers apply on top of it
+// (conversationTextBlocks) deliberately stops here, because status is
+// re-derived from which role spoke last and must not move with what an entry
+// happens to say. Any failure (missing file, empty transcript, read error)
+// folds into TurnStateUnknown, so callers can treat it as "cannot determine"
+// without guard code.
 //
 // The file is streamed keeping only the last main-conversation entry — a
 // ReadEntries call would materialize every block (including re-marshalled
@@ -573,9 +678,8 @@ func (r *Reader) TurnState(workDir, sessionID string) TurnState {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	// Allow lines up to 16 MiB to accommodate large tool_result payloads.
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 16*1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	var last *transcriptEntry
 	for scanner.Scan() {
@@ -587,10 +691,7 @@ func (r *Reader) TurnState(workDir, sessionID string) TurnState {
 		if err := json.Unmarshal(line, &raw); err != nil {
 			continue
 		}
-		if raw.IsSidechain || raw.IsMeta {
-			continue
-		}
-		if raw.Type != "user" && raw.Type != "assistant" {
+		if !isConversationEntry(&raw) {
 			continue
 		}
 		last = &raw
@@ -656,7 +757,7 @@ func (r *Reader) ReadAITitle(workDir, sessionID string) (string, bool) {
 	var latest string
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -694,9 +795,8 @@ func readEntries(filePath, since string) ([]Entry, error) {
 
 	var entries []Entry
 	scanner := bufio.NewScanner(file)
-	// Allow lines up to 16 MiB to accommodate large tool_result payloads.
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 16*1024*1024)
+	scanner.Buffer(buf, maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
