@@ -245,3 +245,63 @@ func TestE2E_PlaceholderThenNewSessionRelabels(t *testing.T) {
 		t.Errorf("currentSessionID = %q, want %q", got, "s2")
 	}
 }
+
+// TestE2E_AttachTargetsResolvedInnerSocket is the wiring half of
+// TestBuildInnerAttachCmd_UsesResolvedSocket: that one proves the helper
+// formats whatever socket it is handed, this one proves switchToSession hands
+// it the *resolved* name. Only reading the command the pane really ended up
+// running can tell the two apart — a regression that swaps
+// tmux.DefaultSocketName() back for the tmux.SocketName constant leaves the
+// helper's own test green while sending the pane to the production "jin"
+// server.
+func TestE2E_AttachTargetsResolvedInnerSocket(t *testing.T) {
+	// Redirect the inner socket exactly as an isolated verification run would.
+	// Unlike the other tests here, this one makes the pane run a real `tmux
+	// attach`, so the socket has to be a throwaway: TmuxSocket gives a
+	// per-run name and unlinks the socket file afterwards. Do NOT substitute a
+	// fixed name — on a regression the attach lands on whatever this resolves
+	// to, and the whole point is that it must never be the production "jin".
+	innerSocket := testutil.TmuxSocket(t)
+	t.Setenv("JIN_TMUX_SOCKET", innerSocket)
+
+	tc, displayPaneID := outerTmuxFixture(t)
+
+	// The session does not exist, so the attach finds no server and fails
+	// immediately — it disturbs nothing. It does leave a client process behind
+	// though, which the cleanup below reaps; see there.
+	const innerSession = "sess-e2e-resolved-socket-does-not-exist"
+	sessions := []session.Info{{
+		ID:             "s1",
+		Description:    "attach-target",
+		Status:         session.StatusRunning,
+		TmuxWindowName: innerSession,
+	}}
+	m := Model{
+		sessions:      sessions,
+		cursor:        0,
+		deletingIDs:   map[string]bool{},
+		height:        100,
+		tmuxClient:    tc,
+		displayPaneID: displayPaneID,
+	}
+
+	m.switchToSession("s1")
+
+	// The pane now runs `tmux attach`, and that client outlives the pane: when
+	// the fixture kills the outer server the attach is reparented to init and
+	// sits there holding the socket open. Measured on a first run of this test:
+	// one orphaned `tmux -L <socket> attach` per invocation. Respawning the
+	// pane while the outer server is still up makes tmux kill it for us
+	// (respawn-pane -k). Registered after the fixture's cleanup so it runs
+	// before it — t.Cleanup is LIFO.
+	t.Cleanup(func() { _ = tc.RespawnPane(displayPaneID, tmux.PlaceholderCmd) })
+
+	got := paneStartCommand(t, tc, displayPaneID)
+	if !strings.Contains(got, "-L "+innerSocket+" ") {
+		t.Errorf("display pane runs %q, want it to attach on the overridden socket %q", got, innerSocket)
+	}
+	if strings.Contains(got, "-L "+tmux.SocketName+" ") {
+		t.Errorf("display pane runs %q — it targets the built-in default socket despite JIN_TMUX_SOCKET=%s",
+			got, innerSocket)
+	}
+}

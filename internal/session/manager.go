@@ -94,7 +94,8 @@ func (m *Manager) SetPluginDispatcher(d plugin.Dispatcher) {
 }
 
 // SetTmuxSocketName overrides the tmux socket name used by ensureTmuxClient's
-// lazy fallback (production leaves this empty and gets tmux.SocketName).
+// lazy fallback (production leaves this empty and gets tmux.DefaultSocketName,
+// i.e. JIN_TMUX_SOCKET or "jin").
 // Tests set an isolated per-run name so a test that exercises the auto-init
 // path — where the caller deliberately skips SetTmuxClient — cannot leak a
 // real "-L jin" server that would then pollute a subsequent daemon start's

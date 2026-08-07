@@ -689,8 +689,35 @@ func (m *Model) resolveFocusSession() bool {
 	return true
 }
 
+// buildInnerAttachCmd assembles the shell command the display pane runs to
+// attach to an inner tmux session. socketName must be the *resolved* inner
+// socket (tmux.DefaultSocketName), never the tmux.SocketName constant: this
+// string is handed to a fresh `tmux` process, so it is the one place the
+// display pane's socket is chosen independently of the Client objects the
+// Model holds. Passing the constant sends the pane to the real "jin" server
+// even when JIN_TMUX_SOCKET points everything else somewhere else.
+//
+// Kept as a pure function so the socket wiring is unit-testable without tmux,
+// mirroring buildSplitArgs / buildSendKeysArgs in internal/tmux.
+func buildInnerAttachCmd(socketName, innerSession string) string {
+	// Unset $TMUX so tmux does not refuse with "sessions should be nested with
+	// care": the display pane runs inside the outer tmux, so $TMUX points to
+	// the outer session. Without env -u TMUX, attaching to the inner tmux on
+	// the same host is rejected as nesting. This mirrors the env -u TMUX
+	// pattern used in session/manager.go when launching CC processes.
+	//
+	// Chain `tail -f /dev/null` after attach so a quick attach failure (or a
+	// later user-initiated detach) leaves the pane with a still-running
+	// process. Without the tail, the shell exits, and remain-on-exit=on on
+	// this pane surfaces tmux's "Pane is dead" overlay until the next
+	// respawn — a jarring flash on first-session startup that the user would
+	// see between the placeholder and a successful attach.
+	return fmt.Sprintf("env -u TMUX tmux -L %s attach -t %s; tail -f /dev/null", socketName, innerSession)
+}
+
 // switchToSession displays the given session in the right pane via RespawnPane.
-// For local sessions, attaches to the inner tmux session (-L jin).
+// For local sessions, attaches to the inner tmux session (-L jin by default,
+// or whatever JIN_TMUX_SOCKET resolves to).
 // For remote sessions, runs SSH attach command.
 // For stopped/error sessions, shows a placeholder with session info.
 func (m *Model) switchToSession(sessionID string) {
@@ -775,20 +802,11 @@ func (m *Model) switchToSession(sessionID string) {
 		// switch-client failed — fall through to respawn
 	}
 
-	// Local: respawn right pane with inner tmux attach.
-	// Unset $TMUX so tmux does not refuse with "sessions should be nested with care":
-	// the display pane runs inside the outer tmux (jin-mgr), so $TMUX points to
-	// the outer session. Without env -u TMUX, attaching to the inner tmux (jin)
-	// on the same host is rejected as nesting. This mirrors the env -u TMUX pattern
-	// used in session/manager.go when launching CC processes.
-	//
-	// Chain `tail -f /dev/null` after attach so a quick attach failure (or a
-	// later user-initiated detach) leaves the pane with a still-running
-	// process. Without the tail, the shell exits, and remain-on-exit=on on
-	// this pane surfaces tmux's "Pane is dead" overlay until the next
-	// respawn — a jarring flash on first-session startup that the user would
-	// see between the placeholder and a successful attach.
-	attachCmd := fmt.Sprintf("env -u TMUX tmux -L %s attach -t %s; tail -f /dev/null", tmux.SocketName, sess.TmuxWindowName)
+	// Local: respawn right pane with inner tmux attach. The socket is resolved
+	// the same way m.innerTmuxClient was built (tmux.NewClient →
+	// DefaultSocketName), so the pane and the Model agree on which inner
+	// server they are talking about.
+	attachCmd := buildInnerAttachCmd(tmux.DefaultSocketName(), sess.TmuxWindowName)
 	_ = m.tmuxClient.RespawnPane(m.displayPaneID, attachCmd)
 	_ = m.tmuxClient.ClearHistory(m.displayPaneID)
 	m.displayLocalAttach = true
