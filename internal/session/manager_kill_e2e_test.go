@@ -31,6 +31,10 @@ func (e2eAgent) StatusSource() StatusSource          { return fakeStatusSource{}
 func (e2eAgent) ClearInputKeys() []string            { return nil }
 func (e2eAgent) PastePlaceholder(string) string      { return "" }
 
+// DismissOverlayKeys returns nil: these tests drive a pane running `sleep`,
+// which has no input area and so no overlay to close.
+func (e2eAgent) DismissOverlayKeys(string) []string { return nil }
+
 type e2eResolver struct{}
 
 func (e2eResolver) Resolve(string) (Agent, error) { return e2eAgent{}, nil }
