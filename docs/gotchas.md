@@ -497,7 +497,160 @@ Common pitfalls and caveats that agents tend to fall into.
   tmux's `pane_current_path` is also polled, but the hook takes priority.
   (Added in commit a705a80)
 
+## Claude Code adapter
+
+- **Workspace trust lives in `~/.claude.json`, which is not a settings file.**
+  `EnsureTrustState` writes `projects[<workDir>].hasTrustDialogAccepted = true`
+  there because that is the only place Claude Code reads it from; the docs
+  describe the file as holding "per-project state (allowed tools, trust
+  settings)" alongside the OAuth session, the user/local-scope MCP
+  configuration and every cache. The settings files are a separate system with
+  a validated schema that has no `projects` key at all, so trust written to
+  `~/.claude/settings.json`, `~/.claude/settings.local.json` or
+  `<project>/.claude/settings.local.json` is silently ignored. `--settings`
+  injection cannot carry it either, which is why this is the one place any
+  jind-ai adapter writes to user-global config — the documented exception to
+  the design principle in [architecture.md](architecture.md), not a precedent
+  for the next adapter.
+
+- **Claude Code inherits trust from ancestor directories.** It checks the
+  workspace key (the git root, or the start directory outside a repo) and then
+  walks up to `/`, so a trusted parent covers everything beneath it.
+  `EnsureTrustState` mirrors that walk before deciding to write. Practical
+  consequence: **trust the directory worktrees are created under, once, and
+  jind-ai stops writing to `~/.claude.json` for worktree sessions** — every
+  session below it is already covered. Sessions started without `--worktree`
+  run in the current directory, which is somewhere else entirely, so those
+  still get an entry apiece until their own tree is trusted.
+
+  The inheritance cuts both ways. The entry jind-ai writes for a session's
+  workDir trusts **that whole subtree**, exactly as accepting the dialog there
+  would have. jind-ai never writes an entry *above* the workDir, so the grant is
+  always the tree the user pointed the session at — but starting a session
+  directly in `~` or `/` does trust everything beneath it, and jind-ai does not
+  refuse to: the only other thing it could do is leave the session stuck on the
+  dialog it exists to prevent.
+
+  The directory to trust is the *parent* of where worktrees land, not an
+  individual worktree. By default that is `~/.local/state/jind-ai/worktrees`
+  (worktrees go in `.../worktrees/<name>`). `worktree.base_dir` replaces that
+  with a placement *template*, expanding `{name}`, `{repo}` and `${ENV}` — so
+  what to trust is the deepest directory that is the same for every worktree,
+  which is not always the template's parent. `/wt/{name}/src` puts it two levels
+  up from the worktree, and a template containing `{repo}` has a different one
+  per repository.
+
+  ```
+  cd ~/.local/state/jind-ai/worktrees && claude   # accept the trust dialog, then quit
+  ```
+
+  That directory must not sit inside a git repository. Claude Code keys trust by
+  git root, so accepting the dialog there would trust the entire repository
+  rather than the directory you are standing in. The default location is outside
+  any repo; a custom `worktree.base_dir` need not be.
+
+- **Old jind-ai versions wrote trust to `~/.claude/settings.local.json` and it
+  never took effect.** Installs that ran those versions have a large dead
+  `projects` map there — commonly over a thousand entries, nearly all of them
+  paths of worktrees that no longer exist. jind-ai no longer writes to that
+  file and does not delete or migrate what is already in it: the file belongs
+  to the user, and moving the entries would only bloat `~/.claude.json` with
+  dead paths. If the file has no other keys it is safe to remove:
+
+  ```
+  jq 'keys' ~/.claude/settings.local.json   # ["projects"] → nothing else is in there
+  rm ~/.claude/settings.local.json
+  ```
+
+- **Every value in `~/.claude.json` survives a jind-ai write; the file's shape
+  does not.** The adapter decodes it as `map[string]json.RawMessage` at both
+  levels and sets exactly one scalar, because a typed round-trip would drop the
+  ~76 top-level keys it has no fields for — including the OAuth session. For the
+  same reason the encoder has HTML escaping switched off: `encoding/json`
+  rewrites `<`, `>` and `&` inside raw messages too, which would mangle an MCP
+  server URL's query string. Be clear about the limit, though: Go sorts map keys
+  on marshal and the whole file is re-indented, so a write moves nearly every
+  line even though no value changes. Claude Code restores its own ordering on
+  its next write.
+
+  One thing does not survive: bytes that are not valid UTF-8. Values are safe,
+  but object *keys* decode into Go strings and the decoder substitutes U+FFFD —
+  and the keys here are filesystem paths, which on Linux are bytes. Rather than
+  silently rename somebody's project entry, such a file is refused like any
+  other malformed input.
+
+  The file mode is set to `0600` on every write. That is right for a file
+  holding an OAuth session, but note it is applied to files that already exist:
+  a `~/.claude.json` deliberately left at `0644` will come back at `0600`, and
+  one at `0400` is now rewritten rather than refused, because replacing a file
+  by rename needs no write permission on the file itself.
+
+  A file that is unreadable or not valid JSON produces an error instead of a
+  replacement, so the failure mode stays "a trust dialog appears" rather than
+  "the user is logged out". Claude Code handles the corrupt case itself, and
+  better than jind-ai could: it names the file and the parse error on stderr,
+  moves the broken file aside into `~/.claude/backups/`, and starts from a fresh
+  config. Repairing it here would race that recovery and skip the backup. The
+  cost is that the session which hit the corrupt file gets the trust dialog —
+  which in a jind-ai pane means it hangs, not that someone answers it. Claude
+  Code's recovery leaves a valid file behind, so the next session start writes
+  the entry normally; `JIN_DEBUG=1` logs jind-ai's side of it.
+
+- **What the atomic write buys, and what it does not.** `atomicfile.Write`
+  renames a complete temp file over the target, so no reader ever sees a
+  half-written file. That is all it does. It does **not** prevent lost updates:
+  read and write are separate steps, and whoever renames last wins.
+
+  Concurrent calls dropped one of the two entries about 85 times in 100 when
+  measured on a harness that calls `EnsureTrustState` directly. Ordinary session
+  starts never reached that state — `Manager.StartBackground` holds `m.mu` for
+  the whole of `startSessionTmux`, so they queue — but the quick-fail resume
+  retry rebuilds its spawn command after releasing `m.mu` on purpose, and that
+  one can run alongside a start. Those writes are serialised by a mutex in the
+  adapter now, which covers everything inside the daemon process.
+
+  Claude Code writing the file from *its* process cannot be locked out: the CLI
+  takes no lock, so there is nothing for jind-ai to take either. That one is
+  handled by re-checking instead. The adapter stamps the file's size and
+  modification time when it reads, checks them again immediately before the
+  rename, and on a change reloads and merges into the new contents rather than
+  renaming a stale snapshot over it — up to three attempts, after which it
+  writes anyway, because a session stuck on the trust dialog is worse than the
+  sliver of a window three attempts leave. That sliver is the rename itself
+  rather than the whole read-merge-write, which is where it would otherwise sit;
+  measured, the latter runs about 19 ms on a config with 1800 project entries.
+
+  This matters more than the numbers suggest, because jind-ai's normal use is
+  starting sessions while other Claude Code processes are running. What would be
+  rolled back is whatever the CLI last saved — usually `lastCost` or
+  `lastSessionId`, but the same write covers the OAuth session. Note also that
+  jind-ai writes at most once per session start and only when nothing in the
+  workDir's ancestry is trusted yet, so trusting the base directory removes the
+  exposure entirely.
+
+- **The rename replaces a symlink instead of following it.** `os.Rename` swaps
+  the link itself, so a `~/.claude.json` symlinked into a dotfiles repository
+  would have become a plain file in `$HOME` with the repository copy orphaned at
+  its old contents — silently, since nothing fails. `EnsureTrustState` resolves
+  the path before writing, so the link survives and the file the user actually
+  keeps is the one updated. A link whose target does not exist yet — repository
+  not cloned, volume not mounted — is followed as well, via `readlink`, and the
+  target is created: `filepath.EvalSymlinks` refuses a path it cannot stat, and
+  falling back to the link path would destroy the link in exactly the case the
+  resolution exists for.
+
+  Because the rename has to stay on one filesystem, the temp file lands next to
+  the resolved target — inside the dotfiles directory for the duration of the
+  write, which is why it carries a recognisable `.jin-` prefix rather than a
+  random name. It also means the write needs permission on that *directory*,
+  not just on the file, which a plain overwrite would not have.
+
 ## Codex adapter
+
+> Codex has two trust prompts of its own, both described below. Neither has
+> anything to do with the Claude Code workspace trust above: different agent,
+> different file, different mechanism. Nothing in this section touches
+> `~/.claude.json`.
 
 - **Initial `/hooks` trust approval is required.** The first time `jin
   session new --agent codex` runs in a given install (or after the `jin`

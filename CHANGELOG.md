@@ -5,6 +5,23 @@ attaches them to the corresponding [GitHub Release](https://github.com/takaaki-s
 This file is the curated overview — highlights per release, not a per-commit
 log.
 
+## Unreleased
+
+### Behaviour change
+
+- **Workspace trust for Claude Code sessions is now written to
+  `~/.claude.json`**, the file Claude Code actually reads it from, instead of
+  `~/.claude/settings.local.json`, where it was silently ignored. A session
+  started in a fresh worktree no longer stops at the trust dialog.
+- The old file is neither migrated nor deleted — jind-ai just stops writing
+  to it. Installs that ran earlier versions have a large dead `projects` map
+  there, which is safe to remove when the file holds nothing else; see
+  [docs/gotchas.md](docs/gotchas.md#claude-code-adapter) for the steps.
+- Trusting the directory your worktrees are created under, once, stops
+  jind-ai writing to `~/.claude.json` for every session below it — Claude
+  Code inherits trust from ancestor directories. Sessions started without
+  `--worktree` run elsewhere and are not covered by that.
+
 ## 0.9.0
 
 ### Features
