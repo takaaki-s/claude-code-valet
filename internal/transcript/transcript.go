@@ -112,10 +112,16 @@ func (r *Reader) GetLastMessages(workDir, sessionID string) (*LastMessages, erro
 // GetConversation returns the last N exchanges from the transcript, where an
 // exchange is a user prompt plus the assistant's reply to it (see lastExchanges).
 // workDir may be empty: a glob fallback locates the JSONL by sessionID.
-// lastN specifies the number of exchanges to return.
+// lastN is the number of exchanges to return and must be at least 1: "no
+// exchanges asked for" is rejected rather than answered with the whole
+// conversation, which is the direction of failure that hurts — callers pipe
+// this into another agent's context.
 // Returns ErrNoTranscript when no transcript file exists (yet), and an empty
 // slice when one exists but carries no plain-text message.
 func (r *Reader) GetConversation(workDir, sessionID string, lastN int) ([]Message, error) {
+	if lastN < 1 {
+		return nil, errors.New("lastN must be >= 1")
+	}
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
 		return nil, err
@@ -187,11 +193,9 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 // exchanges when every turn happens to be exactly one message; in practice it
 // returned two consecutive assistant messages and no prompt at all. Fewer
 // than n boundaries — or none, as in a transcript that is all assistant
-// text — returns everything rather than guessing at a cut point.
+// text — returns everything rather than guessing at a cut point. n comes from
+// GetConversation, which refuses anything below 1.
 func lastExchanges(msgs []Message, n int) []Message {
-	if n <= 0 {
-		return msgs
-	}
 	seen := 0
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Type != "user" {
@@ -366,7 +370,11 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 // single injected skill body runs to thousands of lines, so admitting them
 // drowns the conversation it is supposed to show.
 //
-// TurnState applies the same two exclusions for the same reason.
+// TurnState calls this for the same reason, which is why the test is made of
+// nothing but the flags the transcript itself sets: a session's live status is
+// re-derived from which role spoke last, and that classification must not move
+// because of what an entry happens to say. Exclusions that depend on the
+// content live in conversationTextBlocks instead.
 func isConversationEntry(entry *transcriptEntry) bool {
 	if entry.Type != "user" && entry.Type != "assistant" {
 		return false
@@ -374,15 +382,14 @@ func isConversationEntry(entry *transcriptEntry) bool {
 	return !entry.IsSidechain && !entry.IsMeta
 }
 
-// collectTextBlocks pulls the conversation text out of an entry's content.
-// Content is a bare string on some entries and an array of blocks on others,
-// and either shape can appear for either role — user prompts in particular
-// arrive as arrays often enough that reading only the string form dropped
-// them from the conversation entirely.
+// collectTextBlocks pulls the text out of an entry's content. Content is a
+// bare string on some entries and an array of blocks on others, and either
+// shape can appear for either role, so this stays role-agnostic — which of
+// those texts count as conversation is conversationTextBlocks' decision.
 //
-// tool_result blocks are skipped on purpose. They ride along inside user
-// entries but are what a tool wrote back, not something the user said, and
-// letting them through buries every real message under tool output.
+// Blocks other than text are skipped on purpose. A tool_result rides along
+// inside a user entry but is what a tool wrote back, not something the user
+// said, and letting them through buries every real message under tool output.
 func collectTextBlocks(content any) []string {
 	switch c := content.(type) {
 	case string:
@@ -409,10 +416,49 @@ func collectTextBlocks(content any) []string {
 	return nil
 }
 
+// conversationTextBlocks returns the text of an entry that should be read as
+// something its author actually said.
+//
+// A prompt a person types reaches the transcript as a bare string. On the user
+// side the array shape appears only when the turn carries structured content
+// alongside the words — a pasted image, a tool_result written back. So a user
+// array holding nothing but text blocks did not come from a keyboard: it is
+// the agent writing in the user's voice, the same class of entry as isMeta
+// (see isConversationEntry), and admitting it puts the agent's own bookkeeping
+// where the last real reply belongs on the default `session output` path.
+//
+// Assistant entries are the opposite case — a text-only array is their normal
+// shape — so the rule is deliberately scoped to one role.
+func conversationTextBlocks(entry *transcriptEntry) []string {
+	if entry.Type == "user" && isTextOnlyArray(entry.Message.Content) {
+		return nil
+	}
+	return collectTextBlocks(entry.Message.Content)
+}
+
+// isTextOnlyArray reports whether content is a block array carrying no block
+// kind other than "text". String content is not an array and never qualifies.
+func isTextOnlyArray(content any) bool {
+	blocks, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range blocks {
+		block, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if kind, _ := block["type"].(string); kind != "text" {
+			return false
+		}
+	}
+	return true
+}
+
 // extractContent extracts an entry's text collapsed onto a single line, for
 // display in list rows and detail panes.
 func extractContent(entry *transcriptEntry) string {
-	texts := collectTextBlocks(entry.Message.Content)
+	texts := conversationTextBlocks(entry)
 	if len(texts) == 0 {
 		return ""
 	}
@@ -422,7 +468,7 @@ func extractContent(entry *transcriptEntry) string {
 // extractFullContent extracts an entry's text with its line structure intact,
 // for callers that render the message as the agent wrote it.
 func extractFullContent(entry *transcriptEntry) string {
-	texts := collectTextBlocks(entry.Message.Content)
+	texts := conversationTextBlocks(entry)
 	if len(texts) == 0 {
 		return ""
 	}
@@ -596,12 +642,12 @@ const (
 )
 
 // TurnState returns the classification of the last conversational turn.
-// Entries that are not part of the main conversation are ignored:
-// system/summary types, sidechain entries (a subagent's turns would
-// otherwise read as the main thread finishing), and meta messages. Any
-// failure (missing file, empty transcript, read error) folds into
-// TurnStateUnknown, so callers can treat it as "cannot determine" without
-// guard code.
+// Entries that are not part of the main conversation are ignored on the same
+// terms as every reader in this package (isConversationEntry): system/summary
+// types, sidechain entries (a subagent's turns would otherwise read as the
+// main thread finishing), and meta messages. Any failure (missing file, empty
+// transcript, read error) folds into TurnStateUnknown, so callers can treat it
+// as "cannot determine" without guard code.
 //
 // The file is streamed keeping only the last main-conversation entry — a
 // ReadEntries call would materialize every block (including re-marshalled
@@ -631,10 +677,7 @@ func (r *Reader) TurnState(workDir, sessionID string) TurnState {
 		if err := json.Unmarshal(line, &raw); err != nil {
 			continue
 		}
-		if raw.IsSidechain || raw.IsMeta {
-			continue
-		}
-		if raw.Type != "user" && raw.Type != "assistant" {
+		if !isConversationEntry(&raw) {
 			continue
 		}
 		last = &raw

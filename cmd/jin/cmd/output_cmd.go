@@ -25,7 +25,9 @@ var outputCmd = &cobra.Command{
 	Short: "Get the output of a session",
 	Long: `Get the conversation output from a Claude Code session.
 
-By default, shows the last assistant message. Use --last N to get the last N conversation pairs.
+By default, shows the last assistant message. Use --last N to get the last N
+exchanges, an exchange being a prompt plus the agent's whole reply to it. One
+exchange can span many messages, so N does not bound how much comes back.
 The selector may be an ID prefix or a description substring (case-insensitive).
 
 Examples:
@@ -37,6 +39,13 @@ Examples:
 	RunE: func(cmd *cobra.Command, args []string) error {
 		nameOrID := args[0]
 		lastN, _ := cmd.Flags().GetInt("last")
+
+		// 0 is the flag's zero value and cannot be told apart from "not
+		// passed", so it keeps meaning the default path; a negative count is
+		// unambiguous and is refused the way `session result` refuses it.
+		if lastN < 0 {
+			return fmt.Errorf("--last must be >= 0")
+		}
 
 		client := daemon.NewClient(getSocketPath())
 
@@ -60,41 +69,15 @@ Examples:
 		if lastN > 0 {
 			msgs, err := reader.GetConversation(workDir, info.AgentSessionID, lastN)
 			if err != nil {
-				if errors.Is(err, transcript.ErrNoTranscript) {
-					return errNoTranscriptFound
-				}
-				return fmt.Errorf("failed to read conversation: %w", err)
+				return mapTranscriptErr(err)
 			}
-
-			// A transcript that exists but holds nothing readable is a state
-			// every session passes through, so it stays a success — but it
-			// used to be indistinguishable from a missing transcript, which
-			// is why an empty `--last` read as "the agent said nothing".
-			if len(msgs) == 0 {
-				fmt.Fprintln(os.Stderr, noReadableMessagesHint)
-			}
-
-			if jsonOutput {
-				// Ensure JSON outputs [] instead of null for empty results
-				if msgs == nil {
-					msgs = []transcript.Message{}
-				}
-				return renderOutputJSON(os.Stdout, msgs)
-			}
-
-			for _, msg := range msgs {
-				fmt.Fprintf(os.Stdout, "[%s] %s\n", msg.Type, msg.Content)
-			}
-			return nil
+			return renderConversation(os.Stdout, os.Stderr, msgs, jsonOutput)
 		}
 
 		// Default: last assistant/user message with plain text.
 		msg, err := reader.GetLastMessage(workDir, info.AgentSessionID)
 		if err != nil {
-			if errors.Is(err, transcript.ErrNoTranscript) {
-				return errNoTranscriptFound
-			}
-			return fmt.Errorf("failed to read transcript: %w", err)
+			return mapTranscriptErr(err)
 		}
 		if msg == nil {
 			// The transcript exists but every user/assistant entry so far
@@ -111,6 +94,41 @@ Examples:
 		fmt.Println(msg.Content)
 		return nil
 	},
+}
+
+// mapTranscriptErr turns a transcript read failure into the message the user
+// gets. A missing transcript is the one failure a caller can act on — wrong
+// session, or too early — so it keeps its own wording instead of surfacing as
+// a read error.
+func mapTranscriptErr(err error) error {
+	if errors.Is(err, transcript.ErrNoTranscript) {
+		return errNoTranscriptFound
+	}
+	return fmt.Errorf("failed to read transcript: %w", err)
+}
+
+// renderConversation writes the --last output. A transcript that exists but
+// holds nothing readable is a state every session passes through, so it stays
+// a success — the note goes to stderr precisely because stdout is being piped
+// somewhere, and an empty stdout used to be indistinguishable from a missing
+// transcript.
+func renderConversation(out, errOut io.Writer, msgs []transcript.Message, jsonOut bool) error {
+	if len(msgs) == 0 {
+		fmt.Fprintln(errOut, noReadableMessagesHint)
+	}
+
+	if jsonOut {
+		// Ensure JSON outputs [] instead of null for empty results
+		if msgs == nil {
+			msgs = []transcript.Message{}
+		}
+		return renderOutputJSON(out, msgs)
+	}
+
+	for _, msg := range msgs {
+		fmt.Fprintf(out, "[%s] %s\n", msg.Type, msg.Content)
+	}
+	return nil
 }
 
 // transcriptWorkDir picks the directory to feed to the transcript reader.
@@ -134,5 +152,5 @@ func renderOutputJSON(w io.Writer, v any) error {
 func init() {
 	sessionCmd.AddCommand(outputCmd)
 
-	outputCmd.Flags().Int("last", 0, "Number of conversation pairs to show")
+	outputCmd.Flags().Int("last", 0, "Number of exchanges to show — a prompt plus the agent's whole reply; one exchange can span many messages")
 }
