@@ -294,11 +294,15 @@ func (r *Reader) getTranscriptPath(workDir, sessionID string) string {
 
 // transcriptEntry represents a single entry in the JSONL file
 type transcriptEntry struct {
-	Type        string    `json:"type"`
-	Message     msgObject `json:"message"`
-	Timestamp   string    `json:"timestamp"`
-	IsSidechain bool      `json:"isSidechain"`
-	IsMeta      bool      `json:"isMeta"`
+	Type      string    `json:"type"`
+	Message   msgObject `json:"message"`
+	Timestamp string    `json:"timestamp"`
+	// PromptSource records how Claude Code received a user entry ("typed" from
+	// the terminal, "sdk" from a stream-json caller). Its absence on a user
+	// entry means nobody supplied it — see conversationTextBlocks.
+	PromptSource string `json:"promptSource"`
+	IsSidechain  bool   `json:"isSidechain"`
+	IsMeta       bool   `json:"isMeta"`
 }
 
 // msgObject represents the message field which can have different structures
@@ -419,18 +423,25 @@ func collectTextBlocks(content any) []string {
 // conversationTextBlocks returns the text of an entry that should be read as
 // something its author actually said.
 //
-// A prompt a person types reaches the transcript as a bare string. On the user
-// side the array shape appears only when the turn carries structured content
-// alongside the words — a pasted image, a tool_result written back. So a user
-// array holding nothing but text blocks did not come from a keyboard: it is
-// the agent writing in the user's voice, the same class of entry as isMeta
-// (see isConversationEntry), and admitting it puts the agent's own bookkeeping
-// where the last real reply belongs on the default `session output` path.
+// Claude Code stamps a promptSource on every user entry it was handed as input:
+// "typed" for a terminal prompt, "sdk" for one fed to `claude -p
+// --input-format stream-json`. A user entry with no promptSource was supplied
+// by nobody, and when its content is an array of nothing but text it is the
+// agent writing in the user's voice — on real transcripts, always an
+// interruption notice. That is the same class of entry as isMeta (see
+// isConversationEntry), and admitting it puts the agent's own bookkeeping where
+// the last real reply belongs on the default `session output` path.
+//
+// The promptSource half of the test is what keeps a genuine prompt out of the
+// rule: the shape alone does not separate them, because stream-json input
+// arrives as a text-only array too. On a Claude Code old enough not to write
+// promptSource the field is absent everywhere and this falls back to the
+// shape-only behaviour it replaced.
 //
 // Assistant entries are the opposite case — a text-only array is their normal
 // shape — so the rule is deliberately scoped to one role.
 func conversationTextBlocks(entry *transcriptEntry) []string {
-	if entry.Type == "user" && isTextOnlyArray(entry.Message.Content) {
+	if entry.Type == "user" && entry.PromptSource == "" && isTextOnlyArray(entry.Message.Content) {
 		return nil
 	}
 	return collectTextBlocks(entry.Message.Content)

@@ -61,6 +61,29 @@ func TestMapTranscriptErr(t *testing.T) {
 	}
 }
 
+// TestOutputCmd_NegativeLastRejected verifies that a negative --last is refused
+// locally, before the daemon client is built — the same shape as
+// TestDeleteCmd_ForceWorktreeRequiresWorktree. Without the guard the value
+// reaches GetConversation, whose own "lastN must be >= 1" check is worded for
+// the library caller, not for someone at the CLI.
+func TestOutputCmd_NegativeLastRejected(t *testing.T) {
+	flags := outputCmd.Flags()
+	if err := flags.Set("last", "-1"); err != nil {
+		t.Fatalf("Set(last): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = flags.Set("last", "0")
+	})
+
+	err := outputCmd.RunE(outputCmd, []string{"some-session"})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "--last must be >= 0") {
+		t.Errorf("error message = %q, want to contain %q", err.Error(), "--last must be >= 0")
+	}
+}
+
 func TestRenderConversation(t *testing.T) {
 	msgs := []transcript.Message{
 		{Type: "user", Content: "Hi", Timestamp: "2025-01-01T00:00:00Z"},

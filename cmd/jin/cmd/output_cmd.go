@@ -25,9 +25,10 @@ var outputCmd = &cobra.Command{
 	Short: "Get the output of a session",
 	Long: `Get the conversation output from a Claude Code session.
 
-By default, shows the last assistant message. Use --last N to get the last N
-exchanges, an exchange being a prompt plus the agent's whole reply to it. One
-exchange can span many messages, so N does not bound how much comes back.
+By default, shows the newest plain-text message: usually the agent's reply, but
+the prompt itself while the agent is still working on it. Use --last N to get
+the last N exchanges, an exchange being a prompt plus the agent's whole reply to
+it. One exchange can span many messages, so N does not bound how much comes back.
 The selector may be an ID prefix or a description substring (case-insensitive).
 
 Examples:

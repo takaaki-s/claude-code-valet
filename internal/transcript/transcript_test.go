@@ -131,16 +131,21 @@ func TestCleanContent(t *testing.T) {
 // --- extractContent ---
 
 func TestExtractContent_UserString(t *testing.T) {
+	// The fixture carries a newline and a tab because collapsing to one line is
+	// the whole point of extractContent, not an incidental effect of
+	// cleanContent: its result lands in `jin session info`'s tabwriter row and
+	// in the TUI detail pane, and neither of those splits on "\n".
 	entry := &transcriptEntry{
 		Type: "user",
 		Message: msgObject{
 			Role:    "user",
-			Content: "hello world",
+			Content: "hello\nworld\tand  more",
 		},
 	}
 	got := extractContent(entry)
-	if got != "hello world" {
-		t.Errorf("expected %q, got %q", "hello world", got)
+	want := "hello world and more"
+	if got != want {
+		t.Errorf("expected %q, got %q", want, got)
 	}
 }
 
@@ -883,12 +888,11 @@ func textBlock(s string) map[string]any {
 }
 
 func TestExtractContent_UserTextOnlyArrayIsNotConversation(t *testing.T) {
-	// A prompt a person types reaches the transcript as a bare string. On the
-	// user side the array shape shows up only when the turn carries something
-	// structural alongside the words, so an array of nothing but text is the
-	// agent writing in the user's voice. On real transcripts every one of them
-	// was an interruption notice like the fixture below — the rule keys on the
-	// shape, not on this wording.
+	// No promptSource means Claude Code was handed this by nobody, so a
+	// text-only array here is the agent writing in the user's voice. On real
+	// transcripts every one of them was an interruption notice like the fixture
+	// below — the rule keys on the missing field and the shape, not on this
+	// wording.
 	entry := &transcriptEntry{
 		Type:    "user",
 		Message: msgObject{Role: "user", Content: []any{textBlock("[Request interrupted by user]")}},
@@ -902,8 +906,9 @@ func TestExtractContent_UserTextOnlyArrayIsNotConversation(t *testing.T) {
 }
 
 func TestExtractContent_UserArrayWithAttachmentKeepsText(t *testing.T) {
-	// The user array a person does produce: words plus a pasted image. The
-	// non-text block is what marks the entry as typed rather than generated.
+	// Words plus a pasted image. The entry is admitted on shape alone — it is
+	// not a text-only array — which is what keeps an attachment prompt readable
+	// on a Claude Code too old to write promptSource.
 	entry := &transcriptEntry{
 		Type: "user",
 		Message: msgObject{Role: "user", Content: []any{
@@ -1087,6 +1092,11 @@ func TestGetConversation_ExchangesSpanUnevenTurns(t *testing.T) {
 	// that alternates user/assistant perfectly is returned identically by a
 	// fixed 2n tail slice, so it cannot tell lastExchanges from the
 	// implementation it replaced.
+	//
+	// One reply is deliberately multi-line: --last output is piped into another
+	// agent's context, so this path reads through extractFullContent rather
+	// than the single-line extractContent the display paths use. Keep the "\n"
+	// in the expectations — it is what pins that choice.
 	tmpDir := t.TempDir()
 	r := &Reader{claudeDir: tmpDir}
 	workDir := "/exchange/test"
@@ -1098,7 +1108,7 @@ func TestGetConversation_ExchangesSpanUnevenTurns(t *testing.T) {
 		{Type: "user", Message: msgObject{Role: "user", Content: "second question"}, Timestamp: "2024-01-01T00:00:02Z"},
 		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{map[string]any{"type": "tool_use", "name": "Bash", "id": "tu_1"}}}, Timestamp: "2024-01-01T00:00:03Z"},
 		{Type: "user", Message: msgObject{Role: "user", Content: []any{map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"}}}, Timestamp: "2024-01-01T00:00:04Z"},
-		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("second answer")}}, Timestamp: "2024-01-01T00:00:05Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("second answer:\n- one\n- two")}}, Timestamp: "2024-01-01T00:00:05Z"},
 		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("and one more thing")}}, Timestamp: "2024-01-01T00:00:06Z"},
 	})
 
@@ -1106,13 +1116,13 @@ func TestGetConversation_ExchangesSpanUnevenTurns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	assertContents(t, msgs, []string{"second question", "second answer", "and one more thing"})
+	assertContents(t, msgs, []string{"second question", "second answer:\n- one\n- two", "and one more thing"})
 
 	msgs, err = r.GetConversation(workDir, sessionID, 2)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	assertContents(t, msgs, []string{"first question", "first answer", "second question", "second answer", "and one more thing"})
+	assertContents(t, msgs, []string{"first question", "first answer", "second question", "second answer:\n- one\n- two", "and one more thing"})
 }
 
 func TestReaders_UserTextOnlyArrayIsNobodySpeaking(t *testing.T) {
@@ -1158,6 +1168,41 @@ func TestReaders_UserTextOnlyArrayIsNobodySpeaking(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		assertContents(t, msgs, []string{"typed prompt", "first half of the answer", "second half of the answer"})
+	})
+}
+
+func TestReaders_TextOnlyUserArrayWithPromptSourceIsAPrompt(t *testing.T) {
+	// `claude -p --input-format stream-json` writes a real prompt as a
+	// text-only array — the same shape an interruption marker has. promptSource
+	// is what separates them: Claude Code stamps it on everything it received
+	// as input. Keying on the shape alone dropped this prompt outright, leaving
+	// `--last 1` showing a reply to a question nobody appeared to ask.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/sdk/test"
+	sessionID := "sess-sdk"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "user", PromptSource: "sdk", Message: msgObject{Role: "user", Content: []any{textBlock("run the migration")}}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{textBlock("migration applied")}}, Timestamp: "2024-01-01T00:00:01Z"},
+	})
+
+	t.Run("GetLastMessages attributes it to the user", func(t *testing.T) {
+		msgs, err := r.GetLastMessages(workDir, sessionID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if msgs == nil || msgs.User == nil || msgs.User.Content != "run the migration" {
+			t.Fatalf("GetLastMessages.User = %+v, want the SDK-supplied prompt", msgs)
+		}
+	})
+
+	t.Run("GetConversation opens an exchange on it", func(t *testing.T) {
+		msgs, err := r.GetConversation(workDir, sessionID, 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertContents(t, msgs, []string{"run the migration", "migration applied"})
 	})
 }
 
@@ -1609,6 +1654,13 @@ func TestTurnState(t *testing.T) {
 		Timestamp: "2024-01-01T00:00:02Z",
 		IsMeta:    true,
 	}
+	interruptMarkerUser := transcriptEntry{
+		Type: "user",
+		Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "text", "text": "[Request interrupted by user]"},
+		}},
+		Timestamp: "2024-01-01T00:00:02Z",
+	}
 
 	cases := []struct {
 		name    string
@@ -1651,6 +1703,20 @@ func TestTurnState(t *testing.T) {
 			name:    "meta user tail is skipped, prior assistant decides",
 			entries: []transcriptEntry{userText, assistantText, metaUser},
 			want:    TurnStateComplete,
+		},
+		{
+			// Deliberate split, not an oversight: every message reader drops
+			// this entry (conversationTextBlocks — a text-only user array with
+			// no promptSource is nobody speaking), and TurnState must not.
+			// Status is re-derived from which role spoke last, so it stays on
+			// the entry's type and block kinds and never asks whether the words
+			// count as conversation. The price is visible and accepted: a
+			// transcript ending on an interruption marker reports UserPending,
+			// which the Claude adapter renders as "thinking" on daemon
+			// recovery.
+			name:    "text-only user array still counts as the user speaking",
+			entries: []transcriptEntry{userText, assistantText, interruptMarkerUser},
+			want:    TurnStateUserPending,
 		},
 		{
 			name:    "thinking-only assistant tail is still in flight",
