@@ -13,16 +13,17 @@ import (
 //
 //   - `codex` on the first spawn — Codex has no `--session-id`
 //     equivalent, so we spawn fresh and let SessionStart's hook stdin
-//     write the actual UUID back into Session.AgentSessionID (see
-//     02_design.md §3.5). The pre-mint UUID Manager set on
-//     Session.AgentSessionID is intentionally ignored here.
+//     write the actual UUID back into Session.AgentSessionID. The
+//     pre-mint UUID Manager set on Session.AgentSessionID is
+//     intentionally ignored here — see "Codex adapter" in
+//     docs/gotchas.md for why.
 //   - `codex resume <UUID>` once AgentSessionStarted is true and
 //     AgentSessionID has been re-keyed to the real Codex UUID. `codex
 //     resume` fails fast on an unknown UUID (~3s in Codex 0.144.1, well
 //     within the existing 10s quick-fail auto-recovery window), so a
 //     stale UUID does not require a defensive glob check up front.
 //   - Hook injection via `--enable hooks` + one `-c 'hooks.X=[...]'`
-//     per managedEvent (§3.3, §3.4). See hook_args.go.
+//     per managedEvent. See hook_args.go.
 //   - The behaviour overrides in configArgs, injected per spawn rather
 //     than written into the user's Codex config.
 //

@@ -4637,10 +4637,9 @@ func TestSendPrompt_ResidualClearedOnRetry(t *testing.T) {
 
 // TestSendPrompt_MultipleClearKeysAllSentInOrder asserts that when
 // ClearInputKeys returns more than one key (the fallback shape reserved
-// for TUIs where C-u is bound to something else — 02_design D3 lists
-// ["C-a", "C-k"] as the concrete example), SendPrompt sends every key and
-// preserves the declared order. Guards against a refactor that accidentally
-// collapses the ranging loop into "send first key only".
+// for a TUI where C-u is bound to something else), SendPrompt sends every
+// key and preserves the declared order. Guards against a refactor that
+// accidentally collapses the ranging loop into "send first key only".
 func TestSendPrompt_MultipleClearKeysAllSentInOrder(t *testing.T) {
 	mgr, mock, _ := newTestManager(t)
 	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)

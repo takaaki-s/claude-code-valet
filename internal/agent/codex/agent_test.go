@@ -19,8 +19,8 @@ func TestAgent_Kind(t *testing.T) {
 
 func TestAgent_Setup_NoFileWrites(t *testing.T) {
 	// The Codex adapter must not touch the user's global config files —
-	// hooks are injected per-invocation via -c (§3.3). Setup with a fresh
-	// HOME + CODEX_HOME and verify nothing lands under either.
+	// hooks are injected per-invocation via -c. Setup with a fresh HOME +
+	// CODEX_HOME and verify nothing lands under either.
 	home := t.TempDir()
 	codexHome := t.TempDir()
 	t.Setenv("HOME", home)
@@ -48,7 +48,7 @@ func TestAgent_Setup_NoFileWrites(t *testing.T) {
 			return nil
 		})
 		if count > 0 {
-			t.Errorf("Setup wrote %d files under %s; expected 0 (hooks are injected via -c, §3.3)", count, root)
+			t.Errorf("Setup wrote %d files under %s; expected 0 (hooks are injected via -c)", count, root)
 		}
 	}
 }

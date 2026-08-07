@@ -222,8 +222,8 @@ func runPluginInstallBySource(cmd *cobra.Command, arg string) error {
 	if err != nil {
 		return err
 	}
-	// --force is scoped to the registry install path in 04_install.md, so
-	// the git-URL path keeps the historical fail-closed compat behaviour.
+	// --force is scoped to the registry install path, so the git-URL path
+	// keeps the historical fail-closed compat behaviour.
 	// `@ref` on the CLI = the user explicitly picked a version, so `plugin
 	// update` must not silently move them off it later.
 	plan, err := plugin.Fetch(src, paths.Plugins(), getStateDir(), plugin.FetchOptions{

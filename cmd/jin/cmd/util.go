@@ -30,7 +30,7 @@ type envWriter interface {
 // untouched rather than publish a value the parent would have to interpret —
 // for the confirm popup that value would be an answer to a destructive prompt
 // nobody answered. tmux errors are swallowed so non-tmux invocations stay
-// non-fatal (V-014).
+// non-fatal.
 func pushPopupResult(tc envWriter, key, selected string) {
 	if selected == "" {
 		return

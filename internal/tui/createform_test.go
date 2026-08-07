@@ -246,8 +246,8 @@ func TestResolveInitialAgentKind_FallsBackToFirstKind(t *testing.T) {
 }
 
 func TestStepIndex(t *testing.T) {
-	// Guards §N1 in 01_spec.md: skipping stepAgent (single adapter) must not
-	// leave a visible gap in the "Step N" numbering shown to the user.
+	// Guards against skipping stepAgent (single adapter) leaving a visible
+	// gap in the "Step N" numbering shown to the user.
 	tests := []struct {
 		name         string
 		step         formStep

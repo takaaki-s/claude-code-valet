@@ -139,10 +139,10 @@ adapter owns the mapping and any needed vocabulary normalisation.
 (`SessionStart` → `AgentSessionStarted` bookkeeping + Layer C trigger,
 `UserPromptSubmit` / `Stop` → Layer C trigger, `CwdChanged` → git branch
 reprobe). Adapters whose native events do not match these names must
-normalise before calling `jin hook` — see
-`internal/agent/codex/status.go` and 02_design.md §2.2 for the exact
-Codex mapping (native events already match Claude Code by name), and
-`internal/agent/opencode/plugin/jin.ts` for a plugin-side normaliser
+normalise before calling `jin hook` — Codex needs no normalisation (its
+native events already match Claude Code by name; see
+`internal/agent/codex/status.go` and the exact mapping below), while
+`internal/agent/opencode/plugin/jin.ts` is a plugin-side normaliser
 (opencode's bus vocabulary shares no names with the canonical set).
 
 The Claude Code adapter's mapping is documented in

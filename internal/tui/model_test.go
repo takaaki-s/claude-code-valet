@@ -3933,8 +3933,8 @@ func TestRenderSession_Indicators(t *testing.T) {
 // are concrete structs with unexported fields, and expanding an interface just
 // for these tests would balloon this task well beyond R4. The tests below
 // cover the routing/guard logic reachable without live clients; the real
-// side-effect wiring (ZoomPane, SetEnvironment, PluginRun) is exercised by
-// the manual verification steps (see 03_todo.md V-006/V-008/V-009).
+// side-effect wiring (ZoomPane, SetEnvironment, PluginRun) is exercised only
+// by manual verification, not by this suite.
 
 // TestDispatchAction_CoreRouting_TogglePane verifies that IDTogglePane routes
 // to handleTogglePane and that the tmuxClient=nil guard keeps it a safe
@@ -4809,7 +4809,7 @@ func TestCurrentCursorSessionID_EmptyList(t *testing.T) {
 
 // TestWriteCursorEnv_UpdatesTmux is a degraded guard test: with tmuxClient=nil
 // (legacy mode / tests), writeCursorEnv must be a no-op. Real SetEnvironment
-// wiring is covered by manual verification (03_todo.md V-009).
+// wiring is covered only by manual verification, not by this suite.
 func TestWriteCursorEnv_UpdatesTmux(t *testing.T) {
 	m := Model{
 		sessions: []session.Info{
@@ -5380,17 +5380,18 @@ func TestOpenPopup_NoConfigMgr_NoOp(t *testing.T) {
 // These run with tmuxClient=nil (the degraded-guard style used across this
 // file): the tmux side-effects (SetEnvironment, @session_name) are skipped, so
 // the tests observe only the in-memory state adoption. Real tmux wiring and the
-// end-to-end choose-tree follow are covered by manual verification (03_todo.md
-// V-001/V-002).
+// end-to-end choose-tree follow are covered only by manual verification, not
+// by this suite.
 
 // TestAdoptAttachedSession covers the in-memory adoption paths: the happy
-// path, cursor tracking of the display index (V-007's reachable half), the
-// steady-state no-op that keeps the poll from thrashing the cursor every tick,
-// unknown names (V-004), empty attach names (V-006, client dead / poll race),
-// and a late msg after leaving local attach. The off-list half of V-007
-// (adopted session hidden by a filter: ID adopted, cursor kept) is not
-// black-box reachable while getDisplaySessions() returns m.sessions
-// unfiltered; moveCursorToSession's guard covers it structurally.
+// path, cursor tracking of the display index (the black-box-reachable half
+// of the cursor-tracking case), the steady-state no-op that keeps the poll
+// from thrashing the cursor every tick, unknown names, empty attach names
+// (client dead / poll race), and a late msg after leaving local attach. The
+// cursor-tracking case's other half (an adopted session hidden by a filter:
+// ID adopted, cursor kept) is not black-box reachable while
+// getDisplaySessions() returns m.sessions unfiltered; moveCursorToSession's
+// guard covers it structurally.
 func TestAdoptAttachedSession(t *testing.T) {
 	sessions := []session.Info{
 		{ID: "s1", TmuxWindowName: "jin-s1", Description: "one"},
@@ -5430,12 +5431,11 @@ func TestAdoptAttachedSession(t *testing.T) {
 	}
 }
 
-// TestPollAttachedSessionCmd_Guards covers V-005: the poll Cmd is only issued
+// TestPollAttachedSessionCmd_Guards verifies that the poll Cmd is only issued
 // when the display pane is locally attached with both tmux clients wired and a
 // known pane ID. Building the Cmd runs no tmux command (that happens only when
 // the closure fires), so the all-satisfied case can assert non-nil with
-// zero-value clients; only the actual tmux round-trip is manual (03_todo.md
-// V-001).
+// zero-value clients; only the actual tmux round-trip is manual.
 func TestPollAttachedSessionCmd_Guards(t *testing.T) {
 	cases := []struct {
 		name        string

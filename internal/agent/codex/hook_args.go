@@ -8,8 +8,8 @@ import (
 )
 
 // managedEvents is the Codex hook event set jind-ai injects on every spawn.
-// The order matches 02_design.md §3.4's mapping table; SpawnCommand emits
-// one -c per entry, and status.go's Interpret must recognise the same set.
+// SpawnCommand emits one -c per entry, and status.go's Interpret must
+// recognise the same set.
 var managedEvents = []string{
 	"SessionStart",
 	"UserPromptSubmit",
@@ -25,9 +25,9 @@ var managedEvents = []string{
 // move the flag onto a different event.
 const sessionStartEvent = "SessionStart"
 
-// hookTimeoutMillis is the Codex-side per-hook execution budget (§3.3). The
-// value is generous because `jin hook` needs to reach the daemon socket and
-// wait for a response — the median case is <100 ms, but a transiently busy
+// hookTimeoutMillis is the Codex-side per-hook execution budget. The value
+// is generous because `jin hook` needs to reach the daemon socket and wait
+// for a response — the median case is <100 ms, but a transiently busy
 // daemon can push into the seconds.
 const hookTimeoutMillis = 10000
 

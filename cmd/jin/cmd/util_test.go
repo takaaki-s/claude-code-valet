@@ -13,7 +13,7 @@ import (
 // writers so tests can assert what tmux env writes would have occurred,
 // without spawning a real tmux server. err (when non-nil) is returned from
 // every SetEnvironment call to exercise the "non-tmux environment" swallow
-// path (V-014).
+// path.
 type fakeEnvWriter struct {
 	sets [][3]string // [session, name, value]
 	err  error

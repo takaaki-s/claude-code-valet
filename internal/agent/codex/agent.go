@@ -55,9 +55,9 @@ func (a *Agent) Kind() string { return "codex" }
 
 // Setup captures os.Executable() so SpawnCommand can wire the `-c` hook
 // payload back to `jin hook`. Unlike the Claude adapter, Setup writes no
-// files: Codex hooks are injected per-invocation on the command line
-// (02_design.md §3.3), so ~/.codex/hooks.json and config.toml both stay
-// untouched.
+// files: Codex hooks are injected per-invocation on the command line, so
+// ~/.codex/hooks.json and config.toml both stay untouched. See "Agent
+// Adapters" in docs/architecture.md for the design principle behind this.
 func (a *Agent) Setup(ctx agent.SetupContext) error {
 	a.setupOnce.Do(func() {
 		a.execPath = ctx.ExecPath

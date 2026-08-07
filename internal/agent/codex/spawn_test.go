@@ -12,8 +12,8 @@ const testExecPath = "/usr/local/bin/jin"
 
 func TestSpawnCommand_Fresh_IgnoresPreMintUUID(t *testing.T) {
 	// AgentSessionStarted=false is the fresh-spawn signal. Manager will
-	// have set AgentSessionID to a pre-mint UUID; §3.5 says we must NOT
-	// pass it through — Codex will refuse a nonexistent resume target,
+	// have set AgentSessionID to a pre-mint UUID, which must NOT be
+	// passed through — Codex will refuse a nonexistent resume target,
 	// and the correct UUID only becomes known after SessionStart writes
 	// back through the hook.
 	plan := SpawnCommand(agent.SpawnOptions{

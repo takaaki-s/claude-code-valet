@@ -608,11 +608,10 @@ func TestCheckJinCompat(t *testing.T) {
 
 // TestCheckV1OnMatcherReportedTwice pins the current behaviour where an
 // invalid v1 top-level `on:` matcher is reported by both checkOn (top) and
-// checkActionsOn (via the normalize-synthesized Actions[0].On). Design
-// consciously accepts this duplication for now (02_design.md §"実装設計 R3");
-// this test freezes the count so a future dedup can be detected as a
-// deliberate change rather than a silent regression. Adjust `want` when the
-// dedup lands.
+// checkActionsOn (via the normalize-synthesized Actions[0].On). The
+// duplication is accepted for now rather than deduped; this test freezes
+// the count so a future dedup can be detected as a deliberate change rather
+// than a silent regression. Adjust `want` when the dedup lands.
 //
 // Inlined YAML (rather than a shared fixture) so the count assertion stays
 // coupled to this test's assumptions: exactly one invalid matcher at top
