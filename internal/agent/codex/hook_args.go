@@ -3,6 +3,8 @@ package codex
 import (
 	"fmt"
 	"strings"
+
+	"github.com/takaaki-s/jind-ai/internal/agentdocs"
 )
 
 // managedEvents is the Codex hook event set jind-ai injects on every spawn.
@@ -16,6 +18,12 @@ var managedEvents = []string{
 	"PermissionRequest",
 	"Stop",
 }
+
+// sessionStartEvent names the one managed event whose hook command also asks
+// `jin hook` to print the agent-facing context. Kept as its own constant
+// rather than indexing managedEvents so reordering that slice cannot silently
+// move the flag onto a different event.
+const sessionStartEvent = "SessionStart"
 
 // hookTimeoutMillis is the Codex-side per-hook execution budget (§3.3). The
 // value is generous because `jin hook` needs to reach the daemon socket and
@@ -42,12 +50,20 @@ func HookArgs(execPath string) []string {
 	if execPath == "" {
 		return nil
 	}
+	// Escaped first, then handed to HookCommand: the flag it appends contains
+	// no character tomlEscapeForShell would have touched, so the command lands
+	// inside the TOML basic string without disturbing the nesting this value
+	// lives in (TOML string, inside shell quotes, inside Manager's own quoting).
+	//
+	// SessionStart alone carries the context flag — Codex adds that hook's
+	// additionalContext to the model's context, which is how a child learns
+	// `jin docs` exists. See agentdocs.HookCommand.
 	escaped := tomlEscapeForShell(execPath)
 	args := []string{"--enable", "hooks"}
 	for _, ev := range managedEvents {
 		val := fmt.Sprintf(
-			`hooks.%s=[{hooks=[{type="command",command="%s hook",timeout=%d}]}]`,
-			ev, escaped, hookTimeoutMillis,
+			`hooks.%s=[{hooks=[{type="command",command="%s",timeout=%d}]}]`,
+			ev, agentdocs.HookCommand(escaped, ev == sessionStartEvent), hookTimeoutMillis,
 		)
 		args = append(args, "-c", "'"+val+"'")
 	}

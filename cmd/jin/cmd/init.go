@@ -61,40 +61,69 @@ keybindings:
 #     my-plugin:    { width: 40, height: 20 }
 `
 
-var forceInit bool
+var (
+	forceInit    bool
+	initSkill    bool
+	initNoSkill  bool
+	initSkillDir string
+	initDryRun   bool
+)
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Initialize jin configuration",
-	Long: `Create the jin configuration directory and a default config.yaml.
+	Short: "Initialize jin configuration and optionally install the agent skill",
+	Long: `Create the jin configuration directory and a default config.yaml, then
+offer to install the jin skill for the agents found on your PATH.
 
-If config.yaml already exists, this command does nothing unless --force is specified.`,
+If config.yaml already exists it is left alone unless --force is given; the
+skill step still runs, so an existing install can pick it up.
+
+The skill is a short document that teaches an agent to drive jin by reading
+'jin docs'. It is shown in full before anything is written, and installing it
+is opt-in: the prompt defaults to no, existing files are never replaced without
+--force, and nothing is written at all when stdin is not a terminal.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		out := cmd.OutOrStdout()
 		configDir := getConfigDir()
 		configFile := filepath.Join(configDir, "config.yaml")
 
-		if err := os.MkdirAll(configDir, 0755); err != nil {
-			return fmt.Errorf("failed to create config directory: %w", err)
-		}
-
-		if !forceInit {
-			if _, err := os.Stat(configFile); err == nil {
-				fmt.Printf("Config already exists: %s\n", configFile)
-				fmt.Println("Use --force to overwrite.")
-				return nil
+		switch {
+		case !forceInit && fileExists(configFile):
+			fmt.Fprintf(out, "Config already exists: %s\n", configFile)
+			fmt.Fprintln(out, "Use --force to overwrite.")
+		case initDryRun:
+			// Checked before MkdirAll, not after: "would create" has to mean
+			// the filesystem is left untouched, parent directories included.
+			fmt.Fprintf(out, "--dry-run: would create %s\n", configFile)
+		default:
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				return fmt.Errorf("failed to create config directory: %w", err)
 			}
+			if err := os.WriteFile(configFile, []byte(configTemplate), 0644); err != nil {
+				return fmt.Errorf("failed to write config: %w", err)
+			}
+			fmt.Fprintf(out, "Created: %s\n", configFile)
 		}
 
-		if err := os.WriteFile(configFile, []byte(configTemplate), 0644); err != nil {
-			return fmt.Errorf("failed to write config: %w", err)
-		}
-
-		fmt.Printf("Created: %s\n", configFile)
-		return nil
+		// An existing config used to end the command here. The skill step runs
+		// regardless now, because the two are independent: someone who has run
+		// jin for months has a config.yaml and no skill, and they are exactly
+		// who this offer is for.
+		return runSkillStep(cmd)
 	},
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func init() {
 	rootCmd.AddCommand(initCmd)
-	initCmd.Flags().BoolVar(&forceInit, "force", false, "Overwrite existing config.yaml")
+	initCmd.Flags().BoolVar(&forceInit, "force", false, "Overwrite an existing config.yaml, and allow replacing an existing skill")
+	initCmd.Flags().BoolVar(&initSkill, "skill", false, "Install the agent skill without asking (works when stdin is not a terminal)")
+	initCmd.Flags().BoolVar(&initNoSkill, "no-skill", false, "Skip the agent skill entirely")
+	initCmd.Flags().StringVar(&initSkillDir, "skill-dir", "", "Install the skill into this directory instead of the per-agent defaults")
+	initCmd.Flags().BoolVar(&initDryRun, "dry-run", false, "Show what would be written without writing anything")
+	initCmd.MarkFlagsMutuallyExclusive("skill", "no-skill")
 }

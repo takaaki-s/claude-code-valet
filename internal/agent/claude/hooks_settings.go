@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/takaaki-s/jind-ai/internal/agentdocs"
 )
 
 // hooksEntry is a single hook command entry — one row inside a matcher's
@@ -38,7 +40,7 @@ type hooksSettings struct {
 func EnsureHooksSettingsFile(stateDir, execPath string) (string, error) {
 	entry := hooksEntry{
 		Type:    "command",
-		Command: execPath + " hook",
+		Command: agentdocs.HookCommand(execPath, false),
 		// Claude Code kills the hook child at this many seconds, so this is the
 		// real ceiling on what a wedged daemon costs a Claude session. Keep it
 		// in step with the two other layers that bound the same exchange: the
@@ -46,6 +48,13 @@ func EnsureHooksSettingsFile(stateDir, execPath string) (string, error) {
 		// Codex per-hook budget (codex.hookTimeoutMillis, 10000ms).
 		Timeout: 10,
 	}
+	// SessionStart is the one event whose hook also writes to stdout: Claude
+	// Code adds that stdout to the session's context, which is how a child
+	// learns `jin docs` exists. See agentdocs.HookCommand for why the flag,
+	// rather than the event name, is what gates the output.
+	contextEntry := entry
+	contextEntry.Command = agentdocs.HookCommand(execPath, true)
+
 	settings := hooksSettings{
 		Hooks: map[string][]hooksMatcher{
 			"UserPromptSubmit": {{Hooks: []hooksEntry{entry}}},
@@ -53,7 +62,7 @@ func EnsureHooksSettingsFile(stateDir, execPath string) (string, error) {
 			"StopFailure":      {{Hooks: []hooksEntry{entry}}},
 			"PostToolUse":      {{Hooks: []hooksEntry{entry}}},
 			"CwdChanged":       {{Hooks: []hooksEntry{entry}}},
-			"SessionStart":     {{Hooks: []hooksEntry{entry}}},
+			"SessionStart":     {{Hooks: []hooksEntry{contextEntry}}},
 			"SessionEnd":       {{Hooks: []hooksEntry{entry}}},
 			"Notification": {{
 				Matcher: "permission_prompt|elicitation_dialog|idle_prompt",

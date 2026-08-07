@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
+	"github.com/takaaki-s/jind-ai/internal/agentdocs"
 )
 
 func TestWritePlugin_Layout(t *testing.T) {
@@ -319,5 +321,168 @@ func TestPluginTmpPattern_StaysOutsideOpencodeGlob(t *testing.T) {
 			t.Errorf("pluginTmpPattern %q produced %s, which opencode's %q glob would import",
 				pluginTmpPattern, filepath.Base(matches[0]), glob)
 		}
+	}
+}
+
+func TestWriteAgentContext_Layout(t *testing.T) {
+	stateDir := t.TempDir()
+	configDir, err := WritePlugin(stateDir, "/usr/local/bin/jin")
+	if err != nil {
+		t.Fatalf("WritePlugin: %v", err)
+	}
+	if err := WriteAgentContext(configDir); err != nil {
+		t.Fatalf("WriteAgentContext: %v", err)
+	}
+
+	// Both files sit directly in OPENCODE_CONFIG_DIR: opencode reads
+	// opencode.json from there because the directory is on its config search
+	// path, and the markdown is named from inside that config.
+	contextPath := filepath.Join(configDir, contextFileName)
+	body, err := os.ReadFile(contextPath)
+	if err != nil {
+		t.Fatalf("context file not written: %v", err)
+	}
+	if string(body) != agentdocs.Context() {
+		t.Error("context file does not match agentdocs.Context()")
+	}
+
+	data, err := os.ReadFile(filepath.Join(configDir, configFileName))
+	if err != nil {
+		t.Fatalf("config not written: %v", err)
+	}
+	var cfg openCodeConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("config is not valid JSON (%v): %s", err, data)
+	}
+	if len(cfg.Instructions) != 1 {
+		t.Fatalf("instructions = %v, want exactly one entry", cfg.Instructions)
+	}
+	if cfg.Instructions[0] != contextPath {
+		t.Errorf("instructions[0] = %q, want %q", cfg.Instructions[0], contextPath)
+	}
+	// opencode resolves instruction paths against a directory this package
+	// does not choose, so a relative entry could silently point nowhere.
+	if !filepath.IsAbs(cfg.Instructions[0]) {
+		t.Errorf("instructions entry is not absolute: %q", cfg.Instructions[0])
+	}
+	if _, err := os.Stat(cfg.Instructions[0]); err != nil {
+		t.Errorf("instructions entry does not exist: %v", err)
+	}
+}
+
+// TestWriteAgentContext_ConfigCarriesNothingElse keeps the contributed config
+// minimal. opencode merges every config on its search path, and `instructions`
+// is specifically unioned rather than replaced — any other field jind-ai wrote
+// here could override a setting the user made deliberately.
+func TestWriteAgentContext_ConfigCarriesNothingElse(t *testing.T) {
+	configDir := t.TempDir()
+	if err := WriteAgentContext(configDir); err != nil {
+		t.Fatalf("WriteAgentContext: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(configDir, configFileName))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("config is not valid JSON: %v", err)
+	}
+	if len(raw) != 1 {
+		t.Errorf("config has %d keys (%v), want only \"instructions\"", len(raw), raw)
+	}
+	if _, ok := raw["instructions"]; !ok {
+		t.Errorf("config has no instructions key: %v", raw)
+	}
+}
+
+func TestWriteAgentContext_RewritesOnEveryCall(t *testing.T) {
+	configDir := t.TempDir()
+	if err := WriteAgentContext(configDir); err != nil {
+		t.Fatalf("WriteAgentContext: %v", err)
+	}
+
+	// A user (or a stray process) truncating the file must not leave the
+	// session permanently without context.
+	contextPath := filepath.Join(configDir, contextFileName)
+	if err := os.WriteFile(contextPath, nil, 0o644); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if err := WriteAgentContext(configDir); err != nil {
+		t.Fatalf("second WriteAgentContext: %v", err)
+	}
+	body, err := os.ReadFile(contextPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(body) != agentdocs.Context() {
+		t.Error("context file was not restored")
+	}
+}
+
+func TestWriteAgentContext_RejectsEmptyDir(t *testing.T) {
+	if err := WriteAgentContext(""); err == nil {
+		t.Error("WriteAgentContext(\"\") returned no error")
+	}
+}
+
+func TestAgent_Setup_WritesAgentContext(t *testing.T) {
+	stateDir := t.TempDir()
+	a := New()
+	if err := a.Setup(agent.SetupContext{StateDir: stateDir, ExecPath: "/usr/local/bin/jin"}); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	configDir := filepath.Join(stateDir, "opencode")
+	for _, name := range []string{contextFileName, configFileName} {
+		if _, err := os.Stat(filepath.Join(configDir, name)); err != nil {
+			t.Errorf("Setup did not write %s: %v", name, err)
+		}
+	}
+}
+
+// TestAgentContextTmpPatterns_StayOutsideOpencodeReads is the counterpart to
+// TestPluginTmpPattern_StaysOutsideOpencodeGlob. A temp file left behind by a
+// crash must not be mistaken for one of opencode's own files: the config names
+// are exact, so the risk is a pattern that could produce one of them.
+func TestAgentContextTmpPatterns_StayOutsideOpencodeReads(t *testing.T) {
+	for _, pattern := range []string{contextTmpPattern, configTmpPattern} {
+		if !strings.HasPrefix(pattern, ".") {
+			t.Errorf("%q does not start with a dot", pattern)
+		}
+		if !strings.HasSuffix(pattern, ".tmp") {
+			t.Errorf("%q does not end in .tmp", pattern)
+		}
+		for _, read := range []string{"opencode.json", "opencode.jsonc"} {
+			if strings.HasPrefix(pattern, strings.TrimSuffix(read, filepath.Ext(read))) {
+				t.Errorf("%q could collide with %q", pattern, read)
+			}
+		}
+	}
+	if contextTmpPattern == configTmpPattern {
+		t.Error("the two temp patterns are identical; concurrent writes could race on the same name")
+	}
+}
+
+// TestWriteAgentContext_WriteOrder pins the ordering the doc comment states:
+// the markdown lands before the config that names it, so opencode reading the
+// directory mid-write never sees an instructions entry pointing at nothing.
+//
+// A comment cannot enforce that — a refactor could swap the two writes and the
+// suite would stay green. Occupying the markdown's path with a directory makes
+// its write fail (atomicfile's rename cannot replace a directory), so the
+// config must be absent afterwards. Reverse the order and opencode.json
+// survives, which fails here.
+func TestWriteAgentContext_WriteOrder(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(configDir, contextFileName), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if err := WriteAgentContext(configDir); err == nil {
+		t.Fatal("expected an error when the context file cannot be written")
+	}
+	if _, err := os.Stat(filepath.Join(configDir, configFileName)); err == nil {
+		t.Error("opencode.json was written even though the file its instructions name could not be")
 	}
 }
