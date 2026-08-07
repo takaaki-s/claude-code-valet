@@ -161,7 +161,7 @@ Session states are detected via Claude Code [hooks](https://docs.anthropic.com/e
 | `permission` | ? | `Notification` hook | Awaiting permission |
 | `running` | ▶ | Internal | Running |
 | `creating` | + | Internal | Creating (CC starting up) |
-| `idle` | ○ | `Stop` hook | Waiting for input |
+| `idle` | ○ | `Stop` hook, or a 30s no-hook fallback | Waiting for input |
 | `stopped` | ■ | Process death detection | Stopped |
 
 ## CLI Commands
@@ -200,7 +200,7 @@ jin session send <session-name> "your prompt here"
 
 # Wait for a session to become idle (default timeout: 300s)
 jin session wait <session-name>
-jin session wait <session-name> --timeout 60
+jin session wait <session-name> --timeout 600
 
 # Get the last assistant message
 jin session output <session-name>

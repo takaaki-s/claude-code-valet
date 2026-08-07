@@ -140,7 +140,7 @@ TUI 内で `n` キーを押してセッション作成、`Enter` でアタッチ
 | `permission` | ? | `Notification` hook | 許可待ち |
 | `running` | ▶ | 内部設定 | 実行中 |
 | `creating` | + | 内部設定 | 作成中（CC起動中） |
-| `idle` | ○ | `Stop` hook | 入力待ち |
+| `idle` | ○ | `Stop` hook / 30秒間 hook が来なければ fallback | 入力待ち |
 | `stopped` | ■ | プロセス死亡検知 | 停止済み |
 
 ## CLI コマンド
@@ -179,7 +179,7 @@ jin session send <session-name> "プロンプト"
 
 # セッションが idle になるまで待機（デフォルトタイムアウト: 300秒）
 jin session wait <session-name>
-jin session wait <session-name> --timeout 60
+jin session wait <session-name> --timeout 600
 
 # 最後のアシスタントメッセージを取得
 jin session output <session-name>

@@ -14,7 +14,7 @@ rather than on the message text — messages get reworded, codes do not.
 | 1 | GeneralError | Anything without a code of its own | Read the message |
 | 2 | SessionNotFound | No session matched the selector | `jin session list --json` and re-check the selector |
 | 3 | DaemonNotRunning | Reserved — **not currently emitted**, see below | — |
-| 4 | Timeout | `session wait` hit its `--timeout` | The child is still working; wait again or escalate |
+| 4 | Timeout | `session wait` or `send --wait-running` hit its timeout | From `wait`: the child is still working — wait again or escalate. From `send`: nothing confirms the child took the prompt — attach and look, do not resend |
 | 5 | WorktreeDirty | A git worktree has uncommitted changes | Commit, stash, or drop the changes |
 | 6 | AmbiguousSelector | The selector matched more than one session | Narrow it — see the `selectors` doc |
 
@@ -47,6 +47,11 @@ esac
 Code 4 from `wait` deserves attention: it means the child did not settle in
 time, not that anything broke. Waiting again is often right. Killing the
 session on a timeout throws away work in progress.
+
+Code 4 from `send --wait-running` means the opposite: the child did *not*
+start on the prompt within the window. The text was verified in its input
+buffer and Enter was sent, but nothing confirms the child took it — attach
+and look instead of resending blind.
 
 ## Errors under --json
 

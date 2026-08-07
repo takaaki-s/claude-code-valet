@@ -29,7 +29,7 @@ jin session new --workdir ~/repos/myapp -d fix-login --json
 
 # 2. Wait for it to come up. `new` returns immediately with status
 #    `creating`; `send` refuses anything that is not `idle`.
-jin session wait fix-login --status idle --timeout 60
+jin session wait fix-login --status idle
 
 # 3. Send work. `prompt` is an alias for `send`.
 jin session send fix-login "run go test ./... and fix what fails"
@@ -57,8 +57,9 @@ jin session delete fix-login
 Skipping the wait is therefore a race you sometimes lose, with
 `session is not idle (current status: creating)`.
 
-Only the *first* send needs it. After `wait --until idle,permission` returns
-idle, the session is ready by definition.
+Later sends are covered by step 4's wait, but only when it comes back `idle`:
+`--until idle,permission` returns on either, and `send` refuses everything but
+`idle`. Check the status you got before sending again.
 
 Once the session is idle, `send` handles the rest itself: it verifies the
 prompt actually reached the input buffer, retrying while the TUI settles,
@@ -95,6 +96,7 @@ what came after it, with no duplicates.
 
 ```bash
 T1=$(jin session result work --json | jq -r '.entries[-1].timestamp')
+# only when the previous wait came back idle, not permission
 jin session send work "now also run go vet"
 jin session wait work --until idle,permission
 jin session result work --since "$T1" --json
@@ -114,6 +116,7 @@ check `git diff` and run the tests yourself. If the work is short of the bar,
 send a correction to the *same* session — it still has the context:
 
 ```bash
+# only when the previous wait came back idle, not permission
 jin session send fix-login "the test still fails on line 42; fix that too"
 jin session wait fix-login --until idle,permission
 ```
@@ -130,7 +133,7 @@ for d in api web worker; do
   jin session new --workdir ~/repos/$d -d "task-$d" --json
 done
 for d in api web worker; do
-  jin session wait "task-$d" --status idle --timeout 60
+  jin session wait "task-$d" --status idle
   jin session send "task-$d" "..."
 done
 for d in api web worker; do

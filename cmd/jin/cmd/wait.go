@@ -19,12 +19,15 @@ import (
 var waitCmd = &cobra.Command{
 	Use:   "wait <selector>",
 	Short: "Wait for a session to reach a specific status",
-	Long: `Wait for a Claude Code session to reach one of the target statuses.
+	Long: `Wait for an agent session to reach one of the target statuses.
 Polls the session status every 2 seconds until a target is reached or timeout occurs.
 The selector may be an ID prefix or a description substring (case-insensitive).
 
 By default, waits for "idle". Pass --until to wait for any of several statuses
-(useful for orchestration where "permission" is also an acceptable terminal state).
+(useful for orchestration where "permission" is also an acceptable terminal
+state). That pair is for waiting on a turn to end; before any "jin session
+send" use --status idle, since send accepts only idle — a wait that ended on
+"permission" is not ready for one.
 
 Examples:
   jin session wait my-session --status idle --timeout 300

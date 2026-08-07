@@ -48,12 +48,17 @@ Wait first:
 
 ```bash
 jin session new --workdir . -d work --json
-jin session wait work --status idle --timeout 60
+jin session wait work --status idle
 jin session send work "..."
 ```
 
-Later sends, after `wait --until idle,permission`, need no extra wait — the
-session is already idle by definition.
+A fresh session commonly needs tens of seconds to reach `idle`. Leave the
+wait's 300s default alone rather than trimming it to what you measured: a
+hook arriving late in startup restarts the clock behind it.
+
+Later sends are covered by the `wait --until idle,permission` you run after
+each turn, but only when it comes back `idle` — `send` refuses everything
+else. When it comes back `permission`, do not send at all: see below.
 
 ## `permission` is a terminal state, and it needs a human
 
@@ -104,8 +109,14 @@ pressing Enter, so a large prompt takes measurably longer to return. That is
 the verification working, not a hang — the retry budget scales with prompt
 size.
 
-If `send` does return an error, the prompt did **not** land — re-send rather
-than assuming partial delivery.
+If `send` fails while verifying, the prompt did **not** land — re-send rather
+than assuming partial delivery. If it fails after that (a `--wait-running`
+timeout, or the session stopping), the text was verified in the input buffer
+and Enter was sent: attach and look before you resend.
+
+One failure tells you neither, and it says so. An error carrying
+`its outcome is unknown` is the client giving up on a daemon that may still
+be working. Do not re-send on it — attach and look.
 
 ## Whitespace-only prompts are rejected
 
