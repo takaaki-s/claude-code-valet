@@ -20,6 +20,12 @@ const (
 	fixtureTaskError  = "testdata/rollout-task-error.jsonl"
 )
 
+// newTranscriptReader builds a TranscriptReader whose Locator resolves home
+// the same way NewLocator does (CODEX_HOME override honoured).
+func newTranscriptReader(home string) *TranscriptReader {
+	return NewTranscriptReader(NewLocator(home))
+}
+
 // entriesFrom parses a fixture through the same code path ReadEntries uses,
 // skipping only the on-disk lookup.
 func entriesFrom(t *testing.T, path, since string) []transcript.Entry {
@@ -435,7 +441,7 @@ func TestReadEntries_BrokenLinesAndEmptyFile(t *testing.T) {
 func TestTranscriptReader_MissingRolloutIsEmptyNotAnError(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
-	r := NewTranscriptReader(home)
+	r := newTranscriptReader(home)
 
 	for _, id := range []string{"", "01900000-0000-7000-8000-00000000dead"} {
 		got, err := r.ReadEntries("/tmp/example", id, "")
@@ -455,7 +461,7 @@ func TestTranscriptReader_ReadsStagedRollout(t *testing.T) {
 	const uuid = "01900000-0000-7000-8000-0000000000e2"
 	stageRollout(t, filepath.Join(codexHome, "sessions"), "2026/07/11", uuid, fixtureGrouping)
 
-	r := NewTranscriptReader(home)
+	r := newTranscriptReader(home)
 	// workDir is deliberately wrong: Codex locates a rollout by UUID alone, so
 	// the hint must not be able to hide a transcript that exists.
 	got, err := r.ReadEntries("/nowhere/at/all", uuid, "")
@@ -540,7 +546,7 @@ func TestTranscriptReader_OpenFailureIsNotSilentlyEmpty(t *testing.T) {
 	if err := os.Symlink(name, name); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	got, err := NewTranscriptReader(home).ReadEntries("", uuid, "")
+	got, err := newTranscriptReader(home).ReadEntries("", uuid, "")
 	if err == nil {
 		t.Fatalf("os.Open failure: err = nil with %d entries; an unopenable rollout must not answer empty", len(got))
 	}
@@ -556,7 +562,7 @@ func TestTranscriptReader_OpenFailureIsNotSilentlyEmpty(t *testing.T) {
 	if err := os.Mkdir(name, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if got, err := NewTranscriptReader(home).ReadEntries("", uuid, ""); err == nil {
+	if got, err := newTranscriptReader(home).ReadEntries("", uuid, ""); err == nil {
 		t.Fatalf("read failure: err = nil with %d entries", len(got))
 	}
 }

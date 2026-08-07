@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -116,6 +117,163 @@ func TestLocator_Find_MultipleHits_NewestWins(t *testing.T) {
 	}
 	if got != newer {
 		t.Errorf("Find = %q, want %q (newest by mtime)", got, newer)
+	}
+}
+
+func TestLocator_Find_CacheHitSkipsGlob(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", root)
+	staged := stageRollout(t, filepath.Join(root, "sessions"), "2026/07/11", basicUUID, fixtureBasic)
+
+	loc := NewLocator("")
+	if got, ok := loc.Find(basicUUID); !ok || got != staged {
+		t.Fatalf("first Find = (%q, %v), want (%q, true)", got, ok, staged)
+	}
+
+	// Break the glob: SessionsDir now points somewhere with nothing staged.
+	// A cache hit must not need it — only a fresh glob would.
+	loc.SessionsDir = t.TempDir()
+
+	got, ok := loc.Find(basicUUID)
+	if !ok || got != staged {
+		t.Errorf("cached Find = (%q, %v), want (%q, true) — a cache hit must not depend on SessionsDir being glob-able", got, ok, staged)
+	}
+}
+
+func TestLocator_Find_MissIsNotCached(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", root)
+	loc := NewLocator("")
+
+	if got, ok := loc.Find(basicUUID); ok {
+		t.Fatalf("Find on empty sessions dir = (%q, true), want false", got)
+	}
+
+	staged := stageRollout(t, filepath.Join(root, "sessions"), "2026/07/11", basicUUID, fixtureBasic)
+	got, ok := loc.Find(basicUUID)
+	if !ok || got != staged {
+		t.Errorf("Find after file appears = (%q, %v), want (%q, true) — a prior miss must not be cached", got, ok, staged)
+	}
+}
+
+func TestLocator_Find_EvictsMissingCachedFile(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", root)
+	staged := stageRollout(t, filepath.Join(root, "sessions"), "2026/07/11", basicUUID, fixtureBasic)
+	loc := NewLocator("")
+
+	if _, ok := loc.Find(basicUUID); !ok {
+		t.Fatalf("first Find = false, want true")
+	}
+	if err := os.Remove(staged); err != nil {
+		t.Fatalf("remove staged file: %v", err)
+	}
+	if got, ok := loc.Find(basicUUID); ok {
+		t.Errorf("Find after the cached file was removed = (%q, true), want false", got)
+	}
+}
+
+func TestLocator_Find_EvictedEntryFindsRelocatedFile(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", root)
+	sessions := filepath.Join(root, "sessions")
+	staged := stageRollout(t, sessions, "2026/07/11", basicUUID, fixtureBasic)
+	loc := NewLocator("")
+
+	if _, ok := loc.Find(basicUUID); !ok {
+		t.Fatalf("first Find = false, want true")
+	}
+	if err := os.Remove(staged); err != nil {
+		t.Fatalf("remove staged file: %v", err)
+	}
+	relocated := stageRollout(t, sessions, "2026/07/12", basicUUID, fixtureBasic)
+
+	got, ok := loc.Find(basicUUID)
+	if !ok || got != relocated {
+		t.Errorf("Find after relocation = (%q, %v), want (%q, true)", got, ok, relocated)
+	}
+}
+
+// TestLocator_Find_StaleCacheSurvivesUntilInvalidated demonstrates the
+// residual risk Find's doc comment and Agent.SpawnCommand's invalidate call
+// exist for: a cache hit is validated only by "does this path still exist",
+// so a second file appearing elsewhere for the same uuid is invisible to
+// Find until the cache is explicitly evicted.
+func TestLocator_Find_StaleCacheSurvivesUntilInvalidated(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", root)
+	sessions := filepath.Join(root, "sessions")
+	staged := stageRollout(t, sessions, "2026/07/11", basicUUID, fixtureBasic)
+	loc := NewLocator("")
+
+	if got, ok := loc.Find(basicUUID); !ok || got != staged {
+		t.Fatalf("first Find = (%q, %v), want (%q, true)", got, ok, staged)
+	}
+
+	relocated := stageRollout(t, sessions, "2026/07/12", basicUUID, fixtureBasic)
+
+	if got, ok := loc.Find(basicUUID); !ok || got != staged {
+		t.Errorf("Find before invalidate = (%q, %v), want the stale cached path (%q, true)", got, ok, staged)
+	}
+
+	loc.invalidate(basicUUID)
+
+	// Force the relocated file to be the newer one so the final assertion
+	// is deterministic rather than depending on filesystem mtime granularity.
+	now := time.Now()
+	if err := os.Chtimes(staged, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatalf("chtimes staged: %v", err)
+	}
+	if err := os.Chtimes(relocated, now, now); err != nil {
+		t.Fatalf("chtimes relocated: %v", err)
+	}
+
+	got, ok := loc.Find(basicUUID)
+	if !ok || got != relocated {
+		t.Errorf("Find after invalidate = (%q, %v), want (%q, true)", got, ok, relocated)
+	}
+}
+
+func TestLocator_Invalidate_MissingUUIDIsNoop(t *testing.T) {
+	loc := NewLocator("")
+	loc.invalidate(basicUUID) // must not panic on an empty/nil cache
+}
+
+func TestLocator_Invalidate_NilReceiver(t *testing.T) {
+	var loc *Locator
+	loc.invalidate(basicUUID) // must not panic
+}
+
+func TestLocator_Find_ConcurrentFindAndInvalidate(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", root)
+	sessions := filepath.Join(root, "sessions")
+	stageRollout(t, sessions, "2026/07/11", basicUUID, fixtureBasic)
+	loc := NewLocator("")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				loc.Find(basicUUID)
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				loc.invalidate(basicUUID)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if _, ok := loc.Find(basicUUID); !ok {
+		t.Error("Find after concurrent Find/invalidate = false, want true")
 	}
 }
 

@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // scannerMaxLine caps a single rollout line at 16 MiB, matching
@@ -44,11 +46,15 @@ type Meta struct {
 
 // Locator resolves a Codex session UUID to its rollout JSONL path on disk.
 // The Codex CLI shards rollouts by date (`<sessionsDir>/YYYY/MM/DD/rollout-*-<UUID>.jsonl`),
-// so a UUID lookup requires a glob across every day shard.
+// so a UUID lookup requires a glob across every day shard — unless a prior
+// Find already resolved it; see the cache field below.
 type Locator struct {
 	// SessionsDir is the absolute path to `~/.codex/sessions` (or the value
 	// of the CODEX_HOME/sessions override — see NewLocator).
 	SessionsDir string
+
+	mu    sync.Mutex
+	cache map[string]string // session UUID -> resolved rollout path
 }
 
 // NewLocator returns a Locator whose SessionsDir honours the same precedence
@@ -70,14 +76,89 @@ func NewLocator(home string) *Locator {
 // uuid, together with ok=true. Returns ("", false) when uuid is empty, when
 // the glob does not match, or when the glob fails.
 //
-// The glob spans every day shard because jind-ai does not know when the
-// session was originally created — a resume may happen many days later. When
-// several files match (theoretically impossible, but real filesystems have
-// clocks that go backwards), the newest one by mtime wins.
+// A resolved uuid is cached, since a caller that already knows the answer
+// asks again routinely: `jin session result --since` polls the same session
+// repeatedly, and DescriptionEnhancer retries on every hook until it
+// succeeds. A cache hit is re-verified with a single os.Stat before being
+// trusted, so a file that was deleted or moved out from under a stale entry
+// falls back to a fresh glob instead of handing back a dead path. A miss is
+// never cached — nothing here distinguishes "not written yet" (the rollout
+// appears moments after SessionStart) from "never will be", and caching the
+// former would make it permanent.
+//
+// The glob itself still spans every day shard because jind-ai does not know
+// when the session was originally created — a resume may happen many days
+// later. When several files match (theoretically impossible, but real
+// filesystems have clocks that go backwards), the newest one by mtime wins.
+//
+// The cache assumes one uuid maps to one file for the life of the process,
+// which is what the glob above already assumes (multiple real matches are
+// "theoretically impossible"). Whether `codex resume <UUID>` can retarget a
+// UUID onto a different rollout file is unverified — jind-ai itself issues
+// that command (see Agent.SpawnCommand), and evicts the cache entry first so
+// a Find made after the resume re-globs instead of trusting a pre-resume
+// answer. That eviction happens before the resumed process starts, so a
+// narrow window remains: a concurrent Find landing between the eviction and
+// the resumed file actually existing would re-cache the pre-resume path,
+// which then survives (its stat still succeeds) until the next resume. This
+// is accepted rather than closed, since it is a race around a Codex behaviour
+// that is not even confirmed to happen.
 func (l *Locator) Find(uuid string) (string, bool) {
 	if uuid == "" || l == nil || l.SessionsDir == "" {
 		return "", false
 	}
+	if path, ok := l.cached(uuid); ok {
+		return path, true
+	}
+	path, ok := l.glob(uuid)
+	if ok {
+		l.remember(uuid, path)
+	}
+	return path, ok
+}
+
+// cached returns uuid's memoized path, verifying with os.Stat that it still
+// exists before handing it back. A hit that fails the stat is evicted so the
+// caller falls through to a fresh glob instead of a path that resolves to
+// nothing.
+func (l *Locator) cached(uuid string) (string, bool) {
+	l.mu.Lock()
+	path, ok := l.cache[uuid]
+	l.mu.Unlock()
+	if !ok {
+		return "", false
+	}
+	if _, err := os.Stat(path); err != nil {
+		l.invalidate(uuid)
+		return "", false
+	}
+	return path, true
+}
+
+// remember stores uuid's resolved path for future Find calls.
+func (l *Locator) remember(uuid, path string) {
+	l.mu.Lock()
+	if l.cache == nil {
+		l.cache = make(map[string]string)
+	}
+	l.cache[uuid] = path
+	l.mu.Unlock()
+}
+
+// invalidate evicts uuid's cached path, if any. A miss is a no-op. See
+// Agent.SpawnCommand for the one caller jind-ai has today.
+func (l *Locator) invalidate(uuid string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	delete(l.cache, uuid)
+	l.mu.Unlock()
+}
+
+// glob performs the day-shard search Find falls back to on a cache miss —
+// unconditionally what Find used to do before caching was added.
+func (l *Locator) glob(uuid string) (string, bool) {
 	pattern := filepath.Join(l.SessionsDir, "*", "*", "*", "rollout-*-"+uuid+".jsonl")
 	matches, err := filepath.Glob(pattern)
 	if err != nil || len(matches) == 0 {
@@ -86,17 +167,38 @@ func (l *Locator) Find(uuid string) (string, bool) {
 	if len(matches) == 1 {
 		return matches[0], true
 	}
-	sort.SliceStable(matches, func(i, j int) bool {
-		si, err1 := os.Stat(matches[i])
-		sj, err2 := os.Stat(matches[j])
-		if err1 != nil || err2 != nil {
+	return newestMatch(matches), true
+}
+
+// newestMatch returns the match with the most recent mtime. Each candidate is
+// stat'd exactly once up front (decorate-sort-undecorate) rather than inside
+// the sort comparator, which would stat it once per comparison — O(n log n)
+// stats for n matches instead of O(n). This branch is rare (see Find's doc
+// comment), but there is no reason to pay more than one stat per file when it
+// does run.
+func newestMatch(matches []string) string {
+	type stamped struct {
+		path string
+		mod  time.Time
+		ok   bool
+	}
+	decorated := make([]stamped, len(matches))
+	for i, m := range matches {
+		info, err := os.Stat(m)
+		decorated[i] = stamped{path: m, ok: err == nil}
+		if err == nil {
+			decorated[i].mod = info.ModTime()
+		}
+	}
+	sort.SliceStable(decorated, func(i, j int) bool {
+		if !decorated[i].ok || !decorated[j].ok {
 			// A stat failure shouldn't ever happen for a glob hit, but if it
 			// does, fall back to lexical order so behaviour stays defined.
-			return matches[i] < matches[j]
+			return decorated[i].path < decorated[j].path
 		}
-		return si.ModTime().After(sj.ModTime())
+		return decorated[i].mod.After(decorated[j].mod)
 	})
-	return matches[0], true
+	return decorated[0].path
 }
 
 // rolloutRow is the union of every rollout line shape the parser inspects.

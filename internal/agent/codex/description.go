@@ -23,15 +23,17 @@ const descriptionMaxBytes = 60
 // new dependency (see f0.3-codex-runtime-notes.md for the investigation).
 //
 // The enhancer holds a Locator so it can be built once at Agent construction
-// and reused for every TryGenerate call. Safe for concurrent use.
+// and reused for every TryGenerate call. Safe for concurrent use. Agent hands
+// it the same Locator instance used by the TranscriptReader it builds for
+// Transcript(), so a path either one resolves is cached for both.
 type DescriptionEnhancer struct {
 	locator *Locator
 }
 
-// NewDescriptionEnhancer returns an enhancer whose Locator honours the same
-// CODEX_HOME / ~/.codex precedence NewLocator does.
-func NewDescriptionEnhancer(home string) *DescriptionEnhancer {
-	return &DescriptionEnhancer{locator: NewLocator(home)}
+// NewDescriptionEnhancer returns an enhancer that resolves rollouts through
+// loc.
+func NewDescriptionEnhancer(loc *Locator) *DescriptionEnhancer {
+	return &DescriptionEnhancer{locator: loc}
 }
 
 // TryGenerate implements session.DescriptionEnhancer.
