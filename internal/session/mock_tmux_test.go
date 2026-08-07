@@ -14,6 +14,13 @@ type mockCall struct {
 	args   []string
 }
 
+// captureFailure makes one CapturePane call fail. nth is 1-based over the
+// calls for a single target.
+type captureFailure struct {
+	nth int
+	err error
+}
+
 // mockTmuxRunner is a test double for tmux.Runner.
 // Configure the maps before calling Manager methods, then inspect calls afterwards.
 //
@@ -58,6 +65,16 @@ type mockTmuxRunner struct {
 	// calls without relying on capturedSequence consumption.
 	captureCallCount map[string]int
 
+	// captureErrAtCall fails one specific CapturePane call (1-based) on a
+	// target. captureErrAfter cannot express this: it fires from the second
+	// call onward, so it takes out the verify loop's "after" capture before
+	// a later one is ever reached. The post-dismiss re-capture is exactly
+	// such a later call.
+	//
+	// One map, not two: split across a count map and an error map, setting
+	// only one half would leave the injection silently inert.
+	captureErrAtCall map[string]captureFailure
+
 	// sendKeysLiteralErr injects an error for SendKeysLiteral on a given
 	// target. Used by SendPrompt tests to simulate a tmux write failure
 	// during the prompt-injection phase.
@@ -73,6 +90,15 @@ type mockTmuxRunner struct {
 	// test can assert the gap SendPrompt leaves between chunks without
 	// timing the call from the outside.
 	sendKeysLiteralTimes map[string][]time.Time
+
+	// sendKeysTimes and captureTimes do the same for the two calls that
+	// bracket the post-dismiss settle. A delay is otherwise invisible to
+	// this mock — it advances its recorded pane content by call count, not
+	// by time — so removing the sleep would leave every ordering and content
+	// assertion satisfied while the re-check read a pane that had not
+	// repainted yet.
+	sendKeysTimes map[string][]time.Time
+	captureTimes  map[string][]time.Time
 
 	// loadedBuffers records what the paste transport handed over, so a test
 	// can assert the prompt went across whole. Call COUNTS come from the
@@ -141,6 +167,7 @@ func newMockTmuxRunner() *mockTmuxRunner {
 		captureErr:         make(map[string]error),
 		captureErrAfter:    make(map[string]error),
 		captureCallCount:   make(map[string]int),
+		captureErrAtCall:   make(map[string]captureFailure),
 		sendKeysLiteralErr: make(map[string]error),
 		sendKeysErr:        make(map[string]error),
 		terminateErr:       make(map[string]error),
@@ -148,6 +175,8 @@ func newMockTmuxRunner() *mockTmuxRunner {
 
 		sendKeysLiteralErrAfterN: make(map[string]int),
 		sendKeysLiteralTimes:     make(map[string][]time.Time),
+		sendKeysTimes:            make(map[string][]time.Time),
+		captureTimes:             make(map[string][]time.Time),
 		loadedBuffers:            make(map[string]string),
 	}
 }
@@ -297,6 +326,7 @@ func (m *mockTmuxRunner) SendKeys(target, keys string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("SendKeys", target, keys)
+	m.sendKeysTimes[target] = append(m.sendKeysTimes[target], time.Now())
 	if err, ok := m.sendKeysErr[keys]; ok && err != nil {
 		return err
 	}
@@ -380,12 +410,16 @@ func (m *mockTmuxRunner) CapturePane(target string, ansi bool) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("CapturePane", target)
+	m.captureTimes[target] = append(m.captureTimes[target], time.Now())
 	m.captureCallCount[target]++
 	if err, ok := m.captureErr[target]; ok && err != nil {
 		return "", err
 	}
 	if err, ok := m.captureErrAfter[target]; ok && err != nil && m.captureCallCount[target] > 1 {
 		return "", err
+	}
+	if f, ok := m.captureErrAtCall[target]; ok && f.err != nil && m.captureCallCount[target] == f.nth {
+		return "", f.err
 	}
 	if seq, ok := m.capturedSequence[target]; ok && len(seq) > 0 {
 		idx := m.capturedIdx[target]
@@ -468,6 +502,55 @@ func (m *mockTmuxRunner) firstCallIndex(method string, args ...string) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i, c := range m.calls {
+		if c.method != method || len(c.args) != len(args) {
+			continue
+		}
+		match := true
+		for j := range args {
+			if c.args[j] != args[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// dismissSettleGap returns how long SendPrompt waited between its last
+// SendKeys and its last CapturePane on a target — the settle that separates
+// the overlay-dismiss keys from the re-check that reads their effect.
+//
+// Returns -1 when either call is missing. Note this is only meaningful when
+// the send ended without pressing Enter (Enter is a SendKeys and would become
+// the last one); the aborting tests are where the gap is asserted.
+func (m *mockTmuxRunner) dismissSettleGap(target string) time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keys, caps := m.sendKeysTimes[target], m.captureTimes[target]
+	if len(keys) == 0 || len(caps) == 0 {
+		return -1
+	}
+	return caps[len(caps)-1].Sub(keys[len(keys)-1])
+}
+
+// lastCallIndex is firstCallIndex from the other end.
+//
+// It exists because CapturePane records only its target, so every capture in
+// a send looks identical in the call log and firstCallIndex always names the
+// baseline. The ordering that needs pinning is the LAST one: the post-dismiss
+// re-check has to read the pane after the dismiss keys went out. Capturing
+// first would make it observe the pre-dismiss state and pass no matter what
+// those keys did — a guard that is always satisfied is not a guard, and no
+// content assertion can catch it, because the mock advances its recorded
+// sequence by call count rather than by time.
+func (m *mockTmuxRunner) lastCallIndex(method string, args ...string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.calls) - 1; i >= 0; i-- {
+		c := m.calls[i]
 		if c.method != method || len(c.args) != len(args) {
 			continue
 		}

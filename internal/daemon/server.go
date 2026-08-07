@@ -564,6 +564,14 @@ func (s *Server) handleSend(data json.RawMessage) Response {
 		return Response{Success: false, Error: "prompt has no verifiable content " +
 			"(only whitespace or box-drawing characters)"}
 	}
+	// Success here means the keystrokes reached the input area and Enter was
+	// pressed — not that a turn began on them. SendPrompt closes any
+	// completion overlay first and re-checks the prompt survived, so the
+	// specific case where Enter is swallowed as a completion is covered, but
+	// nothing downstream confirms the agent picked the prompt up. Callers
+	// that need that fact poll for it (`send --wait-running`); a caller that
+	// treats this true as "the child is working" can be reading the previous
+	// turn's output.
 	if err := s.manager.SendPrompt(req.ID, req.Prompt); err != nil {
 		return Response{Success: false, Error: err.Error()}
 	}

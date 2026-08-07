@@ -39,7 +39,12 @@ way rather than as a failure to respond.
 The 60s response wait is deliberately generous. With `pane-popup` out of its
 scope — and `hook` and `stop` on bounds of their own — what it covers is tmux
 subprocess calls and local file reads, plus one handler with a named cost:
-`send` waits up to 5s for the prompt to appear in the pane before giving up.
+`send` waits for the prompt to appear in the pane before giving up, and that
+wait is not the flat 5s this said for a long time — `sendVerifyBudget` scales
+with the prompt, from roughly 5s for a short one to 22.6s at 8KB. Which makes
+this bound the ceiling on that one: raising the send budget past what 60s
+absorbs would only move the failure here.
+
 Those handlers queue behind the manager lock, so 60s is sized to clear a
 backlog of them; hitting it should mean "the daemon is wedged", not "this
 machine is loaded". `new` and `delete` also live under this default: see

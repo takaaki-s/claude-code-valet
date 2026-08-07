@@ -139,6 +139,22 @@ func (a *Agent) PastePlaceholder(prompt string) string {
 	return fmt.Sprintf("[Pasted ~%d lines]", pasteLineCount(prompt))
 }
 
+// DismissOverlayKeys returns nil: opencode's completion behaviour has not
+// been measured, so there is nothing to base a key on.
+//
+// Claude Code was found to leave a completion overlay open for prompts that
+// end in an in-progress token, which then eats the Enter that SendPrompt
+// presses. Whether opencode does the same is unknown — the run that would
+// have settled it could not be made, because the local install has no
+// provider configured and never reaches a usable prompt.
+//
+// This adapter also takes the paste transport, where the whole prompt
+// arrives as one bracketed write rather than as typing, so it is not even
+// clear that a completion would be triggered. Both reasons point the same
+// way: opt out, stay byte-identical to the pre-fix behaviour, and measure
+// before sending a key that is destructive when it misfires.
+func (a *Agent) DismissOverlayKeys(string) []string { return nil }
+
 // pasteLineCount counts prompt's lines the way opencode counts them when it
 // summarises a paste. Two details are measured, not assumed, and getting
 // either wrong would reject sends that in fact landed:

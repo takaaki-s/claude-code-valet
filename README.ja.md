@@ -212,12 +212,15 @@ jin session info <session-name> --json
 jin session kill <session-name> --json
 
 # プロンプト送信 → 完了待機 → 出力取得
-jin session send <session-name> "テストを修正して" --json
+jin session send <session-name> "テストを修正して" --wait-running --json
 jin session wait <session-name> --timeout 120 --json
 jin session output <session-name> --json
 
 # パイプライン例: プロンプト送信 → 待機 → 出力取得
-jin session send my-session "main.go をリファクタリング"
+# --wait-running はエージェントがターンを開始したことまで確認します。付けない場合、
+# send は「入力欄に届いた」ところまでしか保証しません。未送信のまま残ったプロンプトでも
+# 終了コードは 0 になり、続く wait は idle のままのセッションに対して即座に返ります。
+jin session send my-session "main.go をリファクタリング" --wait-running
 jin session wait my-session --timeout 300
 jin session output my-session --last 1
 ```
@@ -227,10 +230,17 @@ jin session output my-session --last 1
 | コード | 意味 |
 |--------|------|
 | 0 | 成功 |
-| 1 | 一般エラー |
+| 1 | 一般エラー（デーモンに接続できない場合を含む） |
 | 2 | セッションが見つからない |
-| 3 | デーモン未起動 |
-| 4 | タイムアウト（`session wait`） |
+| 3 | 予約済み（デーモン未起動）。**現在は返されません** |
+| 4 | タイムアウト（`session wait` / `send --wait-running`） |
+| 5 | worktree に未コミットの変更がある |
+| 6 | セレクタが複数のセッションに一致 |
+
+デーモンの停止を 3 で判定しないでください。代わりに
+`jin daemon status >/dev/null 2>&1 || jin daemon start` で事前に確認します。
+
+各コードへの対処は `jin docs show exit-codes` を参照してください。
 
 ### ユーティリティ
 

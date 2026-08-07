@@ -224,3 +224,56 @@ func TestSendPrompt_PasteClampsClearRepeats(t *testing.T) {
 		}
 	})
 }
+
+// TestSendPrompt_PasteDismissesOnPlaceholderEvidence checks the overlay
+// dismissal composes with the paste transport instead of contradicting it.
+//
+// The post-dismiss re-check reuses the same two-needle rule as the verify
+// loop, so a folded paste — where the prompt text is not on screen at all and
+// only the placeholder stands in for it — still reads as "the prompt is
+// there". Judging it by the tail alone would abort every folded send that
+// asked for a dismissal.
+func TestSendPrompt_PasteDismissesOnPlaceholderEvidence(t *testing.T) {
+	mgr, mock, sess, pane := newPasteSession(t, "pastedismiss", 2*time.Second)
+	withShortSendDismiss(t, time.Millisecond)
+	installDismissKeys(t, mgr, []string{"Escape"})
+
+	prompt := "line one\nline two"
+	placeholder := opencodePlaceholder(prompt)
+	mock.capturedSequence[pane] = []string{
+		"$ ",               // before
+		"$ " + placeholder, // verify passes on the placeholder
+		"$ " + placeholder, // still there after Escape
+	}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+	if got := countCallsWithArgs(mock, "SendKeys", pane, "Enter"); got != 1 {
+		t.Errorf("Enter sent %d times, want 1", got)
+	}
+}
+
+// TestSendPrompt_PasteUnchangedWhenAdapterOptsOut is the regression guard for
+// the shipped opencode adapter, which returns no dismiss keys: its send must
+// stay byte-identical to the pre-fix sequence.
+func TestSendPrompt_PasteUnchangedWhenAdapterOptsOut(t *testing.T) {
+	mgr, mock, sess, pane := newPasteSession(t, "pastenodismiss", 2*time.Second)
+
+	prompt := "line one\nline two"
+	mock.capturedSequence[pane] = []string{"$ ", "$ " + opencodePlaceholder(prompt)}
+
+	if err := mgr.SendPrompt(sess.ID, prompt); err != nil {
+		t.Fatalf("SendPrompt returned err=%v, want nil", err)
+	}
+	if got := countCallsWithArgs(mock, "SendKeys", pane, "Escape"); got != 0 {
+		t.Errorf("Escape sent %d times on the opt-out paste path, want 0", got)
+	}
+	// Paste sends no nudge, so Enter is the only key on this path.
+	if got := countCalls(mock, "SendKeys", pane); got != 1 {
+		t.Errorf("SendKeys called %d times, want 1 (Enter only)", got)
+	}
+	if got := countCalls(mock, "CapturePane", pane); got != 2 {
+		t.Errorf("CapturePane called %d times, want 2 (before + verify)", got)
+	}
+}

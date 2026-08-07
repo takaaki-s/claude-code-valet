@@ -14,7 +14,7 @@ rather than on the message text — messages get reworded, codes do not.
 | 1 | GeneralError | Anything without a code of its own | Read the message |
 | 2 | SessionNotFound | No session matched the selector | `jin session list --json` and re-check the selector |
 | 3 | DaemonNotRunning | Reserved — **not currently emitted**, see below | — |
-| 4 | Timeout | `session wait` or `send --wait-running` hit its timeout | From `wait`: the child is still working — wait again or escalate. From `send`: nothing confirms the child took the prompt — attach and look, do not resend |
+| 4 | Timeout | `session wait` or `send --wait-running` hit its timeout | From `wait`: the child is still working — wait again or escalate. From `send`: nothing confirms the child took the prompt — attach and look at the input box before deciding whether to resend |
 | 5 | WorktreeDirty | A git worktree has uncommitted changes | Commit, stash, or drop the changes |
 | 6 | AmbiguousSelector | The selector matched more than one session | Narrow it — see the `selectors` doc |
 
@@ -50,8 +50,21 @@ session on a timeout throws away work in progress.
 
 Code 4 from `send --wait-running` means the opposite: the child did *not*
 start on the prompt within the window. The text was verified in its input
-buffer and Enter was sent, but nothing confirms the child took it — attach
-and look instead of resending blind.
+buffer and Enter was sent, but nothing confirms the child took it.
+
+"Verified in the input buffer" is a narrower claim than it sounds. It says
+the text was there before Enter — not that Enter submitted it, and not that
+what was there is still what you sent, since an agent's completion popup can
+rewrite the text and then eat the Enter. So attach and look at the input box
+first. Both blind reflexes are wrong from here: resending duplicates the turn
+if the child merely started late, and repeats the same swallow if a popup
+took the Enter.
+
+The most frequent cause is neither: while a child runs a sub-agent, jin
+reports the parent as `idle`, so `--wait-running` times out on a prompt that
+was submitted and is being worked on right now. `jin pane capture <selector>`
+settles it — an empty input box with the agent busy means the send was fine
+and the flag was wrong, not the send.
 
 ## Errors under --json
 

@@ -31,12 +31,15 @@ jin session new --workdir ~/repos/myapp -d fix-login --json
 #    `creating`; `send` refuses anything that is not `idle`.
 jin session wait fix-login --status idle
 
-# 3. Send work. `prompt` is an alias for `send`.
-jin session send fix-login "run go test ./... and fix what fails"
+# 3. Send work. `prompt` is an alias for `send`. Always pass
+#    `--wait-running`: without it a prompt that reached the input box but
+#    was never submitted still exits 0.
+jin session send fix-login "run go test ./... and fix what fails" --wait-running
 
 # 4. Wait for it to settle. Include `permission` — a session blocked on a
 #    permission prompt is stopped, not working, and waiting only for `idle`
-#    will burn the whole timeout on it.
+#    will burn the whole timeout on it. If this returns almost instantly,
+#    the turn never started — see below.
 jin session wait fix-login --until idle,permission --timeout 600 --json
 
 # 5. Collect.
@@ -62,12 +65,25 @@ Later sends are covered by step 4's wait, but only when it comes back `idle`:
 `idle`. Check the status you got before sending again.
 
 Once the session is idle, `send` handles the rest itself: it verifies the
-prompt actually reached the input buffer, retrying while the TUI settles,
-before pressing Enter. A successful `send` means the text landed.
+prompt actually reached the input box, retrying while the TUI settles,
+before pressing Enter. A successful `send` means the text landed **in the
+input box**. It does not mean the child started a turn.
 
-`--wait-running` answers a further question — did the child *start working* on
-it (leave idle for running/thinking/permission)? Use it when you need the turn
-to have begun, not merely that the text arrived.
+## Why step 3 needs `--wait-running`
+
+Those two can come apart — an agent TUI can take the Enter for something of
+its own (a completion popup, a dialog) and leave the prompt sitting unsent.
+`send` still exits 0, because the text did land.
+
+The damage is in step 4, not step 3. An unsubmitted prompt leaves the session
+on `idle`, so `wait --until idle,permission` returns **immediately** and you
+go on to read the previous turn's output as this turn's result. Nothing in
+the sequence looks like a failure.
+
+`--wait-running` closes that: it polls until the child leaves idle for
+running/thinking/permission and exits 4 if it never does. Exit 4 here means
+"nothing confirmed the turn started" — attach and look at the input box
+rather than resending blind. See the `exit-codes` doc.
 
 ## Inspecting what the child did
 
@@ -97,7 +113,7 @@ what came after it, with no duplicates.
 ```bash
 T1=$(jin session result work --json | jq -r '.entries[-1].timestamp')
 # only when the previous wait came back idle, not permission
-jin session send work "now also run go vet"
+jin session send work "now also run go vet" --wait-running
 jin session wait work --until idle,permission
 jin session result work --since "$T1" --json
 ```
@@ -117,7 +133,7 @@ send a correction to the *same* session — it still has the context:
 
 ```bash
 # only when the previous wait came back idle, not permission
-jin session send fix-login "the test still fails on line 42; fix that too"
+jin session send fix-login "the test still fails on line 42; fix that too" --wait-running
 jin session wait fix-login --until idle,permission
 ```
 
@@ -134,7 +150,7 @@ for d in api web worker; do
 done
 for d in api web worker; do
   jin session wait "task-$d" --status idle
-  jin session send "task-$d" "..."
+  jin session send "task-$d" "..." --wait-running
 done
 for d in api web worker; do
   jin session wait "task-$d" --until idle,permission --timeout 900

@@ -94,3 +94,18 @@ func (a *Agent) ClearInputKeys() []string { return []string{"C-u"} }
 // byte count ("[Pasted Content N chars]"), so this could be revisited if a
 // size shows up that typing cannot reach.
 func (a *Agent) PastePlaceholder(string) string { return "" }
+
+// DismissOverlayKeys returns nil: Codex's completion behaviour has not been
+// measured, so there is nothing to base a key on.
+//
+// Claude Code was found to leave a completion overlay open for prompts that
+// end in an in-progress token, which then eats the Enter that SendPrompt
+// presses. Codex has slash commands too, so it may well share the defect —
+// but the run that would have settled it could not be made: the account hit
+// its API usage limit, and the pane dies before a prompt can be typed.
+//
+// Opting out keeps this adapter byte-identical to its pre-fix behaviour.
+// Guessing a key here would be the same mistake in the other direction:
+// Escape is destructive on a running turn, and nothing yet says Codex needs
+// it. Measure first, then return keys.
+func (a *Agent) DismissOverlayKeys(string) []string { return nil }

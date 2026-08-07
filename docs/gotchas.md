@@ -102,13 +102,79 @@ Common pitfalls and caveats that agents tend to fall into.
   send and checks that the tail of the prompt appeared in the visible buffer
   (`sendVerifyOK` in `internal/session/manager.go`). Attempts repeat with
   backoff until the budget from `sendVerifyBudget` runs out; Enter is only
-  pressed after a successful verify. This means the CLI contract is stronger
-  than it looks: when `jin session send` returns nil, the prompt is in the
-  input buffer, and a prompt that was dropped outright is reported as an
-  error instead of being silently committed.
+  pressed after a successful verify.
 
-- **That contract covers delivery, not readiness — the first send still has
-  to wait for idle.** `SendPrompt` rejects any session whose status is not
+  **The contract reads in one direction only.** A prompt that was dropped
+  outright is reported as an error instead of being silently committed —
+  that half holds. The converse does not: when `jin session send` returns
+  nil, the prompt **reached the input area**, and that is all it says. It
+  does **not** say the turn was submitted. Verify observes the input area;
+  the Enter that follows is a separate event whose outcome nothing checks.
+  The next entry is the case where the two come apart.
+
+- **A completion overlay eats the Enter, and the send still reports
+  success.** Claude Code opens a file-completion overlay while the prompt
+  ends in an `@` token, and Enter there accepts a candidate instead of
+  submitting. Measured on Claude Code 2.1.224 / tmux 3.5a, three runs per
+  row:
+
+  | prompt | overlay | what Enter did | n |
+  |---|---|---|---|
+  | `list @internal/agent` | opens | consumed; the input area was left holding `list @internal/agentdocs/`, rewritten by the completion and unsent | 3/3 |
+  | `list @internal/agent and say ok` | does not open | submitted normally | 3/3 |
+  | `/<ambiguous-prefix>` | never drawn, still live | ran a **different** command | 3/3 |
+  | `/<exact-command>` | never drawn | ran as sent | 3/3 |
+  | `explain the fix/send-deadlock branch` | does not open | submitted normally | 3/3 |
+
+  Verify passes in every one of those rows, because the text really is in the
+  input area — so `SendPrompt` returns nil and `jin session send` exits 0.
+  What makes this expensive rather than merely wrong is the status: an
+  unsubmitted prompt leaves the session on `idle`, so a
+  `session wait --until idle,permission` behind it returns immediately and
+  the caller reads the **previous** turn's output as this turn's result.
+  Nothing in the sequence looks like a failure.
+
+  A bare slash command is the same defect with the evidence removed: sent as
+  one `send-keys -l` burst the slash overlay is never drawn into
+  `capture-pane` at all, so no capture-based check can see the state it is
+  in. An ambiguous prefix still ran a different command than the one sent —
+  which one depends on where the nudge left the selection, see the nudge
+  entry below.
+
+  **The fix closes the overlay instead of detecting it.**
+  `Agent.DismissOverlayKeys(prompt)` lets an adapter declare the keys for
+  that; claude returns `["Escape"]` for a prompt whose last whitespace-
+  separated token starts with `@`, or whose trimmed whole starts with `/`
+  and contains no whitespace, and nil otherwise. The condition is narrow on
+  purpose: Escape also interrupts a turn in progress, so it must not go to
+  prompts that cannot open an overlay. `SendPrompt` sends the keys after verify
+  succeeds and before Enter, then captures once more to confirm the tail is
+  still in the input area — a dismiss key that wiped the input would
+  otherwise turn one silent failure into another. With Escape in place every
+  row above submitted verbatim, 3/3 each, the ambiguous prefix included
+  (Claude Code then answers `Unknown command: <prefix>`, which is the correct
+  outcome for what was actually sent).
+
+  codex and opencode return nil. Their completion overlays are unmeasured,
+  and applying an unmeasured remedy is how the claim this entry replaces got
+  written in the first place.
+
+  **The narrowing bounds the interrupt risk, it does not remove it.** The
+  prompts that get Escape are exactly the ones an orchestrator sends most —
+  a bare `/command`, or a message ending in an `@path`. So if a session is
+  reported `idle` while it is in fact mid-turn, one of those sends will
+  interrupt real work rather than merely queue behind it. That misreport is
+  a known open bug: jin shows the parent as `idle` while a sub-agent runs.
+  Sending on a wrong `idle` was already destructive — the clear keys and the
+  prompt go into a live input either way — but before this change the turn
+  survived, and now it does not. Weigh that before widening the condition.
+
+  The clear step is unaffected: `C-u` was measured to empty Claude Code's
+  input even with the overlay open (3/3), so the residue-concat path that
+  would otherwise follow a swallowed Enter does not arise.
+
+- **The verify contract covers delivery, not readiness — the first send still
+  has to wait for idle.** `SendPrompt` rejects any session whose status is not
   `idle` before it touches the pane, so on a session that just came up verify
   never runs at all. `session new` answers while the session is still
   `creating`: provisioning and `StartBackground` are dispatched to a
@@ -180,6 +246,12 @@ Common pitfalls and caveats that agents tend to fall into.
   a stronger transport guarantee for a readiness guarantee. Making `new`
   asynchronous later widened the window rather than opening it.
 
+  The transport guarantee it leaned on was itself weaker than advertised —
+  delivery to the input area, never submission (see the completion-overlay
+  entry above). So the note was wrong twice over, and the second error
+  outlived the first: the correction written at the time replaced the
+  readiness claim and left the transport claim standing.
+
 - **The retry budget scales with the prompt, so it is not a fixed 5s.**
   A big prompt costs more per attempt (more chunks, far more clear
   keypresses, more nudges), and a flat timeout would quietly leave large
@@ -209,11 +281,23 @@ Common pitfalls and caveats that agents tend to fall into.
   was measured to have no effect on Claude Code or OpenCode — only Codex
   honours it — so they cannot be collapsed.
 
-- **`send --wait-running` only verifies the agent took the prompt.** Since
-  `SendPrompt` itself guarantees keystroke reception, `--wait-running` is
-  now purely about "did the agent transition into running/thinking/permission
-  after the prompt landed?". Callers that only care about "was my prompt
-  seen?" can drop the flag entirely.
+- **`send --wait-running` is the only thing that observes a submission.**
+  `SendPrompt` guarantees keystroke reception and stops there, so the
+  question `--wait-running` asks — did the session leave idle for
+  running/thinking/permission? — is the only signal that separates a prompt
+  the agent took from one still sitting in the input area. Keep the flag on
+  any send whose result something downstream reads.
+
+  An earlier version of this entry said the opposite: that callers who "only
+  care whether the prompt was seen" could drop the flag. That advice inverts
+  the risk, because "seen" was never the property in doubt. It rested on
+  reading the delivery guarantee as a submission guarantee — the same
+  misreading corrected at the top of this section.
+
+  It is a signal, not a proof of failure in reverse: a timeout says nothing
+  confirmed the turn started, which covers an agent that was merely slow as
+  well as an Enter that went nowhere. That is an "attach and look" outcome,
+  which is what `exitcode.Timeout` from `send` is documented to mean.
 
 - **The verify check keys off the prompt's tail, not full text.** TUIs wrap
   long input across visible rows and may add ANSI styling. `promptTail` /
@@ -265,6 +349,29 @@ Common pitfalls and caveats that agents tend to fall into.
   something nobody sent — and twenty presses against a filled input preserved
   every byte. Both still verify a 16KB prompt with it. `C-End`, `NPage` and
   `C-e` moved nothing on OpenCode.
+
+  **That population had no completion state in it, and `Down` is not inert
+  there.** An empty input and a plain-text input were the only two conditions
+  measured; a live completion list is a third, and in it `Down` moves the
+  selection. Measured on Claude Code 2.1.224 with a slash prefix matching two
+  commands, three runs each: without the nudge the first entry ran, with the
+  nudge the second did — a different command from either the one sent or the
+  one the same bytes produce unnudged. "Byte-identical across every case we tried" and "safe
+  unconditionally" are not the same statement, and the gap between them is
+  exactly the case nobody tried.
+
+  It stays one constant rather than an adapter capability anyway, but for a
+  new reason: the dismiss step closes the overlay before Enter, so whatever
+  the nudge did to a selection no longer decides what gets submitted
+  (prefix + nudge + Escape submitted the prefix verbatim, 3/3). Removing the nudge
+  instead would have been the costly repair — `sendVerifyLookCount` scales
+  with prompt length on the premise that each look drags OpenCode's viewport
+  further toward the tail, and that premise is the nudge.
+
+  That cover is claude-only. codex and opencode opt out of the dismiss keys,
+  so for them the nudge is still unconditional over a completion state nobody
+  has measured — the same standing this paragraph just took away from the
+  claim above it. Measure their overlays before treating it as settled.
 
 - **Input-area clear per attempt suppresses residual-concat corruption.**
   `Manager.SendPrompt` sends the key sequence returned by the adapter's
@@ -441,6 +548,19 @@ Common pitfalls and caveats that agents tend to fall into.
   box. Because verify fails rather than passing on partial evidence, Enter is
   never pressed, so nothing truncated is committed. The failure is a loud
   "could not verify", not silent corruption.
+
+  **That is a property of this failure mode, not of `send`.** It holds
+  wherever the keys are the thing that goes missing, because verify is
+  watching precisely that. The opencode update modal further down is the
+  clearest example: it swallows every keystroke, nothing appears, verify
+  never passes, and the error names itself. A completion overlay fails the
+  other way round — the keys all arrive and only the Enter is taken — so
+  verify passes on true evidence, `send` exits 0, and the session stays
+  `idle` with an unsent prompt in the box. Same command, opposite shape: one
+  is loud because the transport broke, the other silent because the transport
+  worked and the commit did not. The dismiss step closes that second shape on
+  claude; it does not turn "fails loudly" into a property of `send`. The
+  clear-cap entry below is a third silent case, still open.
 
   The nudge must still not be sent in a burst: at 50ms intervals it never
   revealed the tail, at 200ms or slower it often did, which is why
@@ -799,6 +919,12 @@ Common pitfalls and caveats that agents tend to fall into.
   never committed. If a send fails with "the TUI may not have been ready to
   receive input", capture the pane before assuming the verify heuristic is
   at fault.
+
+  It behaves correctly because of *how* this dialog fails, not because
+  `send` covers dialogs generally: the keystrokes never arrive, which is the
+  one thing verify watches. A completion overlay takes the Enter and lets the
+  keystrokes through, and that one reports success — see the
+  completion-overlay entry under Session send.
 
 - **The plugin is a pure observer.** It subscribes via the `event` hook,
   not the `permission.ask` hook. Note that `permission.ask` (a `Hooks`

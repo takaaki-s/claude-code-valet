@@ -1,6 +1,6 @@
 ---
 title: Traps an orchestrating agent will hit
-description: The failures that look like bugs but are not — per-agent limits on result collection, the creating-to-idle race, and why a pane capture is not evidence.
+description: The failures that look like bugs but are not — per-agent limits on result collection, the creating-to-idle race, a send that exits 0 without starting a turn, and why a pane capture is not evidence.
 ---
 
 # Traps an orchestrating agent will hit
@@ -41,7 +41,7 @@ creating)`:
 
 ```bash
 jin session new --workdir . -d work --json
-jin session send work "..."          # may fail
+jin session send work "..." --wait-running   # may fail
 ```
 
 Wait first:
@@ -49,7 +49,7 @@ Wait first:
 ```bash
 jin session new --workdir . -d work --json
 jin session wait work --status idle
-jin session send work "..."
+jin session send work "..." --wait-running
 ```
 
 A fresh session commonly needs tens of seconds to reach `idle`. Leave the
@@ -104,19 +104,51 @@ into the binary.
 
 ## Large prompts are slower, not broken
 
-`send` verifies the text actually reached the agent's input buffer before
+`send` verifies the text actually reached the agent's input box before
 pressing Enter, so a large prompt takes measurably longer to return. That is
 the verification working, not a hang — the retry budget scales with prompt
 size.
 
 If `send` fails while verifying, the prompt did **not** land — re-send rather
 than assuming partial delivery. If it fails after that (a `--wait-running`
-timeout, or the session stopping), the text was verified in the input buffer
+timeout, or the session stopping), the text was verified in the input box
 and Enter was sent: attach and look before you resend.
 
 One failure tells you neither, and it says so. An error carrying
 `its outcome is unknown` is the client giving up on a daemon that may still
 be working. Do not re-send on it — attach and look.
+
+## A `send` that exits 0 is not a turn that started
+
+`send` verifies the text reached the input box. It does not check what the
+Enter after it did. An agent TUI can take that Enter for itself — a
+completion popup is the usual culprit — and leave the prompt unsent while
+`send` reports success.
+
+The session then stays `idle`, so the `wait --until idle,permission` behind
+it returns at once and you read the previous turn's output as this one's.
+Pass `--wait-running` on every send whose result you act on; exit 4 from it
+means nothing confirmed the turn started.
+
+When a send did exit 0 but the child looks like it never worked, check for
+this before concluding anything about the child:
+
+```bash
+jin session info work --json | jq -r '.status'   # still idle right after a send?
+jin pane capture work                            # is your prompt still in the box?
+```
+
+This is the one question a capture answers well: the input box is on screen
+by definition, which is not true of the work you would otherwise be judging
+from it (see "A pane capture is not evidence").
+
+Your prompt sitting in the input box — possibly rewritten, e.g. a trailing
+`@internal/agent` turned into `@internal/agentdocs/` — is the signature.
+`jin` closes the popup before pressing Enter on Claude Code sessions, so you
+should not see this there; if you do, attach and press Enter yourself rather
+than re-sending the same text, which reproduces it. The prompts that trigger
+it end in an `@` path token or consist of a bare `/command` — putting a word
+after the `@` token avoids it entirely.
 
 ## Whitespace-only prompts are rejected
 

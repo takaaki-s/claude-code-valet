@@ -248,12 +248,15 @@ jin session info <session-name> --json
 jin session kill <session-name> --json
 
 # Send a prompt and wait for completion
-jin session send <session-name> "fix the failing test" --json
+jin session send <session-name> "fix the failing test" --wait-running --json
 jin session wait <session-name> --timeout 120 --json
 jin session output <session-name> --json
 
-# Pipeline example: send a prompt, wait, get output
-jin session send my-session "refactor main.go"
+# Pipeline example: send a prompt, wait, get output.
+# --wait-running confirms the agent started the turn. Without it, send reports
+# delivery only — a prompt that reached the input box but was never submitted
+# still exits 0, and the wait below then returns at once on the idle session.
+jin session send my-session "refactor main.go" --wait-running
 jin session wait my-session --timeout 300
 jin session output my-session --last 1
 ```
@@ -268,8 +271,9 @@ truncation by scrollback buffer.
 
 ```bash
 # Send a prompt, wait until the child stops (idle OR waiting on permission),
-# then fetch what it actually did.
-jin session prompt my-session "run go test ./... and report failures"
+# then fetch what it actually did. Keep --wait-running on every send whose
+# result you are going to read.
+jin session prompt my-session "run go test ./... and report failures" --wait-running
 jin session wait my-session --until idle,permission --timeout 600
 jin session result my-session --json | jq '.entries[].blocks[] | select(.kind=="tool_result")'
 
@@ -278,7 +282,7 @@ jin session result my-session --json | jq '.entries[].blocks[] | select(.kind=="
 # only entries that came after it (no duplicates). Claude Code emits timestamps
 # with millisecond precision (e.g. "2026-04-09T13:23:10.456Z").
 T1=$(jin session result my-session --json | jq -r '.entries[-1].timestamp')
-jin session prompt my-session "now also run go vet"
+jin session prompt my-session "now also run go vet" --wait-running
 jin session wait my-session --until idle,permission
 jin session result my-session --since "$T1" --json
 
@@ -297,7 +301,7 @@ jin session result my-session --errors-only --json
 | 1 | General error — including a failure to reach the daemon |
 | 2 | Session not found |
 | 3 | Reserved (daemon not running); **not currently emitted** |
-| 4 | Timeout (`session wait`) |
+| 4 | Timeout (`session wait` or `send --wait-running`) |
 | 5 | Worktree dirty |
 | 6 | Ambiguous selector |
 
