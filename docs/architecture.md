@@ -318,7 +318,7 @@ session/           → config, tmux, transcript, plugin (Dispatcher seam only)
                       │
 agent/             → session (borrows Agent + supporting types via aliases)
 agent/claude/      → agent, session, transcript, debug, agentdocs   (CC-specific adapter)
-agent/codex/       → agent, session, agentdocs            (Codex-specific adapter)
+agent/codex/       → agent, session, transcript, agentdocs (Codex-specific adapter)
 agent/opencode/    → agent, session, debug, agentdocs     (opencode-specific adapter)
 agent/register/    → agent, agent/claude, agent/codex, agent/opencode  (init-time Register)
                       │

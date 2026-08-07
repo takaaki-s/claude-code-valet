@@ -46,6 +46,10 @@ type StatusSource = session.StatusSource
 // DescriptionSource is the Layer C description enhancer surface.
 type DescriptionSource = session.DescriptionEnhancer
 
+// TranscriptSource reads an agent's own conversation log; the return type of
+// Agent.Transcript.
+type TranscriptSource = session.TranscriptSource
+
 // NotifyKind categorises the notification signal an adapter attaches to a
 // StatusUpdate; downstream plugins receive it via JIN_NOTIFY_KIND.
 type NotifyKind = session.NotifyKind

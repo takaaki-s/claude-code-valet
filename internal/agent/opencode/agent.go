@@ -108,6 +108,17 @@ func (a *Agent) StatusSource() agent.StatusSource { return a.statusSrc }
 // interface explicitly permits nil here.
 func (a *Agent) Description() agent.DescriptionSource { return nil }
 
+// Transcript returns nil: opencode keeps its conversation in a SQLite
+// database rather than a JSONL log, so reading it needs a different reader
+// than either shipped one, and that is its own piece of work.
+//
+// nil is the honest answer and it is not free — `jin session result` fails
+// for opencode sessions instead of returning zero entries and success. That
+// is the intended change. The old empty-and-succeed answer was not "opencode
+// is unsupported", it was "this session produced nothing", and an
+// orchestrator cannot tell those apart.
+func (a *Agent) Transcript() agent.TranscriptSource { return nil }
+
 // ClearInputKeys returns the tmux key sequence Manager.SendPrompt sends
 // before each attempt to wipe opencode's input line to empty, preventing
 // residual text from concatenating with the new prompt. C-u empties the

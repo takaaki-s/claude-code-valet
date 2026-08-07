@@ -266,8 +266,14 @@ jin session output my-session --last 1
 For richer orchestration (e.g. a parent Claude that needs to inspect what a
 child actually *did*, not just the assistant's text), use `session result`.
 It returns structured `tool_use` / `tool_result` / `thinking` blocks parsed
-directly from the Claude Code transcript JSONL — no tmux pane scraping, no
+directly from the agent's own conversation log — no tmux pane scraping, no
 truncation by scrollback buffer.
+
+How much comes back depends on the agent: Claude Code sessions give all of it,
+Codex sessions give the conversation and the tool calls but neither
+`--errors-only` nor `--tool` can be relied on there, and opencode sessions are
+not supported at all — the command fails rather than returning an empty
+result. See [docs/gotchas.md](docs/gotchas.md#session-result).
 
 ```bash
 # Send a prompt, wait until the child stops (idle OR waiting on permission),
@@ -275,7 +281,7 @@ truncation by scrollback buffer.
 # result you are going to read.
 jin session prompt my-session "run go test ./... and report failures" --wait-running
 jin session wait my-session --until idle,permission --timeout 600
-jin session result my-session --json | jq '.entries[].blocks[] | select(.kind=="tool_result")'
+jin session result my-session --json | jq '.entries[].blocks[]? | select(.kind=="tool_result")'
 
 # Incremental fetch: only entries after a checkpoint.
 # --since is strictly exclusive: pass the last entry's timestamp to receive

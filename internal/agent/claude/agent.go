@@ -58,6 +58,15 @@ func (a *Agent) StatusSource() agent.StatusSource { return a.statusSrc }
 // a better human-readable label.
 func (a *Agent) Description() agent.DescriptionSource { return a.enhancer }
 
+// Transcript returns the Claude Code transcript reader. It is the reference
+// implementation of the interface — transcript.Reader's ReadEntries already
+// has the signature TranscriptSource declares, so this hands it over as-is
+// rather than wrapping it.
+//
+// Built per call, unlike enhancer and statusSrc above; see the same method on
+// the Codex adapter for why caching it buys nothing.
+func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader() }
+
 // Setup writes the process-wide hooks-settings.json (exactly once) and the
 // per-workDir trust flag. Both failures are logged but do not abort the
 // session start — the historical behaviour is "warn and continue", matching

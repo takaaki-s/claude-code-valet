@@ -30,6 +30,11 @@ type StubAgent struct {
 	// session.Agent.DismissOverlayKeys. Nil (the default) opts out, so a
 	// stub sends no extra keys before Enter unless a test asks for them.
 	DismissFn func(prompt string) []string
+	// TranscriptSrc is what Transcript returns; see
+	// session.Agent.Transcript. Nil (the default) means "this stub cannot
+	// read a transcript", which is the answer `jin session result` turns
+	// into an error — tests covering the readable path must set it.
+	TranscriptSrc session.TranscriptSource
 }
 
 func (s *StubAgent) Kind() string {
@@ -56,6 +61,10 @@ func (s *StubAgent) SpawnCommand(opts session.SpawnOptions) session.SpawnPlan {
 func (s *StubAgent) StatusSource() session.StatusSource { return statusSourceFn(s.InterpretFn) }
 
 func (s *StubAgent) Description() session.DescriptionEnhancer { return s.DescribeFn }
+
+// Transcript returns TranscriptSrc, nil by default. A nil source is a
+// meaningful answer rather than a missing one, so it is returned verbatim.
+func (s *StubAgent) Transcript() session.TranscriptSource { return s.TranscriptSrc }
 
 func (s *StubAgent) ClearInputKeys() []string { return s.ClearKeys }
 

@@ -7,8 +7,29 @@ log.
 
 ## Unreleased
 
+### Features
+
+- **`jin session result` works on Codex sessions.** It reads the agent's own
+  rollout log and returns the same `text` / `tool_use` / `tool_result` entries
+  a Claude Code session returns, so an orchestrator can inspect what a codex
+  child actually did instead of falling back to `git diff`. Two filters are
+  weaker there than on Claude Code and the difference matters when you act on
+  them: `--errors-only` cannot see a command that merely exited non-zero
+  (Codex records no exit code), and `--tool` barely discriminates (Codex
+  declares the same tool name for nearly everything it runs). `usage` and
+  `thinking` are not available on codex entries. See
+  [docs/gotchas.md](docs/gotchas.md#session-result), or `jin docs show gotchas`
+  for the orchestration-facing version.
+
 ### Behaviour change
 
+- **Breaking: `jin session result` on an opencode session now fails** instead
+  of exiting 0 with an empty entry list. jind-ai cannot read opencode's
+  conversation, and the old answer was indistinguishable from a child that ran
+  and produced nothing — a caller could not tell the two apart. The error
+  names the agent kind. Check opencode children through `git diff` and their
+  tests. Sessions whose agent has not started yet still return empty and exit
+  0, for every kind.
 - **Workspace trust for Claude Code sessions is now written to
   `~/.claude.json`**, the file Claude Code actually reads it from, instead of
   `~/.claude/settings.local.json`, where it was silently ignored. A session

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
+	"github.com/takaaki-s/jind-ai/internal/transcript"
 	// Blank import triggers init() in the register package, which is the
 	// side-effect under test. Without this, agent.Registry stays empty in
 	// tests because the daemon-side blank import from cmd/jin doesn't
@@ -54,5 +55,54 @@ func TestRegisterInit_LookupOpencode(t *testing.T) {
 	}
 	if a.Kind() != "opencode" {
 		t.Errorf("Kind() = %q, want %q", a.Kind(), "opencode")
+	}
+}
+
+// TestRegisterInit_TranscriptWiring guards the three one-line methods that
+// decide what `jin session result` answers for each kind.
+//
+// Every other part of that path is covered from both sides — the daemon test
+// proves the handler asks the session's own adapter, and the codex reader's
+// tests prove the parsing — but the methods joining them were not, and each
+// one is a single return statement. Rewriting claude's to return nil makes
+// `session result` fail for every Claude Code session, and before this test
+// the whole suite stayed green.
+func TestRegisterInit_TranscriptWiring(t *testing.T) {
+	tests := []struct {
+		kind     string
+		readable bool
+		why      string
+	}{
+		{"claude", true, "the reference reader; nil here breaks result for every Claude Code session"},
+		{"codex", true, "reads the rollout JSONL; nil here silently removes the feature"},
+		{"opencode", false, "no reader exists — a non-nil one would restore the empty+success answer this change removed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.kind, func(t *testing.T) {
+			a, err := agent.Lookup(tt.kind)
+			if err != nil {
+				t.Fatalf("Lookup(%s): %v", tt.kind, err)
+			}
+			src := a.Transcript()
+			if (src != nil) != tt.readable {
+				t.Fatalf("Transcript() != nil is %v, want %v — %s", src != nil, tt.readable, tt.why)
+			}
+		})
+	}
+}
+
+// TestRegisterInit_ClaudeReturnsTheSharedReader pins claude to
+// transcript.Reader specifically, not merely to something non-nil.
+//
+// The nil check above cannot see a swap to a different implementation, and a
+// swap would change what every existing Claude Code session returns — the one
+// outcome this change was required not to have.
+func TestRegisterInit_ClaudeReturnsTheSharedReader(t *testing.T) {
+	a, err := agent.Lookup("claude")
+	if err != nil {
+		t.Fatalf("Lookup(claude): %v", err)
+	}
+	if _, ok := a.Transcript().(*transcript.Reader); !ok {
+		t.Fatalf("Transcript() is %T, want *transcript.Reader (the pre-change reader, unchanged)", a.Transcript())
 	}
 }

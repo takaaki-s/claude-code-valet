@@ -35,6 +35,10 @@ func (e2eAgent) PastePlaceholder(string) string      { return "" }
 // which has no input area and so no overlay to close.
 func (e2eAgent) DismissOverlayKeys(string) []string { return nil }
 
+// Transcript returns nil: `sleep` writes no conversation log, and these tests
+// exercise kill/recovery rather than anything that reads one.
+func (e2eAgent) Transcript() TranscriptSource { return nil }
+
 type e2eResolver struct{}
 
 func (e2eResolver) Resolve(string) (Agent, error) { return e2eAgent{}, nil }
