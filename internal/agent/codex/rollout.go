@@ -101,12 +101,16 @@ type rolloutRow struct {
 		ID  string `json:"id"`
 		Cwd string `json:"cwd"`
 		// response_item payload
-		Type    string `json:"type"`
-		Role    string `json:"role"`
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
+		Type    string         `json:"type"`
+		Role    string         `json:"role"`
+		Content []contentBlock `json:"content"`
 	} `json:"payload"`
+}
+
+// contentBlock is one element of a response_item message's content array.
+// Codex splits a single user item across several of them.
+type contentBlock struct {
+	Text string `json:"text"`
 }
 
 // ReadMeta parses the first line of the rollout at path and returns the Meta
@@ -148,8 +152,17 @@ func ReadMeta(path string) (Meta, error) {
 // See f0.3-codex-runtime-notes.md item 10 for what these look like in
 // practice; the `<system` / `<instructions` prefixes are defensive against
 // future Codex builds adding similar wrappers.
+// Measured against 14 real rollouts (35 `role: "user"` items, ground-truthed
+// against the 20 `event_msg/user_message` lines those files carry): with these
+// prefixes the check rejects every injection and passes every human prompt.
+// `<recommended_plugins>` and `<skill>` were added after that measurement
+// found them leaking — `<recommended_plugins>` became the session description
+// for 2 of the 14 sessions, both non-interactive `codex exec` runs, where the
+// operator's actual first words were two lines further down.
 var pseudoUserPrefixes = []string{
 	"<environment_context>",
+	"<recommended_plugins>",
+	"<skill>",
 	"<system",
 	"<instructions",
 }
@@ -190,14 +203,30 @@ func firstUserPromptFrom(r io.Reader) (string, bool) {
 		if row.Payload.Type != "message" || row.Payload.Role != "user" {
 			continue
 		}
-		if len(row.Payload.Content) == 0 {
-			continue
-		}
-		text := row.Payload.Content[0].Text
-		if isPseudoUser(text) {
+		// Look past the injected blocks rather than judging the item by its
+		// first one. Codex packs several blocks into one user item, and the
+		// order is not fixed: the `<recommended_plugins>` items in the
+		// measured corpus carry the injection at index 0 and
+		// `<environment_context>` at index 1, so the reverse arrangement —
+		// injection first, the operator's words after — is one Codex build
+		// away, and a first-block-only test would answer "" for it.
+		text, ok := firstGenuineBlock(row.Payload.Content)
+		if !ok {
 			continue
 		}
 		return text, true
+	}
+	return "", false
+}
+
+// firstGenuineBlock returns the text of the first content block that is not
+// one of Codex's injections, and whether there was one. An item made entirely
+// of injections has nothing the operator said in it.
+func firstGenuineBlock(content []contentBlock) (string, bool) {
+	for _, c := range content {
+		if !isPseudoUser(c.Text) {
+			return c.Text, true
+		}
 	}
 	return "", false
 }

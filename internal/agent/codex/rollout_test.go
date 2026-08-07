@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -260,4 +261,73 @@ func TestFirstUserPrompt_ReturnsFirstOnlyNotSecond(t *testing.T) {
 	if got == "Second user prompt, must NOT be returned by FirstUserPrompt" {
 		t.Error("FirstUserPrompt returned the second prompt; must return the first")
 	}
+}
+
+// TestFirstUserPrompt_SkipsInjectionsFoundInRealRollouts pins the two
+// injections that were leaking into session descriptions.
+//
+// Each body below is the shape a real rollout on disk had. Measured across 14
+// of them: `<recommended_plugins>` was answered as the first user prompt for 2
+// sessions — both `codex exec` runs, where the operator's actual words were
+// two lines further down — and `<skill>` for one interactive session.
+func TestFirstUserPrompt_SkipsInjectionsFoundInRealRollouts(t *testing.T) {
+	cases := []struct {
+		name     string
+		injected string
+	}{
+		{"recommended_plugins", "<recommended_plugins>\nHere is a list of plugins that are available but not installed"},
+		{"skill", "<skill>\n<name>my-03-work</name>\n<path>/home/x/SKILL.md</path>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Join([]string{
+				userItem(tc.injected),
+				userItem("say hi"),
+			}, "\n")
+			got, ok := firstUserPromptFrom(strings.NewReader(body))
+			if !ok || got != "say hi" {
+				t.Errorf("got = (%q, %v), want (%q, true)", got, ok, "say hi")
+			}
+		})
+	}
+}
+
+// TestFirstUserPrompt_ReadsPastAnInjectedFirstBlock covers the arrangement the
+// first-block-only check could not express.
+//
+// Codex packs several blocks into one user item, and the order is not fixed:
+// the real `<recommended_plugins>` items carry the injection at index 0 and
+// `<environment_context>` at index 1. Nothing in the format says the operator's
+// words cannot land at index 1 instead — and against a first-block-only test
+// that item answers "" and the search moves on, losing the prompt entirely.
+func TestFirstUserPrompt_ReadsPastAnInjectedFirstBlock(t *testing.T) {
+	body := `{"type":"response_item","payload":{"type":"message","role":"user","content":[` +
+		`{"type":"input_text","text":"<environment_context>machine</environment_context>"},` +
+		`{"type":"input_text","text":"the real prompt"}]}}`
+	got, ok := firstUserPromptFrom(strings.NewReader(body))
+	if !ok || got != "the real prompt" {
+		t.Errorf("got = (%q, %v), want (%q, true)", got, ok, "the real prompt")
+	}
+}
+
+// TestFirstUserPrompt_AllBlocksInjectedIsNotAPrompt is the other side of that
+// rule: an item made only of injections has nothing the operator said in it,
+// so the search must keep going rather than answer with the injection.
+func TestFirstUserPrompt_AllBlocksInjectedIsNotAPrompt(t *testing.T) {
+	body := strings.Join([]string{
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[` +
+			`{"type":"input_text","text":"<recommended_plugins>list</recommended_plugins>"},` +
+			`{"type":"input_text","text":"<environment_context>machine</environment_context>"}]}}`,
+		userItem("say hi"),
+	}, "\n")
+	got, ok := firstUserPromptFrom(strings.NewReader(body))
+	if !ok || got != "say hi" {
+		t.Errorf("got = (%q, %v), want (%q, true)", got, ok, "say hi")
+	}
+}
+
+// userItem builds a one-block user response_item carrying text.
+func userItem(text string) string {
+	b, _ := json.Marshal(text)
+	return `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":` + string(b) + `}]}}`
 }
