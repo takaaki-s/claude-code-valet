@@ -34,7 +34,12 @@ var sendCmd = &cobra.Command{
 	Use:     "send <selector> <prompt>",
 	Aliases: []string{"prompt"},
 	Short:   "Send a prompt to a session",
-	Long: `Send a prompt to a Claude Code session. The session must be in idle status.
+	Long: `Send a prompt to an agent session. The session must be in idle status:
+a send to a session that is not idle fails immediately instead of queuing, so
+after "jin session new" wait for idle first ("jin session wait <selector>
+--status idle"). A fresh session commonly needs tens of seconds to get there;
+leave the 300s default timeout of "jin session wait" alone.
+
 The selector may be an ID prefix or a description substring (case-insensitive).
 
 Multiple arguments after the selector are joined with spaces:
@@ -44,11 +49,12 @@ Multiple arguments after the selector are joined with spaces:
 Use "-" as the prompt to read from stdin:
   echo "Fix the bug" | jin session send my-session -
 
-Use --wait-running to verify the prompt was picked up. Without it, send only
-tells you the keystrokes were injected — a freshly started or busy TUI may
-buffer them and never actually submit. With it, send polls the session status
-until it leaves idle for running / thinking / permission (up to --wait-timeout
-seconds), and exits non-zero on timeout so callers can retry or escalate.`,
+Use --wait-running to confirm the agent picked the prompt up. Without it, send
+reports delivery only: it verifies the keystrokes reached the input buffer
+before pressing Enter, but not that the agent started a turn on them. With it,
+send polls the session status until it leaves idle for running / thinking /
+permission (up to --wait-timeout seconds), and exits non-zero on timeout so
+callers can escalate.`,
 	Args:              cobra.MinimumNArgs(1),
 	ValidArgsFunction: completeSessionNames,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -175,7 +181,7 @@ func pollSendAccepted(ctx context.Context, g statusGetter, sessionID string, tim
 			}
 			if time.Now().After(deadline) {
 				return nil, exitcode.Errorf(exitcode.Timeout,
-					"timeout waiting for session to leave idle after send (last status: %s); the prompt keystrokes may have been buffered without being submitted — try again or attach the session to inspect",
+					"timeout waiting for session to leave idle after send (last status: %s); the prompt was verified in the input buffer and Enter was sent, but nothing confirms the agent took it — attach the session and look before resending",
 					info.Status)
 			}
 		}

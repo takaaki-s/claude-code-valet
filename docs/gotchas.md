@@ -104,9 +104,81 @@ Common pitfalls and caveats that agents tend to fall into.
   backoff until the budget from `sendVerifyBudget` runs out; Enter is only
   pressed after a successful verify. This means the CLI contract is stronger
   than it looks: when `jin session send` returns nil, the prompt is in the
-  input buffer — orchestration callers do NOT need to interleave
-  `jin session wait --status idle` between `session new` and the first
-  `session send`.
+  input buffer, and a prompt that was dropped outright is reported as an
+  error instead of being silently committed.
+
+- **That contract covers delivery, not readiness — the first send still has
+  to wait for idle.** `SendPrompt` rejects any session whose status is not
+  `idle` before it touches the pane, so on a session that just came up verify
+  never runs at all. `session new` answers while the session is still
+  `creating`: provisioning and `StartBackground` are dispatched to a
+  goroutine and the handler returns the reservation immediately. The session
+  then sits at `running`, and on the starts measured nothing the agent does
+  moves the status off it before the timeout in the next bullet does —
+  `Stop` needs a turn to finish, and `idle_prompt` needs the input line to
+  sit untouched long enough for Claude Code to notice. Measured on Claude
+  Code over three normal starts, `new` to `idle` took 42s every time, and a
+  `send` fired straight after `new` failed 3/3 with
+  `session is not idle (current status: running)` — `creating` if you beat
+  a process spawn to it.
+
+  **So the wait belongs there, and it is `--status idle` specifically.** Not
+  the `--until idle,permission` that README recommends for orchestration:
+  that pair is for waiting on a turn to end, and `SendPrompt` accepts only
+  `idle`. Pass the id `new` returned (`--json`, `.id`) when you let the
+  description default, because worktree provisioning and the agent's first
+  hook can both rewrite it inside that window; an explicit `-d` sets
+  `DescriptionLocked`, which closes both, and that is why the agent docs
+  address sessions by description. Leave the 300s default alone:
+  a hook arriving late in startup restarts the clock behind it, so trimming
+  to just past the measured 42s is not safe.
+
+  **A `session wait` that times out is a diagnosis, not a signal to retry.**
+  `--no-start` parks the session on `stopped`, and so do a creation whose
+  provisioning or start failed (that one also sets `ErrorMessage`) and an
+  agent that spawned and then died (that one does not). None of them ever
+  reaches `idle`, so follow the timeout with `session info`: `stopped`
+  separates those from a slow start. `running` does not — a slow start and
+  a session the daemon recovered after a restart look alike there, and the
+  next bullet explains why the recovered one never crosses on its own.
+
+- **What ends the wait for a fresh session is a timeout, not a readiness
+  signal.** The `idle` it arrives at comes from the `hookIdleTimeout`
+  fallback in `captureOutputTmux`: 30s with no hook, measured against
+  `LastOutputTime`. Despite the name, the pane's own output never moves that
+  field — the start, a pane respawn, daemon recovery, an incoming hook and
+  the fallback itself do — so every hook that lands during startup restarts
+  the 30s, and one carrying a status verdict takes the session off `running`
+  so the fallback stops applying rather than merely resetting. The two are
+  not the same: a reset only delays the crossing, with no ceiling on how far
+  it slides, while a verdict cancels it outright — the fallback is guarded
+  on the status still being `running`, and only jind-ai's own start, restart
+  and recovery paths write that back. A `thinking` verdict still reaches
+  `idle` on the turn's `Stop`; `permission` waits on a human, and `stopped`
+  on nothing at all. Recovery writes `running` back without re-arming the
+  fallback, because the guard also requires `StartedAt`, which is
+  runtime-only: a session the daemon recovered after a restart is left
+  outside the fallback on purpose and waits on a real hook.
+
+  **The crossing lands on a 10s tick, and that is where the 42s comes
+  from.** The check runs on the capture loop's tick, created a few lines
+  after the clock is set, so a start with no hooks at all crosses on the 30s
+  tick. A normal Claude Code start is not that: its `SessionStart` hook
+  lands inside the first tick and moves `LastOutputTime` without moving the
+  status, pushing the crossing out to the 40s tick — which is the 42s
+  above, read through `session wait`'s own 2s poll.
+
+  **Nothing in that path looks at what is on screen.** A session blocked on
+  a dialog (Claude Code's trust prompt, say) is exactly as quiet and is
+  marked `idle` too. The send that follows passes the status gate and fails
+  verify instead.
+
+- **The note this replaces was wrong when it was written, not merely
+  outdated.** It said orchestration callers could drop the wait between
+  `session new` and the first `session send`. The idle gate predates
+  verify-by-capture, so the wait was already required then; the note mistook
+  a stronger transport guarantee for a readiness guarantee. Making `new`
+  asynchronous later widened the window rather than opening it.
 
 - **The retry budget scales with the prompt, so it is not a fixed 5s.**
   A big prompt costs more per attempt (more chunks, far more clear
@@ -436,13 +508,16 @@ Common pitfalls and caveats that agents tend to fall into.
   command path stays the same. `--dangerously-bypass-hook-trust` is not
   used by jind-ai on purpose (see 02_design.md §3.3).
 
-- **30 s poll fallback during the trust dialog is harmless.** Between
-  session spawn and the user's trust confirmation, no hook fires. The
-  daemon's `[POLL] no hook received for 30s, fallback` path takes the
-  status from `running` down to `idle`. Once trust lands, subsequent
-  `UserPromptSubmit` / `Stop` hooks drive the status correctly. If you see
-  the poll fallback in normal use, the trust dialog is usually still open
-  in the pane.
+- **30s poll fallback during the trust dialog is harmless for status
+  tracking, but not for sends.** Between session spawn and the user's trust
+  confirmation, no hook fires. The daemon's `[POLL] no hook received for
+  30s, fallback` path takes the status from `running` down to `idle`. Once
+  trust lands, subsequent `UserPromptSubmit` / `Stop` hooks drive the status
+  correctly. If you see the poll fallback in normal use, the trust dialog is
+  usually still open in the pane. A `send` issued in that window is the part
+  that is not harmless: it passes the status gate on that borrowed `idle`
+  and then fails verify, because the dialog has the keystrokes. See
+  "Nothing in that path looks at what is on screen" under Session send.
 
 - **Directory trust ("Do you trust this directory?")** is a separate
   Codex sandbox prompt shown on the first launch in a given cwd; it is
