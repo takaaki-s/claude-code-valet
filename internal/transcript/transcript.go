@@ -653,12 +653,15 @@ const (
 )
 
 // TurnState returns the classification of the last conversational turn.
-// Entries that are not part of the main conversation are ignored on the same
-// terms as every reader in this package (isConversationEntry): system/summary
-// types, sidechain entries (a subagent's turns would otherwise read as the
-// main thread finishing), and meta messages. Any failure (missing file, empty
-// transcript, read error) folds into TurnStateUnknown, so callers can treat it
-// as "cannot determine" without guard code.
+// Entries outside the main conversation are ignored on isConversationEntry's
+// flag terms and those alone: system/summary types, sidechain entries (a
+// subagent's turns would otherwise read as the main thread finishing), and meta
+// messages. The content-based exclusion the message readers apply on top of it
+// (conversationTextBlocks) deliberately stops here, because status is
+// re-derived from which role spoke last and must not move with what an entry
+// happens to say. Any failure (missing file, empty transcript, read error)
+// folds into TurnStateUnknown, so callers can treat it as "cannot determine"
+// without guard code.
 //
 // The file is streamed keeping only the last main-conversation entry — a
 // ReadEntries call would materialize every block (including re-marshalled

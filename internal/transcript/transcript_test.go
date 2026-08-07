@@ -1912,3 +1912,36 @@ func TestGetLastMessage_ReturnsErrNoTranscriptWhenTrulyMissing(t *testing.T) {
 		t.Fatalf("expected nil message, got %+v", msg)
 	}
 }
+
+func TestGetLastMessage_ToolOnlyTranscriptHasNothingToSay(t *testing.T) {
+	// A session that has so far only called tools has a transcript, but no
+	// message to print. GetLastMessage reports that as (nil, nil), which
+	// output_cmd turns into the "no plain-text messages" hint. Returning the
+	// empty text of a tool_use entry instead would make `jin session output`
+	// print a blank line and exit 0 — indistinguishable from the missing
+	// transcript this pair of states was split apart to expose.
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/toolonly/test"
+	sessionID := "sess-toolonly"
+
+	writeJSONL(t, r.getTranscriptPath(workDir, sessionID), []transcriptEntry{
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{
+			map[string]any{"type": "tool_use", "name": "Bash", "id": "tu_1", "input": map[string]any{"command": "echo hi"}},
+		}}, Timestamp: "2024-01-01T00:00:00Z"},
+		{Type: "user", Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "content": "hi"},
+		}}, Timestamp: "2024-01-01T00:00:01Z"},
+		{Type: "assistant", Message: msgObject{Role: "assistant", Content: []any{
+			map[string]any{"type": "thinking", "thinking": "let me see"},
+		}}, Timestamp: "2024-01-01T00:00:02Z"},
+	})
+
+	msg, err := r.GetLastMessage(workDir, sessionID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg != nil {
+		t.Fatalf("GetLastMessage = %+v, want nil: none of these entries carries plain text", msg)
+	}
+}

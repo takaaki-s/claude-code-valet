@@ -64,37 +64,58 @@ Examples:
 			return fmt.Errorf("session has no agent session ID (session may not have started yet)")
 		}
 
-		workDir := transcriptWorkDir(info)
-		reader := transcript.NewReader()
+		return runOutput(os.Stdout, os.Stderr, transcript.NewReader(),
+			transcriptWorkDir(info), info.AgentSessionID, lastN, jsonOutput)
+	},
+}
 
-		if lastN > 0 {
-			msgs, err := reader.GetConversation(workDir, info.AgentSessionID, lastN)
-			if err != nil {
-				return mapTranscriptErr(err)
-			}
-			return renderConversation(os.Stdout, os.Stderr, msgs, jsonOutput)
-		}
+// conversationReader is the slice of *transcript.Reader this command needs.
+// It lives next to its consumer rather than in internal/transcript, the same
+// way send.go declares statusGetter for daemon.Client, so runOutput can be
+// exercised without a transcript on disk.
+type conversationReader interface {
+	GetConversation(workDir, sessionID string, lastN int) ([]transcript.Message, error)
+	GetLastMessage(workDir, sessionID string) (*transcript.Message, error)
+}
 
-		// Default: last assistant/user message with plain text.
-		msg, err := reader.GetLastMessage(workDir, info.AgentSessionID)
+// runOutput decides what `session output` prints and writes it. RunE keeps the
+// flag parsing and the daemon lookup; everything downstream of "which
+// transcript, and how much of it" lives here, because that is the part with
+// branches worth pinning — which reader call is made, how a failure is worded,
+// and which stream each half of the output goes to.
+func runOutput(out, errOut io.Writer, r conversationReader, workDir, sessionID string, lastN int, jsonOut bool) error {
+	if lastN > 0 {
+		msgs, err := r.GetConversation(workDir, sessionID, lastN)
 		if err != nil {
 			return mapTranscriptErr(err)
 		}
-		if msg == nil {
-			// The transcript exists but every user/assistant entry so far
-			// consists only of tool_use / thinking blocks with no plain text.
-			// A missing transcript is now a separate error, so this message no
-			// longer has to cover both.
-			return errors.New(noReadableMessagesHint)
-		}
+		return renderConversation(out, errOut, msgs, jsonOut)
+	}
 
-		if jsonOutput {
-			return renderOutputJSON(os.Stdout, msg)
-		}
+	msg, err := r.GetLastMessage(workDir, sessionID)
+	if err != nil {
+		return mapTranscriptErr(err)
+	}
+	return renderLastMessage(out, msg, jsonOut)
+}
 
-		fmt.Println(msg.Content)
-		return nil
-	},
+// renderLastMessage writes the default output: the newest plain-text message.
+// Nothing readable is an error here, unlike on the --last path, because a
+// single message is the entire answer — printing an empty line and exiting 0
+// would look exactly like a session whose transcript is missing.
+func renderLastMessage(out io.Writer, msg *transcript.Message, jsonOut bool) error {
+	if msg == nil {
+		// The transcript exists but every user/assistant entry so far consists
+		// only of tool_use / thinking blocks with no plain text. A missing
+		// transcript is a separate error, so this message no longer has to
+		// cover both.
+		return errors.New(noReadableMessagesHint)
+	}
+	if jsonOut {
+		return renderOutputJSON(out, msg)
+	}
+	fmt.Fprintln(out, msg.Content)
+	return nil
 }
 
 // mapTranscriptErr turns a transcript read failure into the message the user

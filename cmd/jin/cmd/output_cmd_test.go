@@ -84,6 +84,204 @@ func TestOutputCmd_NegativeLastRejected(t *testing.T) {
 	}
 }
 
+// fakeConversationReader stands in for *transcript.Reader. It records which
+// path was taken so a test can pin the reader call runOutput made, not only
+// what came out the other end.
+type fakeConversationReader struct {
+	conversation    []transcript.Message
+	conversationErr error
+	lastMessage     *transcript.Message
+	lastMessageErr  error
+
+	conversationCalls int
+	lastMessageCalls  int
+	gotWorkDir        string
+	gotSessionID      string
+	gotLastN          int
+}
+
+func (f *fakeConversationReader) GetConversation(workDir, sessionID string, lastN int) ([]transcript.Message, error) {
+	f.conversationCalls++
+	f.gotWorkDir, f.gotSessionID, f.gotLastN = workDir, sessionID, lastN
+	return f.conversation, f.conversationErr
+}
+
+func (f *fakeConversationReader) GetLastMessage(workDir, sessionID string) (*transcript.Message, error) {
+	f.lastMessageCalls++
+	f.gotWorkDir, f.gotSessionID = workDir, sessionID
+	return f.lastMessage, f.lastMessageErr
+}
+
+func TestRunOutput(t *testing.T) {
+	const workDir = "/actual/worktree"
+	const sessionID = "agent-sess-1"
+
+	reply := &transcript.Message{Type: "assistant", Content: "the reply", Timestamp: "2025-01-01T00:00:01Z"}
+	exchange := []transcript.Message{
+		{Type: "user", Content: "Hi", Timestamp: "2025-01-01T00:00:00Z"},
+		{Type: "assistant", Content: "Hello!", Timestamp: "2025-01-01T00:00:01Z"},
+	}
+	readFailure := errors.New("token too long")
+
+	tests := []struct {
+		name    string
+		lastN   int
+		jsonOut bool
+		reader  fakeConversationReader
+
+		wantStdout    string
+		wantStderr    string
+		wantErrIs     error
+		wantErrSubstr string
+		wantConvCalls int
+		wantLastCalls int
+	}{
+		{
+			name:          "no --last reads the newest message alone",
+			lastN:         0,
+			reader:        fakeConversationReader{lastMessage: reply},
+			wantStdout:    "the reply\n",
+			wantLastCalls: 1,
+		},
+		{
+			name:          "--last N asks the reader for that many exchanges",
+			lastN:         2,
+			reader:        fakeConversationReader{conversation: exchange},
+			wantStdout:    "[user] Hi\n[assistant] Hello!\n",
+			wantConvCalls: 1,
+		},
+		{
+			name:          "no --last, missing transcript becomes the actionable error",
+			lastN:         0,
+			reader:        fakeConversationReader{lastMessageErr: transcript.ErrNoTranscript},
+			wantErrIs:     errNoTranscriptFound,
+			wantLastCalls: 1,
+		},
+		{
+			name:          "--last N, missing transcript becomes the actionable error",
+			lastN:         1,
+			reader:        fakeConversationReader{conversationErr: transcript.ErrNoTranscript},
+			wantErrIs:     errNoTranscriptFound,
+			wantConvCalls: 1,
+		},
+		{
+			name:          "no --last, a read failure keeps its cause and gains context",
+			lastN:         0,
+			reader:        fakeConversationReader{lastMessageErr: readFailure},
+			wantErrIs:     readFailure,
+			wantErrSubstr: "failed to read transcript",
+			wantLastCalls: 1,
+		},
+		{
+			name:          "--last N, a read failure keeps its cause and gains context",
+			lastN:         1,
+			reader:        fakeConversationReader{conversationErr: readFailure},
+			wantErrIs:     readFailure,
+			wantErrSubstr: "failed to read transcript",
+			wantConvCalls: 1,
+		},
+		{
+			// The state commit 4a25c19 split apart: a transcript that exists
+			// but has only tool activity in it. Printing an empty line and
+			// exiting 0 would put it back where a missing transcript is.
+			name:          "no --last, nothing readable is an error rather than an empty line",
+			lastN:         0,
+			reader:        fakeConversationReader{lastMessage: nil},
+			wantErrSubstr: noReadableMessagesHint,
+			wantLastCalls: 1,
+		},
+		{
+			// Same state, opposite verdict: --last is a window over a
+			// conversation, and an empty window is a phase every session goes
+			// through. The note goes to stderr so stdout stays pipeable.
+			name:          "--last N, nothing readable is a success with a note on stderr",
+			lastN:         1,
+			reader:        fakeConversationReader{conversation: nil},
+			wantStdout:    "",
+			wantStderr:    noReadableMessagesHint + "\n",
+			wantConvCalls: 1,
+		},
+		{
+			name:    "no --last with --json emits one object",
+			lastN:   0,
+			jsonOut: true,
+			reader:  fakeConversationReader{lastMessage: reply},
+			wantStdout: `{
+  "Type": "assistant",
+  "Content": "the reply",
+  "Timestamp": "2025-01-01T00:00:01Z"
+}
+`,
+			wantLastCalls: 1,
+		},
+		{
+			name:    "--last N with --json emits an array",
+			lastN:   1,
+			jsonOut: true,
+			reader:  fakeConversationReader{conversation: exchange},
+			wantStdout: `[
+  {
+    "Type": "user",
+    "Content": "Hi",
+    "Timestamp": "2025-01-01T00:00:00Z"
+  },
+  {
+    "Type": "assistant",
+    "Content": "Hello!",
+    "Timestamp": "2025-01-01T00:00:01Z"
+  }
+]
+`,
+			wantConvCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			r := tc.reader
+
+			err := runOutput(&out, &errOut, &r, workDir, sessionID, tc.lastN, tc.jsonOut)
+
+			if tc.wantErrIs == nil && tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("runOutput returned error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("runOutput returned nil, want an error")
+				}
+				if tc.wantErrIs != nil && !errors.Is(err, tc.wantErrIs) {
+					t.Errorf("error = %v, want it to be %v", err, tc.wantErrIs)
+				}
+				if tc.wantErrSubstr != "" && !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Errorf("error = %q, want it to mention %q", err, tc.wantErrSubstr)
+				}
+			}
+
+			if out.String() != tc.wantStdout {
+				t.Errorf("stdout = %q, want %q", out.String(), tc.wantStdout)
+			}
+			if errOut.String() != tc.wantStderr {
+				t.Errorf("stderr = %q, want %q", errOut.String(), tc.wantStderr)
+			}
+
+			if r.conversationCalls != tc.wantConvCalls {
+				t.Errorf("GetConversation calls = %d, want %d", r.conversationCalls, tc.wantConvCalls)
+			}
+			if r.lastMessageCalls != tc.wantLastCalls {
+				t.Errorf("GetLastMessage calls = %d, want %d", r.lastMessageCalls, tc.wantLastCalls)
+			}
+			if tc.wantConvCalls > 0 && r.gotLastN != tc.lastN {
+				t.Errorf("GetConversation lastN = %d, want %d", r.gotLastN, tc.lastN)
+			}
+			if r.gotWorkDir != workDir || r.gotSessionID != sessionID {
+				t.Errorf("reader called with (%q, %q), want (%q, %q)", r.gotWorkDir, r.gotSessionID, workDir, sessionID)
+			}
+		})
+	}
+}
+
 func TestRenderConversation(t *testing.T) {
 	msgs := []transcript.Message{
 		{Type: "user", Content: "Hi", Timestamp: "2025-01-01T00:00:00Z"},
