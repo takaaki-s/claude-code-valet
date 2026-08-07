@@ -447,8 +447,9 @@ Common pitfalls and caveats that agents tend to fall into.
   `sendVerifyLookDelay` is not tightened.
 
 
-- **tmux version matters more than the README floor suggests. 3.5a is the one
-  that works.** Measured against real agent panes on one machine:
+- **tmux behaviour varies sharply between versions, and 3.5a is the one that
+  works — this table is what the README's 3.5+ floor rests on.** Measured
+  against real agent panes on one machine:
 
   | tmux | garbage in the input on attach | rendering | repeated attach |
   |---|---|---|---|
@@ -458,8 +459,8 @@ Common pitfalls and caveats that agents tend to fall into.
   | 3.7a | no | **broken** | fine |
 
   - **3.3a** — the second attach to a session fails outright. jind-ai attaches
-    repeatedly by design, so this is not usable even though it clears the
-    declared minimum.
+    repeatedly by design, so this is not usable at all; that failure is why the
+    documented minimum sits above it.
   - **3.6a** drops a short run of garbage into an agent's input area whenever a
     client attaches — `c/0000cccc/cccc/cccc…`, fragments of `rgb:…`
     colour-query responses. It does not corrupt a send (the run is short and
