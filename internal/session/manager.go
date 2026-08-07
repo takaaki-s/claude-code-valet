@@ -1201,14 +1201,15 @@ var (
 	// into the field) and against a filled one (twenty presses preserved
 	// every byte). Both still hold, and both were taken on inputs with no
 	// completion overlay open. On an input that has one, `Down` is not inert:
-	// it walks the overlay's selection. Measured on Claude Code 2.1.224,
-	// `/my-0` ran /my-03-work without the nudge and /my-01-spec with it, 3/3
-	// each — a different command from the one the caller sent.
+	// it walks the overlay's selection. Measured on Claude Code 2.1.224 with a
+	// slash prefix matching two commands: without the nudge the first entry
+	// ran, with it the second did, 3/3 each — a different command from the one
+	// the caller sent.
 	//
 	// It stays a constant because the fix belongs at the other end. The
 	// adapter's DismissOverlayKeys closes the overlay before Enter, which
-	// discards the selection the nudge moved, so the same `/my-0` submits as
-	// `/my-0` (3/3). Making the nudge itself conditional would instead cost
+	// discards the selection the nudge moved, so the same prefix submits
+	// verbatim (3/3). Making the nudge itself conditional would instead cost
 	// the thing it exists for: the look count scales with the prompt because
 	// each look nudges, and on OpenCode those nudges are what walk a tall
 	// input's tail into view at all.

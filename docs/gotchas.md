@@ -122,8 +122,8 @@ Common pitfalls and caveats that agents tend to fall into.
   |---|---|---|---|
   | `list @internal/agent` | opens | consumed; the input area was left holding `list @internal/agentdocs/`, rewritten by the completion and unsent | 3/3 |
   | `list @internal/agent and say ok` | does not open | submitted normally | 3/3 |
-  | `/my-0` | never drawn, still live | ran `/my-01-spec` | 3/3 |
-  | `/my-03-work` | never drawn | ran `/my-03-work` | 3/3 |
+  | `/<ambiguous-prefix>` | never drawn, still live | ran a **different** command | 3/3 |
+  | `/<exact-command>` | never drawn | ran as sent | 3/3 |
   | `explain the fix/send-deadlock branch` | does not open | submitted normally | 3/3 |
 
   Verify passes in every one of those rows, because the text really is in the
@@ -137,7 +137,7 @@ Common pitfalls and caveats that agents tend to fall into.
   A bare slash command is the same defect with the evidence removed: sent as
   one `send-keys -l` burst the slash overlay is never drawn into
   `capture-pane` at all, so no capture-based check can see the state it is
-  in. `/my-0` still ran a different command than the one that was sent —
+  in. An ambiguous prefix still ran a different command than the one sent —
   which one depends on where the nudge left the selection, see the nudge
   entry below.
 
@@ -151,9 +151,9 @@ Common pitfalls and caveats that agents tend to fall into.
   succeeds and before Enter, then captures once more to confirm the tail is
   still in the input area — a dismiss key that wiped the input would
   otherwise turn one silent failure into another. With Escape in place every
-  row above submitted verbatim, 3/3 each, `/my-0` included (Claude Code then
-  answers `Unknown command: /my-0`, which is the correct outcome for what was
-  actually sent).
+  row above submitted verbatim, 3/3 each, the ambiguous prefix included
+  (Claude Code then answers `Unknown command: <prefix>`, which is the correct
+  outcome for what was actually sent).
 
   codex and opencode return nil. Their completion overlays are unmeasured,
   and applying an unmeasured remedy is how the claim this entry replaces got
@@ -353,17 +353,17 @@ Common pitfalls and caveats that agents tend to fall into.
   **That population had no completion state in it, and `Down` is not inert
   there.** An empty input and a plain-text input were the only two conditions
   measured; a live completion list is a third, and in it `Down` moves the
-  selection. Measured on Claude Code 2.1.224, three runs each: `/my-0` sent
-  without the nudge ran `/my-03-work`, and with the nudge ran `/my-01-spec` —
-  a different command from either the one sent or the one the same bytes
-  produce unnudged. "Byte-identical across every case we tried" and "safe
+  selection. Measured on Claude Code 2.1.224 with a slash prefix matching two
+  commands, three runs each: without the nudge the first entry ran, with the
+  nudge the second did — a different command from either the one sent or the
+  one the same bytes produce unnudged. "Byte-identical across every case we tried" and "safe
   unconditionally" are not the same statement, and the gap between them is
   exactly the case nobody tried.
 
   It stays one constant rather than an adapter capability anyway, but for a
   new reason: the dismiss step closes the overlay before Enter, so whatever
   the nudge did to a selection no longer decides what gets submitted
-  (`/my-0` + nudge + Escape submitted `/my-0`, 3/3). Removing the nudge
+  (prefix + nudge + Escape submitted the prefix verbatim, 3/3). Removing the nudge
   instead would have been the costly repair — `sendVerifyLookCount` scales
   with prompt length on the premise that each look drags OpenCode's viewport
   further toward the tail, and that premise is the nudge.

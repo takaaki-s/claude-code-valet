@@ -102,20 +102,22 @@ func (a *Agent) PastePlaceholder(string) string { return "" }
 // Escape is the right key and it is not a free one. Measured on Claude Code
 // 2.1.224 against a throwaway tmux server, 3/3 per row:
 //
-//	prompt                          without Escape              with Escape
-//	list @internal/agent            Enter eaten; input left      submitted verbatim
-//	                                holding "list
-//	                                @internal/agentdocs/"
-//	/my-0                           ran /my-01-spec             submitted as /my-0
-//	/my-03-work                     ran /my-03-work             ran /my-03-work
-//	say pong only                   submitted                   submitted
+//	prompt                     without Escape                with Escape
+//	list @internal/agent       Enter eaten; input left       submitted verbatim
+//	                           holding "list
+//	                           @internal/agentdocs/"
+//	/<ambiguous-prefix>        ran a DIFFERENT command       submitted as sent
+//	/<exact-command>           ran as sent                   ran as sent
+//	say pong only              submitted                     submitted
 //
-// The second row is the one that justifies returning keys for bare slash
+// The third row is the one that justifies returning keys for bare slash
 // commands even though nothing is drawn on screen: a burst
 // `send-keys -l` write does not render the slash overlay at all — only
 // character-by-character typing does (3/3 either way) — yet the selection is
-// live, and SendPrompt's nudge key walks it onto a different command. Escape
-// discards that selection, so the prompt runs as the caller wrote it.
+// live, and SendPrompt's nudge key walks it onto a different entry. Measured
+// with a prefix matching two commands: without the nudge the first entry ran,
+// with it the second did. Escape discards that selection, so the prompt runs
+// as the caller wrote it.
 //
 // Why not every prompt: Escape also interrupts a running turn (2/3, the
 // third run's turn finished first). SendPrompt only sends while a session

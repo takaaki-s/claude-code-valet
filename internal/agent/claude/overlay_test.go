@@ -27,11 +27,12 @@ func TestOpensCompletionOverlay(t *testing.T) {
 		// as soon as the caret leaves the token.
 		{"file-ref followed by words", "list @internal/agent and say ok", false},
 		// Measured: nothing was drawn, but the selection was live — the nudge
-		// walked it and /my-01-spec ran instead of /my-03-work (3/3).
-		{"bare slash command", "/my-0", true},
+		// walked it and the SECOND matching command ran instead of the first
+		// (3/3). Measured with a prefix that matched two.
+		{"bare slash command, ambiguous prefix", "/exa", true},
 		// Measured: ran as sent (3/3). Still returns true: the overlay is
 		// open either way, and one candidate today can become two tomorrow.
-		{"bare slash command, unique", "/my-03-work", true},
+		{"bare slash command, unique", "/example-command", true},
 		// Measured: no overlay, submitted verbatim (3/3). A slash that is not
 		// the first character is just text.
 		{"slash inside a sentence", "explain the fix/send-deadlock branch", false},
@@ -44,13 +45,13 @@ func TestOpensCompletionOverlay(t *testing.T) {
 		// unnecessary Escape was measured harmless (3/3), a missed one leaves
 		// the defect in place.
 		{"file-ref with trailing space", "list @internal/agent ", true},
-		{"bare slash with trailing newline", "/my-03-work\n", true},
+		{"bare slash with trailing newline", "/example-command\n", true},
 		// Fields splits on newlines too, so the final token of the whole
 		// prompt is what counts — not the final token of the first line.
 		{"multiline ending in file-ref", "do this:\nthen read @internal/session", true},
 		{"multiline ending in prose", "read @internal/session\nthen summarise it", false},
 		// A slash command is the entire input or it is not one at all.
-		{"slash command with an argument", "/my-03-work now please", false},
+		{"slash command with an argument", "/example-command now please", false},
 		{"lone at-sign", "@", true},
 		{"lone slash", "/", true},
 
@@ -85,7 +86,7 @@ func TestOpensCompletionOverlay(t *testing.T) {
 func TestDismissOverlayKeys(t *testing.T) {
 	a := &Agent{}
 
-	for _, prompt := range []string{"list @internal/agent", "/my-03-work", "@"} {
+	for _, prompt := range []string{"list @internal/agent", "/example-command", "@"} {
 		if got := a.DismissOverlayKeys(prompt); !reflect.DeepEqual(got, []string{"Escape"}) {
 			t.Errorf("DismissOverlayKeys(%q) = %v, want [Escape]", prompt, got)
 		}
@@ -112,7 +113,7 @@ func TestDismissOverlayKeysNeverReturnsDestructiveKeys(t *testing.T) {
 		"Enter": "commits — the very thing we are deferring",
 	}
 	prompts := []string{
-		"list @internal/agent", "/my-03-work", "/my-0", "@", "/",
+		"list @internal/agent", "/example-command", "/exa", "@", "/",
 		"say pong only", "list @internal/agent and say ok", "",
 	}
 	for _, prompt := range prompts {
