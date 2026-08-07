@@ -104,14 +104,23 @@ jin session result fix-login --errors-only --json
 **What comes back depends on the agent kind.** For `claude`, all of it. For
 `codex`, the conversation and the tool calls — but the two filters above are
 weak there: `--errors-only` cannot see a command that merely exited non-zero,
-and every codex tool call is named `exec`. For `opencode`, `session result`
-**fails** rather than answering empty, because jin cannot read that agent's
-log; judge an opencode child by `git diff` and its tests instead.
+and every codex tool call is named `exec`. For `opencode`, the conversation,
+`thinking` and `usage` all come back and `--tool` is exact (opencode's own
+lower-case names, so `--tool bash`), while `--errors-only` is exact only for
+`bash`: no other opencode tool records an exit status, so a failure opencode
+did not flag itself does not raise the flag.
+
+**An opencode read runs opencode**, which is why it is the one kind where
+polling costs something: measured 1.45–1.77s per call whatever the session
+size, because the time is opencode's start-up rather than the conversation.
+`--since` does not make it cheaper. Read an opencode child rarely and in full
+rather than often and incrementally, and expect an error — not an empty result
+— if `opencode` is missing from the daemon's PATH.
 
 `session output` reads Claude Code's transcript only, whatever the kind.
 
-Read the `gotchas` doc before acting on a codex result: the limits decide what
-an empty answer is allowed to mean.
+Read the `gotchas` doc before acting on a codex or opencode result: the limits
+decide what an empty answer is allowed to mean.
 
 ### Incremental collection
 
@@ -122,10 +131,33 @@ what came after it, with no duplicates.
 is not a unique key, and when the next entry carries the same one as the entry
 you passed, that entry is dropped and never appears in any later poll either.
 It is rare — measured at 1 of 112 adjacent entry pairs across 14 codex
-sessions, and 42 of 51,681 across 242 Claude Code transcripts — but it is
-silent, and it applies to every agent kind. When completeness matters more
-than volume (deciding whether a child finished, collecting a final answer),
-read the whole result rather than the tail.
+sessions, 42 of 51,681 across 242 Claude Code transcripts, and 12 of 478
+entries across 34 opencode sessions — but it is silent, and it applies to every
+agent kind. When completeness matters more than volume (deciding whether a
+child finished, collecting a final answer), read the whole result rather than
+the tail.
+
+**`--since` shrinks the answer, not the work, on every kind.** jin reads the
+whole conversation and then drops what you already have: the Claude Code reader
+walks every line, the codex reader walks every line and only skips decoding the
+ones below the bound, and the opencode reader exports the entire session. So a
+poll that asks for the last few entries costs what a full read costs, and
+polling four times as often costs four times as much for the same conversation.
+
+That has always been true; opencode only makes it visible, because its constant
+is a second and a half rather than a millisecond:
+
+| kind | one read |
+|---|---|
+| `claude` | opens one file |
+| `codex` | opens one file |
+| `opencode` | ~1.5s — jin runs `opencode export`, and the time is opencode starting up, so a 3-part session costs the same as a 117-part one |
+
+**Poll turns, not seconds.** `send` → `wait --until idle,permission` → `result`
+is one read per turn, and a turn takes minutes, so even opencode's second and a
+half disappears into it. Do not run `result` on a short timer to watch progress
+— that is what `wait` is for, and on an opencode child it starts a process every
+time round.
 
 ```bash
 T1=$(jin session result work --json | jq -r '.entries[-1].timestamp')

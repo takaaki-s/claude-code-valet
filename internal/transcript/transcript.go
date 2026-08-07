@@ -45,7 +45,12 @@ type LastMessages struct {
 // (text, thinking, tool_use, tool_result) and usage info, suitable for
 // programmatic orchestration.
 type Entry struct {
-	Type      string  `json:"type"`                // "user" | "assistant" | "system" | ...
+	// Type is "user", "assistant" or "system". A reader reports a turn that
+	// died — an aborted message, a usage limit — as a "system" entry, because
+	// from the conversation alone a turn that will never answer looks exactly
+	// like one still being thought about. Orchestrators are told to look for
+	// those, so a reader that has such a signal must not drop it.
+	Type      string  `json:"type"`
 	Timestamp string  `json:"timestamp,omitempty"` // ISO8601
 	Blocks    []Block `json:"blocks,omitempty"`
 	Usage     *Usage  `json:"usage,omitempty"` // assistant only
@@ -81,7 +86,12 @@ type Block struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_use id, or tool_result's referenced id
 	Input     json.RawMessage `json:"input,omitempty"`       // tool_use input (preserved structure)
 	Output    string          `json:"output,omitempty"`      // tool_result content (string-ified)
-	IsError   bool            `json:"is_error,omitempty"`    // tool_result error flag
+	// IsError flags a tool_result the reader concluded had failed. False means
+	// "no failure was found", NOT "the call succeeded": what a reader can see
+	// depends on the format, and Codex records no failure signal at all. Each
+	// adapter documents its own recall with a measurement; do not read a false
+	// here as evidence.
+	IsError bool `json:"is_error,omitempty"`
 }
 
 // Usage captures Anthropic API usage info from an assistant message.
@@ -958,3 +968,10 @@ func stringifyToolResultContent(c any) string {
 		return ""
 	}
 }
+
+// CheapEnoughToPoll implements session.PollableTranscriptSource.
+//
+// ReadEntries opens one file and walks it, so the preview path may call it on
+// every list refresh — which is what it did before adapters owned their own
+// readers, and what it must keep doing.
+func (r *Reader) CheapEnoughToPoll() {}

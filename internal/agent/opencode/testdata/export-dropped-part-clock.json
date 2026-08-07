@@ -1,0 +1,47 @@
+{
+  "info": {
+    "id": "ses_fixture0000000000000001",
+    "title": "fixture"
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000001000
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "visible",
+          "time": {
+            "start": 1786000001000
+          }
+        },
+        {
+          "type": "text",
+          "text": "injected context",
+          "synthetic": true,
+          "time": {
+            "start": 1786000009000
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1786000002000
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "next"
+        }
+      ]
+    }
+  ]
+}

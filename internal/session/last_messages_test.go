@@ -32,6 +32,12 @@ func (s *stubTranscript) ReadEntries(workDir, sessionID, since string) ([]transc
 	return s.entries, s.err
 }
 
+// CheapEnoughToPoll makes the stub stand in for a file-backed reader, which is
+// what every kind wired into the preview path is. A stub that did not declare
+// this would be skipped, and every assertion below would pass for the wrong
+// reason — see TestAttachLastMessages_SkipsAReaderThatIsNotCheapToPoll.
+func (s *stubTranscript) CheapEnoughToPoll() {}
+
 func (s *stubTranscript) seen() (calls int, workDir, sessID, since string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -213,5 +219,54 @@ func TestAttachLastMessages_ExcludesInjected(t *testing.T) {
 	mgr.AttachLastMessages(&info)
 	if info.LastUserMessage != "the real prompt" {
 		t.Errorf("LastUserMessage = %q, want the operator's own words", info.LastUserMessage)
+	}
+}
+
+// expensiveTranscript stands in for the opencode reader: a TranscriptSource
+// that does not declare itself pollable because answering costs a subprocess.
+type expensiveTranscript struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *expensiveTranscript) ReadEntries(string, string, string) ([]transcript.Entry, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return []transcript.Entry{
+		{Type: "assistant", Blocks: []transcript.Block{{Kind: "text", Text: "expensive to learn"}}},
+	}, nil
+}
+
+func (s *expensiveTranscript) seen() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestAttachLastMessages_SkipsAReaderThatIsNotCheapToPoll is the guard between
+// a preview and a fork bomb.
+//
+// List calls this for every row in parallel and the TUI refreshes on a timer.
+// The opencode reader answers by running `opencode export`, so a list holding
+// opencode rows would start one process per row every couple of seconds — forever, to fill in a
+// second line. The reader is right to be expensive and this function is right
+// to want the data; only the combination is wrong, which is why neither side's
+// own tests would catch it.
+func TestAttachLastMessages_SkipsAReaderThatIsNotCheapToPoll(t *testing.T) {
+	src := &expensiveTranscript{}
+	mgr, _, _ := newTestManager(t)
+	mgr.SetAgentResolver(&fakeAgentResolver{agents: map[string]Agent{
+		"costly": &fakeAgent{transcriptSrc: src},
+	}})
+
+	info := Info{AgentKind: "costly", AgentSessionID: "sess-1", WorkDir: "/tmp/x"}
+	mgr.AttachLastMessages(&info)
+
+	if got := src.seen(); got != 0 {
+		t.Errorf("the reader was called %d times; a preview must never pay for a subprocess", got)
+	}
+	if info.LastAssistantMessage != "" {
+		t.Errorf("preview = %q, want empty: the row renders without it", info.LastAssistantMessage)
 	}
 }

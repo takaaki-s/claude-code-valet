@@ -132,12 +132,13 @@ const (
 	NotifyPermission NotifyKind = "permission"
 )
 
-// TranscriptSource reads an agent's own on-disk conversation log and returns
-// it as jind-ai's shared transcript.Entry form, which is what `jin session
-// result` serialises. Each adapter's log format is its own — Claude Code
-// writes one JSONL per session under ~/.claude/projects, Codex writes a
-// date-sharded rollout — so the translation into Entry/Block lives with the
-// adapter and only the result shape is common.
+// TranscriptSource returns an agent's own conversation as jind-ai's shared
+// transcript.Entry form, which is what `jin session result` serialises. How an
+// adapter gets it is its own business — Claude Code writes one JSONL per
+// session under ~/.claude/projects, Codex writes a date-sharded rollout, and
+// opencode keeps its conversation in a database and is asked to print it — so
+// the translation into Entry/Block lives with the adapter and only the result
+// shape is common.
 //
 // Contract, matching what transcript.Reader already does:
 //
@@ -183,8 +184,44 @@ const (
 // functions over []Entry, not here. Adding them would make every adapter
 // re-implement exchange boundaries, which is how the same flag ends up meaning
 // different things per agent kind.
+//
+// What the one method does NOT say is what a read costs, and the callers differ by
+// orders of magnitude. `jin session result` is one command an orchestrator
+// chose to run, so a read that takes a second is fine. A preview decorates
+// every row of `session list`, which the TUI refreshes on a timer, so the
+// budget there is per-session-per-refresh. An implementation that shells out
+// satisfies the first and ruins the second. PollableTranscriptSource is how a
+// reader says which it is.
 type TranscriptSource interface {
 	ReadEntries(workDir, sessionID, since string) ([]transcript.Entry, error)
+}
+
+// PollableTranscriptSource is a TranscriptSource whose ReadEntries is cheap
+// enough to call on a timer, once per session per refresh.
+//
+// Reading a local file qualifies; spawning a process does not. The opencode
+// adapter asks opencode to print the session, so it deliberately does not
+// implement this: on a list of opencode sessions refreshed every two seconds, a
+// preview would mean one process per row per refresh, permanently. The measured
+// cost of that read is quoted once, where it is made — see exportTimeout in
+// internal/agent/opencode.
+//
+// Opt-in rather than opt-out, and that direction is the whole design. An
+// adapter that forgets to declare itself loses its previews — visible, and
+// harmless. The opposite default would let a new expensive reader melt the
+// list, and no test on either side would catch it, because neither the reader
+// nor the preview is wrong on its own.
+//
+// Callers on a polling path must type-assert for this interface and skip the
+// source when it is absent. Callers with a per-command budget — handleResult —
+// must not: refusing to read there would turn a slow answer into no answer.
+type PollableTranscriptSource interface {
+	TranscriptSource
+	// CheapEnoughToPoll declares the fact by existing, and returns nothing on
+	// purpose. A bool would let a reader answer false, which says exactly what
+	// not implementing the interface already says — one fact with two spellings,
+	// and a branch at every caller for the one that never happens.
+	CheapEnoughToPoll()
 }
 
 // StatusSource translates raw StatusSignals into StatusUpdates. Adapters

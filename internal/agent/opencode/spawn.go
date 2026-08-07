@@ -1,8 +1,6 @@
 package opencode
 
 import (
-	"strings"
-
 	"github.com/takaaki-s/jind-ai/internal/agent"
 )
 
@@ -10,7 +8,9 @@ import (
 // (packages/opencode/src/id/id.ts: prefixes.session = "ses", joined with
 // "_"). jind-ai pre-mints Session.AgentSessionID as a UUID, which can never
 // collide with this, so the prefix is a reliable "has opencode told us its
-// real id yet?" test.
+// real id yet?" test. isSessionID in transcript.go is that test; both the
+// resume decision here and the transcript read go through it, so there is one
+// answer to widen if opencode ever changes the format.
 //
 // This matters because startSessionTmux flips AgentSessionStarted to true
 // before the process is even spawned, so that flag alone cannot distinguish
@@ -57,7 +57,7 @@ const rootSessionEnv = "JIN_OPENCODE_ROOT_SESSION"
 // This is the same fail-open posture the Codex adapter takes when it has no
 // executable path to build hook arguments from.
 func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
-	resuming := opts.AgentSessionStarted && strings.HasPrefix(opts.AgentSessionID, sessionIDPrefix)
+	resuming := opts.AgentSessionStarted && isSessionID(opts.AgentSessionID)
 
 	cmd := "opencode"
 	if resuming {

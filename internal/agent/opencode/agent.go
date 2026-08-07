@@ -108,16 +108,16 @@ func (a *Agent) StatusSource() agent.StatusSource { return a.statusSrc }
 // interface explicitly permits nil here.
 func (a *Agent) Description() agent.DescriptionSource { return nil }
 
-// Transcript returns nil: opencode keeps its conversation in a SQLite
-// database rather than a JSONL log, so reading it needs a different reader
-// than either shipped one, and that is its own piece of work.
+// Transcript returns the reader that asks opencode to print the session.
 //
-// nil is the honest answer and it is not free — `jin session result` fails
-// for opencode sessions instead of returning zero entries and success. That
-// is the intended change. The old empty-and-succeed answer was not "opencode
-// is unsupported", it was "this session produced nothing", and an
-// orchestrator cannot tell those apart.
-func (a *Agent) Transcript() agent.TranscriptSource { return nil }
+// Never nil. Whether the read can actually happen — whether `opencode` is on
+// the daemon's PATH — is decided per call, and the answer when it is not is an
+// error naming the reason. Returning nil here instead would report "this
+// adapter has no transcript reader", which is a different and untrue thing.
+//
+// Built per call rather than cached, like the Codex adapter: the reader is one
+// word wide and the allocation is noise next to spawning a process.
+func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader() }
 
 // ClearInputKeys returns the tmux key sequence Manager.SendPrompt sends
 // before each attempt to wipe opencode's input line to empty, preventing

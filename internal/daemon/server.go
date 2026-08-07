@@ -592,6 +592,26 @@ type ResultResponse struct {
 	Truncated      bool               `json:"truncated,omitempty"` // true if Last truncation was applied
 }
 
+// MarshalJSON renders Entries as an array even when it is nil.
+//
+// The invariant belongs on the type rather than at a call site because this
+// value is marshalled twice on the way to a user: once by the daemon, and
+// again by the CLI, which re-encodes the struct it decoded rather than passing
+// the daemon's bytes through (cmd/jin/cmd/result.go). A nil slice encodes as
+// `null`, and the way the agent-facing docs tell an orchestrator to separate
+// "the child said nothing" from "the conversation was lost" is
+// `jq '.entries[] | select(.type=="system")'` — which dies with "Cannot
+// iterate over null" at precisely the moment someone is asking which of the
+// two happened.
+func (r ResultResponse) MarshalJSON() ([]byte, error) {
+	// The alias drops the method set, so this does not recurse.
+	type wire ResultResponse
+	if r.Entries == nil {
+		r.Entries = []transcript.Entry{}
+	}
+	return json.Marshal(wire(r))
+}
+
 func (s *Server) handleResult(data json.RawMessage) Response {
 	var req ResultRequest
 	if err := json.Unmarshal(data, &req); err != nil {
@@ -608,11 +628,7 @@ func (s *Server) handleResult(data json.RawMessage) Response {
 	}
 	info := sess.ToInfo()
 
-	resp := ResultResponse{
-		SessionID:      info.ID,
-		AgentSessionID: info.AgentSessionID,
-		Entries:        []transcript.Entry{},
-	}
+	resp := ResultResponse{SessionID: info.ID, AgentSessionID: info.AgentSessionID}
 
 	// No agent session ID yet means the agent has not been launched, which is
 	// a state every session starts in rather than a failure. Empty + success

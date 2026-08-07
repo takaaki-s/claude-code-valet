@@ -91,7 +91,7 @@ jind-ai は個人プロジェクトです。開発者が自身の日常利用の
 |---|---|---|
 | `claude` (デフォルト) | [Claude Code](https://claude.com/product/claude-code) 2.x | first-class サポート。`--session-id` / `--resume` と CC のネイティブ hook で状態追跡。 |
 | `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) 0.144+ | spawn ごとに `-c hooks.X=[...]` で hook を注入。初回のみ `/hooks` ダイアログでトラスト承認が必要 (詳細: [docs/gotchas.md](docs/gotchas.md#codex-adapter))。Codex には `--session-id` 相当がないため、session UUID は `SessionStart` hook で受け取って daemon 側に書き戻す。 |
-| `opencode` | [opencode](https://github.com/sst/opencode) 1.17+ | **Experimental。** 状態通知は `jin` バイナリに埋め込んだ TypeScript plugin が担当する。plugin は jind-ai の state 配下に展開し、`OPENCODE_CONFIG_DIR` で opencode に読ませる。この env は検索パスへの**加算**なので `~/.config/opencode` は汚さない (詳細: [docs/gotchas.md](docs/gotchas.md#opencode-adapter))。外部の bun インストールは不要。opencode にも `--session-id` 相当がないため、resume 用 ID は plugin の `SessionStart` で受け取る。 |
+| `opencode` | [opencode](https://github.com/sst/opencode) 1.17+ | **Experimental。** 状態通知は `jin` バイナリに埋め込んだ TypeScript plugin が担当する。plugin は jind-ai の state 配下に展開し、`OPENCODE_CONFIG_DIR` で opencode に読ませる。この env は検索パスへの**加算**なので `~/.config/opencode` は汚さない (詳細: [docs/gotchas.md](docs/gotchas.md#opencode-adapter))。外部の bun インストールは不要。opencode にも `--session-id` 相当がないため、resume 用 ID は plugin の `SessionStart` で受け取る。opencode 自身の会話は SQLite に入っているため、`jin session result` は都度 `opencode export --pure <session id>` を実行してその出力を読む。jind-ai 側には何も記録しないが、その代わり `opencode` が daemon の PATH 上にある必要がある。 |
 
 Claude Code を first-class citizen としてサポートしています。他エージェントは
 `internal/agent/<kind>/` にアダプタを追加することで拡張可能です。

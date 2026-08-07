@@ -95,7 +95,7 @@ Bug reports with reproduction steps are the most welcome kind of contribution.
 |---|---|---|
 | `claude` (default) | [Claude Code](https://claude.com/product/claude-code) 2.x | First-class support. Uses `--session-id` / `--resume` and Claude Code's native hook system for state tracking. |
 | `codex` | [OpenAI Codex CLI](https://github.com/openai/codex) 0.144+ | Hooks are injected per-invocation via `-c hooks.X=[...]`; grant trust once through the `/hooks` dialog on first launch (see [docs/gotchas.md](docs/gotchas.md#codex-adapter)). Session name / resume UUID are learned from Codex's `SessionStart` hook payload (no `--session-id` equivalent upstream yet). |
-| `opencode` | [opencode](https://github.com/sst/opencode) 1.17+ | **Experimental.** Status is reported by a TypeScript plugin embedded in the `jin` binary and materialised under jind-ai state; opencode is pointed at it via `OPENCODE_CONFIG_DIR`, which is additive and leaves `~/.config/opencode` untouched (see [docs/gotchas.md](docs/gotchas.md#opencode-adapter)). No external bun install is required. The resume id is learned from the plugin's `SessionStart` (no `--session-id` equivalent upstream). |
+| `opencode` | [opencode](https://github.com/sst/opencode) 1.17+ | **Experimental.** Status is reported by a TypeScript plugin embedded in the `jin` binary and materialised under jind-ai state; opencode is pointed at it via `OPENCODE_CONFIG_DIR`, which is additive and leaves `~/.config/opencode` untouched (see [docs/gotchas.md](docs/gotchas.md#opencode-adapter)). No external bun install is required. The resume id is learned from the plugin's `SessionStart` (no `--session-id` equivalent upstream). `jin session result` runs `opencode export --pure <session id>` and parses that — opencode keeps its conversation in SQLite, jind-ai records nothing of its own, and `opencode` therefore has to be on the daemon's PATH. |
 
 Claude Code is the first-class citizen; other agents plug in as adapters under
 `internal/agent/<kind>/`.
@@ -269,11 +269,13 @@ It returns structured `tool_use` / `tool_result` / `thinking` blocks parsed
 directly from the agent's own conversation log — no tmux pane scraping, no
 truncation by scrollback buffer.
 
-How much comes back depends on the agent: Claude Code sessions give all of it,
-Codex sessions give the conversation and the tool calls but neither
-`--errors-only` nor `--tool` can be relied on there, and opencode sessions are
-not supported at all — the command fails rather than returning an empty
-result. See [docs/gotchas.md](docs/gotchas.md#session-result).
+How much comes back depends on the agent: Claude Code sessions give all of it;
+Codex sessions give the conversation and the tool calls, but neither
+`--errors-only` nor `--tool` can be relied on there; opencode sessions give
+text, thinking, tool calls, results and usage, fetched by running
+`opencode export` on demand — so `opencode` must be on the daemon's PATH, each
+read costs about 1.5s whatever the session size, and `--errors-only` is exact
+only for `bash`. See [docs/gotchas.md](docs/gotchas.md#session-result).
 
 ```bash
 # Send a prompt, wait until the child stops (idle OR waiting on permission),

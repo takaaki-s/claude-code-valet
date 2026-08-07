@@ -1,0 +1,52 @@
+{
+  "info": {
+    "id": "ses_fixture0000000000000001",
+    "title": "fixture"
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1786000001000
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "run the build"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000002000
+        }
+      },
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "reasoning",
+          "text": "pick the build command",
+          "time": {
+            "start": 1786000002100
+          }
+        },
+        {
+          "type": "text",
+          "text": "building now",
+          "time": {
+            "start": 1786000002200
+          }
+        },
+        {
+          "type": "step-finish"
+        }
+      ]
+    }
+  ]
+}

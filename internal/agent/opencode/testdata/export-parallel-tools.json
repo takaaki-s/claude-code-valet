@@ -1,0 +1,74 @@
+{
+  "info": {
+    "id": "ses_fixture0000000000000001",
+    "title": "fixture"
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000006000
+        },
+        "tokens": {
+          "input": 100,
+          "output": 10,
+          "reasoning": 4,
+          "cache": {
+            "read": 1000,
+            "write": 50
+          }
+        }
+      },
+      "parts": [
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_1",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "value"
+            },
+            "time": {
+              "start": 1786000006100,
+              "end": 1786000006900
+            },
+            "output": "first",
+            "title": "one",
+            "metadata": {
+              "exit": 0
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_2",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "value"
+            },
+            "time": {
+              "start": 1786000006200,
+              "end": 1786000006300
+            },
+            "output": "second",
+            "title": "two",
+            "metadata": {
+              "exit": 0
+            }
+          }
+        },
+        {
+          "type": "text",
+          "text": "both done",
+          "time": {
+            "start": 1786000007000
+          }
+        }
+      ]
+    }
+  ]
+}

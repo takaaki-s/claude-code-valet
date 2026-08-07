@@ -1043,6 +1043,21 @@ func (m *Manager) List() []Info {
 // `session result`: this decorates a row that has to render either way, and a
 // list command that failed because one session's transcript was unreadable
 // would be worse than a row with an empty second line.
+//
+// A reader that has not declared itself cheap is skipped, and that is not
+// caution — it is the difference between this being a read and being a fork.
+// List calls this for every row, in parallel, and the TUI refreshes on a
+// timer; the opencode reader answers by running `opencode export`, which costs
+// a subprocess whatever the session's size. Left unguarded, a list holding
+// three opencode rows would start three processes every couple of seconds,
+// to fill in a second line. Neither this function nor that reader is wrong on
+// its own, which is exactly why the guard has to be here rather than in either
+// of them.
+//
+// The guard sits in here rather than at the callers because every caller is a
+// polling path: List refreshes the TUI on a timer, and handleGet is polled by
+// `session wait` and `send`. A one-shot caller would want the read even at a
+// second and a half, and would have to lift the check out to get it.
 func (m *Manager) AttachLastMessages(info *Info) {
 	if info.AgentSessionID == "" || info.WorkDir == "" {
 		return
@@ -1053,6 +1068,9 @@ func (m *Manager) AttachLastMessages(info *Info) {
 	}
 	src := ag.Transcript()
 	if src == nil {
+		return
+	}
+	if _, ok := src.(PollableTranscriptSource); !ok {
 		return
 	}
 	entries, err := src.ReadEntries(info.WorkDir, info.AgentSessionID, "")

@@ -11,7 +11,7 @@ description: The failures that look like bugs but are not — per-agent limits o
 |---|---|
 | `claude` | everything — text, thinking, tool calls, tool results, errors |
 | `codex` | the conversation and the tool calls, with the limits below |
-| `opencode` | **an error** — jin cannot read that agent's conversation log |
+| `opencode` | the conversation, tool calls, `thinking` and `usage` — with the limits below |
 
 Check the kind before you decide what an answer means:
 
@@ -19,31 +19,28 @@ Check the kind before you decide what an answer means:
 jin session info work --json | jq -r '.agent_kind'
 ```
 
-The `opencode` failure is deliberate. That case used to answer zero entries
-and exit 0, which reads exactly like a child that ran and said nothing — a
-wrong answer delivered quietly. It now exits non-zero and names the kind.
-It exits 1, the same code as any other general failure, so there is no code
-that means "unreadable kind" — decide from `agent_kind` up front rather than
-from the message text.
-
-**An empty result that exits 0 is still ambiguous, and on codex it can be
-wrong for longer than you expect.** It normally means the agent has not
-started, so no conversation exists yet. But a codex session carries an ID jin
-minted before launch, and Codex picks its own instead; until Codex's first
-hook reports the real one back, jin looks up a session that does not exist and
-answers empty and successful. If hooks are not wired for that session, it
-never stops doing so. Do not read empty-and-successful as "the child did
-nothing" on a codex session — check `git diff` and the tests, or
+**An empty result that exits 0 is ambiguous, and on codex and opencode it can
+be wrong for longer than you expect.** It normally means the agent has not
+started, so no conversation exists yet. But both of those kinds carry an ID jin
+minted before launch and pick one of their own instead; until the agent reports
+the real one back, jin has no id worth asking about and answers empty and
+successful. On codex, if hooks are not wired for that session, it never stops
+doing so. On opencode that window closes as soon as the agent reports its own
+id, and from then on a conversation jin cannot fetch is an *error*, not an
+empty result. Do not read empty-and-successful as "the child did nothing" on
+a codex or opencode session — check `git diff` and the tests, or
 `jin pane capture` if you need to see that it is alive at all.
 
 `session output` is a different command and unchanged: it reads Claude Code's
 transcript only, and on a `codex` or `opencode` session it reports that no
-transcript was found. For a codex child use `session result` instead.
+transcript was found. For a codex or opencode child use `session result`
+instead.
 
 What works for every kind: `new`, `send`, `wait`, `kill`, `delete`, `list`,
 `info`, and status (`idle` / `thinking` / `permission`).
 
-For a child jin cannot read, go to the artifacts:
+When the result is empty, or the limits below say you cannot trust it, go to
+the artifacts:
 
 ```bash
 git -C <workdir> diff              # what actually changed
@@ -145,6 +142,111 @@ with blank ones. Neither is missing data you can recover by asking again.
   is blocked on one. The session's status is what tells you that — wait with
   `--until idle,permission`.
 
+## An opencode row shows no last message, and that is not a failure
+
+`session info` and the `session list` rows carry the last user and assistant
+message for `claude` and `codex` sessions. On `opencode` both stay empty, on
+purpose: producing them means running `opencode export`, and those rows are
+re-read on a timer, so a list holding opencode sessions would start a process
+per row every couple of seconds to fill in a second line.
+
+An empty preview on an opencode row therefore says nothing about the session.
+Use `session result` when you need to know what it said.
+
+## An opencode result comes from running opencode, and costs ~1.5s a read
+
+opencode keeps its conversation in a SQLite database, so there is no log to
+read: `session result` runs `opencode export` on the session and parses what it
+prints. jin records nothing of its own and keeps no copy, so nothing here
+depends on the session having been watched while it ran.
+
+What comes back is fuller than codex gives — `thinking` carries the real
+reasoning text, entries carry `usage` (opencode splits one turn across several
+messages and the entry holds their sum; its reasoning-token count has no field
+in jin's shape and is dropped), and `--tool` matches real per-tool names. Those
+names are opencode's own and the match is exact, so on an opencode session it
+is `--tool bash`, not `--tool Bash`.
+
+Three things follow from the answer being a subprocess, and they change how you
+should poll:
+
+- **Every read costs about the same second and a half.** Measured 1.45–1.77s
+  per call across sessions from 3 to 117 parts: the time is opencode starting
+  up, not the conversation being read. Asking for less does not buy anything —
+  `--since` costs exactly as much as a whole read. Prefer fewer, larger polls,
+  and keep `session result` off a tight loop against an opencode child.
+- **`opencode` has to be on the daemon's PATH**, and it is not enough that the
+  session works: jin launches agents through your login shell, which resolves a
+  version manager's shims, while the daemon's own PATH may not. When it cannot,
+  the read fails with an error saying exactly that — start the daemon from a
+  shell where `opencode` resolves.
+- **A read that fails is an error, not a short answer.** A truncated or
+  unparseable export is refused rather than returned as a conversation that
+  merely looks thin. The one quiet case is the pre-mint window above.
+
+Two limits on the content:
+
+- **Revert and undo are not tracked.** opencode can remove a message or a part
+  from its own history; jin does not follow those removals, so content the
+  child undid can still appear in the result.
+- **Four part types never reach an entry:** `file`, `agent`, `patch` and
+  `snapshot`. They exist in opencode's schema but appeared nowhere in the
+  measured corpus (0 of 672 parts), and mapping a shape nobody has seen is how
+  a reader invents content.
+
+A turn that ended in failure comes back as an entry of type `system` carrying
+opencode's own error name and message — both cases in the measured corpus were
+aborted turns (2 of 124 assistant messages). The check is the same command that
+catches codex's dead turns, and it is worth running before you conclude
+anything from a thin result:
+
+```bash
+jin session result work --json | jq -r '.entries[] | select(.type=="system")'
+```
+
+## On opencode, `--errors-only` is exact for bash and partial for everything else
+
+`is_error` comes from two things: an error opencode flagged itself (the one
+such call in the 194-call measured corpus is a `read` that could not open a
+file), and, for a call opencode called `completed`, the exit status it recorded
+alongside it.
+
+The second half is needed because the status alone lies: opencode records a
+shell command that exited non-zero as `status: "completed"` — all 5 such calls
+in the corpus. jin reads `metadata.exit`, the real exit status, for those.
+
+**Only `bash` carries that field.** 32 of its 33 calls in the corpus record an
+exit number and 1 records null; `read`, `grep`, `glob`, `task`, `skill`,
+`websearch` and `write` have no exit field at all — 0 of 158 calls.
+
+So `is_error: false` on a `completed` opencode tool result means one of two
+different things, and you cannot tell which from the result: the tool reported
+an exit status and it was zero, or the tool reports no exit status and jin
+cannot tell. Use `--errors-only` to find failed commands; never read an empty
+one as "nothing failed", because any non-bash tool that failed without opencode
+flagging it is invisible to it.
+
+## An opencode result's timestamps are opencode's, with one correction
+
+Each entry carries the time opencode itself recorded, except where opencode's
+clock disagrees with the order of the conversation: there the previous entry's
+value is carried forward rather than a new time being invented. Parallel tool
+calls are the cause — a call issued first can finish last — and the correction
+is rare: 13 of 620 blocks across 34 real sessions need it, the largest going
+back 204s.
+
+Two things follow:
+
+- **`--since` can silently drop an opencode entry, exactly as it can on the
+  other two kinds.** Carrying a value forward means two entries can share a
+  timestamp — 12 of 478 in that corpus — and `--since` is exclusive, so a poll
+  landing on such a pair loses the second entry and no later poll returns it.
+  opencode is *not* an exception to this; see "Incremental collection" in the
+  `orchestration` doc.
+- **Parallel tool calls come back in the order they finished**, not the order
+  the child issued them. That is what actually happened, and it is the only
+  ordering one sequence of timestamps can express.
+
 ## Send after `new` needs a wait
 
 `jin session new` returns as soon as the session is reserved, with status
@@ -203,9 +305,11 @@ artifacts directly.
 
 An agent that says "fixed and tested" may have edited nothing. For code
 changes, look at `git diff` and run the tests yourself. `session result
---tool Bash --json` and `--errors-only` exist for exactly this check on
-Claude Code sessions; on codex both filters are weak, so read the entries and
-run the tests rather than filtering.
+--tool Bash --json` and `--errors-only` exist for exactly this check, and both
+mean what they say on `claude`. On opencode `--tool` is exact (with opencode's
+own lower-case names) while `--errors-only` is exact only for bash; on codex
+both are weak. On either, read the entries and run the tests rather than
+trusting a filter.
 
 ## Everything except `jin docs` needs the daemon
 

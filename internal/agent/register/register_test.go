@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
+	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/transcript"
 	// Blank import triggers init() in the register package, which is the
 	// side-effect under test. Without this, agent.Registry stays empty in
@@ -75,7 +76,7 @@ func TestRegisterInit_TranscriptWiring(t *testing.T) {
 	}{
 		{"claude", true, "the reference reader; nil here breaks result for every Claude Code session"},
 		{"codex", true, "reads the rollout JSONL; nil here silently removes the feature"},
-		{"opencode", false, "no reader exists — a non-nil one would restore the empty+success answer this change removed"},
+		{"opencode", true, "shells out to `opencode export`; nil here silently removes the feature"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.kind, func(t *testing.T) {
@@ -104,5 +105,37 @@ func TestRegisterInit_ClaudeReturnsTheSharedReader(t *testing.T) {
 	}
 	if _, ok := a.Transcript().(*transcript.Reader); !ok {
 		t.Fatalf("Transcript() is %T, want *transcript.Reader (the pre-change reader, unchanged)", a.Transcript())
+	}
+}
+
+// TestRegisterInit_PollableWiring pins which readers the preview path may call
+// on a timer.
+//
+// Manager.AttachLastMessages decorates every row of `session list`, which the
+// TUI refreshes on a timer, so it must skip a reader that spawns a process.
+// The opencode reader does: it runs `opencode export`, which on a list of
+// opencode rows would be one process per row per refresh, permanently. Neither `session result` nor the
+// preview is wrong on its own, so nothing else would catch this.
+func TestRegisterInit_PollableWiring(t *testing.T) {
+	tests := []struct {
+		kind     string
+		pollable bool
+		why      string
+	}{
+		{"claude", true, "opens one file; the preview path has always called it"},
+		{"codex", true, "locates and walks a rollout, the same order of cost"},
+		{"opencode", false, "spawns `opencode export`; a timer must never call it"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.kind, func(t *testing.T) {
+			a, err := agent.Lookup(tt.kind)
+			if err != nil {
+				t.Fatalf("Lookup(%s): %v", tt.kind, err)
+			}
+			_, got := a.Transcript().(session.PollableTranscriptSource)
+			if got != tt.pollable {
+				t.Fatalf("pollable = %v, want %v — %s", got, tt.pollable, tt.why)
+			}
+		})
 	}
 }
