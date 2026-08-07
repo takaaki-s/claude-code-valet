@@ -9,6 +9,12 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/session"
 )
 
+// newEnhancer builds a DescriptionEnhancer honouring whatever CODEX_HOME the
+// caller has already set via t.Setenv.
+func newEnhancer() *DescriptionEnhancer {
+	return NewDescriptionEnhancer(NewLocator(""))
+}
+
 // newEnhancerWithFixture builds a DescriptionEnhancer whose Locator points at
 // a fake $CODEX_HOME populated by copying `fixture` into a real day-shard
 // path under sessionsDir. Returns the enhancer and the session UUID a caller
@@ -18,7 +24,7 @@ func newEnhancerWithFixture(t *testing.T, fixture string) (*DescriptionEnhancer,
 	root := t.TempDir()
 	t.Setenv("CODEX_HOME", root)
 	stageRollout(t, filepath.Join(root, "sessions"), "2026/07/11", basicUUID, fixture)
-	return NewDescriptionEnhancer(""), basicUUID
+	return newEnhancer(), basicUUID
 }
 
 func TestDescriptionEnhancer_HitReturnsTranscriptLayer(t *testing.T) {
@@ -56,7 +62,7 @@ func TestDescriptionEnhancer_LocatorMiss(t *testing.T) {
 	// Empty sessions dir → no rollout matches → false.
 	root := t.TempDir()
 	t.Setenv("CODEX_HOME", root)
-	e := NewDescriptionEnhancer("")
+	e := newEnhancer()
 
 	sess := &session.Session{AgentSessionID: basicUUID}
 	if got, _, ok := e.TryGenerate(sess); ok {
@@ -91,7 +97,7 @@ func TestDescriptionEnhancer_Truncation(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	e := NewDescriptionEnhancer("")
+	e := newEnhancer()
 	got, _, ok := e.TryGenerate(&session.Session{AgentSessionID: basicUUID})
 	if !ok {
 		t.Fatalf("TryGenerate = _, _, false; want ok=true")
@@ -110,5 +116,5 @@ func TestDescriptionEnhancer_ImplementsInterface(t *testing.T) {
 	// session.DescriptionEnhancer contract so Agent.Description() can hand
 	// it out untyped.
 	var _ session.DescriptionEnhancer = (*DescriptionEnhancer)(nil)
-	var _ session.DescriptionEnhancer = NewDescriptionEnhancer("")
+	var _ session.DescriptionEnhancer = newEnhancer()
 }

@@ -23,29 +23,31 @@ import (
 //   - execPath is os.Executable() captured from the first Setup and reused
 //     by hook_args.go to build the `-c 'hooks.X=[...]'` payloads. It never
 //     changes for the lifetime of the daemon.
-//   - home is the value os.UserHomeDir() returned at Agent construction —
-//     used by the DescriptionEnhancer's Locator when CODEX_HOME is unset.
-//     Grabbed eagerly rather than at Setup because it, too, is invariant
-//     for a running daemon and tests set CODEX_HOME directly.
+//   - locator is built once, from os.UserHomeDir() resolved eagerly at
+//     construction (invariant for a running daemon; tests set CODEX_HOME
+//     directly), and shared by enhancer and every TranscriptReader
+//     Transcript() hands out, so a rollout path either one resolves is
+//     cached for both — see rollout.go's Locator cache.
 //   - enhancer and statusSrc are cached instances so hot-path calls to
 //     Description() / StatusSource() don't reallocate on every hook.
 type Agent struct {
 	setupOnce sync.Once
 	execPath  string
-	home      string
+	locator   *Locator
 	enhancer  *DescriptionEnhancer
 	statusSrc *HookStatusSource
 }
 
 // New returns a fully-wired Codex adapter. Home dir is resolved eagerly; if
-// the lookup fails the enhancer falls back to a relative-path Locator (which
-// will simply never find any rollout — TryGenerate then returns false and
-// the session keeps whatever description Layer A/B provided).
+// the lookup fails, locator falls back to a relative path (which will simply
+// never find any rollout — TryGenerate then returns false and the session
+// keeps whatever description Layer A/B provided).
 func New() *Agent {
 	home, _ := os.UserHomeDir()
+	loc := NewLocator(home)
 	return &Agent{
-		home:      home,
-		enhancer:  NewDescriptionEnhancer(home),
+		locator:   loc,
+		enhancer:  NewDescriptionEnhancer(loc),
 		statusSrc: NewHookStatusSource(),
 	}
 }
@@ -69,7 +71,16 @@ func (a *Agent) Setup(ctx agent.SetupContext) error {
 // execPath. When Setup has not run yet — an edge case the interface
 // contract does not forbid — execPath is the zero value, and HookArgs
 // gracefully falls back to a hook-less `codex` invocation.
+//
+// A resume (isResume(opts)) evicts AgentSessionID from locator's cache
+// first. Whether `codex resume` can retarget a UUID onto a different rollout
+// file is unverified (see rollout.go), but if it does, the next Find must
+// re-glob rather than keep answering with whatever the cache resolved before
+// the resume.
 func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
+	if isResume(opts) {
+		a.locator.invalidate(opts.AgentSessionID)
+	}
 	return SpawnCommand(opts, a.execPath)
 }
 
@@ -85,12 +96,14 @@ func (a *Agent) Description() agent.DescriptionSource { return a.enhancer }
 // flag on a tool result, and one tool name for every call — and transcript.go
 // documents each gap where the mapping loses something.
 //
-// Built per call, unlike enhancer and statusSrc above. Those are cached
-// because hooks call them constantly; this has one non-test caller, reached
-// once per `jin session result`, and constructing it measured at 240ns against
-// a read that takes milliseconds. Caching it would also freeze CODEX_HOME for
-// the daemon's lifetime for no gain worth having.
-func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader(a.home) }
+// The TranscriptReader wrapper is still built fresh per call, unlike enhancer
+// and statusSrc above: it holds nothing but a Locator pointer, and
+// constructing it measured at 240ns against a read that takes milliseconds.
+// What it wraps is not fresh, though — it shares locator with enhancer, so a
+// `jin session result` call and a hook-driven description attempt for the
+// same session hit the same uuid->path cache instead of each re-globbing
+// every day shard.
+func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader(a.locator) }
 
 // ClearInputKeys returns the tmux key sequence Manager.SendPrompt sends
 // before each attempt to wipe Codex's input line to empty, preventing

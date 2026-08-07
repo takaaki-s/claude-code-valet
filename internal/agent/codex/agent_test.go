@@ -134,6 +134,55 @@ func TestAgent_Description_NonNil(t *testing.T) {
 	}
 }
 
+func TestAgent_SharesLocatorAcrossDescriptionAndTranscript(t *testing.T) {
+	a := New()
+	tr, ok := a.Transcript().(*TranscriptReader)
+	if !ok {
+		t.Fatalf("Transcript() = %T, want *TranscriptReader", a.Transcript())
+	}
+	if tr.locator != a.enhancer.locator {
+		t.Error("Transcript() and Description() do not share the same Locator — a path either one resolves would not be cached for the other")
+	}
+}
+
+// TestAgent_SpawnCommand_CacheInvalidation covers both isResume outcomes with
+// the same non-empty AgentSessionID in both cases — that is what lets the
+// "not started" case notice a mutation that invalidates unconditionally
+// instead of gating on isResume (see TestSpawnCommand_NoResumeWithoutStarted
+// for the same edge case at the plain SpawnCommand level).
+func TestAgent_SpawnCommand_CacheInvalidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		started    bool
+		wantCached bool
+	}{
+		{"resume evicts", true, false},
+		{"fresh spawn leaves cache intact", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			codexHome := filepath.Join(home, "codex")
+			t.Setenv("CODEX_HOME", codexHome)
+			stageRollout(t, filepath.Join(codexHome, "sessions"), "2026/07/11", basicUUID, fixtureBasic)
+
+			a := New()
+			if _, ok := a.locator.Find(basicUUID); !ok {
+				t.Fatalf("warm-up Find = false, want true")
+			}
+
+			a.SpawnCommand(agent.SpawnOptions{AgentSessionID: basicUUID, AgentSessionStarted: tt.started})
+
+			a.locator.mu.Lock()
+			_, cached := a.locator.cache[basicUUID]
+			a.locator.mu.Unlock()
+			if cached != tt.wantCached {
+				t.Errorf("cached = %v, want %v", cached, tt.wantCached)
+			}
+		})
+	}
+}
+
 func TestAgent_ImplementsInterface(t *testing.T) {
 	// Compile-time interface check: Agent must satisfy session.Agent so
 	// register.go can hand it to agent.Register().

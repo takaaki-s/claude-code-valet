@@ -22,10 +22,9 @@ type TranscriptReader struct {
 	locator *Locator
 }
 
-// NewTranscriptReader returns a reader that locates rollouts the same way the
-// description enhancer does — CODEX_HOME when set, else <home>/.codex/sessions.
-func NewTranscriptReader(home string) *TranscriptReader {
-	return &TranscriptReader{locator: NewLocator(home)}
+// NewTranscriptReader returns a reader that locates rollouts through loc.
+func NewTranscriptReader(loc *Locator) *TranscriptReader {
+	return &TranscriptReader{locator: loc}
 }
 
 // ReadEntries returns the conversation recorded for sessionID, keeping only

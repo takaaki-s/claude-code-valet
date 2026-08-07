@@ -65,9 +65,18 @@ func configArgs() []string {
 	}
 }
 
+// isResume reports whether opts calls for `codex resume <UUID>` rather than a
+// fresh `codex` spawn — see SpawnCommand's doc comment for the two cases.
+// Exported as its own predicate rather than inlined so Agent.SpawnCommand
+// (agent.go) can check the identical condition without the two silently
+// drifting apart.
+func isResume(opts agent.SpawnOptions) bool {
+	return opts.AgentSessionID != "" && opts.AgentSessionStarted
+}
+
 func SpawnCommand(opts agent.SpawnOptions, execPath string) agent.SpawnPlan {
 	base := "codex"
-	if opts.AgentSessionID != "" && opts.AgentSessionStarted {
+	if isResume(opts) {
 		base = fmt.Sprintf("codex resume %s", opts.AgentSessionID)
 	}
 	args := configArgs()
