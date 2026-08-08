@@ -118,12 +118,12 @@ func TestRespondIsDispatched(t *testing.T) {
 func TestHandleRespond_TextLengthBound(t *testing.T) {
 	s := newTestServer(t)
 
-	ok := strings.Repeat("a", RespondMaxTextBytes)
+	ok := strings.Repeat("a", session.MaxAnswerTextBytes)
 	if resp := s.handleRespond(respondReq(t, RespondRequest{ID: "x", Text: ok})); strings.Contains(resp.Error, "bytes") {
 		t.Errorf("a %d-byte answer was rejected for length: %q", len(ok), resp.Error)
 	}
 
-	tooBig := strings.Repeat("a", RespondMaxTextBytes+1)
+	tooBig := strings.Repeat("a", session.MaxAnswerTextBytes+1)
 	resp := s.handleRespond(respondReq(t, RespondRequest{ID: "x", Text: tooBig}))
 	if resp.Success {
 		t.Fatal("an over-long answer was accepted")

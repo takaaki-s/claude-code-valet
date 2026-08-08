@@ -67,19 +67,19 @@ still there — the keys went out, so attach and look before answering again.`,
 		case !optionSet && !textSet:
 			return usageError(cmd, "an answer is required: pass --option <n> or --text <answer>")
 		}
-		if optionSet && (option < 1 || option > daemon.RespondMaxOption) {
+		if optionSet && (option < 1 || option > session.MaxAnswerOption) {
 			return usageError(cmd,
-				"--option must be between 1 and %d (an answer is one keystroke)", daemon.RespondMaxOption)
+				"--option must be between 1 and %d (an answer is one keystroke)", session.MaxAnswerOption)
 		}
 		// Rejected by the same rule as an unverifiable prompt, and for the
 		// same reason: RespondToBlock confirms free text rendered before it
 		// presses the key that submits it, and text that normalizes to
 		// nothing would pass that check without any evidence.
-		if textSet && len(text) > daemon.RespondMaxTextBytes {
+		if textSet && len(text) > session.MaxAnswerTextBytes {
 			return fmt.Errorf("--text is %d bytes; answers over %d cannot be verified, because "+
 				"the agent folds a write that large into a placeholder and jin would have "+
 				"nothing to check for. Attach the session for a longer answer",
-				len(text), daemon.RespondMaxTextBytes)
+				len(text), session.MaxAnswerTextBytes)
 		}
 		if textSet && !session.PromptVerifiable(text) {
 			return fmt.Errorf("--text has no verifiable content (only whitespace or box-drawing characters)")

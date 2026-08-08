@@ -360,3 +360,33 @@ func TestAnswerBlockKeysTextAcceptsTheBoundary(t *testing.T) {
 		t.Errorf("steps = %+v, want the first step to address option 9", steps)
 	}
 }
+
+// TestAnswerBlockKeysOptionIsBounded covers the same hazard as
+// TestAnswerBlockKeysTextRefusesUnaddressableOption, on the other input path.
+// The daemon bounds a caller-supplied --option, but RespondToBlock is an
+// ordinary exported method and this adapter is where "one keystroke" is known,
+// so the check has to hold here too — an Option of 12 would otherwise go out
+// as "1" then "2", and the "1" commits an answer by itself.
+func TestAnswerBlockKeysOptionIsBounded(t *testing.T) {
+	capture := loadCapture(t, "permission.txt")
+	for _, n := range []int{0, -1, 10, 12, 99} {
+		steps, err := New().AnswerBlockKeys(session.BlockPermission, capture, session.BlockAnswer{Option: n})
+		if err == nil {
+			t.Errorf("Option %d returned steps=%+v, want a refusal", n, steps)
+		}
+		if steps != nil {
+			t.Errorf("Option %d returned steps=%+v on a refusal, want nil", n, steps)
+		}
+	}
+	// Negative control: the boundary still works, or the rule above would be
+	// satisfied by refusing everything.
+	for _, n := range []int{1, 9} {
+		steps, err := New().AnswerBlockKeys(session.BlockPermission, capture, session.BlockAnswer{Option: n})
+		if err != nil {
+			t.Errorf("Option %d returned err=%v, want nil", n, err)
+		}
+		if len(steps) != 1 || steps[0].Literal != fmt.Sprintf("%d", n) {
+			t.Errorf("Option %d gave steps=%+v", n, steps)
+		}
+	}
+}

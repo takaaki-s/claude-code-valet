@@ -65,9 +65,18 @@ const (
 )
 
 // blockAnchor pairs a screen literal with the kind it proves.
+//
+// needle is stored already normalized. DetectBlock runs on every poll of
+// RespondToBlock's clear loop — up to ~50 times for one answer — and the
+// anchors are constants, so normalizing them per call is work whose result
+// never differs.
 type blockAnchor struct {
 	needle string
 	kind   session.BlockKind
+}
+
+func anchor(needle string, kind session.BlockKind) blockAnchor {
+	return blockAnchor{needle: session.NormalizeForVerify(needle), kind: kind}
 }
 
 // blockAnchors is scanned in order, and the order is the safety property.
@@ -85,11 +94,11 @@ type blockAnchor struct {
 // can. Uncertainty then costs a refusal instead of keys in the pane, which
 // is the same direction session.BlockKind's doc comment describes.
 var blockAnchors = []blockAnchor{
-	{anchorSubmit, session.BlockQuestionSubmit},
-	{hintMultiTab, session.BlockQuestionMulti},
-	{hintMultiPlain, session.BlockQuestionMulti},
-	{hintPermission, session.BlockPermission},
-	{hintQuestion, session.BlockQuestion},
+	anchor(anchorSubmit, session.BlockQuestionSubmit),
+	anchor(hintMultiTab, session.BlockQuestionMulti),
+	anchor(hintMultiPlain, session.BlockQuestionMulti),
+	anchor(hintPermission, session.BlockPermission),
+	anchor(hintQuestion, session.BlockQuestion),
 }
 
 // DetectBlock reports which blocking prompt the captured pane shows.
@@ -100,7 +109,7 @@ var blockAnchors = []blockAnchor{
 func (a *Agent) DetectBlock(capture string) agent.BlockKind {
 	norm := session.NormalizeForVerify(capture)
 	for _, anc := range blockAnchors {
-		if strings.Contains(norm, session.NormalizeForVerify(anc.needle)) {
+		if strings.Contains(norm, anc.needle) {
 			return anc.kind
 		}
 	}
@@ -144,6 +153,17 @@ func (a *Agent) AnswerBlockKeys(kind agent.BlockKind, capture string, ans agent.
 	if ans.Text != "" {
 		return a.freeTextKeys(kind, capture, ans.Text)
 	}
+	// Bounded here as well as at the daemon's edge, and not as belt-and-braces:
+	// "an answer is one keystroke" is a fact about THIS agent, so this is the
+	// layer that owns it. RespondToBlock is an ordinary exported method and the
+	// daemon handler is merely its only caller today; a second one would
+	// otherwise reach the keyboard with the check left behind. Unbounded, an
+	// Option of 12 goes out as "1" then "2" — and the "1" selects and commits
+	// an answer on its own.
+	if ans.Option < 1 || ans.Option > session.MaxAnswerOption {
+		return nil, fmt.Errorf("option %d cannot be selected: an answer is sent as a single "+
+			"keystroke, so only 1-%d are addressable", ans.Option, session.MaxAnswerOption)
+	}
 	// One keystroke, and deliberately no Enter after it. The digit commits by
 	// itself, so an Enter here would arrive after the dialog is already gone
 	// and land in whatever replaced it — the input box, or the next prompt.
@@ -181,10 +201,10 @@ func (a *Agent) freeTextKeys(kind agent.BlockKind, capture, text string) ([]agen
 	// measurement the first of them selects and commits an answer on its own.
 	// "10" would therefore commit option 1 and drop a stray "0" into whatever
 	// replaced the dialog.
-	if n > maxAddressableOption {
+	if n > session.MaxAnswerOption {
 		return nil, fmt.Errorf("the free-text entry is numbered %d, which jin cannot select: "+
 			"an answer is sent as a single keystroke, so only 1-%d are addressable. "+
-			"Attach the session and answer it there", n, maxAddressableOption)
+			"Attach the session and answer it there", n, session.MaxAnswerOption)
 	}
 	return []agent.KeyStep{
 		{Literal: strconv.Itoa(n)},
@@ -192,14 +212,6 @@ func (a *Agent) freeTextKeys(kind agent.BlockKind, capture, text string) ([]agen
 		{Key: "Enter"},
 	}, nil
 }
-
-// maxAddressableOption is the largest choice a single keystroke can name.
-//
-// It mirrors the daemon's bound on a caller-supplied --option, and exists
-// separately because the two numbers arrive by different routes: one is typed
-// by an operator and validated at the edge, the other is read off the pane and
-// would otherwise reach the keyboard unchecked.
-const maxAddressableOption = 9
 
 // freeTextOption returns the on-screen number of the free-text entry.
 //

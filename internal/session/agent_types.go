@@ -301,6 +301,30 @@ func (k BlockKind) Answerable() bool {
 	return k == BlockPermission || k == BlockQuestion
 }
 
+// The bounds a BlockAnswer has to satisfy. They live here, beside the type
+// they describe, because every layer that handles an answer needs them and
+// none of those layers owns the reason:
+//
+//   - MaxAnswerOption is a consequence of delivery. An answer is sent as ONE
+//     keystroke, so a two-digit choice is not addressable — "12" would go out
+//     as "1" then "2", and on a numbered dialog the "1" selects and commits an
+//     answer by itself.
+//   - MaxAnswerTextBytes is a consequence of verification. Free text goes out
+//     as one SendKeysLiteral write, and an agent folds a read that large into
+//     a placeholder (see sendChunkMaxBytes for the measured threshold), hiding
+//     the very text RespondToBlock looks for before pressing the key that
+//     submits it. Set below the threshold so an answer that cannot be verified
+//     is refused with a reason rather than failing as a pane that "did not
+//     show" it.
+//
+// Enforced at more than one layer on purpose: the edge rejects early with a
+// usage error, and the adapter rejects because "one keystroke" is a fact about
+// the agent rather than about the request.
+const (
+	MaxAnswerOption    = 9
+	MaxAnswerTextBytes = 700
+)
+
 // BlockAnswer is the answer a caller wants to give a blocking prompt.
 // Exactly one field carries it; the daemon rejects a request that sets both
 // or neither, so an adapter may assume it received one of the two.

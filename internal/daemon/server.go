@@ -604,31 +604,6 @@ type RespondResponse struct {
 // stable. Callers strip it before display.
 const RespondNotClearedPrefix = "not-cleared: "
 
-// RespondMaxTextBytes bounds free-text answers.
-//
-// Not a policy choice — a consequence of how the answer is verified. The text
-// goes out as ONE SendKeysLiteral write, and Claude Code folds a single
-// oversized read into a "[Pasted Content N chars]" placeholder at a measured
-// 801 bytes (see sendChunkMaxBytes in internal/session). A folded answer hides
-// its own text from capture-pane, which is precisely what RespondToBlock looks
-// for before pressing the key that submits it — so anything past the fold
-// fails verification deterministically, and the error would name the pane
-// rather than the length.
-//
-// Bounded here instead, well under the threshold, so an answer that cannot
-// work is refused with a reason. Chunking it the way SendPrompt does was not
-// done: that path clears the input between attempts, and nothing measured says
-// what a clear key does to this dialog.
-const RespondMaxTextBytes = 700
-
-// RespondMaxOption is the largest answer a caller can name.
-//
-// It is not a guess about how many choices a prompt has: an answer is
-// delivered as a single keystroke, so a two-digit choice is not addressable
-// at all. Bounding it here turns "10" into an immediate, explicit error
-// instead of a keystroke that types "1" and then "0" into a dialog.
-const RespondMaxOption = 9
-
 // tagRespondError flattens a RespondToBlock failure into the wire's one error
 // string, marking the single case the CLI turns into a distinct exit code.
 //
@@ -660,19 +635,19 @@ func (s *Server) handleRespond(data json.RawMessage) Response {
 	case !hasOption && !hasText:
 		return Response{Success: false, Error: "an answer is required: pass an option or text"}
 	}
-	if hasOption && (req.Option < 1 || req.Option > RespondMaxOption) {
+	if hasOption && (req.Option < 1 || req.Option > session.MaxAnswerOption) {
 		return Response{Success: false, Error: fmt.Sprintf(
-			"option must be between 1 and %d (an answer is one keystroke)", RespondMaxOption)}
+			"option must be between 1 and %d (an answer is one keystroke)", session.MaxAnswerOption)}
 	}
 	// Reject text the verify step could not search the pane for, by the same
 	// rule and for the same reason as "send" — RespondToBlock confirms free
 	// text rendered before it presses the key that submits it, and text that
 	// normalizes to nothing would satisfy that check without evidence.
-	if hasText && len(req.Text) > RespondMaxTextBytes {
+	if hasText && len(req.Text) > session.MaxAnswerTextBytes {
 		return Response{Success: false, Error: fmt.Sprintf(
 			"text is %d bytes; answers over %d cannot be verified because the agent folds a "+
 				"write that large into a placeholder, hiding the text jin checks for",
-			len(req.Text), RespondMaxTextBytes)}
+			len(req.Text), session.MaxAnswerTextBytes)}
 	}
 	if hasText && !session.PromptVerifiable(req.Text) {
 		return Response{Success: false, Error: "text has no verifiable content " +
