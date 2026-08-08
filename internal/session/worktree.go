@@ -51,10 +51,8 @@ func deriveBranchName(worktreeName, prefix, override string) string {
 // The state dir is threaded in rather than read from paths.State(), because a
 // Manager honours the one it was given for every other artifact it writes —
 // hooks-settings.json, and bin/jin, which hookBinaryPath already describes as a
-// sibling of worktrees/. Resolving this one globally broke that relationship: a
-// Manager built over a different state dir still placed its worktrees in the
-// process's real one. The measured cost was two directories per test-suite run
-// under the developer's own state dir, but any second Manager pays it.
+// sibling of worktrees/. Reading the global instead left worktrees outside that
+// set, silently, for every Manager not built over the process's own state dir.
 //
 // An empty stateDir yields a relative template, which expandBaseDir rejects.
 // That is the intended failure — the alternative is a worktree in whatever the
@@ -68,8 +66,9 @@ func worktreeTemplate(cfgBaseDir, stateDir string) string {
 
 // expandBaseDir expands {name}, {repo}, and ${ENV} in a base_dir template.
 // Returns an absolute path, or an error if the template contains an unknown
-// {xxx} variable or does not resolve to an absolute path. The default for an
-// unset base_dir is worktreeTemplate's, not this function's.
+// {xxx} variable or does not resolve to an absolute path. worktreeTemplate owns
+// the default for an unset base_dir; an empty template arriving here is a
+// caller bug.
 func expandBaseDir(template, worktreeName, repoBasename string) (string, error) {
 	expanded := os.ExpandEnv(template)
 	replaced := strings.ReplaceAll(expanded, "{name}", worktreeName)

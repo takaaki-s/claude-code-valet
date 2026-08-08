@@ -603,8 +603,6 @@ func (m *Manager) provisionWorktree(sessionID string, opts CreateOptions) (workt
 	originalRepoDir := opts.WorkDir
 	repoBasename := filepath.Base(originalRepoDir)
 	baseName := deriveWorktreeName(sessionID, opts.WorktreeName)
-	// Resolved once so the collision probe below and the final path below that
-	// cannot disagree about where worktrees go.
 	pathTemplate := worktreeTemplate(cfg.BaseDir, m.stateDir)
 
 	// Clear orphan worktree registrations (`.git/worktrees/<name>/` metadata

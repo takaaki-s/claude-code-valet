@@ -1,8 +1,6 @@
 package session
 
 import (
-	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,10 +56,8 @@ func TestDeriveBranchName(t *testing.T) {
 	}
 }
 
-// TestWorktreeTemplate pins where an unset worktree.base_dir lands. The state
-// dir is the Manager's, not the process-wide one, so a Manager built over a
-// different state dir keeps its worktrees inside it — see worktreeTemplate for
-// what reading the global cost.
+// TestWorktreeTemplate pins where an unset worktree.base_dir lands; see
+// worktreeTemplate for why the state dir is the Manager's and not the global.
 func TestWorktreeTemplate(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -82,9 +78,7 @@ func TestWorktreeTemplate(t *testing.T) {
 			want:       "/tmp/wt/{name}",
 		},
 		{
-			// Not an absolute path, so expandBaseDir rejects it. The
-			// alternative is a worktree in the process's working directory.
-			name:       "no state dir yields something expandBaseDir refuses",
+			name:       "no state dir yields a relative template",
 			cfgBaseDir: "",
 			stateDir:   "",
 			want:       "worktrees/{name}",
@@ -97,12 +91,23 @@ func TestWorktreeTemplate(t *testing.T) {
 				t.Errorf("worktreeTemplate(%q, %q) = %q, want %q",
 					tc.cfgBaseDir, tc.stateDir, got, tc.want)
 			}
-			if tc.stateDir == "" {
-				if _, err := expandBaseDir(got, "jin-abc", "repo"); err == nil {
-					t.Error("expandBaseDir accepted the relative template; it must reject it")
-				}
-			}
 		})
+	}
+}
+
+// TestWorktreeTemplate_EmptyStateDirIsRejectedDownstream holds the half of the
+// contract that spans both functions: an empty state dir must not produce a
+// usable path. expandBaseDir has to refuse the relative template, or a worktree
+// lands in whatever the working directory happens to be.
+//
+// Separate from the table above because it asserts about a different function,
+// and a row cannot declare that it carries an extra obligation — a later row
+// with an absolute base_dir and no state dir would inherit an assertion that is
+// wrong for it.
+func TestWorktreeTemplate_EmptyStateDirIsRejectedDownstream(t *testing.T) {
+	tmpl := worktreeTemplate("", "")
+	if _, err := expandBaseDir(tmpl, "jin-abc", "repo"); err == nil {
+		t.Errorf("expandBaseDir(%q) accepted a relative template; it must reject it", tmpl)
 	}
 }
 
@@ -226,50 +231,25 @@ func TestFindAvailableWorktreeName_ThirdSuffix(t *testing.T) {
 	}
 }
 
-// recordingWorktreeRunner captures the path handed to `git worktree add` and
-// then fails, so provisionWorktree returns before the post-create machinery
-// runs. The path is the whole point of the test; nothing after the add call
-// bears on it.
-type recordingWorktreeRunner struct {
-	addPath string
-}
-
-func (r *recordingWorktreeRunner) Run(dir string, args ...string) ([]byte, error) {
-	joined := strings.Join(args, " ")
-	switch {
-	case joined == "symbolic-ref refs/remotes/origin/HEAD":
-		return []byte("refs/remotes/origin/main\n"), nil
-	case len(args) >= 2 && args[0] == "worktree" && args[1] == "prune":
-		return nil, nil
-	case len(args) >= 1 && args[0] == "rev-parse":
-		return nil, errors.New("exit status 1") // branch does not exist
-	case len(args) >= 2 && args[0] == "worktree" && args[1] == "add":
-		// `git worktree add -b <branch> <path> <baseRef>`
-		r.addPath = args[4]
-		return nil, errors.New("exit status 128")
-	}
-	return nil, fmt.Errorf("unexpected git call: %s", joined)
-}
-
 // TestProvisionWorktree_PlacesWorktreesUnderTheStateDirTheManagerWasBuiltOver
 // pins the wiring, not just the helper: NewManager's stateDir argument has to
 // reach the path `git worktree add` is given.
 //
-// It bites on a real defect rather than a hypothetical one. Resolving that path
-// from the process-wide state dir instead meant a Manager built over a temp dir
-// still wrote into the developer's own — measured at two directories per full
-// test-suite run, which accumulated into four figures before anyone noticed.
-// Nothing failed when it happened, so only a test that reads the path back can
-// hold it.
+// Resolving that path from the process-wide state dir instead meant a Manager
+// built over a temp dir still wrote into the developer's own — two directories
+// per full test-suite run, and nothing ever failed on the way. Only a test that
+// reads the path back holds it.
 func TestProvisionWorktree_PlacesWorktreesUnderTheStateDirTheManagerWasBuiltOver(t *testing.T) {
-	configDir := t.TempDir()
-	configMgr, err := config.NewManager(configDir)
+	configMgr, err := config.NewManager(t.TempDir())
 	if err != nil {
 		t.Fatalf("config.NewManager: %v", err)
 	}
-	// Distinct from every other temp dir, so the assertion below can only pass
-	// if this specific argument is what the path was built from.
+	// Distinct from every other temp dir here, so the assertion below can only
+	// pass if this specific argument is what the path was built from.
 	stateDir := t.TempDir()
+	// Built directly rather than through newTestManager because the state dir
+	// is the subject. hookRunner stays nil, which skips the post-create hook —
+	// provisionWorktree gets to `worktree add` and returns.
 	mgr, err := NewManager(t.TempDir(), stateDir, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
@@ -279,19 +259,23 @@ func TestProvisionWorktree_PlacesWorktreesUnderTheStateDirTheManagerWasBuiltOver
 	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir .git: %v", err)
 	}
-	runner := &recordingWorktreeRunner{}
+	runner := hookHappyPathGitRunner()
 	mgr.SetGitClient(git.NewClientWithRunner(runner))
 
-	_, err = mgr.provisionWorktree("3f9a2b4c-1111-2222-3333-444444444444", CreateOptions{
+	if _, err := mgr.provisionWorktree("3f9a2b4c-1111-2222-3333-444444444444", CreateOptions{
 		WorkDir:  repo,
 		Worktree: true,
-	})
-	if err == nil {
-		t.Fatal("provisionWorktree succeeded; the scripted `worktree add` was supposed to fail it")
+	}); err != nil {
+		t.Fatalf("provisionWorktree: %v", err)
 	}
 
+	// `git worktree add -b <branch> <path> <baseRef>`
+	addCall := runner.findCall("worktree", "add")
+	if addCall == nil {
+		t.Fatal("no `git worktree add` call recorded")
+	}
 	want := filepath.Join(stateDir, "worktrees", "jin-3f9a2b4c")
-	if runner.addPath != want {
-		t.Errorf("`git worktree add` path = %q, want %q", runner.addPath, want)
+	if addCall[4] != want {
+		t.Errorf("`git worktree add` path = %q, want %q", addCall[4], want)
 	}
 }

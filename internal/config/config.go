@@ -98,7 +98,7 @@ type KeybindingsConfig struct {
 
 // WorktreeConfig represents settings for the git-worktree session option.
 type WorktreeConfig struct {
-	BaseDir       string `mapstructure:"base_dir,omitempty"`       // Placement template. Empty → worktrees/{name} under the session manager's state dir
+	BaseDir       string `mapstructure:"base_dir,omitempty"`       // Placement template. Empty → the caller resolves it (see DefaultWorktreeConfig)
 	BranchPrefix  string `mapstructure:"branch_prefix,omitempty"`  // Auto-generated branch name prefix (default: "jin/")
 	DefaultBranch string `mapstructure:"default_branch,omitempty"` // Fallback when origin/HEAD detection fails
 	HookEnabled   *bool  `mapstructure:"hook_enabled,omitempty"`   // nil = default(true)

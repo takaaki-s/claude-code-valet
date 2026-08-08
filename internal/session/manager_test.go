@@ -31,7 +31,10 @@ func newTestManager(t *testing.T) (*Manager, *mockTmuxRunner, *mockHookRunner) {
 	if err != nil {
 		t.Fatalf("config.NewManager failed: %v", err)
 	}
-	mgr, err := NewManager(dir, configDir, configMgr)
+	// A state dir of its own, not configDir reused. Anything asserting against
+	// mgr.stateDir — worktree placement, hook logs, bin/jin — cannot tell a
+	// state-dir bug from a config-dir one while the two are the same path.
+	mgr, err := NewManager(dir, t.TempDir(), configMgr)
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
@@ -2864,8 +2867,8 @@ func TestManager_RepoName_ProvisionAsync(t *testing.T) {
 	}
 	mgr, _, _ := newTestManager(t)
 
-	stateDir := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", stateDir)
+	// A decoy — see the same line in setupHookTest.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	repoDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(repoDir, ".git"), 0o755); err != nil {
@@ -3297,12 +3300,10 @@ func TestManager_CreateWithOptions_Worktree_RejectsNonGitRepo(t *testing.T) {
 func TestManager_CreateWithOptions_Worktree_HappyPath(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 
-	// A decoy. Worktree placement comes from the state dir this Manager was
-	// built over, so pointing the process-wide one somewhere else and asserting
-	// against mgr.stateDir below fails if that ever goes back to being read
-	// globally. This test used to set the variable for the opposite reason —
-	// to stop the leak into the developer's own state dir that reading it
-	// caused.
+	// A decoy: worktree placement comes from the state dir this Manager was
+	// built over, so pointing the process-wide one elsewhere makes the
+	// mgr.stateDir assertion below fail if placement ever goes back to reading
+	// the global.
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	workDir := t.TempDir()
