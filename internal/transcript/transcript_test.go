@@ -1610,9 +1610,24 @@ func TestReader_ReadAITitle(t *testing.T) {
 
 func TestTurnState(t *testing.T) {
 	userText := transcriptEntry{
-		Type:      "user",
-		Message:   msgObject{Role: "user", Content: "please do the thing"},
-		Timestamp: "2024-01-01T00:00:00Z",
+		Type:         "user",
+		Message:      msgObject{Role: "user", Content: "please do the thing"},
+		Timestamp:    "2024-01-01T00:00:00Z",
+		PromptSource: "typed",
+	}
+	userQueued := transcriptEntry{
+		Type:         "user",
+		Message:      msgObject{Role: "user", Content: "and then this"},
+		Timestamp:    "2024-01-01T00:00:04Z",
+		PromptSource: "queued",
+	}
+	// Claude Code answers a background-task notice like any other input, and
+	// stamps it accordingly — the stamp, not the shape, is what admits it.
+	taskNotification := transcriptEntry{
+		Type:         "user",
+		Message:      msgObject{Role: "user", Content: "<task-notification>\n<task-id>t1</task-id>\n</task-notification>"},
+		Timestamp:    "2024-01-01T00:00:04Z",
+		PromptSource: "system",
 	}
 	assistantText := transcriptEntry{
 		Type: "assistant",
@@ -1666,8 +1681,30 @@ func TestTurnState(t *testing.T) {
 		Message: msgObject{Role: "user", Content: []any{
 			map[string]any{"type": "text", "text": "[Request interrupted by user]"},
 		}},
+		Timestamp:            "2024-01-01T00:00:02Z",
+		InterruptedMessageID: "msg_cut_short",
+	}
+	// Older transcripts carry the marker without the field. The stamp test
+	// still drops it, so the entry underneath decides instead of it.
+	interruptMarkerNoID := transcriptEntry{
+		Type: "user",
+		Message: msgObject{Role: "user", Content: []any{
+			map[string]any{"type": "text", "text": "[Request interrupted by user for tool use]"},
+		}},
 		Timestamp: "2024-01-01T00:00:02Z",
 	}
+
+	// The shapes Claude Code writes in the user's voice that nobody submitted.
+	// None carries a promptSource; that absence, not the tag, is what drops them.
+	injected := func(content string) transcriptEntry {
+		return transcriptEntry{
+			Type:      "user",
+			Message:   msgObject{Role: "user", Content: content},
+			Timestamp: "2024-01-01T00:00:02Z",
+		}
+	}
+	localCommandStdout := injected("<local-command-stdout>Set model to Sonnet</local-command-stdout>")
+	commandName := injected("<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>sonnet</command-args>")
 
 	cases := []struct {
 		name    string
@@ -1712,20 +1749,6 @@ func TestTurnState(t *testing.T) {
 			want:    TurnStateComplete,
 		},
 		{
-			// Deliberate split, not an oversight: every message reader drops
-			// this entry (conversationTextBlocks — a text-only user array with
-			// no promptSource is nobody speaking), and TurnState must not.
-			// Status is re-derived from which role spoke last, so it stays on
-			// the entry's type and block kinds and never asks whether the words
-			// count as conversation. The price is visible and accepted: a
-			// transcript ending on an interruption marker reports UserPending,
-			// which the Claude adapter renders as "thinking" on daemon
-			// recovery.
-			name:    "text-only user array still counts as the user speaking",
-			entries: []transcriptEntry{userText, assistantText, interruptMarkerUser},
-			want:    TurnStateUserPending,
-		},
-		{
 			name:    "thinking-only assistant tail is still in flight",
 			entries: []transcriptEntry{userText, assistantThinkingOnly},
 			want:    TurnStateUserPending,
@@ -1734,6 +1757,97 @@ func TestTurnState(t *testing.T) {
 			name:    "sidechain-only transcript is unknown",
 			entries: []transcriptEntry{sidechainAssistantText},
 			want:    TurnStateUnknown,
+		},
+
+		// --- input the agent owes a reply to keeps the turn open ---
+		{
+			name:    "queued prompt counts as the user speaking",
+			entries: []transcriptEntry{assistantText, userQueued},
+			want:    TurnStateUserPending,
+		},
+		{
+			// Stamped "system" and answered like any prompt: the tag it opens
+			// with must not decide, only the stamp.
+			name:    "task notification counts as the user speaking",
+			entries: []transcriptEntry{assistantText, taskNotification},
+			want:    TurnStateUserPending,
+		},
+
+		// --- entries Claude Code writes in the user's voice do not ---
+		//
+		// The catalogue of shapes lives in its own loop below: the code reads
+		// none of that text, so as table cases they would detect one defect
+		// five times over.
+		{
+			// A session opened and closed on a slash command: nothing was ever
+			// asked, so there is no turn to classify and recovery must fall
+			// back on what the caller already decided.
+			name:    "transcript of nothing but injected entries is unknown",
+			entries: []transcriptEntry{commandName, localCommandStdout},
+			want:    TurnStateUnknown,
+		},
+
+		// --- an interruption ends the turn ---
+		{
+			// This case used to assert the opposite, and the transcript it
+			// describes is the one that pinned an idle session to "thinking":
+			// restarting the daemon re-read the same transcript and reached
+			// the same verdict. Kept for that record, but note it does not
+			// isolate the interruption rule — the reply underneath would carry
+			// it to the same answer. The two cases below are the ones that do.
+			name:    "interruption after a reply ends the turn",
+			entries: []transcriptEntry{userText, assistantText, interruptMarkerUser},
+			want:    TurnStateComplete,
+		},
+		{
+			// Passing over the marker would land back on the tool_result and
+			// call the turn live again, so the marker has to outrank it.
+			name:    "interruption after a tool_result ends the turn",
+			entries: []transcriptEntry{userText, assistantToolUse, userToolResult, interruptMarkerUser},
+			want:    TurnStateComplete,
+		},
+		{
+			// Same rule, with the half-written reply as what gets outranked.
+			name:    "interruption of a half-written reply ends the turn",
+			entries: []transcriptEntry{userText, assistantThinkingOnly, interruptMarkerUser},
+			want:    TurnStateComplete,
+		},
+		{
+			name:    "interruption with nothing before it still ends a turn",
+			entries: []transcriptEntry{interruptMarkerUser},
+			want:    TurnStateComplete,
+		},
+		{
+			name:    "a prompt after the interruption reopens the turn",
+			entries: []transcriptEntry{userText, assistantText, interruptMarkerUser, userQueued},
+			want:    TurnStateUserPending,
+		},
+		{
+			name:    "unstamped interruption marker is skipped, prior assistant decides",
+			entries: []transcriptEntry{userText, assistantText, interruptMarkerNoID},
+			want:    TurnStateComplete,
+		},
+		{
+			// ESC and then a slash command — an everyday pair. Skipping the
+			// command must not forget that the turn already ended, or the
+			// tool_result underneath reads as live again.
+			name:    "injected entries after an interruption do not reopen the turn",
+			entries: []transcriptEntry{userText, assistantToolUse, userToolResult, interruptMarkerUser, commandName, localCommandStdout},
+			want:    TurnStateComplete,
+		},
+		{
+			// Both signals on one entry. A stamp means the agent owes a reply,
+			// so it wins — the opposite reading would report a working agent
+			// as idle and let a send through to it.
+			name: "a stamped prompt carrying the interrupt field is still input",
+			entries: []transcriptEntry{userText, assistantThinkingOnly, {
+				Type:                 "user",
+				Message:              msgObject{Role: "user", Content: "changed my mind, do this instead"},
+				Timestamp:            "2024-01-01T00:00:03Z",
+				PromptSource:         "typed",
+				InterruptedMessageID: "msg_cut_short",
+			}},
+			want: TurnStateUserPending,
 		},
 	}
 
@@ -1749,6 +1863,59 @@ func TestTurnState(t *testing.T) {
 				t.Errorf("TurnState = %d, want %d", got, tc.want)
 			}
 		})
+	}
+
+	// The catalogue of shapes Claude Code writes in the user's voice. They all
+	// take the same path — none carries a stamp, and the code reads none of
+	// the text — so they share one assertion rather than five table cases.
+	// Run one tail per transcript, not all of them appended: a regression on
+	// an earlier shape would otherwise hide behind the ones after it.
+	for _, tail := range []struct {
+		name  string
+		entry transcriptEntry
+	}{
+		{"local command stdout", localCommandStdout},
+		{"command invocation", commandName},
+		{"command message", injected("<command-message>review</command-message>\n<command-name>/review</command-name>")},
+		{"bash-mode echo", injected("<bash-input>ls -la</bash-input>")},
+		{"bash-mode output", injected("<bash-stdout>(Bash completed with no output)</bash-stdout><bash-stderr></bash-stderr>")},
+		// The tags are incidental; the missing stamp is the whole rule.
+		{"unstamped plain text", injected("nobody submitted this")},
+	} {
+		t.Run("tail written in the user's voice is passed over: "+tail.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			r := &Reader{claudeDir: tmpDir}
+			workDir := "/turnstate/injected"
+			sessionID := "sess-ts-injected"
+			writeJSONL(t, r.getTranscriptPath(workDir, sessionID),
+				[]transcriptEntry{userText, assistantText, tail.entry})
+
+			if got := r.TurnState(workDir, sessionID); got != TurnStateComplete {
+				t.Errorf("TurnState = %d, want %d (prior assistant should decide)", got, TurnStateComplete)
+			}
+		})
+	}
+}
+
+// TestTurnState_InterruptFieldNameIsWireFormat pins the spelling of the field
+// the interruption rule reads. Every other case builds its fixture from
+// transcriptEntry and marshals it back through the same struct tag, so a
+// rename would round-trip and leave the table green while the rule silently
+// stopped firing on real transcripts. The entry underneath is thinking-only on
+// purpose: drop the field and the answer becomes UserPending, so this case can
+// only pass by way of the interruption branch.
+func TestTurnState_InterruptFieldNameIsWireFormat(t *testing.T) {
+	tmpDir := t.TempDir()
+	r := &Reader{claudeDir: tmpDir}
+	workDir := "/turnstate/wire"
+	sessionID := "sess-ts-wire"
+	writeRawJSONL(t, r.getTranscriptPath(workDir, sessionID), []string{
+		`{"type":"user","message":{"role":"user","content":"do the thing"},"timestamp":"2024-01-01T00:00:00Z","promptSource":"typed"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"let me see"}]},"timestamp":"2024-01-01T00:00:01Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"timestamp":"2024-01-01T00:00:02Z","interruptedMessageId":"msg_1"}`,
+	})
+	if got := r.TurnState(workDir, sessionID); got != TurnStateComplete {
+		t.Errorf("TurnState = %d, want %d (interruptedMessageId not read off the wire?)", got, TurnStateComplete)
 	}
 }
 
@@ -1784,7 +1951,7 @@ func TestTurnState_MalformedLinesSkipped(t *testing.T) {
 	sessionID := "sess-ts-broken"
 	writeRawJSONL(t, r.getTranscriptPath(workDir, sessionID), []string{
 		`{not json`,
-		`{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2024-01-01T00:00:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2024-01-01T00:00:00Z","promptSource":"typed"}`,
 		`}also not json`,
 		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]},"timestamp":"2024-01-01T00:00:01Z"}`,
 	})

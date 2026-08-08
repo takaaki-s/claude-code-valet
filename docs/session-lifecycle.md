@@ -152,6 +152,20 @@ stdout/stderr are saved to `~/.local/state/jind-ai/hook-logs/<session-id>.log` r
      (or permission when persisted, indistinguishable from the transcript
      alone), last entry user → thinking. Unknown/no transcript keeps the
      step-1 decision
+   - "Last entry user" means a user entry the agent owes a reply to: one
+     carrying a promptSource stamp, or a tool_result. Claude Code also writes
+     entries in the user's voice that nobody submitted — the stdout of a local
+     slash command, the notice raised when one is invoked, the echo of a `!`
+     bash line — and those are skipped so the entry underneath decides. An
+     interruption ends the turn outright (→ idle), taking the entries before it
+     with it. Without this, a transcript ending on any of them read as a fresh
+     prompt and pinned an idle session to "thinking", which closes SendPrompt's
+     idle gate with no way to reopen it from jin: "thinking" is only left
+     through a hook, every hook needs the agent to act, and the gate is what
+     refuses to ask it to. Recovery re-reads the same transcript on the next
+     daemon start and reaches the same verdict, so restarting does not clear it
+     either — only driving the agent by hand does (attaching to the pane, or
+     stopping and restarting the session, whose SessionStart writes idle)
 4. Pane dead → StatusStopped (TmuxWindowName preserved for RespawnPane).
    Killed sessions land here too, since a kill leaves the pane dead rather
    than destroying it
