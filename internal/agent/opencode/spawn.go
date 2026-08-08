@@ -8,11 +8,11 @@ import (
 // (packages/opencode/src/id/id.ts: prefixes.session = "ses", joined with
 // "_"). jind-ai pre-mints Session.AgentSessionID as a UUID, which can never
 // collide with this, so the prefix is a reliable "has opencode told us its
-// real id yet?" test. hasSessionIDPrefix in transcript.go asks exactly that and
-// is what the resume decision below uses; isSessionID beside it is the stricter
-// question, and the two are deliberately not the same — see its doc comment. isSessionID in transcript.go is that test; both the
-// resume decision here and the transcript read go through it, so there is one
-// answer to widen if opencode ever changes the format.
+// real id yet?" test. hasSessionIDPrefix in transcript.go asks exactly that,
+// and it is what the resume decision below uses. isSessionID beside it asks
+// the stricter question, and the two are deliberately not one predicate — see
+// isSessionID's doc comment for why the resume path must have the looser of
+// them.
 //
 // This matters because startSessionTmux flips AgentSessionStarted to true
 // before the process is even spawned, so that flag alone cannot distinguish

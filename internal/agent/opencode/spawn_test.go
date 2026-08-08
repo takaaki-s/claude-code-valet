@@ -175,3 +175,28 @@ func TestSpawnCommand_ResumesOnThePrefixAlone(t *testing.T) {
 		t.Errorf("SpawnCommand(uuid) = %q, want a fresh start", plan.Command)
 	}
 }
+
+// TestSpawnCommand_AHostileIDNeverReachesTheCommand closes the adapter end of
+// the injection path.
+//
+// internal/session proves that an ExtraEnv value is not interpreted by the
+// shell; this proves the opencode adapter actually uses ExtraEnv for the one
+// value it does not choose. Neither test can cover both ends — internal/agent
+// imports internal/session, so putting them together is an import cycle — and
+// either one alone leaves the path open.
+func TestSpawnCommand_AHostileIDNeverReachesTheCommand(t *testing.T) {
+	for _, id := range []string{
+		"ses_x$(touch /tmp/jin-should-not-exist)",
+		"ses_x;touch /tmp/jin-should-not-exist",
+		"ses_x`touch /tmp/jin-should-not-exist`",
+		"ses_x'; touch /tmp/jin-should-not-exist; '",
+	} {
+		plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: id, AgentSessionStarted: true}, testConfigDir)
+		if strings.Contains(plan.Command, "touch") || strings.Contains(plan.Command, id) {
+			t.Errorf("SpawnCommand(%q) put the id in Command: %q", id, plan.Command)
+		}
+		if plan.ExtraEnv[sessionArgEnv] != id {
+			t.Errorf("SpawnCommand(%q) did not carry the id in %s: %v", id, sessionArgEnv, plan.ExtraEnv)
+		}
+	}
+}

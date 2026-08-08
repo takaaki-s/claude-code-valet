@@ -38,22 +38,41 @@ type SpawnOptions struct {
 // agent. Manager splices the pieces into the fixed shell template it uses to
 // wrap every session (`cd DIR; env -u ... KEY=VAL SHELL -ic 'COMMAND'`).
 //
-// Shell safety contract — how Manager treats each field:
+// Shell safety contract. The two fields are NOT alike, and the difference is
+// the one thing to take from this comment:
 //
-//   - Command is placed inside single quotes; Manager defensively escapes
-//     any single quote it finds. Adapters SHOULD NOT pre-escape their own
-//     quotes: the replacement is designed for the raw form, and
-//     double-escaping would break the wrapping. Emit the literal command
-//     as if you were typing it into an interactive shell.
-//   - ExtraEnv values are single-quoted by Manager (KEY='value'), so
-//     arbitrary content survives — including whitespace and shell
-//     metacharacters. Adapters can pass values verbatim.
-//   - ExtraEnv keys and UnsetEnv entries must be POSIX env-var names
-//     matching [A-Za-z_][A-Za-z0-9_]*. Manager rejects any that don't
-//     (returns an error before the process is spawned).
+//   - **Command is executed as a shell command. Never build it out of a value
+//     you did not choose.** It ends up as the argument to `SHELL -ic`, which
+//     means a shell is handed it to interpret — so `$(...)`, backticks, `;`
+//     and the rest are live. The single quotes Manager wraps it in protect the
+//     OUTER shell, not the command's own contents, and escaping the quotes
+//     does not change that: an injection needs no quote of its own. This was
+//     not theoretical. The opencode adapter concatenated a session id — a
+//     value written from a hook payload without validation — and
+//     `ses_x$(touch F)` ran, at whatever later moment that session resumed.
+//   - **ExtraEnv values are data.** Manager single-quotes each one, so
+//     arbitrary content survives verbatim: whitespace, metacharacters, quotes.
+//     Pass them raw; pre-escaping is the adapter's bug, not Manager's.
+//   - ExtraEnv keys and UnsetEnv entries must be POSIX env-var names matching
+//     [A-Za-z_][A-Za-z0-9_]*. Manager rejects any that don't, before the
+//     process is spawned.
 //
-// The contract is intentionally "Manager is the last line of defence":
-// adapters return honest, unescaped values and Manager makes them safe.
+// So an adapter that needs an untrusted value on the command line puts the
+// value in ExtraEnv and names it from Command:
+//
+//	Command:  `opencode --session "$JIN_OPENCODE_SESSION"`,
+//	ExtraEnv: map[string]string{"JIN_OPENCODE_SESSION": id},
+//
+// A shell does not re-scan the result of a parameter expansion for
+// substitutions, so the value arrives as one argument however it is spelled.
+// internal/session's TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted checks
+// that by running the command rather than by reading it.
+//
+// "Manager is the last line of defence" holds for ExtraEnv values and for
+// key validation. It does not hold for what is inside Command, and reading it
+// that way is what the paragraph above is here to prevent. Emit Command as the
+// literal line you would type — including the quoting you would type around a
+// value you did not choose.
 type SpawnPlan struct {
 	// Command is the single-line shell command that starts the agent
 	// (e.g. `claude --settings /path/to/hooks.json --session-id UUID`).

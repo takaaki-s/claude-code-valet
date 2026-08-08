@@ -6041,8 +6041,19 @@ func TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAgentShellCmd: %v", err)
 	}
-	if strings.Contains(shellCmd, "$(touch") && !strings.Contains(shellCmd, "'") {
-		t.Fatalf("the value reached the command unquoted: %s", shellCmd)
+	// The value belongs in the quoted env assignment and nowhere else. It must
+	// not appear inside `-ic '...'`, which is the part a shell interprets.
+	// Checking this before running tells two failures apart: the canary staying
+	// absent because the value never reached the command, versus because the
+	// quoting happened to hold.
+	inner := shellCmd
+	if i := strings.Index(shellCmd, "-ic '"); i >= 0 {
+		inner = shellCmd[i:]
+	} else {
+		t.Fatalf("template no longer wraps the command in -ic '...': %s", shellCmd)
+	}
+	if strings.Contains(inner, canary) {
+		t.Errorf("the ExtraEnv value was spliced into the interpreted command: %s", inner)
 	}
 
 	// Running it is the assertion. -ic needs an interactive-capable shell;
