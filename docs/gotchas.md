@@ -874,6 +874,35 @@ Common pitfalls and caveats that agents tend to fall into.
   tmux's `pane_current_path` is also polled, but the hook takes priority.
   (Added in commit a705a80)
 
+- **`stopped` has no automatic exit, so a stop written by mistake persists
+  until a hook happens to disagree.** Nothing re-derives the status from the
+  world: `captureOutputTmux` returns the moment it reads `StatusStopped`
+  (`manager.go`, top of the ticker loop), which is correct for a session that
+  really stopped — the goroutine must not outlive it — but it also retires the
+  one component that could notice the pane is still alive. From then on the
+  record can only be corrected by an incoming hook whose verdict maps
+  elsewhere.
+
+  That makes the lie expensive while it lasts, because both orchestration
+  primitives read it and neither reports doubt: `session send` refuses a
+  `stopped` session outright (`isProcessRunning`), and `session wait` treats
+  it as a finished turn and returns. An orchestrator following the documented
+  `send` → `wait` → `result` pipeline gets a completion for a turn that never
+  ran.
+
+  `SessionStart` now clears a stale stop (see
+  [session-lifecycle.md](session-lifecycle.md#status-detection-via-agent-adapters)),
+  which closes the case that produced it in practice: a restart records the
+  stop and the replacement announces itself. What remains is the general
+  shape — a stop written from any other path waits for the next hook, and an
+  agent blocked inside one long tool call emits none for as long as that call
+  runs. Measured on a real session before the fix: a resumed agent read as
+  `stopped` for over half an hour while it worked.
+
+  When reading a status that says `stopped`, a second source settles it —
+  `pane_current_command` on the session's pane says whether the agent process
+  is there.
+
 ## Claude Code adapter
 
 - **Workspace trust lives in `~/.claude.json`, which is not a settings file.**

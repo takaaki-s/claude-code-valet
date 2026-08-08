@@ -211,6 +211,24 @@ and Status mapping — the Claude Code mapping lives in
 `internal/agent/claude/status.go`; other adapters plug their own
 `StatusSource` into the same slot without touching `session/manager.go`.
 
+**One status decision is the Manager's and not an adapter's: `SessionStart`
+clears a `stopped`, and touches no other status.** Its premise is process
+liveness — something announced it is running — which belongs to no
+vocabulary, and the Manager already draws that inference from that event to
+set `AgentSessionStarted`. Placement is also what makes it safe: `Interpret`
+runs before `m.mu` is taken, so a conditional verdict computed in an adapter
+(a route exists, via `StatusSignal.Payload` — that is how `persisted_status`
+reaches `interpretRecover`) could be decided against a status the monitor
+goroutine has already replaced. Recovery tolerates that because
+`applyRecovery` revalidates; the hook path has no such stage, so it reads and
+writes `Status` inside one critical section instead.
+
+The narrowness matters as much as the rule: `SessionStart` also fires for
+resume, `/clear` and `/compact`, so an unconditional verdict would drop a
+session to `idle` mid-turn the moment an auto-compaction ran. See the
+`stopped` note under [gotchas.md](gotchas.md#hook) for why the stale stop
+exists at all.
+
 `StatusSignal.Kind` currently has two values: `"hook"` (live hook callback)
 and `"recover"` (daemon-restart recovery, see above). Adapters ignore kinds
 they don't understand by returning a false verdict, so new kinds are additive.
