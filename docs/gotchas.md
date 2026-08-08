@@ -1228,6 +1228,102 @@ Common pitfalls and caveats that agents tend to fall into.
   Only the Claude Code adapter sets the flag. Codex maps `PreToolUse` /
   `PostToolUse` to `thinking` the same way and has the same shape of hole, but
   no equivalent measurement exists for it, so its verdicts are unchanged.
+## Answering a blocked session
+
+- **A dialog draws nothing of what you type into it, so `SendPrompt` cannot be
+  pointed at one.** Measured on Claude Code 2.1.226, against a blocking
+  dialog: typed prose is not drawn and is not buffered — it is gone once the
+  dialog closes (3/3); the adapter's `C-u` clear key is inert (3/3); and
+  `sendNudgeKey` ("Down") moves the dialog's selection (3/3).
+
+  Those three together decide the design. Widening `SendPrompt`'s idle gate
+  would not have worked: verify never lands, so the whole budget burns and the
+  call fails — while each look has walked the selection down one more row. The
+  prompt is never committed, because `Enter` is only pressed after a verify
+  that cannot succeed, but the dialog is left pointing somewhere the caller
+  did not choose. `SendPrompt` therefore still refuses anything but `idle`,
+  and `Manager.RespondToBlock` drives dialogs instead.
+
+- **A bare digit is an absolute address, not a cursor move.** Pressing "1"
+  with the cursor parked on option 3 ran the tool; pressing "3" with it on
+  option 2 declined it (2/2). It commits with no `Enter`, which is why the
+  adapter plans exactly one keystroke — an `Enter` after it would arrive once
+  the dialog was already gone. An out-of-range digit does nothing at all and
+  leaves the dialog standing (2/2), so no range check is needed: the miss
+  surfaces as the block failing to clear.
+
+- **The `permission` status is not a usable gate, because a fast caller never
+  sees it.** `Notification{permission_prompt}` arrives 6.075 / 6.078 / 6.087 s
+  after `PreToolUse` (n=3). Answer inside that window and the hook never fires
+  at all (n=9) — the tool completes first. Gating `respond` on
+  `status == permission` would therefore have rejected exactly the callers
+  that were quickest to answer, which is the same shape as the defect it was
+  meant to fix. The pane is the authority instead; status only rules out
+  `stopped` / `creating` / `deleting`, which have no pane worth reading.
+
+- **Each dialog draws a hint line, and the hint line is present only while the
+  dialog is live.** Sampled at five points per round (idle, mid-turn before
+  the dialog, dialog live, just answered, turn settled), three rounds per
+  dialog: the matching hint appears exactly while the dialog is up and nowhere
+  else (3/3 each). Rounds ran on top of earlier rounds' output, and the earlier
+  menus' option rows were still on the visible screen — not scrolled away —
+  while contributing nothing to detection (6/6). That distinction is what makes
+  the number mean anything, since `CapturePane(_, false)` reads the visible
+  pane only and a menu that had scrolled off would have proved nothing. The
+  *options* of a finished menu staying on screen is exactly the trap that
+  matching on them would walk into.
+
+- **AskUserQuestion has more than one form, and they take different keys.**
+  Four screens were observed: a single question; a multi-question form; a
+  multi-question form that renders option previews; and a submit
+  confirmation. On the preview-bearing form a digit only moves the cursor and
+  an `Enter` is needed to commit (2/2) — the opposite of the single-question
+  form. The preview form's hint line *contains* the single-question form's
+  verbatim, which is why `blockAnchors` tests the multi-question anchors
+  first; misordering them is not cosmetic, it is jin typing a digit into a
+  form where that digit does not answer anything.
+
+  Multi-question forms are recognised and refused rather than driven. One
+  answer leaves the form standing, so "the block cleared" — the only
+  post-condition `RespondToBlock` has — could not distinguish a half-filled
+  form from an answer that never landed. The submit confirmation draws no hint
+  line at all, so it is matched on body text; a stale match there costs a
+  refusal, never a keystroke.
+
+- **Declining a tool leaves the session's status stale at `thinking`.** The
+  rejection reaches the agent — `session result` shows the tool_result saying
+  the user declined — but the turn it abandons produces no `Stop`, so nothing
+  moves the session off `thinking`. Measured on a live session: still
+  `thinking` 90s after the decline, pane idle, and the 60s idle notification
+  did not fire either (it appears to key off the `Stop` that never came).
+  Approving does not have this shape: the turn continues and ends normally.
+  This is Claude Code behaviour rather than something `respond` introduced,
+  but `respond` is what makes it reachable from a script.
+
+- **The approval dialog's hint line changes as the cursor moves.**
+  "Tab to amend" is drawn for options 1 and 3 and not for option 2 (3/3 across
+  the three positions), so an anchor containing it stops matching the moment
+  anything moves the selection. This was found by answering a live dialog, not
+  by the fixtures — every fixture had captured the cursor-on-first-option
+  state, the one state where such an anchor works. `hintPermission` is now
+  `ctrl+e to explain`, which held across all three positions and vanished with
+  the dialog along with every other fragment of the line (4/4).
+
+- **Not measured: a second dialog appearing inside the clear budget.** The
+  post-condition is `BlockNone`, so if answering one dialog immediately raises
+  another — approve tool A, tool B asks next — and no frame between them falls
+  on a 200ms poll, `respond` reports exit 4 for an answer that did land.
+  `DetectBlock` cannot tell "still the old dialog" from "a new one", so this is
+  inherent to the post-condition rather than a defect in it. It has not been
+  observed, and it has not been ruled out.
+
+- **Codex and OpenCode are opted out, for different reasons.** Codex's
+  approval dialog could not be reached (the account was over its usage limit
+  on both the default and fallback models, 2/2), so nothing is known about it.
+  OpenCode's *was* measured — see `internal/agent/opencode/agent.go` for the
+  table — and is left unimplemented because driving it means reading which
+  button is currently lit and moving from there, and a misread approves
+  something nobody approved. Claude Code's digit needs no position at all.
 
 ## Claude Code adapter
 

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -326,6 +327,8 @@ func (s *Server) handleRequest(req *Request) Response {
 		return s.handlePaneCapture(req.Data)
 	case "pane-send-keys":
 		return s.handlePaneSendKeys(req.Data)
+	case "respond":
+		return s.handleRespond(req.Data)
 	case "plugin-run":
 		return s.handlePluginRun(req.Data)
 	default:
@@ -571,6 +574,104 @@ func (s *Server) handleSend(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 	return Response{Success: true}
+}
+
+// RespondRequest is the request payload for the "respond" action: an answer
+// to a prompt an agent is blocked on. Exactly one of Option and Text carries
+// the answer.
+type RespondRequest struct {
+	ID string `json:"id"`
+	// Option is a choice's on-screen number, 1-based.
+	Option int `json:"option,omitempty"`
+	// Text is free text, for a prompt that offers a free-text entry.
+	Text string `json:"text,omitempty"`
+}
+
+// RespondResponse reports which sort of prompt was answered. The caller
+// cannot see the pane, and asking it to capture one to find out would push it
+// onto the exact evidence jin's own docs warn against — a capture keeps
+// finished menus on screen.
+type RespondResponse struct {
+	Kind string `json:"kind"`
+}
+
+// RespondNotClearedPrefix tags the one "respond" failure the CLI maps to the
+// timeout exit code: the prompt was still on screen after the answer went out.
+//
+// A prefix rather than a shared phrase because the wire format has no room for
+// an error code, and rather than a substring match on the message because that
+// couples an exit code the docs promise to wording nobody would think to keep
+// stable. Callers strip it before display.
+const RespondNotClearedPrefix = "not-cleared: "
+
+// tagRespondError flattens a RespondToBlock failure into the wire's one error
+// string, marking the single case the CLI turns into a distinct exit code.
+//
+// Split out from the handler because it is the whole of that contract and the
+// handler is not reachable in a test without a live tmux pane. A classifier
+// nothing can exercise is a classifier that silently stops classifying.
+func tagRespondError(err error) string {
+	if errors.Is(err, session.ErrBlockNotCleared) {
+		return RespondNotClearedPrefix + err.Error()
+	}
+	return err.Error()
+}
+
+func (s *Server) handleRespond(data json.RawMessage) Response {
+	var req RespondRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+	if req.ID == "" {
+		return Response{Success: false, Error: "id is required"}
+	}
+	// Validated here as well as in the CLI because this endpoint is reachable
+	// without it — plugins shell out to jin, but nothing stops a caller
+	// speaking the protocol directly.
+	hasOption, hasText := req.Option != 0, req.Text != ""
+	switch {
+	case hasOption && hasText:
+		return Response{Success: false, Error: "pass either an option or text, not both"}
+	case !hasOption && !hasText:
+		return Response{Success: false, Error: "an answer is required: pass an option or text"}
+	}
+	if hasOption && (req.Option < 1 || req.Option > session.MaxAnswerOption) {
+		return Response{Success: false, Error: fmt.Sprintf(
+			"option must be between 1 and %d (an answer is one keystroke)", session.MaxAnswerOption)}
+	}
+	// Reject text the verify step could not search the pane for, by the same
+	// rule and for the same reason as "send" — RespondToBlock confirms free
+	// text rendered before it presses the key that submits it, and text that
+	// normalizes to nothing would satisfy that check without evidence.
+	if hasText && len(req.Text) > session.MaxAnswerTextBytes {
+		return Response{Success: false, Error: fmt.Sprintf(
+			"text is %d bytes; answers over %d cannot be verified because the agent folds a "+
+				"write that large into a placeholder, hiding the text jin checks for",
+			len(req.Text), session.MaxAnswerTextBytes)}
+	}
+	if hasText && !session.PromptVerifiable(req.Text) {
+		return Response{Success: false, Error: "text has no verifiable content " +
+			"(only whitespace or box-drawing characters)"}
+	}
+
+	kind, err := s.manager.RespondToBlock(req.ID, session.BlockAnswer{Option: req.Option, Text: req.Text})
+	if err != nil {
+		// The protocol carries errors as strings, so the one distinction the
+		// CLI has to make — "the prompt never cleared", which becomes the
+		// timeout exit code — is tagged here while the typed error still
+		// exists. Matching the message text on the far side would make a
+		// reworded sentence silently change an exit code.
+		return Response{Success: false, Error: tagRespondError(err)}
+	}
+	// Unlike "send", success here means the prompt left the pane — not merely
+	// that keys were delivered. That is why this action has no equivalent of
+	// send's --wait-running: there is no gap between "sent" and "taken" left
+	// for a caller to poll.
+	payload, err := json.Marshal(RespondResponse{Kind: string(kind)})
+	if err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+	return Response{Success: true, Data: payload}
 }
 
 // ResultRequest is the request payload for the "result" action.

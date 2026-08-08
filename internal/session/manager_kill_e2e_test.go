@@ -3,6 +3,7 @@
 package session
 
 import (
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -43,6 +44,13 @@ func (e2eAgent) DismissOverlayKeys(string) []string { return nil }
 // Transcript returns nil: `sleep` writes no conversation log, and these tests
 // exercise kill/recovery rather than anything that reads one.
 func (e2eAgent) Transcript() TranscriptSource { return nil }
+
+// DetectBlock reports BlockNone and AnswerBlockKeys refuses: a pane running
+// `sleep` shows no dialog, so there is never anything here to answer.
+func (e2eAgent) DetectBlock(string) BlockKind { return BlockNone }
+func (e2eAgent) AnswerBlockKeys(BlockKind, string, BlockAnswer) ([]KeyStep, error) {
+	return nil, fmt.Errorf("e2e agent has no blocking prompts")
+}
 
 type e2eResolver struct{}
 

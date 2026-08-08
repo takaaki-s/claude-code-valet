@@ -1,0 +1,10 @@
+←  ☐ レイアウト  ☐ 配色  ☐ フォント  ✔ Submit  →
+どのレイアウトが良いかね？
+❯ 1. サイドバー型                 ┌────────────────────┐
+  2. トップナビ型                 │ +----+-----------+ │
+  3. グリッド型                   │ |Nav |  Content  | │
+  4. 分割型                       │ +----+-----------+ │
+                                  └────────────────────┘
+                                  Notes: press n to add notes
+  Chat about this
+Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel

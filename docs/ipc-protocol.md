@@ -114,6 +114,7 @@ it alone.
 | `list` | (none) | List all sessions (with last-message enrichment) |
 | `get` | `IDRequest` | Get a single session (with last-message enrichment) |
 | `send` | `SendRequest` | Send a prompt to a session (alias `prompt` on the CLI) |
+| `respond` | `RespondRequest` | Answer a prompt an agent is blocked on; returns `RespondResponse` |
 | `start` | `IDRequest` | Start session |
 | `kill` | `IDRequest` | Kill session |
 | `delete` | `DeleteRequest` | Delete session (async; poll via `get`, optionally with worktree) |
@@ -215,6 +216,22 @@ type HookRequest struct {
 type SendRequest struct {
     ID     string `json:"id"`
     Prompt string `json:"prompt"`
+}
+
+// Exactly one of Option and Text carries the answer; the handler rejects a
+// request that sets both or neither. Option is the choice's on-screen number,
+// bounded to 1-9 because an answer is delivered as a single keystroke.
+type RespondRequest struct {
+    ID     string `json:"id"`
+    Option int    `json:"option,omitempty"`
+    Text   string `json:"text,omitempty"`
+}
+
+// Data on a successful "respond". Kind names the sort of prompt that was
+// answered ("tool-permission" or "question"), so a caller learns what it
+// agreed to without capturing the pane.
+type RespondResponse struct {
+    Kind string `json:"kind"`
 }
 
 // ResultRequest fetches structured transcript entries (text/thinking/tool_use/
@@ -351,6 +368,12 @@ type PluginRunRequest struct {
     CallerTmuxPane   string `json:"caller_tmux_pane,omitempty"`
 }
 ```
+
+`respond` was added without a ProtocolVersion bump, which is the rule above
+applied rather than an exception to it: an action that never existed cannot
+break an old client, because an old client never calls it. Adding a field to
+`SendRequest` instead — the alternative considered — would have been a change
+to an existing endpoint's Data shape, and would have needed one.
 
 ## Adding a New Action
 

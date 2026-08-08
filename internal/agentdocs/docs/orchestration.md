@@ -1,6 +1,6 @@
 ---
 title: Drive a child session end to end
-description: The full delegation loop — create a session, send a prompt, wait for it to settle, collect what it actually did, clean up. Read this first.
+description: The full delegation loop — create a session, send a prompt, wait for it to settle, answer it if it blocks, collect what it actually did, clean up. Read this first.
 ---
 
 # Drive a child session end to end
@@ -42,6 +42,11 @@ jin session send fix-login "run go test ./... and fix what fails" --wait-running
 #    the turn never started — see below.
 jin session wait fix-login --until idle,permission --timeout 600 --json
 
+# 4b. If it came back `permission`, answer it. `send` refuses a blocked
+#     session; `respond` drives the dialog and returns once it is gone.
+jin session result fix-login --json              # what is being asked
+jin session respond fix-login --option 1
+
 # 5. Collect. How much of this works depends on the agent kind — see below.
 jin session output fix-login --last 1 --json     # the final assistant text
 jin session result fix-login --json              # what it actually did
@@ -62,7 +67,8 @@ Skipping the wait is therefore a race you sometimes lose, with
 
 Later sends are covered by step 4's wait, but only when it comes back `idle`:
 `--until idle,permission` returns on either, and `send` refuses everything but
-`idle`. Check the status you got before sending again.
+`idle`. Check the status you got before sending again — on `permission`, answer
+with `jin session respond` (step 4b) rather than sending.
 
 Once the session is idle, `send` handles the rest itself: it verifies the
 prompt actually reached the input box, retrying while the TUI settles,
@@ -175,8 +181,9 @@ whether a resume keeps writing to the same log was never measured, and
 
 `creating`, `running`, `thinking`, `idle`, `permission`, `stopped`, `deleting`.
 
-Terminal for a turn: `idle` (finished) and `permission` (blocked, needs a
-human). `stopped` means the process is gone.
+Terminal for a turn: `idle` (finished) and `permission` (blocked, waiting to be
+answered — `jin session respond`, not `send`). `stopped` means the process is
+gone.
 
 `stopped` is the one status worth a second look. Nothing re-derives it from
 the world, so a stop recorded by mistake stays until a hook disagrees — and an
@@ -209,8 +216,19 @@ jin session send fix-login "the test still fails on line 42; fix that too" --wai
 jin session wait fix-login --until idle,permission
 ```
 
-Escalate to the human when a session sits in `permission`, or when two rounds
-of correction have not moved it.
+Answer a session that sits in `permission` with `respond`. What is safe to
+answer depends on what is being asked, and only you can tell:
+
+- **A tool approval** — "may I run this command?" — is a capability you already
+  have. Answer it.
+- **A question about the work** — which approach, whether to keep going — is a
+  decision. Answer it when it is yours to make. Escalate when it is not:
+  spending the operator's resources, changing what was agreed, anything that
+  cannot be undone. `respond` cannot tell these apart, so this is your
+  judgment, not a check it performs.
+
+Escalate also when `respond` refuses — a multi-question form, or an agent kind
+it does not drive — or when two rounds of correction have not moved the session.
 
 ## Running several at once
 

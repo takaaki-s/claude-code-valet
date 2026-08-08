@@ -7,6 +7,8 @@
 package agenttest
 
 import (
+	"fmt"
+
 	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/session"
 )
@@ -30,6 +32,16 @@ type StubAgent struct {
 	// session.Agent.DismissOverlayKeys. Nil (the default) opts out, so a
 	// stub sends no extra keys before Enter unless a test asks for them.
 	DismissFn func(prompt string) []string
+	// DetectFn classifies a capture; see session.Agent.DetectBlock. Nil (the
+	// default) reports no block, which is what makes RespondToBlock refuse
+	// before it sends anything — tests covering the answerable path have to
+	// set it, and tests that do not mention blocks get the refusal they
+	// should.
+	DetectFn func(capture string) session.BlockKind
+	// AnswerFn plans the keys; see session.Agent.AnswerBlockKeys. Nil (the
+	// default) opts out with an error, matching an adapter that has not
+	// measured its agent's blocking prompts.
+	AnswerFn func(session.BlockKind, string, session.BlockAnswer) ([]session.KeyStep, error)
 	// TranscriptSrc is what Transcript returns; see
 	// session.Agent.Transcript. Nil (the default) means "this stub cannot
 	// read a transcript", which is the answer `jin session result` turns
@@ -107,6 +119,30 @@ func (s *StubAgent) DismissOverlayKeys(prompt string) []string {
 		return nil
 	}
 	return s.DismissFn(prompt)
+}
+
+// DetectBlock reports BlockNone by default, so a stub looks like an agent
+// that is not blocked on anything.
+//
+// The default is load-bearing in the same way DismissOverlayKeys' is: every
+// test that never mentions a blocking prompt is asserting that RespondToBlock
+// refuses and types nothing, and a stub that quietly started reporting a
+// block would turn those into assertions about a key sequence instead.
+func (s *StubAgent) DetectBlock(capture string) session.BlockKind {
+	if s.DetectFn == nil {
+		return session.BlockNone
+	}
+	return s.DetectFn(capture)
+}
+
+// AnswerBlockKeys refuses by default. A stub that reports a block but plans
+// no keys is the shape of an adapter which recognises a screen it cannot
+// drive, so tests get that case without writing a callback for it.
+func (s *StubAgent) AnswerBlockKeys(kind session.BlockKind, capture string, ans session.BlockAnswer) ([]session.KeyStep, error) {
+	if s.AnswerFn == nil {
+		return nil, fmt.Errorf("stub agent cannot answer %q prompts", kind)
+	}
+	return s.AnswerFn(kind, capture, ans)
 }
 
 type statusSourceFn func(session.StatusSignal) (session.StatusUpdate, bool)

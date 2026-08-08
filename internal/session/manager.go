@@ -1177,7 +1177,7 @@ var (
 	// reflow false negatives while still uniquely identifying the send.
 	//
 	// Do not raise this hoping for a stronger anchor: a longer needle is
-	// MORE likely to straddle a wrapped row, not less. normalizeForVerify
+	// MORE likely to straddle a wrapped row, not less. NormalizeForVerify
 	// is what makes the match robust, not the length.
 	sendVerifyTailBytes = 32
 	// sendClearSettleDelay is how long we wait after sending the adapter's
@@ -1319,7 +1319,52 @@ var (
 	sendClearMaxKeys = 512
 )
 
-// normalizeForVerify strips every rune that the TUI may inject into — or
+// Respond tuning. Kept as vars for the same reason as the send knobs above —
+// tests shorten them — but read them differently. The send values are
+// measurements; these are bounds. Nothing below was derived from timing a
+// dialog, and none of them should be quoted as if it were: they are ceilings
+// picked to be generous, so what each comment states is what happens when the
+// ceiling is reached.
+//
+// Being generous is cheap in both directions here. Overshooting costs a slower
+// error on a session that was never going to answer, and RespondToBlock reports
+// that case rather than papering over it. Undershooting would report failure on
+// an agent that simply had not repainted yet — while the keys are already in the
+// pane, which is the worse of the two.
+var (
+	// respondClearPollDelay is the pause between two captures. Both loops use
+	// it: the one waiting for a Verify step's text to render, and the one
+	// waiting for the block to leave the pane. One number rather than two,
+	// because nothing measured says the two waits differ.
+	respondClearPollDelay = 200 * time.Millisecond
+	// respondClearBudget bounds the wait for the block to disappear. The keys
+	// are already out by the time this loop starts, so expiry decides only how
+	// long jin looks before saying it does not know — the error says exactly
+	// that, and RespondToBlock has no way to take an answer back.
+	respondClearBudget = 10 * time.Second
+	// respondVerifyLooks is how many times a Verify step re-checks the pane for
+	// its own text before giving up.
+	//
+	// There is no re-send behind it, which is the difference from
+	// sendVerifyLooksBase. SendPrompt can push the whole prompt again because a
+	// TUI input line is idempotent; the keys here address a dialog by position,
+	// so sending them twice answers a different question. Exhausting the looks
+	// therefore abandons the sequence: the steps after this one — the Enter that
+	// commits — are not sent at all.
+	respondVerifyLooks = 10
+)
+
+// ErrBlockNotCleared reports that a prompt was still on screen after its
+// answer was sent.
+//
+// It is a sentinel rather than a phrase to match because the CLI maps exactly
+// this case to the timeout exit code, and the two live in different packages.
+// A reworded message would otherwise turn a documented exit 4 into a generic
+// exit 1 with nothing failing — the README, the Japanese README and the
+// embedded exit-codes doc all promise the 4.
+var ErrBlockNotCleared = errors.New("the prompt was still on screen")
+
+// NormalizeForVerify strips every rune that the TUI may inject into — or
 // around — the prompt while rendering it, so a needle taken from the
 // prompt still matches the captured pane.
 //
@@ -1338,7 +1383,12 @@ var (
 //
 // Applied to BOTH sides of the comparison, so a prompt that legitimately
 // contains box-drawing characters stays symmetric and still matches.
-func normalizeForVerify(s string) string {
+//
+// Exported for the same reason as PromptVerifiable: an adapter matching its
+// own screen literals against a capture — Agent.DetectBlock does — faces the
+// wrap seam this was written for, and a second normalizer written next to it
+// would drift. Callers must apply it to both sides.
+func NormalizeForVerify(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
@@ -1349,7 +1399,7 @@ func normalizeForVerify(s string) string {
 	return b.String()
 }
 
-// survivesNormalize is the single statement of what normalizeForVerify keeps.
+// survivesNormalize is the single statement of what NormalizeForVerify keeps.
 // PromptVerifiable is defined as "at least one rune survives", so both read
 // the rule from here: adding a third stripped class must not silently stop
 // the daemon's guard from covering it.
@@ -1362,7 +1412,7 @@ func isBoxDrawing(r rune) bool { return r >= 0x2500 && r <= 0x257F }
 
 // PromptVerifiable reports whether SendPrompt can prove that the given
 // prompt reached the pane. Verification works by finding the prompt's tail
-// in the captured pane, and normalizeForVerify discards whitespace and
+// in the captured pane, and NormalizeForVerify discards whitespace and
 // box-drawing runes — so a prompt built only from those normalizes to
 // nothing, leaves no needle to search for, and would be accepted without
 // any evidence it landed.
@@ -1384,12 +1434,12 @@ func PromptVerifiable(prompt string) bool {
 }
 
 // promptTail returns the needle sendVerifyOK looks for: the prompt run
-// through normalizeForVerify, truncated to at most n bytes. Truncation
+// through NormalizeForVerify, truncated to at most n bytes. Truncation
 // backs off to a rune boundary so a multi-byte character is never cut in
 // half — a byte-sliced tail cannot match the equally-normalized haystack
 // once its leading fragment is no longer valid UTF-8.
 func promptTail(prompt string, n int) string {
-	s := normalizeForVerify(prompt)
+	s := NormalizeForVerify(prompt)
 	if len(s) <= n {
 		return s
 	}
@@ -1484,7 +1534,7 @@ func sendVerifyBudget(chunks, clearPresses, looks int) time.Duration {
 // as callers reject those first — daemon.handleSend does, via
 // PromptVerifiable, which is defined as the exact complement of this case.
 func sendVerifyOK(before, after, prompt string) bool {
-	return sendVerifyLanded(normalizeForVerify(before), after,
+	return sendVerifyLanded(NormalizeForVerify(before), after,
 		promptTail(prompt, sendVerifyTailBytes))
 }
 
@@ -1496,7 +1546,7 @@ func sendVerifyOK(before, after, prompt string) bool {
 // normalizing a 32KB capture per needle per look would cost more than the
 // capture it is checking.
 func sendVerifyLanded(beforeNorm, after, tail string) bool {
-	return sendVerifyAppeared(beforeNorm, normalizeForVerify(after), tail)
+	return sendVerifyAppeared(beforeNorm, NormalizeForVerify(after), tail)
 }
 
 // sendVerifyAppeared reports whether needle occurs more often in the pane now
@@ -1637,7 +1687,7 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 	// Fixed for the whole send: hoisted so the look loop does not re-normalize
 	// them on every pass.
 	tail := promptTail(prompt, sendVerifyTailBytes)
-	foldNeedle := normalizeForVerify(placeholder)
+	foldNeedle := NormalizeForVerify(placeholder)
 	budget := sendVerifyBudget(len(chunks), clearRepeats*len(clearKeys), looks)
 
 	// The post-clear baseline the whole attempt compares against. Declared
@@ -1680,7 +1730,7 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		if err != nil {
 			return fmt.Errorf("capture-pane before failed: %w", err)
 		}
-		beforeNorm = normalizeForVerify(before)
+		beforeNorm = NormalizeForVerify(before)
 
 		if pasting {
 			// One atomic bracketed paste. No chunking, so the split-boundary
@@ -1742,7 +1792,7 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 			// stands in for it — but a small paste the TUI declined to fold
 			// still shows its tail, so accept whichever appears rather than
 			// depending on where that fold threshold sits.
-			if landedIn(normalizeForVerify(after)) {
+			if landedIn(NormalizeForVerify(after)) {
 				landed = true
 				break
 			}
@@ -1794,7 +1844,7 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		if err != nil {
 			return fmt.Errorf("capture-pane after overlay dismiss failed: %w", err)
 		}
-		if !landedIn(normalizeForVerify(after)) {
+		if !landedIn(NormalizeForVerify(after)) {
 			return fmt.Errorf(
 				"send verify: the prompt left the input area after the overlay-dismiss keys %v; "+
 					"Enter was not pressed, so nothing was committed", dismissKeys)
@@ -1805,6 +1855,206 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		return fmt.Errorf("failed to send Enter: %w", err)
 	}
 	return nil
+}
+
+// RespondToBlock answers a blocking prompt the session's agent is showing —
+// a tool-approval dialog, or a question — and returns the kind it answered.
+//
+// This is a different verb from SendPrompt because it drives a different
+// thing, not because the gate is looser. SendPrompt types a prompt into an
+// input line and proves it arrived by finding it there. On a dialog there is
+// nothing to find: measured on Claude Code 2.1.226, typed prose is not drawn
+// and is not buffered (3/3), while SendPrompt's own nudge key walks the
+// dialog's selection (3/3). Pointing SendPrompt at a dialog would therefore
+// burn its whole budget, fail, and leave the selection moved — so it keeps
+// refusing anything that is not idle, and this exists instead.
+//
+// The post-condition here is that the block LEFT the pane. That is why only
+// kinds reporting Answerable() are driven: a form of several questions stays
+// standing after one answer, so "the block is gone" could not tell a
+// half-filled form from an answer that never landed. The gate and the
+// post-condition are one design, not two — loosening either alone breaks the
+// other.
+//
+// Status is deliberately not the gate. The hook that turns a session
+// `permission` arrives about six seconds after the agent blocks, so a caller
+// that answers promptly never sees that status at all (n=9). The pane is the
+// authority on whether there is something to answer, and asking it costs
+// nothing that matters: on BlockNone no key is sent.
+func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) {
+	m.mu.RLock()
+	sess, ok := m.sessions[id]
+	if !ok {
+		m.mu.RUnlock()
+		return BlockNone, fmt.Errorf("session not found: %s", id)
+	}
+	status := sess.Status
+	paneID := sess.TmuxPaneID
+	agentKind := sess.AgentKind
+	m.mu.RUnlock()
+
+	// The only statuses refused outright are the ones with no pane worth
+	// looking at. Everything else — including idle — falls through to the
+	// pane, because a session can sit at idle with a dialog up: recovery
+	// derives idle without consulting the screen, and nothing re-derives it
+	// afterwards. Refusing idle here would reject exactly those sessions,
+	// while allowing it costs nothing: with no dialog on screen DetectBlock
+	// reports BlockNone and this returns before sending a key.
+	switch status {
+	case StatusStopped, StatusCreating, StatusDeleting:
+		return BlockNone, fmt.Errorf("session is %s, so there is no prompt to answer", status)
+	}
+
+	if paneID == "" {
+		return BlockNone, fmt.Errorf("session has no tmux pane")
+	}
+	if m.tmuxClient == nil {
+		return BlockNone, fmt.Errorf("tmux client not available")
+	}
+
+	// Unlike SendPrompt, a missing adapter is fatal here. SendPrompt falls
+	// back to defaults because every capability it reads off the adapter has
+	// a safe one and the transport must never refuse a send. There is no safe
+	// default answer to a dialog: which key means "approve" is precisely the
+	// agent-specific knowledge this call needs.
+	ag := m.resolveAgent(agentKind)
+	if ag == nil {
+		return BlockNone, fmt.Errorf("no adapter for agent kind %q, so jin cannot tell "+
+			"what keys its prompts take; attach the session and answer it directly", agentKind)
+	}
+
+	capture, err := m.tmuxClient.CapturePane(paneID, false)
+	if err != nil {
+		return BlockNone, fmt.Errorf("capture-pane failed: %w", err)
+	}
+	kind := ag.DetectBlock(capture)
+
+	// Ask the adapter to plan the answer even for kinds it cannot drive: the
+	// error it returns IS the message the caller gets, and only the adapter
+	// knows which screen this is and therefore what to do about it. Manager
+	// classifying it here would flatten several different situations into one
+	// sentence.
+	steps, err := ag.AnswerBlockKeys(kind, capture, ans)
+	if err != nil {
+		return kind, err
+	}
+	if !kind.Answerable() {
+		// An adapter that plans keys for a kind Manager will not drive is a
+		// bug in the adapter, and a silent one: the keys would look right in
+		// its unit tests. Refuse rather than run them.
+		return kind, fmt.Errorf("internal: adapter planned keys for %q, which jin does not drive", kind)
+	}
+	if len(steps) == 0 {
+		return kind, fmt.Errorf("internal: adapter planned no keys for %q", kind)
+	}
+
+	// Validate the whole plan before any of it runs. A malformed step found
+	// halfway through would be found with keys already in the pane, and the
+	// error would then have to describe a dialog in an unknown state — so the
+	// checks that can be made from the plan alone are made here, where a
+	// refusal still means nothing was typed.
+	for _, step := range steps {
+		switch {
+		case step.Key != "" && step.Literal != "":
+			// KeyStep documents these as exclusive. Picking one silently
+			// would drop the other, and on this path the dropped half is
+			// usually the answer itself.
+			return kind, fmt.Errorf("internal: adapter planned a step with both a key (%q) and text for %q",
+				step.Key, kind)
+		case step.Key == "" && step.Literal == "":
+			return kind, fmt.Errorf("internal: adapter planned an empty key step for %q", kind)
+		}
+		// A Verify step whose text normalizes to nothing leaves no needle,
+		// and sendVerifyAppeared accepts an empty needle unconditionally — so
+		// the check would pass without evidence and the committing steps
+		// after it would run on it. This is PromptVerifiable's rule applied
+		// to the adapter's own plan rather than to the caller's input.
+		if step.Verify && promptTail(step.Literal, sendVerifyTailBytes) == "" {
+			return kind, fmt.Errorf("internal: adapter asked to verify a step with nothing to look for")
+		}
+	}
+
+	for _, step := range steps {
+		// A Verify step is checked against a baseline taken immediately
+		// before it, so what the check reports is what THIS step drew rather
+		// than something already on screen.
+		var beforeNorm string
+		if step.Verify {
+			before, err := m.tmuxClient.CapturePane(paneID, false)
+			if err != nil {
+				return kind, fmt.Errorf("capture-pane before %q failed: %w", step.Literal, err)
+			}
+			beforeNorm = NormalizeForVerify(before)
+		}
+
+		switch {
+		case step.Key != "":
+			if err := m.tmuxClient.SendKeys(paneID, step.Key); err != nil {
+				return kind, fmt.Errorf("failed to send key %q: %w", step.Key, err)
+			}
+		default:
+			if err := m.tmuxClient.SendKeysLiteral(paneID, step.Literal); err != nil {
+				return kind, fmt.Errorf("failed to send %q: %w", step.Literal, err)
+			}
+		}
+
+		if !step.Verify {
+			continue
+		}
+		// Reuse SendPrompt's comparison rather than writing a second one, so
+		// "the text appeared" cannot come to mean two things in one package.
+		needle := promptTail(step.Literal, sendVerifyTailBytes)
+		landed := false
+		for look := 0; look < respondVerifyLooks; look++ {
+			time.Sleep(respondClearPollDelay)
+			after, err := m.tmuxClient.CapturePane(paneID, false)
+			if err != nil {
+				return kind, fmt.Errorf("capture-pane after %q failed: %w", step.Literal, err)
+			}
+			if sendVerifyAppeared(beforeNorm, NormalizeForVerify(after), needle) {
+				landed = true
+				break
+			}
+		}
+		if !landed {
+			// Abandoning here is the point of the flag. The steps left
+			// unsent are the ones that commit, so stopping means nothing was
+			// answered — which is a far better outcome than committing
+			// whatever the dialog happened to be pointing at.
+			//
+			// The message deliberately does NOT invite a retry. The text was
+			// typed; only its appearance could not be confirmed, so the field
+			// may well be holding it. Answering again types into the same
+			// field, and the second attempt's tail could then verify against
+			// a field holding both answers run together.
+			return kind, fmt.Errorf(
+				"the answer text was typed but never appeared in the pane, so the keys that " +
+					"would submit it were not sent. The prompt is still waiting, and its " +
+					"free-text field may already hold part of the answer — attach the session " +
+					"and look rather than answering again")
+		}
+	}
+
+	// The answer is only taken once the dialog is gone. Detection and
+	// clearance run through the same DetectBlock for the reason SendPrompt
+	// folds its two landing checks into one closure: two rules for the same
+	// question drift, and this one decides whether jin reports success.
+	deadline := time.Now().Add(respondClearBudget)
+	for {
+		after, err := m.tmuxClient.CapturePane(paneID, false)
+		if err != nil {
+			return kind, fmt.Errorf("capture-pane after answering failed: %w", err)
+		}
+		if ag.DetectBlock(after) == BlockNone {
+			return kind, nil
+		}
+		if time.Now().After(deadline) {
+			return kind, fmt.Errorf("%w after %s; the keys went out, so whether the agent "+
+				"took them is unknown — attach the session and look before answering again",
+				ErrBlockNotCleared, respondClearBudget)
+		}
+		time.Sleep(respondClearPollDelay)
+	}
 }
 
 // resolveAgent returns the adapter for kind, or nil when the resolver is not
