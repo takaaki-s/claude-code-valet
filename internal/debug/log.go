@@ -14,6 +14,15 @@ import (
 // enabled is true when JIN_DEBUG=1 is set.
 var enabled = os.Getenv("JIN_DEBUG") == "1"
 
+// Enabled reports whether debug logging is on for this process.
+//
+// It exists so that the one place that has to pass the flag on to a child —
+// Manager, building the agent's environment — asks this package rather than
+// re-reading the variable and re-deciding what counts as on. Two readings of
+// the same variable can disagree, and the shape of the disagreement is a child
+// that logs when the parent does not, or the reverse.
+func Enabled() bool { return enabled }
+
 // Untrusted renders a value the local process did not choose so that it is safe
 // to put in a log line: quoted, and bounded to max bytes. Use it with %s — it
 // has already quoted the value.
@@ -73,6 +82,14 @@ func NewLogger(filename string) func(string, ...any) {
 		}
 		defer f.Close()
 		msg := fmt.Sprintf(format, args...)
-		fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05.000"), msg)
+		// The date is load-bearing, not decoration. These files are appended
+		// to and never rotated, so one of them accumulates days of a long-lived
+		// daemon; a clock-only stamp leaves no way to order two lines that read
+		// 20:41 and 05:51, and the file is the only record of when anything
+		// happened. Reconstructing the boundaries afterwards means scanning
+		// backwards for the points where time runs backwards, with a threshold
+		// to tell a day rollover from the small out-of-order writes concurrent
+		// goroutines produce — which is guesswork the writer can just avoid.
+		fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("2006-01-02 15:04:05.000"), msg)
 	}
 }

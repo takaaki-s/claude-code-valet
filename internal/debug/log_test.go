@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // withStateHome forces internal/paths to resolve State() to a deterministic
@@ -70,9 +71,49 @@ func TestNewLogger_Enabled(t *testing.T) {
 	if !strings.Contains(content, "hello world 42") {
 		t.Errorf("log file content %q does not contain expected message", content)
 	}
-	// Verify timestamp format [HH:MM:SS.mmm] is present
-	if !strings.Contains(content, "[") || !strings.Contains(content, "]") {
-		t.Errorf("log file content %q does not contain timestamp brackets", content)
+	// The stamp is TestNewLogger_StampCarriesTheDate's subject. Asserting here
+	// that a "[" and a "]" appear would pass for any stamp at all, including
+	// none.
+}
+
+// TestNewLogger_StampCarriesTheDate pins the part of the line that says when.
+// NewLogger's comment has why the date is load-bearing.
+func TestNewLogger_StampCarriesTheDate(t *testing.T) {
+	origEnabled := enabled
+	enabled = true
+	defer func() { enabled = origEnabled }()
+
+	stateDir := withStateHome(t, t.TempDir())
+
+	// Millisecond truncation because that is the stamp's resolution: an
+	// untruncated `before` can round up past a line written in the same
+	// millisecond and fail the window below on nothing.
+	before := time.Now().Truncate(time.Millisecond)
+	NewLogger("stamp.log")("entry")
+	after := time.Now()
+
+	data, err := os.ReadFile(filepath.Join(stateDir, "stamp.log"))
+	if err != nil {
+		t.Fatalf("failed to read log file: %v", err)
+	}
+	line := strings.TrimSpace(string(data))
+	end := strings.Index(line, "]")
+	if !strings.HasPrefix(line, "[") || end < 0 {
+		t.Fatalf("line %q is not of the form [stamp] message", line)
+	}
+	stamp := line[1:end]
+
+	// Parsing with this layout is the assertion: a clock-only stamp does not
+	// satisfy it, and neither does a date-only one.
+	got, err := time.ParseInLocation("2006-01-02 15:04:05.000", stamp, time.Local)
+	if err != nil {
+		t.Fatalf("stamp %q does not carry a full date and time: %v", stamp, err)
+	}
+	// A parseable stamp could still be a constant. Bounding it to the call
+	// makes the test about when the line was written rather than its shape.
+	if got.Before(before) || got.After(after) {
+		t.Errorf("stamp %s is outside [%s, %s] — it does not report when the line was written",
+			got.Format(time.RFC3339Nano), before.Format(time.RFC3339Nano), after.Format(time.RFC3339Nano))
 	}
 }
 

@@ -67,17 +67,28 @@ the rename succeeds.
 
 ## Debug Logging
 
-debugEnabled / debugLog() are duplicated in the daemon and session packages (not shared).
+Use `internal/debug`. Do not duplicate the pattern per package — an earlier
+version of this section told you to, and what got duplicated was the decision
+about what the flag means and how a line is stamped, which is exactly what has
+to agree across files that are read side by side.
 
 ```go
-var debugEnabled = os.Getenv("JIN_DEBUG") == "1"
-
-func debugLog(format string, args ...interface{}) {
-    // Append to file: [HH:MM:SS] message
-}
+var debugLog = debug.NewLogger("daemon-debug.log")   // one per log file
 ```
 
-If a new package needs debug logging, duplicate the same pattern.
+- `debug.NewLogger(<file>)` writes to the state dir, and is a no-op when
+  debugging is off, so callers need no guard of their own.
+- `debug.Enabled()` is the answer to "is debugging on" for code that has to do
+  something other than write a line — routing a child's output, or passing the
+  flag to a process jind-ai starts. Do not re-read the environment variable.
+- `debug.Untrusted` / `debug.UntrustedBytes` bound and quote any value the
+  local process did not choose, so one payload cannot forge entries or fill the
+  file.
+
+The line format lives in `NewLogger` and nowhere else. It carries a full date
+on purpose: these files are appended to and never rotated, so one accumulates
+days of a long-lived daemon, and a clock-only stamp cannot order two lines
+across a midnight. `internal/debug`'s tests pin it.
 
 ## Configuration Access
 

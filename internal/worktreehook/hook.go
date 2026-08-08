@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/takaaki-s/jind-ai/internal/debug"
 	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
 
@@ -118,7 +119,7 @@ func (r *runner) Run(ctx context.Context, opts RunOptions) error {
 	defer devNull.Close()
 
 	var out io.Writer = logFile
-	if os.Getenv("JIN_DEBUG") == "1" {
+	if debug.Enabled() {
 		out = io.MultiWriter(logFile, os.Stderr)
 	}
 
