@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/takaaki-s/jind-ai/internal/debug"
 	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
 
@@ -122,7 +123,7 @@ func ExecPlugin(ctx context.Context, opts ExecOptions) error {
 	defer logFile.Close()
 
 	var out io.Writer = logFile
-	if os.Getenv("JIN_DEBUG") == "1" {
+	if debug.Enabled() {
 		out = io.MultiWriter(logFile, os.Stderr)
 	}
 

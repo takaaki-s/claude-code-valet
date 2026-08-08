@@ -49,6 +49,13 @@ linters:
         # used to hit every correct site too, so each one had to be read
         # forward a few lines; now any hit outside internal/procgroup is the
         # finding.
+        # The sibling rule for JIN_DEBUG is not here, and the reason is worth
+        # recording: forbidigo matches the function expression only, so
+        # `^os\.Getenv$` is the finest pattern available and it would forbid
+        # every environment read in the project. Measured by putting the
+        # violation back — a pattern carrying the argument matches nothing at
+        # all, which is indistinguishable from a clean tree. That rule lives in
+        # internal/debug's tests instead.
         - pattern: '^exec\.CommandContext$'
           msg: use procgroup.CommandContext, which puts the child in its own process group
 

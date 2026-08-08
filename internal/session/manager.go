@@ -27,6 +27,12 @@ import (
 
 var debugLog = debug.NewLogger("daemon-debug.log")
 
+// debugEnabled reports whether to pass the debug flag on to a spawned agent.
+// A variable only so tests can drive both branches: whether an agent logs is
+// not something a test can arrange through the environment, because the flag is
+// read once when the process starts. Production never reassigns it.
+var debugEnabled = debug.Enabled
+
 // ErrWorktreeDirty is returned when a git worktree has uncommitted changes
 // and force removal was not requested.
 var ErrWorktreeDirty = errors.New("worktree has uncommitted changes")
@@ -2605,6 +2611,31 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	shellDir := workDirForShell(snap.StartDir)
 	customEnv := buildEnvString(m.configMgr.GetEnv())
 	envVars := fmt.Sprintf("JIN_SESSION_ID=%s TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1", snap.JinSessionID)
+	// JIN_DEBUG rides along for the same reason JIN_SESSION_ID does: the
+	// process this launches will run `jin hook`, and that hook is jind-ai's own
+	// binary deciding whether to record what it was handed. Starting the daemon
+	// with the flag used to turn on only half the exchange — the daemon logged
+	// the status transitions it chose, while the hook side stayed silent,
+	// because the flag reached the daemon's environment and stopped there. A
+	// tmux pane inherits the tmux server's environment, not the daemon's, so
+	// nothing carried it across on its own.
+	//
+	// What was lost is the half that says why: the hook payload holds the
+	// stop_reason behind a failed turn, the notification_type that separates a
+	// permission prompt from an idle timer, and the agent session id that fired
+	// — and the daemon only writes a line when a hook changes the status, so a
+	// hook that changed nothing left no trace at all. Anyone who turned the
+	// flag on to investigate got a file that had been empty long enough to look
+	// like the events themselves were missing.
+	//
+	// It belongs here rather than in an adapter because nothing about it is
+	// agent-specific: every kind is launched through this wrapper and every kind
+	// calls the same hook binary. It is written before customEnv so that a user
+	// who names JIN_DEBUG in their own config still wins — `env` applies
+	// assignments left to right.
+	if debugEnabled() {
+		envVars += " JIN_DEBUG=1"
+	}
 	if customEnv != "" {
 		envVars += " " + customEnv
 	}
