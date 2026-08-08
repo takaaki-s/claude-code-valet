@@ -69,6 +69,10 @@ type fakeAgent struct {
 	// this adapter cannot read a conversation, which is what the list rows
 	// must tolerate silently.
 	transcriptSrc TranscriptSource
+	// recognizesFn answers RecognizesSessionID. Nil (the default) accepts
+	// every id, so tests that predate the hook re-key gate keep describing
+	// the same behaviour; tests exercising the gate set it.
+	recognizesFn func(string) bool
 }
 
 func (a *fakeAgent) Kind() string             { return "claude" }
@@ -78,6 +82,12 @@ func (a *fakeAgent) SpawnCommand(opts SpawnOptions) SpawnPlan {
 		return a.spawnFn(opts)
 	}
 	return SpawnPlan{Command: "claude"}
+}
+func (a *fakeAgent) RecognizesSessionID(id string) bool {
+	if a.recognizesFn == nil {
+		return true
+	}
+	return a.recognizesFn(id)
 }
 func (a *fakeAgent) Description() DescriptionEnhancer { return a.enhancer }
 func (a *fakeAgent) StatusSource() StatusSource       { return fakeStatusSource{} }

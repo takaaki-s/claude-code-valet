@@ -49,6 +49,17 @@ type hookContextOutput struct {
 
 var hookEmitContext bool
 
+// hookLogFieldMax bounds any single caller-chosen value written to
+// hook-debug.log. The daemon is what validates these; this command only reports
+// what it was handed, so the bound is generous — enough to identify a value,
+// not enough for one payload to fill the file.
+const hookLogFieldMax = 256
+
+// untrusted is debug.Untrusted at this command's bound, named once so the
+// bound cannot be applied to three fields of a log line and forgotten on the
+// fourth.
+func untrusted(s string) string { return debug.Untrusted(s, hookLogFieldMax) }
+
 var hookLog = debug.NewLogger("hook-debug.log")
 
 var hookCmd = &cobra.Command{
@@ -66,7 +77,13 @@ var hookCmd = &cobra.Command{
 
 		var input hookInput
 		if err := json.Unmarshal(data, &input); err != nil {
-			hookLog("failed to parse JSON: %v (data: %s)", err, string(data))
+			// Bounded and quoted, for the same reason as the event line below:
+			// stdin is chosen by the caller, so an unbounded raw echo lets
+			// anyone who can run `jin hook` write arbitrary lines into this
+			// log — including ones that look like entries jind-ai wrote. Bounded
+			// before the []byte becomes a string, so a huge payload is not
+			// copied onto the heap only to be thrown away.
+			hookLog("failed to parse JSON: %v (data: %s)", err, debug.UntrustedBytes(data, hookLogFieldMax))
 			return nil
 		}
 
@@ -80,7 +97,8 @@ var hookCmd = &cobra.Command{
 		}
 
 		if input.SessionID == "" || input.HookEventName == "" {
-			hookLog("missing required fields: session_id=%q hook_event_name=%q", input.SessionID, input.HookEventName)
+			hookLog("missing required fields: session_id=%s hook_event_name=%s",
+				untrusted(input.SessionID), untrusted(input.HookEventName))
 			return nil
 		}
 
@@ -90,7 +108,13 @@ var hookCmd = &cobra.Command{
 			return nil // Not a jin-managed session, skip
 		}
 
-		hookLog("event=%s cc_session=%s jin_session=%s notification=%s", input.HookEventName, input.SessionID, jinSessionID, input.NotificationType)
+		// Every field the caller chose goes through untrusted — payload and
+		// environment alike. They arrive unvalidated here (the daemon is what
+		// gates them), and a value carrying a newline would otherwise forge whole
+		// lines in this log.
+		hookLog("event=%s agent_session=%s jin_session=%s notification=%s",
+			untrusted(input.HookEventName), untrusted(input.SessionID),
+			untrusted(jinSessionID), untrusted(input.NotificationType))
 
 		// Send to daemon
 		client := daemon.NewClient(getSocketPath())

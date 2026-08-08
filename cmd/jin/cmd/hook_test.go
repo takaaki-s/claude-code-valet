@@ -13,6 +13,10 @@ import (
 // stdout. The flag is reset on both sides because it is a package-level
 // variable bound to a cobra flag, and a leaked "true" would make an unrelated
 // test print JSON into a channel that must stay silent.
+//
+// This runs the real command, which forwards to whatever daemon JIN_SESSION_ID
+// and JIN_SOCKET name. TestMain clears both for the whole package — see the
+// comment there for what these fixtures did to a live session before it did.
 func runHookCmd(t *testing.T, stdin string, args ...string) (string, error) {
 	t.Helper()
 	hookEmitContext = false

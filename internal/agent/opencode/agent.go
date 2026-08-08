@@ -56,6 +56,26 @@ func New() *Agent {
 // Kind is the identifier jind-ai persists in Session.AgentKind.
 func (a *Agent) Kind() string { return "opencode" }
 
+// RecognizesSessionID answers with hasSessionIDPrefix — the LOOSE predicate,
+// not isSessionID beside it — and the choice is the point.
+//
+// This adapter is the one that cannot afford a wrong refusal. opencode mints
+// its own id and reports it through the plugin, and a resume that does not
+// happen starts a new session with nothing saying so: the operator's
+// conversation is simply absent. Answering with the same predicate
+// SpawnCommand already gates the resume on makes the two sets identical, so
+// every id this accepts is an id that would be resumed, and every id this
+// refuses is one the resume path would have ignored anyway. The gate therefore
+// adds no silent failure that was not already there.
+//
+// isSessionID would break that. Its base62 alphabet is evidence about today's
+// ids rather than a rule opencode promised, and using it here would make an
+// upstream alphabet change lose conversations quietly — the exact trade its own
+// doc comment refuses on the resume path. Injection is not the reason to reach
+// for the strict test: Manager's safeAgentSessionID has already refused every
+// shell metacharacter before this is called.
+func (a *Agent) RecognizesSessionID(id string) bool { return hasSessionIDPrefix(id) }
+
 // Setup materialises the bundled plugin under
 // <StateDir>/opencode/plugin/jin.ts and records the directory SpawnCommand
 // hands to opencode via OPENCODE_CONFIG_DIR.

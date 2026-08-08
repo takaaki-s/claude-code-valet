@@ -278,6 +278,43 @@ type Agent interface {
 	// SpawnCommand returns the shell command + env additions that launch
 	// (or resume) the agent for the given session.
 	SpawnCommand(SpawnOptions) SpawnPlan
+	// RecognizesSessionID reports whether id is written the way this
+	// adapter's agent writes its own session ids. Manager asks before
+	// letting a hook payload re-key Session.AgentSessionID, so an id that
+	// belongs to no agent — or to a different one — never lands in the
+	// record, in a resume command line, or in a transcript lookup.
+	//
+	// Shape, not ownership. This cannot tell one live session's id from
+	// another's — a well-formed id belonging to a different session of the
+	// same kind passes, and Manager has no way to know. What the gate
+	// narrows is which VALUES can be recorded, not which session an event
+	// may speak for.
+	//
+	// Answer the LOOSE question, not the exact one. Manager applies a
+	// kind-independent safety gate first (see safeAgentSessionID), which
+	// rules out shell metacharacters, path traversal and leading-hyphen
+	// flag lookalikes — so this predicate is free to accept anything shaped
+	// like an id this agent could mint, including formats it has not
+	// shipped yet. Being wrong in the strict direction is the expensive
+	// one: a refused id is never recorded, so the session keeps whatever it
+	// held before, and what that costs differs per adapter:
+	//
+	//   - Claude Code is told its id (--session-id), so the value already
+	//     held IS the right one and a refusal costs nothing.
+	//   - Codex mints its own, so a refusal leaves the pre-minted UUID,
+	//     `codex resume` fails within seconds, and the quick-fail retry
+	//     starts a fresh session — a visible restart, not a silent one.
+	//   - opencode mints its own AND resumes silently, so a refusal starts a
+	//     new session with the operator's conversation simply absent. That
+	//     is why its answer here is deliberately the same loose prefix test
+	//     its resume path already gates on, and not the stricter alphabet
+	//     check beside it: every id the write gate accepts is an id the
+	//     resume path would use, so no new silent failure is introduced.
+	//
+	// On Agent rather than a side interface for the same reason as
+	// ClearInputKeys: an adapter that forgets this should fail to compile,
+	// because what it reintroduces is an unvalidated write.
+	RecognizesSessionID(id string) bool
 	// StatusSource returns the adapter's interpreter for StatusSignals.
 	// Must never return nil (agents that don't observe status can return a
 	// no-op implementation).

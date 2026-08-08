@@ -22,6 +22,14 @@ func TestStubDefaultsOptOut(t *testing.T) {
 	if got := s.ClearInputKeys(); got != nil {
 		t.Errorf("ClearInputKeys on a zero-value stub = %v, want nil", got)
 	}
+	// Accept-all, and unlike the two above this default is the permissive one.
+	// It is right for a stub — a test that never mentions the hook re-key gate
+	// should not have one imposed on it — and wrong for an adapter, where the
+	// same answer is what the gate exists to prevent. Pinned so the two do not
+	// get reconciled by someone reading only one of them.
+	if !s.RecognizesSessionID("anything-at-all") {
+		t.Error("RecognizesSessionID on a zero-value stub = false, want true")
+	}
 }
 
 // TestStubDismissFnReceivesPrompt checks the stub forwards the prompt rather

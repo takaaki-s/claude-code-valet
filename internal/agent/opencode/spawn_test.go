@@ -57,8 +57,9 @@ func TestSpawnCommand_Resume(t *testing.T) {
 		AgentSessionStarted: true,
 	}, testConfigDir)
 
-	// The id is named, not spliced. See sessionArgEnv, and the injection test
-	// below for what splicing it cost.
+	// The id is named, not spliced. See sessionArgEnv for what splicing it cost;
+	// the rule itself is enforced for every registered adapter by
+	// TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand.
 	want := `opencode --session "$JIN_OPENCODE_SESSION"`
 	if plan.Command != want {
 		t.Errorf("Command = %q, want %q", plan.Command, want)
@@ -176,27 +177,36 @@ func TestSpawnCommand_ResumesOnThePrefixAlone(t *testing.T) {
 	}
 }
 
-// TestSpawnCommand_AHostileIDNeverReachesTheCommand closes the adapter end of
-// the injection path.
+// TestRecognizesSessionID_MatchesTheResumeGate is the invariant that lets this
+// adapter be gated at all.
 //
-// internal/session proves that an ExtraEnv value is not interpreted by the
-// shell; this proves the opencode adapter actually uses ExtraEnv for the one
-// value it does not choose. Neither test can cover both ends — internal/agent
-// imports internal/session, so putting them together is an import cycle — and
-// either one alone leaves the path open.
-func TestSpawnCommand_AHostileIDNeverReachesTheCommand(t *testing.T) {
+// A refused id is never recorded, and for opencode that is silent and
+// unrecoverable: no ses_ id means no resume, which starts a NEW session with
+// the operator's conversation simply absent. Answering the write gate with the
+// same predicate the resume path uses makes the two sets identical, so the gate
+// cannot refuse an id that would have been resumed — it introduces no failure
+// that was not already there.
+//
+// If someone tightens either side, this fails. That is the point: the pairing
+// is the argument for the gate's safety, not an incidental duplication.
+func TestRecognizesSessionID_MatchesTheResumeGate(t *testing.T) {
+	a := New()
 	for _, id := range []string{
-		"ses_x$(touch /tmp/jin-should-not-exist)",
-		"ses_x;touch /tmp/jin-should-not-exist",
-		"ses_x`touch /tmp/jin-should-not-exist`",
-		"ses_x'; touch /tmp/jin-should-not-exist; '",
+		realSessionID,
+		"ses_with-a-dash",
+		"ses_with.dot",
+		"ses_UPPER_and_under",
+		"ses_x",
+		"0198f1b2-4c3d-7a1e-8b2f-000000000abc", // a UUID is not an opencode id
+		"ses_",
+		"",
+		"abc",
 	} {
-		plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: id, AgentSessionStarted: true}, testConfigDir)
-		if strings.Contains(plan.Command, "touch") || strings.Contains(plan.Command, id) {
-			t.Errorf("SpawnCommand(%q) put the id in Command: %q", id, plan.Command)
-		}
-		if plan.ExtraEnv[sessionArgEnv] != id {
-			t.Errorf("SpawnCommand(%q) did not carry the id in %s: %v", id, sessionArgEnv, plan.ExtraEnv)
+		plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: id, AgentSessionStarted: true}, "")
+		resumes := strings.Contains(plan.Command, "--session")
+		if got := a.RecognizesSessionID(id); got != resumes {
+			t.Errorf("RecognizesSessionID(%q) = %v but the resume gate says %v — the two have drifted",
+				id, got, resumes)
 		}
 	}
 }

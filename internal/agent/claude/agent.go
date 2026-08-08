@@ -51,6 +51,15 @@ func New() *Agent {
 // Kind is the identifier jind-ai persists in Session.AgentKind.
 func (a *Agent) Kind() string { return "claude" }
 
+// RecognizesSessionID accepts anything written as a UUID. Claude Code is told
+// its session id rather than minting one — SpawnCommand passes --session-id
+// with the UUID Manager pre-minted — so the id a hook reports is normally the
+// one jind-ai already holds, and a re-key is the exception rather than the
+// rule. That makes this the cheapest of the three adapters to refuse: the
+// value kept on a refusal is the one Claude Code was launched with, so the
+// resume still lands on the operator's conversation.
+func (a *Agent) RecognizesSessionID(id string) bool { return agent.LooksLikeUUID(id) }
+
 // StatusSource returns the CC hook interpreter.
 func (a *Agent) StatusSource() agent.StatusSource { return a.statusSrc }
 
