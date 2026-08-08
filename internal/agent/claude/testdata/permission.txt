@@ -1,0 +1,11 @@
+ Bash command
+
+   sha256sum /etc/hostname
+   Compute SHA-256 of /etc/hostname
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from etc/ from this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain

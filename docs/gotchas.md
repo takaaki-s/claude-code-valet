@@ -1064,6 +1064,73 @@ Common pitfalls and caveats that agents tend to fall into.
   `pane_current_command` on the session's pane says whether the agent process
   is there.
 
+## Answering a blocked session
+
+- **A dialog draws nothing of what you type into it, so `SendPrompt` cannot be
+  pointed at one.** Measured on Claude Code 2.1.226, against a blocking
+  dialog: typed prose is not drawn and is not buffered — it is gone once the
+  dialog closes (3/3); the adapter's `C-u` clear key is inert (3/3); and
+  `sendNudgeKey` ("Down") moves the dialog's selection (3/3).
+
+  Those three together decide the design. Widening `SendPrompt`'s idle gate
+  would not have worked: verify never lands, so the whole budget burns and the
+  call fails — while each look has walked the selection down one more row. The
+  prompt is never committed, because `Enter` is only pressed after a verify
+  that cannot succeed, but the dialog is left pointing somewhere the caller
+  did not choose. `SendPrompt` therefore still refuses anything but `idle`,
+  and `Manager.RespondToBlock` drives dialogs instead.
+
+- **A bare digit is an absolute address, not a cursor move.** Pressing "1"
+  with the cursor parked on option 3 ran the tool; pressing "3" with it on
+  option 2 declined it (2/2). It commits with no `Enter`, which is why the
+  adapter plans exactly one keystroke — an `Enter` after it would arrive once
+  the dialog was already gone. An out-of-range digit does nothing at all and
+  leaves the dialog standing (2/2), so no range check is needed: the miss
+  surfaces as the block failing to clear.
+
+- **The `permission` status is not a usable gate, because a fast caller never
+  sees it.** `Notification{permission_prompt}` arrives 6.075 / 6.078 / 6.087 s
+  after `PreToolUse` (n=3). Answer inside that window and the hook never fires
+  at all (n=9) — the tool completes first. Gating `respond` on
+  `status == permission` would therefore have rejected exactly the callers
+  that were quickest to answer, which is the same shape as the defect it was
+  meant to fix. The pane is the authority instead; status only rules out
+  `stopped` / `creating` / `deleting`, which have no pane worth reading.
+
+- **Each dialog draws a hint line, and the hint line is present only while the
+  dialog is live.** Sampled at five points per round (idle, mid-turn before
+  the dialog, dialog live, just answered, turn settled), three rounds per
+  dialog: the matching hint appears exactly while the dialog is up and nowhere
+  else (3/3 each), and rounds ran on top of earlier rounds' output so finished
+  menus were in scrollback throughout, contributing nothing (6/6). The
+  *options* of a finished menu do stay on screen — matching those instead is
+  the trap this avoids.
+
+- **AskUserQuestion has more than one form, and they take different keys.**
+  Four screens were observed: a single question; a multi-question form; a
+  multi-question form that renders option previews; and a submit
+  confirmation. On the preview-bearing form a digit only moves the cursor and
+  an `Enter` is needed to commit (2/2) — the opposite of the single-question
+  form. The preview form's hint line *contains* the single-question form's
+  verbatim, which is why `blockAnchors` tests the multi-question anchors
+  first; misordering them is not cosmetic, it is jin typing a digit into a
+  form where that digit does not answer anything.
+
+  Multi-question forms are recognised and refused rather than driven. One
+  answer leaves the form standing, so "the block cleared" — the only
+  post-condition `RespondToBlock` has — could not distinguish a half-filled
+  form from an answer that never landed. The submit confirmation draws no hint
+  line at all, so it is matched on body text; a stale match there costs a
+  refusal, never a keystroke.
+
+- **Codex and OpenCode are opted out, for different reasons.** Codex's
+  approval dialog could not be reached (the account was over its usage limit
+  on both the default and fallback models, 2/2), so nothing is known about it.
+  OpenCode's *was* measured — see `internal/agent/opencode/agent.go` for the
+  table — and is left unimplemented because driving it means reading which
+  button is currently lit and moving from there, and a misread approves
+  something nobody approved. Claude Code's digit needs no position at all.
+
 ## Claude Code adapter
 
 - **Workspace trust lives in `~/.claude.json`, which is not a settings file.**

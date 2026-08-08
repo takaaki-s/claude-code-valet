@@ -166,6 +166,60 @@ func (a *Agent) PastePlaceholder(prompt string) string {
 // before sending a key that is destructive when it misfires.
 func (a *Agent) DismissOverlayKeys(string) []string { return nil }
 
+// DetectBlock reports BlockNone always. Unlike the Codex adapter next to it,
+// this one opts out with the measurements already in hand — they are written
+// down here so that finishing the job is a coding task rather than another
+// round of measuring.
+//
+// Measured against opencode 1.18.4 with `permission: {bash: "ask"}`, on a
+// throwaway tmux server. The dialog is a horizontal button row, not a
+// numbered list:
+//
+//	△ Permission required
+//	  # Shell command
+//	$ sha256sum /etc/hostname
+//	 Allow once   Allow always   Reject    ctrl+f fullscreen  ⇆ select  enter confirm
+//
+//	key / input          effect
+//	C-u                  inert (2/2)
+//	typed prose          not drawn, not buffered — but an `h` or `l` INSIDE
+//	                     it moves the selection (2/2)
+//	a digit              inert (1/1) — there are no numbers to address
+//	Down, Tab            inert (1/1, 2/2)
+//	Right / l            selection moves right (2/2)
+//	h                    selection moves left (2/2)
+//	bracketed paste      inert; not drawn, not buffered (1/1). This is the
+//	                     transport PastePlaceholder above selects, so it is
+//	                     the one that would actually be used
+//	Escape               dismisses the dialog (3/3)
+//	at either end        the selection WRAPS: `h` on "Allow once" lands on
+//	                     "Reject" (1/1)
+//	initial selection    "Allow once" (3/3)
+//
+// Two of those decide the shape of any implementation. Because the selection
+// wraps there is no home position, so a fixed number of moves cannot address
+// a button — the current one has to be read first. It can be: the highlight
+// is an SGR background in `capture-pane -e` output and was read correctly
+// 5/5. So the sequence is read, move, read again to confirm the intended
+// label is lit, then Enter — verify-by-capture pointed at the selection
+// rather than at typed text, since typed text is never drawn here.
+//
+// It is left unimplemented because that sequence has a failure mode the
+// Claude path does not: its correctness rests on reading a position, and a
+// misread moves to a different button and confirms it. On a permission
+// dialog that means approving something nobody approved. Claude Code's
+// digit is absolute and needs no position at all, so shipping both together
+// would put two very different risks behind one flag.
+func (a *Agent) DetectBlock(string) agent.BlockKind { return agent.BlockNone }
+
+// AnswerBlockKeys refuses always, for the reason DetectBlock returns
+// BlockNone. See there for the measurements an implementation would use.
+func (a *Agent) AnswerBlockKeys(agent.BlockKind, string, agent.BlockAnswer) ([]agent.KeyStep, error) {
+	return nil, fmt.Errorf("opencode sessions cannot be answered by jin yet: " +
+		"its permission dialog is driven by moving a selection rather than by typing a choice. " +
+		"Attach the session and answer it directly")
+}
+
 // pasteLineCount counts prompt's lines the way opencode counts them when it
 // summarises a paste. Two details are measured, not assumed, and getting
 // either wrong would reject sends that in fact landed:

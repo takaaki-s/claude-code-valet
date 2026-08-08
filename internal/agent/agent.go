@@ -58,6 +58,25 @@ type TranscriptSource = session.TranscriptSource
 // time.
 type PollableTranscriptSource = session.PollableTranscriptSource
 
+// BlockKind categorises the blocking prompt an agent's TUI is showing; the
+// return type of Agent.DetectBlock.
+type BlockKind = session.BlockKind
+
+// BlockAnswer is the answer handed to Agent.AnswerBlockKeys.
+type BlockAnswer = session.BlockAnswer
+
+// KeyStep is one step of the sequence Agent.AnswerBlockKeys returns.
+type KeyStep = session.KeyStep
+
+// Blocking-prompt kind constants — re-exported for adapter convenience.
+const (
+	BlockNone           = session.BlockNone
+	BlockPermission     = session.BlockPermission
+	BlockQuestion       = session.BlockQuestion
+	BlockQuestionMulti  = session.BlockQuestionMulti
+	BlockQuestionSubmit = session.BlockQuestionSubmit
+)
+
 // NotifyKind categorises the notification signal an adapter attaches to a
 // StatusUpdate; downstream plugins receive it via JIN_NOTIFY_KIND.
 type NotifyKind = session.NotifyKind

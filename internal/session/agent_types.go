@@ -260,6 +260,75 @@ type SetupContext struct {
 	WorkDir  string // absolute working directory the session will start in
 }
 
+// BlockKind identifies the sort of blocking prompt an agent's TUI is showing
+// while it waits for a person to answer.
+//
+// Not every kind can be answered. A kind exists for a screen jin can only
+// RECOGNISE, precisely so RespondToBlock can refuse it by name instead of
+// typing into it. Recognising more than we can drive is the point of the
+// enum, not an oversight in it.
+//
+// A screen the adapter cannot classify must come back as BlockNone, because
+// BlockNone is what makes RespondToBlock send nothing at all. Every way of
+// being unsure therefore costs a refusal rather than keys landing somewhere
+// unknown.
+type BlockKind string
+
+const (
+	// BlockNone means the capture shows no blocking prompt.
+	BlockNone BlockKind = ""
+	// BlockPermission is a tool-approval dialog offering numbered choices.
+	BlockPermission BlockKind = "tool-permission"
+	// BlockQuestion is one question with numbered answers.
+	BlockQuestion BlockKind = "question"
+	// BlockQuestionMulti is several questions gathered into one form.
+	// Recognised but not answerable: answering one question leaves the form
+	// standing, so "did the block clear?" — the only post-condition
+	// RespondToBlock has — cannot tell a half-answered form from an answer
+	// that never landed.
+	BlockQuestionMulti BlockKind = "question-multi"
+	// BlockQuestionSubmit is such a form waiting on its final confirmation.
+	// Recognised but not answerable, for the same reason.
+	BlockQuestionSubmit BlockKind = "question-submit"
+)
+
+// Answerable reports whether RespondToBlock can drive this kind.
+//
+// It is deliberately a whitelist: a kind added later is unanswerable until
+// someone writes it in here, which is the safe direction for a value that
+// decides whether keys reach an approval dialog.
+func (k BlockKind) Answerable() bool {
+	return k == BlockPermission || k == BlockQuestion
+}
+
+// BlockAnswer is the answer a caller wants to give a blocking prompt.
+// Exactly one field carries it; the daemon rejects a request that sets both
+// or neither, so an adapter may assume it received one of the two.
+type BlockAnswer struct {
+	// Option is a choice's on-screen number, 1-based.
+	Option int
+	// Text is free text, for a prompt that offers a free-text entry.
+	Text string
+}
+
+// KeyStep is one step of the key sequence that answers a blocking prompt.
+// Exactly one of Key and Literal is set.
+type KeyStep struct {
+	// Key is a tmux key name ("Enter", "Down"), sent via SendKeys.
+	Key string
+	// Literal is text typed verbatim, sent via SendKeysLiteral.
+	Literal string
+	// Verify asks Manager to confirm this step's Literal rendered into the
+	// pane before it runs the next step, and to abandon the sequence when it
+	// did not.
+	//
+	// Set it only where the adapter has measured that the agent draws the
+	// text. A step whose effect cannot be seen must not claim it can: the
+	// steps after it — a committing Enter, typically — would then run on a
+	// guess about what the earlier ones did.
+	Verify bool
+}
+
 // Agent is the interface every agent adapter satisfies. The Manager holds it
 // via AgentResolver and never imports a concrete adapter package.
 //
@@ -377,6 +446,47 @@ type Agent interface {
 	// ClearInputKeys — an adapter that forgets this should fail to compile,
 	// because the failure it reintroduces is silent.
 	DismissOverlayKeys(prompt string) []string
+	// DetectBlock reports which blocking prompt the captured pane shows, or
+	// BlockNone when it shows none.
+	//
+	// Manager asks this both questions it has to settle — "is there anything
+	// to answer?" before it sends a key, and "did the answer take?" after —
+	// so the two can never be judged by different rules. SendPrompt folds its
+	// own pair of "did the prompt land?" checks into one closure for the same
+	// reason.
+	//
+	// What makes that safe is where the uncertainty lands. Manager sends
+	// nothing on BlockNone, so a screen the adapter does not recognise costs
+	// a refusal; a screen it recognises as unanswerable costs a refusal that
+	// can say why. Only a positive, answerable verdict puts keys in the pane,
+	// which is why an adapter should order its checks so the kinds it cannot
+	// drive are ruled out first.
+	//
+	// The parameter is the capture rather than a session, so this stays a
+	// pure function of what was on screen: adapter tests need a string, not
+	// a tmux server.
+	//
+	// Return BlockNone unconditionally to opt out.
+	DetectBlock(capture string) BlockKind
+	// AnswerBlockKeys returns the keys that answer kind with ans, or an error
+	// explaining why this agent cannot express that answer.
+	//
+	// capture is the same snapshot DetectBlock classified, not a fresh one,
+	// so an adapter that has to read the screen — to learn which number a
+	// free-text entry carries, say — reads the frame the verdict was made
+	// against rather than a later one that may have moved.
+	//
+	// An error is a refusal, and Manager has sent nothing by the time it
+	// arrives. The message is the entirety of what the caller gets, so it
+	// should name what to do instead rather than only what failed.
+	//
+	// On Agent rather than a side interface for the same reason as
+	// ClearInputKeys and Transcript: an adapter that forgets it should fail
+	// to compile. Silently answering nothing is exactly the failure this
+	// exists to remove.
+	//
+	// Return an error unconditionally to opt out.
+	AnswerBlockKeys(kind BlockKind, capture string, ans BlockAnswer) ([]KeyStep, error)
 }
 
 // AgentResolver bridges the Manager to the process-global agent registry

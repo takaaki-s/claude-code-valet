@@ -14,7 +14,7 @@ rather than on the message text — messages get reworded, codes do not.
 | 1 | GeneralError | Anything without a code of its own — including a `session result` whose conversation could not be read at all (every shipped kind has a reader; on `opencode` the read runs `opencode`, which has to be on the daemon's PATH) | Read the message. For `result`, what an *empty* answer means still depends on the kind — see the `gotchas` doc |
 | 2 | SessionNotFound | No session matched the selector | `jin session list --json` and re-check the selector |
 | 3 | DaemonNotRunning | Reserved — **not currently emitted**, see below | — |
-| 4 | Timeout | `session wait` or `send --wait-running` hit its timeout | From `wait`: the child is still working — wait again or escalate. From `send`: nothing confirms the child took the prompt — attach and look at the input box before deciding whether to resend |
+| 4 | Timeout | `session wait`, `send --wait-running`, or `respond` hit its timeout | From `wait`: the child is still working — wait again or escalate. From `send`: nothing confirms the child took the prompt — attach and look at the input box before deciding whether to resend. From `respond`: the prompt is still on screen — attach and look before answering again |
 | 5 | WorktreeDirty | A git worktree has uncommitted changes | Commit, stash, or drop the changes |
 | 6 | AmbiguousSelector | The selector matched more than one session | Narrow it — see the `selectors` doc |
 
@@ -65,6 +65,17 @@ reports the parent as `idle`, so `--wait-running` times out on a prompt that
 was submitted and is being worked on right now. `jin pane capture <selector>`
 settles it — an empty input box with the agent busy means the send was fine
 and the flag was wrong, not the send.
+
+Code 4 from `respond` means the prompt was still on screen after the answer
+went out. That is a narrower uncertainty than send's: exit 0 from `respond`
+means the prompt is gone, so a 4 is specifically "the keys were delivered and
+the dialog did not move". Answering again risks answering twice — attach and
+look first.
+
+`respond` reports its other refusals as code 1, and they are worth telling
+apart from a failure: nothing to answer, a form of several questions (which
+jin will not half-fill), and an agent kind it does not drive all land there.
+Read the message; each says what to do instead.
 
 ## Errors under --json
 

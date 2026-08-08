@@ -69,6 +69,14 @@ type fakeAgent struct {
 	// this adapter cannot read a conversation, which is what the list rows
 	// must tolerate silently.
 	transcriptSrc TranscriptSource
+	// detectFn answers DetectBlock. Nil (the default) reports BlockNone, so
+	// a fake looks like an agent that is not blocked — which makes
+	// RespondToBlock refuse before it sends anything. Every test that does
+	// not mention a blocking prompt depends on that default.
+	detectFn func(string) BlockKind
+	// answerFn answers AnswerBlockKeys. Nil (the default) refuses, matching
+	// an adapter that recognises a screen it cannot drive.
+	answerFn func(BlockKind, string, BlockAnswer) ([]KeyStep, error)
 }
 
 func (a *fakeAgent) Kind() string             { return "claude" }
@@ -96,6 +104,20 @@ func (a *fakeAgent) DismissOverlayKeys(prompt string) []string {
 }
 
 func (a *fakeAgent) Transcript() TranscriptSource { return a.transcriptSrc }
+
+func (a *fakeAgent) DetectBlock(capture string) BlockKind {
+	if a.detectFn == nil {
+		return BlockNone
+	}
+	return a.detectFn(capture)
+}
+
+func (a *fakeAgent) AnswerBlockKeys(kind BlockKind, capture string, ans BlockAnswer) ([]KeyStep, error) {
+	if a.answerFn == nil {
+		return nil, fmt.Errorf("fake agent cannot answer %q prompts", kind)
+	}
+	return a.answerFn(kind, capture, ans)
+}
 
 type fakeStatusSource struct{}
 
@@ -5563,8 +5585,8 @@ func TestNormalizeForVerify(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := normalizeForVerify(tc.in); got != tc.want {
-				t.Errorf("normalizeForVerify(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := NormalizeForVerify(tc.in); got != tc.want {
+				t.Errorf("NormalizeForVerify(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -5611,7 +5633,7 @@ func TestPromptTail(t *testing.T) {
 
 // TestPromptVerifiable pins the predicate callers use to reject prompts
 // SendPrompt could not prove landed. Box-drawing-only input is the case the
-// old whitespace-only check missed once normalizeForVerify started stripping
+// old whitespace-only check missed once NormalizeForVerify started stripping
 // those runes: it normalizes to nothing, so verify has no needle and would
 // accept it without evidence.
 func TestPromptVerifiable(t *testing.T) {

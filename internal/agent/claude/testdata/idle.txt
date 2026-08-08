@@ -1,0 +1,7 @@
+❯ Run the bash command: sha256sum /etc/hostname
+
+  Ran 1 shell command
+
+❯
+  Opus 5 (1M context) | 📁 claude
+  ⏸ manual mode on · ← for agents

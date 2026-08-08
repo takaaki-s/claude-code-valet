@@ -10,6 +10,7 @@
 package codex
 
 import (
+	"fmt"
 	"os"
 	"sync"
 
@@ -134,3 +135,34 @@ func (a *Agent) PastePlaceholder(string) string { return "" }
 // Escape is destructive on a running turn, and nothing yet says Codex needs
 // it. Measure first, then return keys.
 func (a *Agent) DismissOverlayKeys(string) []string { return nil }
+
+// DetectBlock reports BlockNone always: what Codex puts on screen while it
+// waits for an approval has not been measured, so there is no literal to
+// match against.
+//
+// The attempt was made and is worth recording, because the next person will
+// otherwise repeat it. Reaching an approval dialog needs a model turn that
+// asks to run something, and the account was over its usage limit on both
+// the default model and the cheaper one it offers to fall back to (2/2
+// refused). Two OTHER Codex menus were reachable — the directory-trust
+// prompt and a rate-limit model switch — and both are numbered `› 1. ...`
+// lists where a bare digit selects and confirms (2/2). That is suggestive
+// and it is not evidence: neither of them is the approval dialog, and this
+// adapter does not get to guess that they render the same way.
+//
+// The cost of guessing is not symmetric with the cost of waiting. A wrong
+// literal here makes DetectBlock report a block that is not there, and
+// RespondToBlock then types a digit into whatever the pane actually holds.
+// Measure the approval dialog, then write the literal.
+func (a *Agent) DetectBlock(string) agent.BlockKind { return agent.BlockNone }
+
+// AnswerBlockKeys refuses always, for the reason DetectBlock returns
+// BlockNone. It is unreachable through RespondToBlock while DetectBlock opts
+// out — Manager stops at BlockNone — but it is the message a caller would
+// get if that ever changed, so it names the state of play rather than
+// blaming the caller.
+func (a *Agent) AnswerBlockKeys(agent.BlockKind, string, agent.BlockAnswer) ([]agent.KeyStep, error) {
+	return nil, fmt.Errorf("codex sessions cannot be answered by jin: " +
+		"its approval prompt has not been measured, so jin does not know what keys it takes. " +
+		"Attach the session and answer it directly")
+}

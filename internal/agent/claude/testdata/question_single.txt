@@ -1,0 +1,11 @@
+ ☐ 好きな色
+君はどの色を好む？
+❯ 1. 赤
+     通常の三倍の速度で駆ける色だ
+  2. 緑
+     落ち着きと安定を示す色だな
+  3. 青
+     冷静さと理知を象徴する色だ
+  4. Type something.
+  5. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel

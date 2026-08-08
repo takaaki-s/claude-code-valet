@@ -1,6 +1,6 @@
 ---
 title: Traps an orchestrating agent will hit
-description: The failures that look like bugs but are not — per-agent limits on result collection, the creating-to-idle race, a send that exits 0 without starting a turn, and why a pane capture is not evidence.
+description: The failures that look like bugs but are not — per-agent limits on result collection, the creating-to-idle race, a send that exits 0 without starting a turn, answering a blocked session, and why a pane capture is not evidence.
 ---
 
 # Traps an orchestrating agent will hit
@@ -276,20 +276,39 @@ hook arriving late in startup restarts the clock behind it.
 
 Later sends are covered by the `wait --until idle,permission` you run after
 each turn, but only when it comes back `idle` — `send` refuses everything
-else. When it comes back `permission`, do not send at all: see below.
+else. When it comes back `permission`, answer it rather than sending: see below.
 
-## `permission` is a terminal state, and it needs a human
+## A blocked session is answered with `respond`, not `send`
 
-A session waiting on a permission prompt has stopped. It will not move until
-someone answers. Waiting only for `idle` burns the entire timeout on it:
+A session waiting on a prompt has stopped and will not move until it is
+answered. Waiting only for `idle` burns the entire timeout on it:
 
 ```bash
 jin session wait work --until idle,permission   # right
 jin session wait work --status idle             # hangs on a blocked session
 ```
 
-When `wait` returns and the status is `permission`, do not send another
-prompt — it will be rejected (not idle). Report it to the human, or attach.
+`send` will refuse it — it only takes `idle` sessions, because a dialog does
+not draw what you type into it and `send` proves delivery by finding the text
+on screen. Use `respond`, and read the choices from the transcript rather than
+the pane:
+
+```bash
+jin session result work --json                  # the question and its options
+jin session respond work --option 1             # choose answer 1
+jin session respond work --text "use bun"       # where free text is offered
+```
+
+`respond` returns only once the prompt is gone from the pane, so exit 0 means
+the answer was taken. Exit 4 means it is still there: the keys went out, so
+attach and look before answering again.
+
+Two limits, both of which refuse without sending anything:
+
+- **Claude Code sessions only.** Other kinds say so; attach and answer those.
+- **A form asking several questions at once cannot be answered**, nor can its
+  final submit confirmation. Answering one question leaves the form standing,
+  so jin cannot tell a half-filled form from an answer that never landed.
 
 ## A pane capture is not evidence
 

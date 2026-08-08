@@ -1,0 +1,9 @@
+←  ☐ 好きな色  ☐ 好きな果物  ☐ 好きな季節  ✔ Submit  →
+好きな色は何かね？
+❯ 1. 赤
+  2. 青
+  3. 白
+  4. 黒
+  5. Type something.
+  6. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

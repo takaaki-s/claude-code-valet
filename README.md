@@ -195,8 +195,12 @@ jin session attach <session-name>
 # Get session details
 jin session info <session-name>
 
-# Send a prompt to a session
+# Send a prompt to a session (idle sessions only)
 jin session send <session-name> "your prompt here"
+
+# Answer a session blocked on a prompt (Claude Code sessions)
+jin session respond <session-name> --option 1
+jin session respond <session-name> --text "use bun"
 
 # Wait for a session to become idle (default timeout: 300s)
 jin session wait <session-name>
@@ -259,7 +263,17 @@ jin session output <session-name> --json
 jin session send my-session "refactor main.go" --wait-running
 jin session wait my-session --timeout 300
 jin session output my-session --last 1
+
+# If the wait came back `permission`, the child is blocked on a prompt. `send`
+# refuses a blocked session; `respond` drives the dialog and returns only once
+# it is gone. Read the choices from the transcript, not the pane.
+jin session result my-session --json
+jin session respond my-session --option 1 --json
 ```
+
+`respond` handles Claude Code sessions. Other agent kinds, a form asking
+several questions at once, and such a form's submit confirmation are all
+refused without sending anything — attach and answer those yourself.
 
 #### Orchestration: parent Claude driving child sessions
 
@@ -309,7 +323,7 @@ jin session result my-session --errors-only --json
 | 1 | General error — including a failure to reach the daemon |
 | 2 | Session not found |
 | 3 | Reserved (daemon not running); **not currently emitted** |
-| 4 | Timeout (`session wait` or `send --wait-running`) |
+| 4 | Timeout (`session wait`, `send --wait-running`, or `respond`) |
 | 5 | Worktree dirty |
 | 6 | Ambiguous selector |
 

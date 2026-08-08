@@ -326,6 +326,8 @@ func (s *Server) handleRequest(req *Request) Response {
 		return s.handlePaneCapture(req.Data)
 	case "pane-send-keys":
 		return s.handlePaneSendKeys(req.Data)
+	case "respond":
+		return s.handleRespond(req.Data)
 	case "plugin-run":
 		return s.handlePluginRun(req.Data)
 	default:
@@ -571,6 +573,79 @@ func (s *Server) handleSend(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 	return Response{Success: true}
+}
+
+// RespondRequest is the request payload for the "respond" action: an answer
+// to a prompt an agent is blocked on. Exactly one of Option and Text carries
+// the answer.
+type RespondRequest struct {
+	ID string `json:"id"`
+	// Option is a choice's on-screen number, 1-based.
+	Option int `json:"option,omitempty"`
+	// Text is free text, for a prompt that offers a free-text entry.
+	Text string `json:"text,omitempty"`
+}
+
+// RespondResponse reports which sort of prompt was answered. The caller
+// cannot see the pane, and asking it to capture one to find out would push it
+// onto the exact evidence jin's own docs warn against — a capture keeps
+// finished menus on screen.
+type RespondResponse struct {
+	Kind string `json:"kind"`
+}
+
+// respondMaxOption is the largest answer a caller can name.
+//
+// It is not a guess about how many choices a prompt has: an answer is
+// delivered as a single keystroke, so a two-digit choice is not addressable
+// at all. Bounding it here turns "10" into an immediate, explicit error
+// instead of a keystroke that types "1" and then "0" into a dialog.
+const respondMaxOption = 9
+
+func (s *Server) handleRespond(data json.RawMessage) Response {
+	var req RespondRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+	if req.ID == "" {
+		return Response{Success: false, Error: "id is required"}
+	}
+	// Validated here as well as in the CLI because this endpoint is reachable
+	// without it — plugins shell out to jin, but nothing stops a caller
+	// speaking the protocol directly.
+	hasOption, hasText := req.Option != 0, req.Text != ""
+	switch {
+	case hasOption && hasText:
+		return Response{Success: false, Error: "pass either an option or text, not both"}
+	case !hasOption && !hasText:
+		return Response{Success: false, Error: "an answer is required: pass an option or text"}
+	}
+	if hasOption && (req.Option < 1 || req.Option > respondMaxOption) {
+		return Response{Success: false, Error: fmt.Sprintf(
+			"option must be between 1 and %d (an answer is one keystroke)", respondMaxOption)}
+	}
+	// Reject text the verify step could not search the pane for, by the same
+	// rule and for the same reason as "send" — RespondToBlock confirms free
+	// text rendered before it presses the key that submits it, and text that
+	// normalizes to nothing would satisfy that check without evidence.
+	if hasText && !session.PromptVerifiable(req.Text) {
+		return Response{Success: false, Error: "text has no verifiable content " +
+			"(only whitespace or box-drawing characters)"}
+	}
+
+	kind, err := s.manager.RespondToBlock(req.ID, session.BlockAnswer{Option: req.Option, Text: req.Text})
+	if err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+	// Unlike "send", success here means the prompt left the pane — not merely
+	// that keys were delivered. That is why this action has no equivalent of
+	// send's --wait-running: there is no gap between "sent" and "taken" left
+	// for a caller to poll.
+	payload, err := json.Marshal(RespondResponse{Kind: string(kind)})
+	if err != nil {
+		return Response{Success: false, Error: err.Error()}
+	}
+	return Response{Success: true, Data: payload}
 }
 
 // ResultRequest is the request payload for the "result" action.

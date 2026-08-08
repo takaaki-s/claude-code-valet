@@ -342,6 +342,30 @@ func (c *Client) Get(id string) (*session.Info, error) {
 	return &info, nil
 }
 
+// Respond answers a prompt the session's agent is blocked on and returns the
+// sort of prompt that was answered. Exactly one of option and text carries
+// the answer; the daemon rejects a call that sets both or neither.
+func (c *Client) Respond(id string, option int, text string) (string, error) {
+	data, _ := json.Marshal(RespondRequest{ID: id, Option: option, Text: text})
+	resp, err := c.send(Request{Action: "respond", Data: data})
+	if err != nil {
+		return "", err
+	}
+	if !resp.Success {
+		return "", errors.New(resp.Error)
+	}
+	var out RespondResponse
+	// A daemon too old to send the payload still answered the call, and the
+	// answer landing is what the caller needs. Report the empty kind rather
+	// than turning a successful answer into an error.
+	if len(resp.Data) > 0 {
+		if err := json.Unmarshal(resp.Data, &out); err != nil {
+			return "", err
+		}
+	}
+	return out.Kind, nil
+}
+
 // Send sends a prompt to a session
 func (c *Client) Send(id, prompt string) error {
 	data, _ := json.Marshal(SendRequest{ID: id, Prompt: prompt})

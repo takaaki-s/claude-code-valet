@@ -174,8 +174,12 @@ jin session attach <session-name>
 # セッションの詳細情報を取得
 jin session info <session-name>
 
-# セッションにプロンプトを送信
+# セッションにプロンプトを送信（idle のセッションのみ）
 jin session send <session-name> "プロンプト"
+
+# プロンプト待ちで止まったセッションに回答する（Claude Code セッション）
+jin session respond <session-name> --option 1
+jin session respond <session-name> --text "bun を使って"
 
 # セッションが idle になるまで待機（デフォルトタイムアウト: 300秒）
 jin session wait <session-name>
@@ -223,7 +227,17 @@ jin session output <session-name> --json
 jin session send my-session "main.go をリファクタリング" --wait-running
 jin session wait my-session --timeout 300
 jin session output my-session --last 1
+
+# wait が `permission` を返した場合、子はプロンプト待ちで止まっています。send は
+# ブロック中のセッションを拒否します。respond はダイアログを操作し、それが消えて
+# から返ります。選択肢は pane ではなく transcript から読んでください。
+jin session result my-session --json
+jin session respond my-session --option 1 --json
 ```
+
+`respond` が対応するのは Claude Code セッションです。それ以外の agent kind、
+複数の質問をまとめて尋ねるフォーム、およびそのフォームの送信確認画面は、
+いずれもキーを送らずに拒否されます。これらは attach して自分で回答してください。
 
 #### 終了コード
 
@@ -233,7 +247,7 @@ jin session output my-session --last 1
 | 1 | 一般エラー（デーモンに接続できない場合を含む） |
 | 2 | セッションが見つからない |
 | 3 | 予約済み（デーモン未起動）。**現在は返されません** |
-| 4 | タイムアウト（`session wait` / `send --wait-running`） |
+| 4 | タイムアウト（`session wait` / `send --wait-running` / `respond`） |
 | 5 | worktree に未コミットの変更がある |
 | 6 | セレクタが複数のセッションに一致 |
 
