@@ -2899,6 +2899,40 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 		sessionStarted = true
 	}
 
+	// The same observation applied to a second field: an agent that just
+	// announced it started is not stopped, so SessionStart clears a stale
+	// stop — and clears nothing else. (Why a stale stop is there to clear,
+	// and what it costs while it lasts, is in docs/gotchas.md under Hook.)
+	//
+	// The narrowness is the point. SessionStart is not only fired at startup:
+	// Claude Code raises it for resume, /clear and /compact too, and the
+	// generated hooks file carries no matcher, so every one of them arrives
+	// here. A verdict that set a status unconditionally would drop a session
+	// to idle in the middle of a turn the moment an auto-compaction ran,
+	// opening SendPrompt's idle gate on a working agent — the same class of
+	// wrong-and-quiet answer this is fixing, pointed the other way. "The
+	// process is alive" contradicts exactly one status, so exactly one is
+	// touched.
+	//
+	// It is Manager's rather than an adapter's for the same reason the
+	// bookkeeping above is: the premise is process liveness, which no
+	// vocabulary owns. An adapter could carry it — a conditional verdict has
+	// a route through StatusSignal.Payload, which is how persisted_status
+	// reaches interpretRecover — but Interpret runs before m.mu is taken, so
+	// the status such a verdict reasoned about may already be gone by the
+	// time it lands, and the monitor writes StatusStopped from its own
+	// goroutine. Recovery affords that gap because applyRecovery revalidates;
+	// this path has no such stage. Reading and writing Status in one critical
+	// section is what makes the rule safe.
+	//
+	// No plugin status_changed event fires for the correction: dispatch below
+	// is gated on updOK, and this is not a verdict. That is deliberate and
+	// matches every other non-verdict status write in this file — a
+	// correction of a stale record is not something that just happened.
+	if eventName == "SessionStart" && session.Status == StatusStopped {
+		session.Status = StatusIdle
+	}
+
 	// SessionEnd on an already-stopped session: no verdict fields should be
 	// applied (they would mutate LastOutputTime / LastActiveAt in memory but
 	// only persist on cwdChanged, which drops the change on daemon restart).

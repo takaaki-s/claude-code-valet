@@ -136,11 +136,11 @@ the agent adapter — `HandleHookEvent` itself is agent-agnostic wiring. Each
 adapter owns the mapping and any needed vocabulary normalisation.
 
 **Canonical events** the manager's side effects key on
-(`SessionStart` → `AgentSessionStarted` bookkeeping + Layer C trigger,
-`UserPromptSubmit` / `Stop` → Layer C trigger, `CwdChanged` → git branch
-reprobe). Adapters whose native events do not match these names must
-normalise before calling `jin hook` — Codex needs no normalisation (its
-native events already match Claude Code by name; see
+(`SessionStart` → `AgentSessionStarted` bookkeeping + stale-stop correction
++ Layer C trigger, `UserPromptSubmit` / `Stop` → Layer C trigger,
+`CwdChanged` → git branch reprobe). Adapters whose native events do not
+match these names must normalise before calling `jin hook` — Codex needs no
+normalisation (its native events already match Claude Code by name; see
 `internal/agent/codex/status.go` and the exact mapping below), while
 `internal/agent/opencode/plugin/jin.ts` is a plugin-side normaliser
 (opencode's bus vocabulary shares no names with the canonical set).

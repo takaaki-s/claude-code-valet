@@ -178,6 +178,25 @@ whether a resume keeps writing to the same log was never measured, and
 Terminal for a turn: `idle` (finished) and `permission` (blocked, needs a
 human). `stopped` means the process is gone.
 
+`stopped` is the one status worth a second look. Nothing re-derives it from
+the world, so a stop recorded by mistake stays until a hook disagrees — and an
+agent blocked inside one long tool call sends no hook while that call runs.
+Meanwhile `wait` reads it as a finished turn and `send` refuses it as a dead
+session, so a wrong one costs you the work twice over.
+
+So when a child reads `stopped` without having reported anything, confirm it
+against `session result`: the transcript is written by the agent, not by jin,
+so a child that is still working keeps producing entries the status knows
+nothing about. `tmux_window_name` is not the check — a killed session keeps
+its window standing so it can be revived in place, so it is non-empty either
+way.
+
+```bash
+jin session result <sel> --last 3
+sleep 30
+jin session result <sel> --last 3   # new entries → still working, status is stale
+```
+
 ## Accepting the work
 
 Do not forward a child's report as your own conclusion. For code changes,
