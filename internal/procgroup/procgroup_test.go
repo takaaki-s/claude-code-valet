@@ -182,3 +182,27 @@ func TestKillOnCancel_ReturnsEvenWhenADescendantEscapes(t *testing.T) {
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+// TestTeardownBudget_OutlastsTheEscalation pins the ordering the two constants
+// only assert in prose.
+//
+// WaitDelay is what stops Wait hanging on a pipe; the SIGKILL is what actually
+// ends the process group. If the delay were not the later of the two, Wait
+// would give up in the same instant the kill fired — reporting a timeout for a
+// teardown that was about to work, and racing it every time.
+//
+// It is also the number callers budget against: internal/daemon adds
+// TeardownBudget to its own timeout to know when it really gets control back,
+// and GracePeriod alone would leave that inequality optimistic.
+func TestTeardownBudget_OutlastsTheEscalation(t *testing.T) {
+	if TeardownBudget <= GracePeriod {
+		t.Errorf("TeardownBudget (%s) does not outlast GracePeriod (%s); Wait would abandon the escalation as it fires",
+			TeardownBudget, GracePeriod)
+	}
+	cmd := exec.Command("/bin/true")
+	KillOnCancel(cmd)
+	if cmd.WaitDelay != TeardownBudget {
+		t.Errorf("WaitDelay = %s but TeardownBudget says %s; a caller budgeting against the constant would be wrong",
+			cmd.WaitDelay, TeardownBudget)
+	}
+}

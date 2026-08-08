@@ -259,8 +259,10 @@ type ResultRequest struct {
 // Truncated=true indicates that Last truncation was applied.
 //
 // Entries is always a JSON array, never null — a reader that found nothing
-// returns nil and the no-filter path passes nil through, so the handler
-// re-empties it before marshalling. Callers script this field with
+// returns nil and the no-filter path passes nil through, so ResultResponse
+// carries its own MarshalJSON that re-empties it. On the type rather than at
+// the handler because the CLI re-encodes this struct after decoding it, so
+// both marshals have to be covered. Callers script this field with
 // `jq '.entries[] | select(.type=="system")'` to tell "the child said nothing"
 // from "the conversation was lost", and jq fails on null.
 type ResultResponse struct {

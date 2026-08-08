@@ -33,6 +33,14 @@ const GracePeriod = 5 * time.Second
 // that was about to work had not yet fired.
 const waitMargin = 2 * time.Second
 
+// TeardownBudget is the longest Wait can take after a context is cancelled:
+// the grace the group gets, plus the extra Wait holds on for I/O before giving
+// up. Exported because it is the number a caller has to add to its own timeout
+// to know when it really gets control back — GracePeriod alone understates it,
+// and a caller that budgets against the smaller figure is 2 seconds optimistic
+// about the worst case.
+const TeardownBudget = GracePeriod + waitMargin
+
 // KillOnCancel places cmd in a new process group and wires context
 // cancellation to signal that whole group: SIGTERM first, then SIGKILL after
 // GracePeriod for anything that ignored it.
@@ -61,7 +69,7 @@ const waitMargin = 2 * time.Second
 // elapsed. A caller that set a timeout is entitled to get control back.
 func KillOnCancel(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.WaitDelay = GracePeriod + waitMargin
+	cmd.WaitDelay = TeardownBudget
 	cmd.Cancel = func() error {
 		pid := cmd.Process.Pid
 		time.AfterFunc(GracePeriod, func() {

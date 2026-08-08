@@ -286,9 +286,13 @@ func TestHandleResult_EntriesIsAlwaysAnArray(t *testing.T) {
 // avoid. The margin covers the teardown: a process that ignores SIGTERM is
 // killed a grace period later, and Wait can hold on a little past that.
 func TestExportTimeoutFitsInsideTheClientBudget(t *testing.T) {
-	worst := opencode.ExportTimeout + procgroup.GracePeriod
+	// TeardownBudget, not GracePeriod: Wait can hold on past the SIGKILL for
+	// I/O, and budgeting against the smaller number leaves the inequality two
+	// seconds optimistic — enough for an exportTimeout that looks safe here to
+	// hold the handler past the point the client has given up.
+	worst := opencode.ExportTimeout + procgroup.TeardownBudget
 	if worst >= defaultRequestTimeout {
 		t.Errorf("an opencode result can take up to %s (export %s + teardown %s), but the client gives up at %s",
-			worst, opencode.ExportTimeout, procgroup.GracePeriod, defaultRequestTimeout)
+			worst, opencode.ExportTimeout, procgroup.TeardownBudget, defaultRequestTimeout)
 	}
 }

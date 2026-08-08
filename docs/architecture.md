@@ -326,9 +326,13 @@ session/           → config, tmux, transcript, plugin (Dispatcher seam only)
 agent/             → session (borrows Agent + supporting types via aliases)
 agent/claude/      → agent, session, transcript, debug, agentdocs   (CC-specific adapter)
 agent/codex/       → agent, session, transcript, agentdocs (Codex-specific adapter)
-agent/opencode/    → agent, session, transcript, debug, agentdocs (opencode adapter)
+agent/opencode/    → agent, session, transcript, procgroup, debug, agentdocs (opencode adapter)
 agent/register/    → agent, agent/claude, agent/codex, agent/opencode  (init-time Register)
                       │
+procgroup/         → (stdlib only) run a child in its own process group so a
+                      cancelled context reaches everything it started.
+                      Used by agent/opencode, plugin and worktreehook.
+worktreehook/      → procgroup (runs .jin/worktree-post-create.sh)
 agentdocs/         → (embedded content only; no internal deps)
                       Being a leaf is what lets cmd/ and every adapter share it:
                       the docs served by `jin docs`, the skill `jin init` offers,

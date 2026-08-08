@@ -637,10 +637,13 @@ Common pitfalls and caveats that agents tend to fall into.
   `ReadEntries`. Both surface as `Success=false`; neither can be mistaken for a
   child that said nothing.
 
-  **`entries` is an array on the wire even when it is empty.** `handleResult`
-  initialises it to `[]`, but a reader that found nothing returns nil and
-  `filterResultEntries` passes nil straight through when no filter is set,
-  which would marshal as `null` and overwrite the initialiser. The documented
+  **`entries` is an array on the wire even when it is empty.** A reader that
+  found nothing returns nil and `filterResultEntries` passes nil straight
+  through when no filter is set, which marshals as `null`. The guarantee lives
+  on the type, in `ResultResponse.MarshalJSON`, rather than at the handler:
+  the value is marshalled twice on the way to a person — once by the daemon and
+  again by the CLI, which re-encodes the struct it decoded — so a guard at one
+  call site would have covered half the path. The documented
   way to tell "said nothing" from "lost the conversation" is
   `jq '.entries[] | select(.type=="system")'`, and jq fails on null with
   "Cannot iterate over null" at exactly the moment a caller is asking which of
@@ -664,10 +667,14 @@ Common pitfalls and caveats that agents tend to fall into.
 
   **opencode has the same window, for the same reason** — no `--session-id`, so
   the real `ses_` id arrives through the plugin's `session.created`. Its reader
-  makes the window explicit rather than incidental: `isSessionID` refuses
-  anything without the `ses_` prefix and answers `(nil, nil)` rather than
-  spending a subprocess and an error message on an id that cannot name a
-  session. The test is an allow-list because the alphabet is known — across 877
+  makes the window explicit rather than incidental, and it asks two separate
+  questions. `hasSessionIDPrefix` decides whether opencode has reported an id
+  at all: no prefix means the window, and the answer is `(nil, nil)` rather
+  than a subprocess and an error message. `isSessionID` then checks the rest of
+  the shape, and failing THAT is an error, not silence — an id carrying the
+  prefix but not the form is something going wrong, not a session that has yet
+  to start. The strict test is an allow-list because the alphabet is known —
+  across 877
   real ids every body is exactly 26 base62 characters — and it is the line to
   change if opencode ever widens it, since a real id rejected there would be a
   quiet empty-and-successful of its own. That window is the **only** silent

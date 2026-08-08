@@ -26,9 +26,10 @@ const exportBinary = "opencode"
 // holding the daemon's handler, not to police a slow one. It has an upper
 // bound too — daemon.defaultRequestTimeout, the 60s the client waits — because
 // past that the client reports a timeout while the daemon is still exporting.
-// A wedged export can take procgroup.GracePeriod longer than this to unblock
-// Wait, since a process that ignores SIGTERM is only killed after it; 30s plus
-// that grace still leaves room under the client's 60s.
+// A wedged export can take procgroup.TeardownBudget longer than this to
+// unblock Wait — the grace before the SIGKILL, plus what Wait holds on for I/O
+// after it. 30s plus that budget still leaves room under the client's 60s, and
+// a test in internal/daemon holds the inequality rather than this sentence.
 const exportTimeout = 30 * time.Second
 
 // ExportTimeout is exportTimeout, exported so the daemon can assert the
@@ -398,9 +399,18 @@ type partRow struct {
 // valid JSON right up to the point it stops, so the only thing standing between
 // a cut-off read and a plausibly short answer is refusing to accept one.
 func entriesFromExport(doc []byte, since string) ([]transcript.Entry, error) {
-	var parsed exportDoc
+	// Decoded through a pointer so a bare `null` is distinguishable. Every
+	// other non-object — an array, a bare string, a number — fails to decode
+	// and is reported below, but `null` is a legal value for a struct pointer
+	// and would otherwise arrive as a document with no messages: empty, and
+	// successful. That is the exact answer this whole reader exists to stop a
+	// caller from mistaking for "the child said nothing".
+	var parsed *exportDoc
 	if err := json.Unmarshal(doc, &parsed); err != nil {
 		return nil, fmt.Errorf("opencode: export output is not a session document (%d bytes): %w", len(doc), err)
+	}
+	if parsed == nil {
+		return nil, fmt.Errorf("opencode: export returned a null document (%d bytes), not a session", len(doc))
 	}
 
 	var b entryBuilder
@@ -412,17 +422,24 @@ func entriesFromExport(doc []byte, since string) ([]transcript.Entry, error) {
 		// A turn that ended in failure is reported after the content it
 		// interrupted, which is where opencode itself records it.
 		//
-		// The clock is only read when there is something to stamp. A message
-		// that ended without one contributes nothing, and moving the clock for
-		// it would let a turn whose parts the reader dropped push the next
-		// real entry forward — the same rule addPart applies to a part, for
-		// the same reason.
-		if m.Info.Error == nil {
+		// The text is decided before the clock is touched. An error carrying
+		// neither a name nor a message produces no entry, and advancing for it
+		// would let a turn nobody can read push the next real entry forward —
+		// the same rule addPart applies to a part, for the same reason. That
+		// is why this is not one call with the stamp as an argument.
+		text, ok := failureText(&m.Info)
+		if !ok {
 			continue
 		}
-		if e, ok := turnFailureEntry(&m.Info, b.stamp(m.Info.Time.Created)); ok && transcript.Newer(e.Timestamp, since) {
-			b.emit(e)
+		ts := b.stamp(m.Info.Time.Created)
+		if !transcript.Newer(ts, since) {
+			continue
 		}
+		b.emit(transcript.Entry{
+			Type:      "system",
+			Timestamp: ts,
+			Blocks:    []transcript.Block{{Kind: "text", Text: text}},
+		})
 	}
 	b.flush()
 	return b.out, nil
@@ -558,8 +575,8 @@ func asText(raw json.RawMessage) string {
 	return string(raw)
 }
 
-// turnFailureEntry converts a message that ended in an error into a standalone
-// system entry.
+// failureText renders a message that ended in an error, and reports whether
+// there was anything to render.
 //
 // This exists for the same reason as the Codex reader's task_complete entry: a
 // turn that died leaves the assistant having said nothing, which from the parts
@@ -568,9 +585,9 @@ func asText(raw json.RawMessage) string {
 //
 // Both fields opencode records are kept and neither is invented — Name is the
 // classifier a caller can match on, Data.Message the sentence a human reads.
-func turnFailureEntry(m *messageRow, ts string) (transcript.Entry, bool) {
+func failureText(m *messageRow) (string, bool) {
 	if m.Error == nil {
-		return transcript.Entry{}, false
+		return "", false
 	}
 	text := m.Error.Name
 	if msg := m.Error.Data.Message; msg != "" {
@@ -579,14 +596,7 @@ func turnFailureEntry(m *messageRow, ts string) (transcript.Entry, bool) {
 		}
 		text += msg
 	}
-	if text == "" {
-		return transcript.Entry{}, false
-	}
-	return transcript.Entry{
-		Type:      "system",
-		Timestamp: ts,
-		Blocks:    []transcript.Block{{Kind: "text", Text: text}},
-	}, true
+	return text, text != ""
 }
 
 // entryBuilder groups consecutive blocks into entries at role boundaries and

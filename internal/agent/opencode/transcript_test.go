@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/transcript"
 )
 
@@ -498,18 +499,13 @@ func TestRunExport_StartsEvenWhenTheProcessCwdIsGone(t *testing.T) {
 	}
 	t.Setenv("PATH", filepath.Dir(stub))
 
-	restore, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
 	doomed := filepath.Join(t.TempDir(), "doomed")
 	if err := os.Mkdir(doomed, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.Chdir(doomed); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(restore) })
+	// t.Chdir restores on its own and refuses to run under t.Parallel, which
+	// hand-rolled Getwd/Cleanup does neither of.
+	t.Chdir(doomed)
 	if err := os.Remove(doomed); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
@@ -564,3 +560,61 @@ func TestReadEntries_OddMetadataDoesNotLoseTheSession(t *testing.T) {
 		}
 	}
 }
+
+// TestReadEntries_ANullDocumentIsLoud closes the one gap in the parse guard.
+//
+// Every other non-object — an array, a bare string, a number, empty input —
+// fails to decode and is reported. `null` is a legal value for a struct
+// pointer, so it decoded cleanly into a document with no messages and came
+// back as an empty conversation and a success: the precise answer this reader
+// exists to stop a caller from mistaking for "the child said nothing".
+func TestReadEntries_ANullDocumentIsLoud(t *testing.T) {
+	for _, body := range []string{"null", " null\n", "[]", `"x"`, "123", ""} {
+		r := &TranscriptReader{export: func(_, _ string) ([]byte, error) { return []byte(body), nil }}
+		entries, err := r.ReadEntries("", "ses_fixture0000000000000001", "")
+		if err == nil {
+			t.Errorf("export output %q = (%v, nil), want an error", body, shape(entries))
+		}
+	}
+	// A real but empty session still reads as empty and successful.
+	r := &TranscriptReader{export: func(_, _ string) ([]byte, error) {
+		return []byte(`{"info":{"id":"x"},"messages":[]}`), nil
+	}}
+	entries, err := r.ReadEntries("", "ses_fixture0000000000000001", "")
+	if err != nil || len(entries) != 0 {
+		t.Errorf("an empty session = (%v, %v), want no entries and no error", shape(entries), err)
+	}
+}
+
+// TestReadEntries_AnUnreadableFailureDoesNotMoveTheClock is the message-level
+// twin of the dropped-part rule.
+//
+// An error carrying neither a name nor a message produces no entry, so it must
+// not advance the clock either — otherwise the next real entry inherits a
+// moment from a turn nobody can read.
+func TestReadEntries_AnUnreadableFailureDoesNotMoveTheClock(t *testing.T) {
+	const doc = `{"messages":[
+	  {"info":{"role":"assistant","time":{"created":1786000009000},
+	           "error":{"name":"","data":{"message":""}}},"parts":[]},
+	  {"info":{"role":"user","time":{"created":1786000002000}},
+	   "parts":[{"type":"text","text":"next"}]}
+	]}`
+	r := &TranscriptReader{export: func(_, _ string) ([]byte, error) { return []byte(doc), nil }}
+	entries, err := r.ReadEntries("", "ses_fixture0000000000000001", "")
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	eq(t, "unreadable failure", shape(entries), []string{"user:text"})
+	if got, want := entries[0].Timestamp, "2026-08-06T07:06:42.000Z"; got != want {
+		t.Errorf("user entry = %q, want its own message's %q — an unreadable failure dragged the clock", got, want)
+	}
+}
+
+// A reader that means to stay off the polling path says so by not implementing
+// the interface; this asserts the opposite direction is not true by accident.
+var _ = func() any {
+	if _, ok := any(&TranscriptReader{}).(agent.PollableTranscriptSource); ok {
+		panic("the opencode reader declared itself cheap enough to poll; it runs a subprocess")
+	}
+	return nil
+}()

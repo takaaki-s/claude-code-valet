@@ -57,9 +57,18 @@ func TestSpawnCommand_Resume(t *testing.T) {
 		AgentSessionStarted: true,
 	}, testConfigDir)
 
-	want := "opencode --session " + id
+	// The id is named, not spliced. See sessionArgEnv, and the injection test
+	// below for what splicing it cost.
+	want := `opencode --session "$JIN_OPENCODE_SESSION"`
 	if plan.Command != want {
 		t.Errorf("Command = %q, want %q", plan.Command, want)
+	}
+	if got := plan.ExtraEnv[sessionArgEnv]; got != id {
+		t.Errorf("%s = %q, want the session id %q — the command names it, so an absent value resumes nothing",
+			sessionArgEnv, got, id)
+	}
+	if strings.Contains(plan.Command, id) {
+		t.Errorf("Command still carries the id verbatim: %q", plan.Command)
 	}
 }
 
@@ -75,20 +84,27 @@ func TestSpawnCommand_ConfigDirEnv(t *testing.T) {
 // Setup failure must degrade to a working agent without status reporting,
 // never to a failed spawn.
 func TestSpawnCommand_NoConfigDir_FailsOpen(t *testing.T) {
-	// The resume input is covered too: with no plugin to load there is
-	// nothing to pin a root session for either.
-	for _, opts := range []agent.SpawnOptions{
-		{},
-		{AgentSessionID: realSessionID, AgentSessionStarted: true},
-	} {
-		plan := SpawnCommand(opts, "")
+	plan := SpawnCommand(agent.SpawnOptions{}, "")
+	if plan.Command == "" {
+		t.Error("Command is empty, want a runnable command")
+	}
+	if len(plan.ExtraEnv) != 0 {
+		t.Errorf("ExtraEnv = %v, want empty when config dir is unknown", plan.ExtraEnv)
+	}
 
-		if plan.Command == "" {
-			t.Error("Command is empty, want a runnable command")
-		}
-		if len(plan.ExtraEnv) != 0 {
-			t.Errorf("ExtraEnv = %v, want empty when config dir is unknown", plan.ExtraEnv)
-		}
+	// A resume is the exception, and it has to be: the command names
+	// sessionArgEnv whether or not a plugin was written, so dropping the value
+	// with the rest of the environment would resume nothing and silently start
+	// a fresh session instead.
+	resume := SpawnCommand(agent.SpawnOptions{AgentSessionID: realSessionID, AgentSessionStarted: true}, "")
+	if got := resume.ExtraEnv[sessionArgEnv]; got != realSessionID {
+		t.Errorf("%s = %q, want the id even with no config dir", sessionArgEnv, got)
+	}
+	if _, ok := resume.ExtraEnv[configDirEnv]; ok {
+		t.Errorf("ExtraEnv leaked a config dir: %v", resume.ExtraEnv)
+	}
+	if _, ok := resume.ExtraEnv[rootSessionEnv]; ok {
+		t.Errorf("ExtraEnv pinned a root session with no plugin to read it: %v", resume.ExtraEnv)
 	}
 }
 
@@ -147,9 +163,9 @@ func TestSpawnCommand_ResumesOnThePrefixAlone(t *testing.T) {
 		"ses_UPPER_and_under",
 	} {
 		plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: id, AgentSessionStarted: true}, "")
-		want := "opencode --session " + id
-		if plan.Command != want {
-			t.Errorf("SpawnCommand(%q) = %q, want %q — a resume was silently turned into a new session", id, plan.Command, want)
+		if !strings.Contains(plan.Command, "--session") || plan.ExtraEnv[sessionArgEnv] != id {
+			t.Errorf("SpawnCommand(%q) = %q env %v — a resume was silently turned into a new session",
+				id, plan.Command, plan.ExtraEnv)
 		}
 	}
 
