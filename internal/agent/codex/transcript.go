@@ -458,3 +458,9 @@ func joinBlockText(blocks []contentBlock, skipPseudo bool) string {
 	}
 	return strings.Join(parts, "\n")
 }
+
+// CheapEnoughToPoll implements session.PollableTranscriptSource.
+//
+// Locating the rollout and walking it is file I/O, the same order of cost as
+// the Claude Code reader, so the preview path may call it on a timer.
+func (r *TranscriptReader) CheapEnoughToPoll() {}

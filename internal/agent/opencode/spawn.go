@@ -1,8 +1,6 @@
 package opencode
 
 import (
-	"strings"
-
 	"github.com/takaaki-s/jind-ai/internal/agent"
 )
 
@@ -10,7 +8,11 @@ import (
 // (packages/opencode/src/id/id.ts: prefixes.session = "ses", joined with
 // "_"). jind-ai pre-mints Session.AgentSessionID as a UUID, which can never
 // collide with this, so the prefix is a reliable "has opencode told us its
-// real id yet?" test.
+// real id yet?" test. hasSessionIDPrefix in transcript.go asks exactly that,
+// and it is what the resume decision below uses. isSessionID beside it asks
+// the stricter question, and the two are deliberately not one predicate — see
+// isSessionID's doc comment for why the resume path must have the looser of
+// them.
 //
 // This matters because startSessionTmux flips AgentSessionStarted to true
 // before the process is even spawned, so that flag alone cannot distinguish
@@ -37,6 +39,32 @@ const configDirEnv = "OPENCODE_CONFIG_DIR"
 // adapter and read by one plugin.
 const rootSessionEnv = "JIN_OPENCODE_ROOT_SESSION"
 
+// sessionArgEnv carries the id that `--session` resumes, and exists so that id
+// never reaches a shell as text.
+//
+// Manager splices Command into `$SHELL -ic '<cmd>'`. The single quotes stop the
+// OUTER shell from touching it, but the inner shell is being handed a command
+// to interpret — that is what -c means — so anything in Command that looks like
+// substitution is substitution. Concatenating the id into the string made
+// `ses_x$(...)`, `ses_x;...` and backticks all execute; measured, all three ran.
+// Nothing about the escaping was broken: `'` is escaped correctly and an
+// attacker does not need one.
+//
+// The id is not trustworthy. It arrives from a hook payload and is persisted
+// unvalidated, so whatever a hook says becomes this value — and it is then run
+// the next time the session resumes, which puts the execution at a different
+// time and under a different trigger than the write.
+//
+// ExtraEnv is the channel Manager already quotes (see SpawnPlan), and a shell
+// does not re-scan the result of a parameter expansion for substitutions, so
+// `--session "$JIN_OPENCODE_SESSION"` receives the value verbatim however it is
+// spelled. Deliberately NOT rootSessionEnv, though the value is the same on
+// this path: that one exists for the plugin, and a change made for the plugin's
+// sake should not be able to silently stop a resume — which is the failure this
+// adapter is least able to afford, because it starts a new session and the
+// operator's conversation is simply gone.
+const sessionArgEnv = "JIN_OPENCODE_SESSION"
+
 // SpawnCommand builds the `opencode ...` command line the daemon splices
 // into its fixed shell wrapper. Manager owns cwd, JIN_SESSION_ID and the
 // unconditional `env -u TMUX`; we only own the agent-specific pieces:
@@ -57,24 +85,33 @@ const rootSessionEnv = "JIN_OPENCODE_ROOT_SESSION"
 // This is the same fail-open posture the Codex adapter takes when it has no
 // executable path to build hook arguments from.
 func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
-	resuming := opts.AgentSessionStarted && strings.HasPrefix(opts.AgentSessionID, sessionIDPrefix)
+	resuming := opts.AgentSessionStarted && hasSessionIDPrefix(opts.AgentSessionID)
 
 	cmd := "opencode"
 	if resuming {
-		cmd = "opencode --session " + opts.AgentSessionID
+		// The id goes through the environment, never into this string. See
+		// sessionArgEnv.
+		cmd = "opencode --session \"$" + sessionArgEnv + "\""
 	}
 
-	plan := agent.SpawnPlan{Command: cmd}
+	plan := agent.SpawnPlan{Command: cmd, ExtraEnv: map[string]string{}}
+	if resuming {
+		// Set whatever else is true: the command above names this variable, so
+		// leaving it out would resume nothing. On a fresh spawn AgentSessionID
+		// is still the pre-minted UUID, which names no opencode session at all.
+		plan.ExtraEnv[sessionArgEnv] = opts.AgentSessionID
+	}
 	if configDir != "" {
 		// Handed over unescaped on purpose: Manager single-quotes every
 		// ExtraEnv value, and the SpawnPlan contract makes double-escaping
 		// the adapter's bug, not Manager's.
-		plan.ExtraEnv = map[string]string{configDirEnv: configDir}
+		plan.ExtraEnv[configDirEnv] = configDir
 		if resuming {
-			// Only on resume: on a fresh spawn AgentSessionID is still the
-			// pre-minted UUID, which names no opencode session at all.
 			plan.ExtraEnv[rootSessionEnv] = opts.AgentSessionID
 		}
+	}
+	if len(plan.ExtraEnv) == 0 {
+		plan.ExtraEnv = nil
 	}
 	return plan
 }

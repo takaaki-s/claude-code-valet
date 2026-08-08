@@ -222,14 +222,18 @@ type SendRequest struct {
 // truncation (Last), and tool/error filtering.
 //
 // The entries come from the adapter that owns the session, resolved by its
-// agent kind, not from a fixed reader. **Breaking change:** the handler used
-// to call the Claude Code reader for every kind, so a session whose adapter
-// cannot be read answered `entries: []` with `Success=true` — indistinguishable
-// from a child that ran and produced nothing. It now returns Success=false
-// when the kind is unknown to the registry, or when its adapter has no
-// transcript reader (opencode today). `AgentSessionID == ""` is not one of
-// those cases: it still returns `entries: []` with Success=true, because an
-// agent that has not started is not a read failure.
+// agent kind, not from a fixed reader. The handler used to call the Claude
+// Code reader for every kind, so a session whose adapter cannot be read
+// answered `entries: []` with `Success=true` — indistinguishable from a child
+// that ran and produced nothing. It now returns Success=false when the kind is
+// unknown to the registry, when its adapter has no transcript reader, or when
+// the reader itself fails. Every shipped kind has a reader, so the second case
+// is reserved for an adapter whose reader is not written yet; the third is
+// live — the opencode reader shells out to `opencode export`, which fails when
+// `opencode` is not on the daemon's PATH or the export cannot be parsed.
+// `AgentSessionID == ""` is not one of those cases: it still returns
+// `entries: []` with Success=true, because an agent that has not started is
+// not a read failure.
 type ResultRequest struct {
     ID string `json:"id"`
     // Since: ISO8601. Only entries with Timestamp strictly greater than Since are returned;
@@ -239,7 +243,12 @@ type ResultRequest struct {
     // lexicographically sortable RFC3339 timestamps with millisecond precision (e.g.
     // "2026-04-09T13:23:10.456Z") — see session.TranscriptSource for the full contract.
     // A timestamp is not a unique key, so an entry sharing the boundary timestamp is
-    // dropped rather than repeated; see docs/gotchas.md "Session result".
+    // dropped rather than repeated; see docs/gotchas.md "Session result". That applies
+    // to every kind — measured 1 of 112 adjacent pairs across 14 codex rollouts,
+    // 42 of 51,681 across 242 Claude Code transcripts, 12 of 478 entries across 34
+    // opencode sessions. On opencode, Since is also no cheaper than a full read: the
+    // reader runs `opencode export` (1.45-1.77s whatever the session size) and filters
+    // afterwards.
     Since      string `json:"since,omitempty"`
     Last       int    `json:"last,omitempty"`         // Truncate to last N entries (0 = no truncation)
     Tool       string `json:"tool,omitempty"`         // Filter by tool name (matches tool_use and its tool_result)
@@ -248,6 +257,14 @@ type ResultRequest struct {
 
 // ResultResponse returns the filtered entry list along with session metadata.
 // Truncated=true indicates that Last truncation was applied.
+//
+// Entries is always a JSON array, never null — a reader that found nothing
+// returns nil and the no-filter path passes nil through, so ResultResponse
+// carries its own MarshalJSON that re-empties it. On the type rather than at
+// the handler because the CLI re-encodes this struct after decoding it, so
+// both marshals have to be covered. Callers script this field with
+// `jq '.entries[] | select(.type=="system")'` to tell "the child said nothing"
+// from "the conversation was lost", and jq fails on null.
 type ResultResponse struct {
     SessionID      string             `json:"session_id"`
     AgentSessionID string             `json:"agent_session_id,omitempty"` // adapter-side session id (Claude Code UUID etc.)

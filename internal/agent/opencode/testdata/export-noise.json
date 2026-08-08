@@ -1,0 +1,59 @@
+{
+  "info": {
+    "id": "ses_fixture0000000000000001",
+    "title": "fixture"
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000008000
+        }
+      },
+      "parts": [
+        {
+          "type": "step-start"
+        },
+        {
+          "type": "text",
+          "text": "injected context",
+          "time": {
+            "start": 1786000008100
+          },
+          "synthetic": true
+        },
+        {
+          "type": "text",
+          "text": "withdrawn",
+          "time": {
+            "start": 1786000008200
+          },
+          "ignored": true
+        },
+        {
+          "type": "text",
+          "text": "   ",
+          "time": {
+            "start": 1786000008300
+          }
+        },
+        {
+          "type": "file",
+          "mime": "image/png",
+          "url": "data:,"
+        },
+        {
+          "type": "patch",
+          "hash": "abc",
+          "files": [
+            "a.txt"
+          ]
+        },
+        {
+          "type": "step-finish"
+        }
+      ]
+    }
+  ]
+}

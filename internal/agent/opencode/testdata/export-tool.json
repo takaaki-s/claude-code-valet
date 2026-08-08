@@ -1,0 +1,128 @@
+{
+  "info": {
+    "id": "ses_fixture0000000000000001",
+    "title": "fixture"
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000003000
+        }
+      },
+      "parts": [
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_ok",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "value"
+            },
+            "time": {
+              "start": 1786000003100,
+              "end": 1786000003200
+            },
+            "output": "ok",
+            "title": "true",
+            "metadata": {
+              "exit": 0
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fail",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "value"
+            },
+            "time": {
+              "start": 1786000003300,
+              "end": 1786000003400
+            },
+            "output": "make: *** [build] Error 2",
+            "title": "make",
+            "metadata": {
+              "exit": 1
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_err",
+          "state": {
+            "status": "error",
+            "input": {
+              "arg": "value"
+            },
+            "time": {
+              "start": 1786000003500,
+              "end": 1786000003600
+            },
+            "error": "file not found"
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "grep",
+          "callID": "call_nofield",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "value"
+            },
+            "time": {
+              "start": 1786000003700,
+              "end": 1786000003800
+            },
+            "output": "3 matches",
+            "title": "grep",
+            "metadata": {
+              "truncated": false
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_null",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "value"
+            },
+            "time": {
+              "start": 1786000003900,
+              "end": 1786000004000
+            },
+            "output": "?",
+            "title": "x",
+            "metadata": {
+              "exit": null
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "glob",
+          "callID": "call_run",
+          "state": {
+            "status": "running",
+            "input": {
+              "arg": "value"
+            },
+            "time": {
+              "start": 1786000004100
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

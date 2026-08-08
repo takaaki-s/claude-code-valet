@@ -50,6 +50,14 @@ type DescriptionSource = session.DescriptionEnhancer
 // Agent.Transcript.
 type TranscriptSource = session.TranscriptSource
 
+// PollableTranscriptSource is the opt-in a reader makes when it is cheap enough
+// to call on a timer. Re-exported because adapters are written against this
+// package, and opting in is invisible when forgotten — the preview simply never
+// appears — so a reader that means to opt in wants
+// `var _ agent.PollableTranscriptSource = (*Reader)(nil)` to say so at compile
+// time.
+type PollableTranscriptSource = session.PollableTranscriptSource
+
 // NotifyKind categorises the notification signal an adapter attaches to a
 // StatusUpdate; downstream plugins receive it via JIN_NOTIFY_KIND.
 type NotifyKind = session.NotifyKind

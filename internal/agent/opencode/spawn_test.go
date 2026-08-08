@@ -57,9 +57,18 @@ func TestSpawnCommand_Resume(t *testing.T) {
 		AgentSessionStarted: true,
 	}, testConfigDir)
 
-	want := "opencode --session " + id
+	// The id is named, not spliced. See sessionArgEnv, and the injection test
+	// below for what splicing it cost.
+	want := `opencode --session "$JIN_OPENCODE_SESSION"`
 	if plan.Command != want {
 		t.Errorf("Command = %q, want %q", plan.Command, want)
+	}
+	if got := plan.ExtraEnv[sessionArgEnv]; got != id {
+		t.Errorf("%s = %q, want the session id %q — the command names it, so an absent value resumes nothing",
+			sessionArgEnv, got, id)
+	}
+	if strings.Contains(plan.Command, id) {
+		t.Errorf("Command still carries the id verbatim: %q", plan.Command)
 	}
 }
 
@@ -75,20 +84,27 @@ func TestSpawnCommand_ConfigDirEnv(t *testing.T) {
 // Setup failure must degrade to a working agent without status reporting,
 // never to a failed spawn.
 func TestSpawnCommand_NoConfigDir_FailsOpen(t *testing.T) {
-	// The resume input is covered too: with no plugin to load there is
-	// nothing to pin a root session for either.
-	for _, opts := range []agent.SpawnOptions{
-		{},
-		{AgentSessionID: realSessionID, AgentSessionStarted: true},
-	} {
-		plan := SpawnCommand(opts, "")
+	plan := SpawnCommand(agent.SpawnOptions{}, "")
+	if plan.Command == "" {
+		t.Error("Command is empty, want a runnable command")
+	}
+	if len(plan.ExtraEnv) != 0 {
+		t.Errorf("ExtraEnv = %v, want empty when config dir is unknown", plan.ExtraEnv)
+	}
 
-		if plan.Command == "" {
-			t.Error("Command is empty, want a runnable command")
-		}
-		if len(plan.ExtraEnv) != 0 {
-			t.Errorf("ExtraEnv = %v, want empty when config dir is unknown", plan.ExtraEnv)
-		}
+	// A resume is the exception, and it has to be: the command names
+	// sessionArgEnv whether or not a plugin was written, so dropping the value
+	// with the rest of the environment would resume nothing and silently start
+	// a fresh session instead.
+	resume := SpawnCommand(agent.SpawnOptions{AgentSessionID: realSessionID, AgentSessionStarted: true}, "")
+	if got := resume.ExtraEnv[sessionArgEnv]; got != realSessionID {
+		t.Errorf("%s = %q, want the id even with no config dir", sessionArgEnv, got)
+	}
+	if _, ok := resume.ExtraEnv[configDirEnv]; ok {
+		t.Errorf("ExtraEnv leaked a config dir: %v", resume.ExtraEnv)
+	}
+	if _, ok := resume.ExtraEnv[rootSessionEnv]; ok {
+		t.Errorf("ExtraEnv pinned a root session with no plugin to read it: %v", resume.ExtraEnv)
 	}
 }
 
@@ -126,5 +142,61 @@ func TestSpawnCommand_Resume_PinsRootSession(t *testing.T) {
 
 	if got := plan.ExtraEnv[rootSessionEnv]; got != id {
 		t.Errorf("%s = %q, want %q", rootSessionEnv, got, id)
+	}
+}
+
+// TestSpawnCommand_ResumesOnThePrefixAlone pins the looser of the two id
+// predicates to the path that needs it.
+//
+// Getting this wrong is silent and unrecoverable: refusing to resume starts a
+// NEW opencode session, so the operator's conversation is simply not there and
+// nothing says why. The read path can afford to be strict because being wrong
+// there costs an error message; this one cannot, so it asks only whether
+// opencode has reported an id at all.
+func TestSpawnCommand_ResumesOnThePrefixAlone(t *testing.T) {
+	// Shapes the strict predicate rejects. If opencode ever widens its
+	// alphabet, resume has to keep working.
+	for _, id := range []string{
+		"ses_0425f0107ffe2ruNWlf2QIqBEJ", // today's shape
+		"ses_with-a-dash",
+		"ses_with.dot",
+		"ses_UPPER_and_under",
+	} {
+		plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: id, AgentSessionStarted: true}, "")
+		if !strings.Contains(plan.Command, "--session") || plan.ExtraEnv[sessionArgEnv] != id {
+			t.Errorf("SpawnCommand(%q) = %q env %v — a resume was silently turned into a new session",
+				id, plan.Command, plan.ExtraEnv)
+		}
+	}
+
+	// And the pre-minted UUID still means "not resumable".
+	plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: "0198f1b2-0000-7000-8000-000000000000", AgentSessionStarted: true}, "")
+	if plan.Command != "opencode" {
+		t.Errorf("SpawnCommand(uuid) = %q, want a fresh start", plan.Command)
+	}
+}
+
+// TestSpawnCommand_AHostileIDNeverReachesTheCommand closes the adapter end of
+// the injection path.
+//
+// internal/session proves that an ExtraEnv value is not interpreted by the
+// shell; this proves the opencode adapter actually uses ExtraEnv for the one
+// value it does not choose. Neither test can cover both ends — internal/agent
+// imports internal/session, so putting them together is an import cycle — and
+// either one alone leaves the path open.
+func TestSpawnCommand_AHostileIDNeverReachesTheCommand(t *testing.T) {
+	for _, id := range []string{
+		"ses_x$(touch /tmp/jin-should-not-exist)",
+		"ses_x;touch /tmp/jin-should-not-exist",
+		"ses_x`touch /tmp/jin-should-not-exist`",
+		"ses_x'; touch /tmp/jin-should-not-exist; '",
+	} {
+		plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: id, AgentSessionStarted: true}, testConfigDir)
+		if strings.Contains(plan.Command, "touch") || strings.Contains(plan.Command, id) {
+			t.Errorf("SpawnCommand(%q) put the id in Command: %q", id, plan.Command)
+		}
+		if plan.ExtraEnv[sessionArgEnv] != id {
+			t.Errorf("SpawnCommand(%q) did not carry the id in %s: %v", id, sessionArgEnv, plan.ExtraEnv)
+		}
 	}
 }

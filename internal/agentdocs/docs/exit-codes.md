@@ -11,7 +11,7 @@ rather than on the message text — messages get reworded, codes do not.
 | Code | Name | Meaning | What to do |
 |------|------|---------|------------|
 | 0 | Success | — | — |
-| 1 | GeneralError | Anything without a code of its own — including `session result` on an agent kind jind-ai cannot read | Read the message. For `result`, decide from `agent_kind` before you call rather than from the failure |
+| 1 | GeneralError | Anything without a code of its own — including a `session result` whose conversation could not be read at all (every shipped kind has a reader; on `opencode` the read runs `opencode`, which has to be on the daemon's PATH) | Read the message. For `result`, what an *empty* answer means still depends on the kind — see the `gotchas` doc |
 | 2 | SessionNotFound | No session matched the selector | `jin session list --json` and re-check the selector |
 | 3 | DaemonNotRunning | Reserved — **not currently emitted**, see below | — |
 | 4 | Timeout | `session wait` or `send --wait-running` hit its timeout | From `wait`: the child is still working — wait again or escalate. From `send`: nothing confirms the child took the prompt — attach and look at the input box before deciding whether to resend |

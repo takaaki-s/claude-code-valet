@@ -38,22 +38,41 @@ type SpawnOptions struct {
 // agent. Manager splices the pieces into the fixed shell template it uses to
 // wrap every session (`cd DIR; env -u ... KEY=VAL SHELL -ic 'COMMAND'`).
 //
-// Shell safety contract — how Manager treats each field:
+// Shell safety contract. The two fields are NOT alike, and the difference is
+// the one thing to take from this comment:
 //
-//   - Command is placed inside single quotes; Manager defensively escapes
-//     any single quote it finds. Adapters SHOULD NOT pre-escape their own
-//     quotes: the replacement is designed for the raw form, and
-//     double-escaping would break the wrapping. Emit the literal command
-//     as if you were typing it into an interactive shell.
-//   - ExtraEnv values are single-quoted by Manager (KEY='value'), so
-//     arbitrary content survives — including whitespace and shell
-//     metacharacters. Adapters can pass values verbatim.
-//   - ExtraEnv keys and UnsetEnv entries must be POSIX env-var names
-//     matching [A-Za-z_][A-Za-z0-9_]*. Manager rejects any that don't
-//     (returns an error before the process is spawned).
+//   - **Command is executed as a shell command. Never build it out of a value
+//     you did not choose.** It ends up as the argument to `SHELL -ic`, which
+//     means a shell is handed it to interpret — so `$(...)`, backticks, `;`
+//     and the rest are live. The single quotes Manager wraps it in protect the
+//     OUTER shell, not the command's own contents, and escaping the quotes
+//     does not change that: an injection needs no quote of its own. This was
+//     not theoretical. The opencode adapter concatenated a session id — a
+//     value written from a hook payload without validation — and
+//     `ses_x$(touch F)` ran, at whatever later moment that session resumed.
+//   - **ExtraEnv values are data.** Manager single-quotes each one, so
+//     arbitrary content survives verbatim: whitespace, metacharacters, quotes.
+//     Pass them raw; pre-escaping is the adapter's bug, not Manager's.
+//   - ExtraEnv keys and UnsetEnv entries must be POSIX env-var names matching
+//     [A-Za-z_][A-Za-z0-9_]*. Manager rejects any that don't, before the
+//     process is spawned.
 //
-// The contract is intentionally "Manager is the last line of defence":
-// adapters return honest, unescaped values and Manager makes them safe.
+// So an adapter that needs an untrusted value on the command line puts the
+// value in ExtraEnv and names it from Command:
+//
+//	Command:  `opencode --session "$JIN_OPENCODE_SESSION"`,
+//	ExtraEnv: map[string]string{"JIN_OPENCODE_SESSION": id},
+//
+// A shell does not re-scan the result of a parameter expansion for
+// substitutions, so the value arrives as one argument however it is spelled.
+// internal/session's TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted checks
+// that by running the command rather than by reading it.
+//
+// "Manager is the last line of defence" holds for ExtraEnv values and for
+// key validation. It does not hold for what is inside Command, and reading it
+// that way is what the paragraph above is here to prevent. Emit Command as the
+// literal line you would type — including the quoting you would type around a
+// value you did not choose.
 type SpawnPlan struct {
 	// Command is the single-line shell command that starts the agent
 	// (e.g. `claude --settings /path/to/hooks.json --session-id UUID`).
@@ -132,12 +151,13 @@ const (
 	NotifyPermission NotifyKind = "permission"
 )
 
-// TranscriptSource reads an agent's own on-disk conversation log and returns
-// it as jind-ai's shared transcript.Entry form, which is what `jin session
-// result` serialises. Each adapter's log format is its own — Claude Code
-// writes one JSONL per session under ~/.claude/projects, Codex writes a
-// date-sharded rollout — so the translation into Entry/Block lives with the
-// adapter and only the result shape is common.
+// TranscriptSource returns an agent's own conversation as jind-ai's shared
+// transcript.Entry form, which is what `jin session result` serialises. How an
+// adapter gets it is its own business — Claude Code writes one JSONL per
+// session under ~/.claude/projects, Codex writes a date-sharded rollout, and
+// opencode keeps its conversation in a database and is asked to print it — so
+// the translation into Entry/Block lives with the adapter and only the result
+// shape is common.
 //
 // Contract, matching what transcript.Reader already does:
 //
@@ -183,8 +203,44 @@ const (
 // functions over []Entry, not here. Adding them would make every adapter
 // re-implement exchange boundaries, which is how the same flag ends up meaning
 // different things per agent kind.
+//
+// What the one method does NOT say is what a read costs, and the callers differ by
+// orders of magnitude. `jin session result` is one command an orchestrator
+// chose to run, so a read that takes a second is fine. A preview decorates
+// every row of `session list`, which the TUI refreshes on a timer, so the
+// budget there is per-session-per-refresh. An implementation that shells out
+// satisfies the first and ruins the second. PollableTranscriptSource is how a
+// reader says which it is.
 type TranscriptSource interface {
 	ReadEntries(workDir, sessionID, since string) ([]transcript.Entry, error)
+}
+
+// PollableTranscriptSource is a TranscriptSource whose ReadEntries is cheap
+// enough to call on a timer, once per session per refresh.
+//
+// Reading a local file qualifies; spawning a process does not. The opencode
+// adapter asks opencode to print the session, so it deliberately does not
+// implement this: on a list of opencode sessions refreshed every two seconds, a
+// preview would mean one process per row per refresh, permanently. The measured
+// cost of that read is quoted once, where it is made — see exportTimeout in
+// internal/agent/opencode.
+//
+// Opt-in rather than opt-out, and that direction is the whole design. An
+// adapter that forgets to declare itself loses its previews — visible, and
+// harmless. The opposite default would let a new expensive reader melt the
+// list, and no test on either side would catch it, because neither the reader
+// nor the preview is wrong on its own.
+//
+// Callers on a polling path must type-assert for this interface and skip the
+// source when it is absent. Callers with a per-command budget — handleResult —
+// must not: refusing to read there would turn a slow answer into no answer.
+type PollableTranscriptSource interface {
+	TranscriptSource
+	// CheapEnoughToPoll declares the fact by existing, and returns nothing on
+	// purpose. A bool would let a reader answer false, which says exactly what
+	// not implementing the interface already says — one fact with two spellings,
+	// and a branch at every caller for the one that never happens.
+	CheapEnoughToPoll()
 }
 
 // StatusSource translates raw StatusSignals into StatusUpdates. Adapters

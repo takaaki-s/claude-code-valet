@@ -628,9 +628,26 @@ Common pitfalls and caveats that agents tend to fall into.
   into `(nil, nil)`. `TranscriptSource` requires that of every implementation,
   so an adapter cannot make "too early" look like an error either.
 
-  This is a breaking change for opencode, which has no reader: `session result`
-  on an opencode session exits non-zero where it used to exit 0 with nothing.
-  See [CHANGELOG.md](../CHANGELOG.md).
+  **Every shipped kind returns a reader now, so nothing reaches that refusal
+  today.** It stays for the next adapter: keep answering with a failure while
+  its reader is unwritten, because empty-and-successful is what makes the gap
+  invisible. "Has no reader" and "has one that could not read" are separate
+  cases and stay separate — the opencode reader is never nil, and reports its
+  own error (`opencode` not on the daemon's PATH, an export that failed) from
+  `ReadEntries`. Both surface as `Success=false`; neither can be mistaken for a
+  child that said nothing.
+
+  **`entries` is an array on the wire even when it is empty.** A reader that
+  found nothing returns nil and `filterResultEntries` passes nil straight
+  through when no filter is set, which marshals as `null`. The guarantee lives
+  on the type, in `ResultResponse.MarshalJSON`, rather than at the handler:
+  the value is marshalled twice on the way to a person — once by the daemon and
+  again by the CLI, which re-encodes the struct it decoded — so a guard at one
+  call site would have covered half the path. The documented
+  way to tell "said nothing" from "lost the conversation" is
+  `jq '.entries[] | select(.type=="system")'`, and jq fails on null with
+  "Cannot iterate over null" at exactly the moment a caller is asking which of
+  the two happened.
 
   **`AgentSessionID != ""` does not prove the ID is the agent's own, and on
   codex it usually is not yet.** `ReserveCreation` pre-mints a UUID for every
@@ -647,6 +664,21 @@ Common pitfalls and caveats that agents tend to fall into.
   re-keyed, which is a persisted-field change; until then the ambiguity is
   stated in the agent-facing `gotchas` doc so an orchestrator does not read
   empty-and-successful as "the child did nothing".
+
+  **opencode has the same window, for the same reason** — no `--session-id`, so
+  the real `ses_` id arrives through the plugin's `session.created`. Its reader
+  makes the window explicit rather than incidental, and it asks two separate
+  questions. `hasSessionIDPrefix` decides whether opencode has reported an id
+  at all: no prefix means the window, and the answer is `(nil, nil)` rather
+  than a subprocess and an error message. `isSessionID` then checks the rest of
+  the shape, and failing THAT is an error, not silence — an id carrying the
+  prefix but not the form is something going wrong, not a session that has yet
+  to start. The strict test is an allow-list because the alphabet is known —
+  across 877
+  real ids every body is exactly 26 base62 characters — and it is the line to
+  change if opencode ever widens it, since a real id rejected there would be a
+  quiet empty-and-successful of its own. That window is the **only** silent
+  case opencode has left; everything past it is an error.
 
 - **The Codex reader groups rollout rows by role, because Codex writes one
   block per row.** A rollout is one `response_item` per block — measured over
@@ -696,6 +728,14 @@ Common pitfalls and caveats that agents tend to fall into.
   read, and an assistant entry holding only a `tool_use` can read as "the child
   said nothing". Claude Code has no equivalent, since one line is one entry
   there. Read whole when completeness matters.
+
+  **This is not codex-only, and it is not addressed here.** The opencode reader
+  applies the bound the same way — per row, before grouping — so it splits a
+  group across two polls for the same reason. Both readers do it because the
+  bound is a property of a row and grouping is a property of the read, and
+  making it entry-level would mean deciding a group is closed before knowing
+  whether the next row joins it. Worth fixing once, for both kinds, rather than
+  per adapter; nothing in this section does.
 
   **Known degeneration:** a human turn arriving directly after a tool result
   would land in the same `user` Entry as that result. The measured corpus never
@@ -766,6 +806,122 @@ Common pitfalls and caveats that agents tend to fall into.
   than `exec`. A full-corpus count says what the corpus contains, not what
   Codex can emit; treat those paths as unmeasured rather than absent.
 
+- **The opencode reader asks opencode to print the session, and stores
+  nothing.** opencode keeps its conversation in SQLite. Reading that database
+  directly would mean a pure-Go SQLite driver (+25 modules, +6.2MB) plus a
+  dependency on a schema that already carries an unused `session_message` table
+  waiting to become the live one. Keeping a recorded copy — which an earlier
+  revision of this adapter did — meant jind-ai owning a growing set of files
+  with nothing to reclaim them, and a result that was only as complete as the
+  recording. Running `opencode export --pure <ses_id>` costs a process and
+  couples to a documented command instead. `--pure` is not optional: it stops
+  opencode loading plugins, including jind-ai's own, which keeps the read off
+  the status-reporting path entirely.
+
+- **One export costs 1.45–1.77s, and the size of the session does not change
+  that.** Measured across sessions from 3 to 117 parts: the time is opencode's
+  start-up, not the conversation. `--since` therefore buys nothing on this kind
+  — it filters after the same second and a half — so the advice for callers is
+  fewer, larger polls. The 30s `exportTimeout` is set against that constant and
+  deliberately far above it: it is there to stop a wedged process holding the
+  handler, not to police a slow one.
+
+- **A reader that spawns a process must never sit on a polling path, and
+  `PollableTranscriptSource` is how it says so.** The two callers differ by
+  orders of magnitude: `jin session result` is one command an orchestrator
+  chose to run, while a last-message preview decorates every row of `session
+  list`, which the TUI refreshes on a timer — one read per session per refresh.
+  Readers opt **in** by implementing the interface; the Claude Code and Codex
+  readers do (both open one local file), the opencode reader does not. The
+  direction is the design: an adapter that forgets to opt in loses its
+  previews, which is visible and harmless, while the opposite default would let
+  a new expensive reader melt the list and no test on either side would catch
+  it, because neither the reader nor the preview is wrong on its own. The
+  consequence is deliberate: an opencode session gets no last-message preview,
+  while claude and codex ones do. Both preview call sites — `Manager.List` and
+  `handleGet` — go through `AttachLastMessages`, so the guard sits inside that
+  one function rather than at each caller; every caller it has today is a
+  polling path, and a one-shot caller would have to lift the guard out.
+  `handleResult` is on the other side of the line and must not skip, because
+  refusing to read there turns a slow answer into no answer.
+
+- **`opencode export`'s stdout truncates at exactly 65536 bytes into a pipe.**
+  Measured on one 133KB session: cut on 8 of 10 runs through a pipe, 0 of 10
+  redirected to a file. `runExport` writes to a temp file for that reason.
+  Every truncation produced invalid JSON and `entriesFromExport` refuses a
+  document that does not parse, so a cut read is loud rather than a plausibly
+  short conversation — but a read that fails 80% of the time is not a read, and
+  the file redirect is what makes it one.
+
+- **The exit status is the verdict; stderr is not.** opencode writes a progress
+  line to stderr on every run, successful ones included, so a non-empty stderr
+  says nothing. Only its tail (512 bytes) is quoted into a failure message.
+  Exporting a session **while it is running** works — 5/5, rc 0, valid JSON —
+  and returns the conversation as far as it has committed, which is also why a
+  `pending` or `running` tool part contributes a `tool_use` block and no
+  `tool_result`: a result block with no output reads as a tool that returned
+  nothing.
+
+- **`Entry.Timestamp` is opencode's own value, carried forward where opencode's
+  clock disagrees with the order of the conversation.** Parallel tool calls
+  mean a call issued first can finish last, so a truthful sequence of real
+  times is genuinely out of order; the reader repeats the previous value rather
+  than nudging by a millisecond, which keeps every stamp a time opencode
+  actually recorded. It is rare: 13 of 620 blocks across 34 sessions need the
+  correction, the largest going back 204s.
+
+  **The cost is the collision documented above for codex and Claude Code, and
+  opencode is not exempt from it.** Two entries can share a stamp — 12 of 478
+  in the corpus — and `--since` is exclusive, so a caller polling across such a
+  pair loses the second entry. An earlier revision of this adapter stamped at
+  its own write time and claimed immunity here; that claim was true only of a
+  recording jind-ai controlled, and it is gone. `Entry.Timestamp` tracks the
+  group's **last** block, for the same incremental-read reason as codex.
+
+- **Entries are grouped by role, and a tool part is split in two.** opencode
+  splits one assistant turn across several messages — one per step, up to 14 in
+  a row in the corpus — so a 1:1 message-to-entry mapping would make `--last 5`
+  mean five *steps* here and five *messages* on Claude Code: the same failure
+  the codex grouping above avoids. A tool result is filed under `user` even
+  though opencode keeps the call and its output in one part; without that split
+  a whole assistant turn collapses into one entry (measured: 478 entries become
+  92 across 34 sessions). `Entry.Usage` is the sum over the messages one turn
+  was split across, credited once per message index rather than once per
+  assistant run — billing per run reported 200 tokens where 100 were spent,
+  because one message issuing two tool calls lands in more than one entry.
+  opencode's reasoning-token count has no field in `transcript.Usage` and is
+  dropped rather than folded into another number.
+
+- **`--errors-only` was wrong here while the docs claimed it was exact, and
+  `metadata.exit` is the fix.** opencode records a shell that exited non-zero
+  as `status: "completed"` — all 5 such calls in the 194-call corpus — so
+  reading the status alone returned none of them, which is the trap this
+  project already documents for codex, reintroduced. The reader now reads
+  `metadata.exit`, the real exit status. **Only `bash` carries it** (32 of 33
+  as a number, 1 as null); `read`, `grep`, `glob`, `task`, `skill`, `websearch`
+  and `write` have no exit field at all — 0 of 161, every call that is not
+  bash. So on a `completed` call
+  `IsError == false` means either "exited zero" or "jind-ai cannot tell", and
+  `--errors-only` is exact for bash and partial for everything else. A
+  `state.status` of `"error"` still sets `IsError` for any tool — the single
+  one in the corpus belongs to a `read` that could not open a file — and that
+  path takes `state.error` rather than `state.output`, because whether opencode
+  ever fills both cannot be told from one failed call.
+
+- **Deliberately not conversation, and one thing that is not handled at all.**
+  `step-start` / `step-finish` are bookkeeping (one of each per assistant
+  message: 124 and 122 against 124 messages); text parts flagged `synthetic` or
+  `ignored` are context opencode inserted on the operator's behalf — a
+  schema-derived rule, since neither flag is set on any of the 132 text parts
+  in the corpus, which is exactly why it is written down; `file`, `agent`,
+  `patch` and `snapshot` exist in opencode's schema and appear nowhere in the
+  corpus (0/672), so mapping them would be inventing content. Reasoning text
+  *is* readable here, unlike codex's encrypted summaries. Revert/undo is the
+  unhandled case: opencode can remove a message or a part and the reader
+  follows no removals, so content the child undid stays in the result. All of
+  this is restated for orchestrators in the agent-facing `gotchas` doc
+  (`internal/agentdocs/docs/gotchas.md`) — keep the two in step.
+
 ## Session previews (`info`, `list`, TUI rows)
 
 - **The two message previews go through the session's adapter too, and for
@@ -774,7 +930,9 @@ Common pitfalls and caveats that agents tend to fall into.
   session ran, so a codex or opencode row's second line was blank forever, and
   because the read error was discarded, blank was indistinguishable from a
   session that had not spoken. Both now call `Manager.AttachLastMessages`,
-  which resolves the adapter through `m.resolveAgent(info.AgentKind)`.
+  which resolves the adapter through `m.resolveAgent(info.AgentKind)`. A codex
+  row gained its previews that way; an opencode row did not, and still does not
+  — see the fifth reason below.
 
   `Manager` cannot use `agent.Lookup` the way `handleResult` does —
   `internal/session` must not import `internal/agent` — but it already carried
@@ -784,8 +942,11 @@ Common pitfalls and caveats that agents tend to fall into.
 
 - **Here an unreadable transcript is silent, unlike `session result`.** These
   decorate a row that has to render either way, so every failure — no adapter,
-  no reader, a read error, nothing said yet — leaves the previews empty and the
-  command succeeds. A `session list` that failed because one session's
+  no reader, a read error, nothing said yet, or a reader too expensive to call
+  on this path — leaves the previews empty and the command succeeds. That last
+  one is why an opencode row is always blank: its reader runs a subprocess, so
+  it does not implement `PollableTranscriptSource` and this path skips it. See
+  "Session result" above. A `session list` that failed because one session's
   transcript was unreadable would be worse than a row with an empty second
   line. The consequence is that **an empty preview still means nothing in
   particular**; `session result` is the call that distinguishes the cases.
@@ -1187,11 +1348,22 @@ Common pitfalls and caveats that agents tend to fall into.
   keystrokes through, and that one reports success — see the
   completion-overlay entry under Session send.
 
-- **`session result` is unsupported here, and says so.** The adapter returns
-  nil from `Transcript()`: opencode keeps its conversation in a SQLite
-  database rather than a JSONL log, so it needs a reader neither shipped one
-  provides. The command fails instead of answering empty — see "Session
-  result" above for why an error is the better wrong answer.
+- **The plugin reports status and nothing else; `session result` does not go
+  through it.** The conversation is fetched by running
+  `opencode export --pure <ses_id>` when someone asks for it, so there is no
+  recording, no jind-ai-owned transcript file, and nothing to retain or reclaim
+  for an opencode session. `--pure` also stops opencode loading this plugin, so
+  a read cannot perturb status reporting. What the reader does with the export
+  — grouping, timestamps, error detection, what it drops — is under "Session
+  result" above.
+
+  One consequence worth knowing before adding a feature here: `opencode` must
+  be on the **daemon's** PATH for a read to work, which is not implied by
+  sessions starting. `SpawnCommand`'s output runs through the user's login
+  shell (`SHELL -ic`), so a version manager's shims resolve there; the daemon
+  process may have been started from an environment where they do not.
+  `runExport` calls `exec.LookPath` per read rather than caching a path at
+  start-up, because the daemon outlives any single install.
 
 - **The plugin is a pure observer.** It subscribes via the `event` hook,
   not the `permission.ask` hook. Note that `permission.ask` (a `Hooks`
@@ -1284,6 +1456,19 @@ Common pitfalls and caveats that agents tend to fall into.
   `bind: invalid argument`. Go 1.26 truncates the pattern and Go 1.24 does not,
   so this passes on a newer local toolchain and fails on the version in
   `go.mod`. Use `testutil.SocketPath(t, name)`.
+
+- **Running the suite from inside a jind-ai session corrupts that session.**
+  `cmd/jin/cmd/hook_test.go` runs the real `hook` command against the real
+  daemon socket with `{"session_id":"abc"}`, and it inherits the `JIN_SESSION_ID`
+  the pane exported — so the hook fires on whichever session is running the
+  tests. Observed twice: the session's status flips to `stopped` and its
+  `agent_session_id` becomes `"abc"`, which breaks resume. Nothing in the test
+  says it is talking to a live daemon, and the damage is silent.
+
+  Until the test is isolated, run it as `env -u JIN_SESSION_ID make test`, or
+  point `JIN_SOCKET` at a path that does not exist. This bites anything that
+  runs the suite repeatedly — a mutation-testing loop re-runs it once per
+  mutation.
 
 - **`make test-e2e` covers two packages**, `./test/e2e/` and `./internal/tui/`.
   The TUI's tmux-backed tests (`model_tmux_e2e_test.go`, build tag `e2e`) drive

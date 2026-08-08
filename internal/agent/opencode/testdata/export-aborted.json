@@ -1,0 +1,31 @@
+{
+  "info": {
+    "id": "ses_fixture0000000000000001",
+    "title": "fixture"
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000009000
+        },
+        "error": {
+          "name": "MessageAbortedError",
+          "data": {
+            "message": "Aborted"
+          }
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "starting",
+          "time": {
+            "start": 1786000009100
+          }
+        }
+      ]
+    }
+  ]
+}

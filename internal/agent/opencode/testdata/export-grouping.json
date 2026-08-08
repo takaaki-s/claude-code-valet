@@ -1,0 +1,91 @@
+{
+  "info": {
+    "id": "ses_fixture0000000000000001",
+    "title": "fixture"
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1786000005000
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "go"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000005100
+        },
+        "tokens": {
+          "input": 10,
+          "output": 1,
+          "reasoning": 7,
+          "cache": {
+            "read": 100,
+            "write": 5
+          }
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "step one",
+          "time": {
+            "start": 1786000005110
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000005200
+        },
+        "tokens": {
+          "input": 20,
+          "output": 2,
+          "reasoning": 9,
+          "cache": {
+            "read": 200,
+            "write": 6
+          }
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "step two",
+          "time": {
+            "start": 1786000005210
+          }
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000005300
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "step three",
+          "time": {
+            "start": 1786000005310
+          }
+        }
+      ]
+    }
+  ]
+}

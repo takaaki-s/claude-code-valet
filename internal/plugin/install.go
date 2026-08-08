@@ -20,6 +20,7 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/google/uuid"
+	"github.com/takaaki-s/jind-ai/internal/procgroup"
 	"github.com/takaaki-s/jind-ai/pkg/plugin/manifest"
 )
 
@@ -478,7 +479,7 @@ func runBuilds(stagingDir, stateDir, name string, cmds []string, timeout time.Du
 		cmd.Env = env
 		cmd.Stdout = out
 		cmd.Stderr = out
-		setProcessGroupKill(cmd)
+		procgroup.KillOnCancel(cmd)
 
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start build step %q: %w", cmdStr, err)

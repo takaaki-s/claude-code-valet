@@ -14,6 +14,21 @@
 - Log only at boundaries (daemon server, manager, etc.)
 - Wrap with `fmt.Errorf("context: %w", err)`
 
+## Spawning a process
+
+A child process that a context can cancel is wired with
+`internal/procgroup.KillOnCancel`, called before `Start`. It puts the child in
+its own process group and escalates SIGTERM to a group-wide SIGKILL after
+`procgroup.GracePeriod`.
+
+Not a nicety: `exec.CommandContext` signals the leader PID, and `Cmd.WaitDelay`
+escalates against that same PID, so neither reaches a grandchild. Everything
+jind-ai starts goes on to start something else — a plugin's interpreter, a
+worktree hook's bash, `opencode export` — which makes "the leader is gone" and
+"the work has stopped" different statements. The same handful of lines was
+rederived twice before it was pulled into one place, and the third caller is
+what paid for the package.
+
 ## Atomic file writes
 
 Publishing a file through a temp sibling and a rename goes through

@@ -21,6 +21,38 @@ log.
   [docs/gotchas.md](docs/gotchas.md#session-result), or `jin docs show gotchas`
   for the orchestration-facing version.
 
+- **`jin session result` works on opencode sessions too.** opencode keeps its
+  conversation in a SQLite database, so jind-ai asks opencode for it: the
+  command runs `opencode export --pure <session id>` and parses the result.
+  Nothing is recorded, no copy is kept, and no SQLite dependency or
+  database-schema coupling is taken on. Where the codex reader is weak this one
+  is not: `thinking` carries the real reasoning text, entries carry `usage`
+  (the sum over the messages opencode splits one turn across — its
+  reasoning-token count has no field in jind-ai's shape and is dropped), and
+  `--tool` matches real per-tool names. Until now the command answered zero
+  entries and exit 0 on an opencode session, which reads exactly like a child
+  that ran and said nothing.
+
+  The limits matter more than the capabilities. `opencode` has to be on the
+  **daemon's** PATH — sessions start through your login shell, which resolves a
+  version manager's shims the daemon may not see — and a read that cannot
+  happen is an error, not an empty result; the one case that stays empty and
+  exits 0 is a session whose agent has not reported its own id yet, the same
+  window codex has. Each read costs 1.45–1.77s whatever the session size (the
+  time is opencode's start-up), so `--since` is no cheaper than a full read and
+  fewer, larger polls are the way to use it. `--errors-only` is exact for
+  `bash` and partial elsewhere: it catches whatever opencode flagged as an
+  error, plus a shell command that exited non-zero (opencode records those as
+  `completed`, so the flag comes from the exit status recorded alongside it) —
+  and no other tool records an exit status at all (0 of 161 calls). Timestamps
+  are opencode's own except where its clock disagrees with the order of the
+  conversation — parallel tool calls, 13 of 620 blocks measured — where the
+  previous value is carried forward, so two entries can share a stamp and
+  `--since` can skip one, exactly as on the other two kinds. Revert and undo
+  are not tracked, so content an opencode child undid can still appear in the
+  result. See
+  [docs/gotchas.md](docs/gotchas.md#session-result), or `jin docs show gotchas`
+  for the orchestration-facing version.
 - **Session rows and `jin session info` show a codex session's last messages.**
   The two message previews — the TUI's second line, the `session list` rows,
   and `last_user_message` / `last_assistant_message` in
@@ -28,20 +60,15 @@ log.
   whatever agent the session ran, so on codex and opencode they were blank
   permanently. They now go through the session's own adapter, like
   `jin session result` already did. Claude Code sessions show exactly what they
-  showed before. These stay a preview rather than a result: an unreadable
+  showed before. opencode rows stay blank on purpose: reading an opencode
+  conversation means running `opencode export`, which is far too expensive for
+  a path the TUI refreshes on a timer. These stay a preview rather than a result: an unreadable
   transcript leaves them empty and the command still succeeds, so an empty
   preview is not evidence a child said nothing — use `jin session result` for
   that. `jin session output` is unchanged and still reads Claude Code only.
 
 ### Behaviour change
 
-- **Breaking: `jin session result` on an opencode session now fails** instead
-  of exiting 0 with an empty entry list. jind-ai cannot read opencode's
-  conversation, and the old answer was indistinguishable from a child that ran
-  and produced nothing — a caller could not tell the two apart. The error
-  names the agent kind. Check opencode children through `git diff` and their
-  tests. Sessions whose agent has not started yet still return empty and exit
-  0, for every kind.
 - **Workspace trust for Claude Code sessions is now written to
   `~/.claude.json`**, the file Claude Code actually reads it from, instead of
   `~/.claude/settings.local.json`, where it was silently ignored. A session

@@ -53,6 +53,9 @@ func newTestManager(t *testing.T) (*Manager, *mockTmuxRunner, *mockHookRunner) {
 // tests that exercise Layer C swap it via installEnhancer (which reaches
 // into the fakeAgentResolver held by newTestManager).
 type fakeAgent struct {
+	// spawnFn overrides SpawnCommand so a test can hand Manager a plan of a
+	// shape a real adapter produces.
+	spawnFn   func(SpawnOptions) SpawnPlan
 	enhancer  DescriptionEnhancer
 	clearKeys []string            // returned from ClearInputKeys; nil = opt-out (matches production default)
 	pasteFn   func(string) string // non-nil opts into the paste transport
@@ -68,12 +71,17 @@ type fakeAgent struct {
 	transcriptSrc TranscriptSource
 }
 
-func (a *fakeAgent) Kind() string                        { return "claude" }
-func (a *fakeAgent) Setup(SetupContext) error            { return nil }
-func (a *fakeAgent) SpawnCommand(SpawnOptions) SpawnPlan { return SpawnPlan{Command: "claude"} }
-func (a *fakeAgent) Description() DescriptionEnhancer    { return a.enhancer }
-func (a *fakeAgent) StatusSource() StatusSource          { return fakeStatusSource{} }
-func (a *fakeAgent) ClearInputKeys() []string            { return a.clearKeys }
+func (a *fakeAgent) Kind() string             { return "claude" }
+func (a *fakeAgent) Setup(SetupContext) error { return nil }
+func (a *fakeAgent) SpawnCommand(opts SpawnOptions) SpawnPlan {
+	if a.spawnFn != nil {
+		return a.spawnFn(opts)
+	}
+	return SpawnPlan{Command: "claude"}
+}
+func (a *fakeAgent) Description() DescriptionEnhancer { return a.enhancer }
+func (a *fakeAgent) StatusSource() StatusSource       { return fakeStatusSource{} }
+func (a *fakeAgent) ClearInputKeys() []string         { return a.clearKeys }
 func (a *fakeAgent) PastePlaceholder(prompt string) string {
 	if a.pasteFn == nil {
 		return ""
@@ -5997,5 +6005,64 @@ func TestManager_KillReadsDescriptionUnderLock(t *testing.T) {
 		mgr.sessions[sess.ID].Status = StatusIdle
 		mgr.sessions[sess.ID].TmuxPaneID = "%killdesc"
 		mgr.mu.Unlock()
+	}
+}
+
+// TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted is the property adapters are
+// promised by the SpawnPlan contract, checked by running the thing rather than
+// reading it.
+//
+// Command is spliced into `$SHELL -ic '<cmd>'`. The single quotes stop the
+// OUTER shell, but the inner shell is handed a command to interpret, so
+// anything an adapter concatenates INTO Command is live: an id of the form
+// `ses_x$(...)` executes, and that id reaches jind-ai unvalidated from a hook
+// payload. ExtraEnv is the way out — Manager quotes those values, and a shell
+// does not re-scan the result of a parameter expansion — so this test pins that
+// a hostile value survives the round trip as text.
+func TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+
+	canary := filepath.Join(t.TempDir(), "EXECUTED")
+	hostile := "ses_x$(touch " + canary + ")`touch " + canary + "`;touch " + canary
+	mgr.SetAgentResolver(&fakeAgentResolver{agents: map[string]Agent{
+		"probe": &fakeAgent{spawnFn: func(SpawnOptions) SpawnPlan {
+			return SpawnPlan{
+				Command:  `printf %s "$JIN_PROBE_VALUE" > ` + filepath.Join(t.TempDir(), "unused"),
+				ExtraEnv: map[string]string{"JIN_PROBE_VALUE": hostile},
+			}
+		}},
+	}})
+
+	shellCmd, err := mgr.buildAgentShellCmd(spawnSnapshot{
+		JinSessionID: "probe-session",
+		AgentKind:    "probe",
+		StartDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("buildAgentShellCmd: %v", err)
+	}
+	// The value belongs in the quoted env assignment and nowhere else. It must
+	// not appear inside `-ic '...'`, which is the part a shell interprets.
+	// Checking this before running tells two failures apart: the canary staying
+	// absent because the value never reached the command, versus because the
+	// quoting happened to hold.
+	inner := shellCmd
+	if i := strings.Index(shellCmd, "-ic '"); i >= 0 {
+		inner = shellCmd[i:]
+	} else {
+		t.Fatalf("template no longer wraps the command in -ic '...': %s", shellCmd)
+	}
+	if strings.Contains(inner, canary) {
+		t.Errorf("the ExtraEnv value was spliced into the interpreted command: %s", inner)
+	}
+
+	// Running it is the assertion. -ic needs an interactive-capable shell;
+	// /bin/sh accepts the flag and the substitutions under test are POSIX.
+	out, err := exec.Command("/bin/sh", "-c", shellCmd).CombinedOutput()
+	if err != nil {
+		t.Logf("shell reported %v (output: %s)", err, out)
+	}
+	if _, err := os.Stat(canary); err == nil {
+		t.Error("a substitution inside an ExtraEnv value was executed by the inner shell")
 	}
 }

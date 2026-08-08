@@ -21,11 +21,12 @@ that need to inspect what a child session actually did, not just the final
 assistant text.
 The selector may be an ID prefix or a description substring (case-insensitive).
 
-How much comes back depends on the agent kind, and on codex the --tool and
---errors-only filters are weaker than they look. opencode is unsupported: the
-command fails rather than answering with an empty result, so an unreadable
-session is never mistaken for a child that did nothing. Run 'jin docs show
-gotchas' for what an empty answer is allowed to mean per kind.
+Every shipped agent kind is readable, but not equally. On codex the --tool and
+--errors-only filters are weaker than they look. On opencode the answer comes
+from running 'opencode export', so that binary has to be on the daemon's PATH
+and every read costs about a second and a half whatever its size — and
+--errors-only is exact for bash there and partial for every other tool. Run
+'jin docs show gotchas' for what an empty answer is allowed to mean per kind.
 
 Examples:
   # Show a summary of recent activity

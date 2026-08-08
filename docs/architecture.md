@@ -235,7 +235,14 @@ internal/agent/opencode/ opencode adapter: Setup materialises an embedded
                          context — opencode's plugin discards `jin hook` stdout,
                          so the hook route the other adapters use cannot reach
                          it). SpawnCommand points opencode at the directory via
-                         OPENCODE_CONFIG_DIR. No Description enhancer.
+                         OPENCODE_CONFIG_DIR. Transcript shells out to
+                         `opencode export --pure <ses_id>` — opencode's own
+                         conversation lives in SQLite, and jind-ai stores
+                         nothing of its own; `--pure` keeps the read from
+                         loading the plugin. It is the one reader that is NOT a
+                         session.PollableTranscriptSource (1.45-1.77s per call),
+                         so a preview path on a timer must skip it. No
+                         Description enhancer.
 internal/agent/textutil.go  Cross-adapter helper — currently `SmartTruncate`
                          shared by claude and codex description enhancers.
 ```
@@ -319,9 +326,13 @@ session/           → config, tmux, transcript, plugin (Dispatcher seam only)
 agent/             → session (borrows Agent + supporting types via aliases)
 agent/claude/      → agent, session, transcript, debug, agentdocs   (CC-specific adapter)
 agent/codex/       → agent, session, transcript, agentdocs (Codex-specific adapter)
-agent/opencode/    → agent, session, debug, agentdocs     (opencode-specific adapter)
+agent/opencode/    → agent, session, transcript, procgroup, debug, agentdocs (opencode adapter)
 agent/register/    → agent, agent/claude, agent/codex, agent/opencode  (init-time Register)
                       │
+procgroup/         → (stdlib only) run a child in its own process group so a
+                      cancelled context reaches everything it started.
+                      Used by agent/opencode, plugin and worktreehook.
+worktreehook/      → procgroup (runs .jin/worktree-post-create.sh)
 agentdocs/         → (embedded content only; no internal deps)
                       Being a leaf is what lets cmd/ and every adapter share it:
                       the docs served by `jin docs`, the skill `jin init` offers,

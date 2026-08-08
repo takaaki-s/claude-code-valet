@@ -46,9 +46,13 @@ const (
 	// teardown to a goroutine (see "Async completion" in
 	// docs/ipc-protocol.md), so the response wait no longer has to cover an
 	// external process of unknown duration. What is left is tmux subprocess
-	// calls and local file reads, plus one handler with a named cost: "send"
-	// retries for up to session.sendVerifyBudget, which scales with the
-	// prompt rather than sitting at a flat 5s. That budget is checked
+	// calls and local file reads, plus two handlers with a named cost.
+	// "result" runs `opencode export` on an opencode session, bounded by that
+	// adapter's own exportTimeout, which is chosen to sit inside this one — if
+	// either constant moves, they have to keep that order or the client gives
+	// up on a read the daemon is still doing. "send" retries for up to
+	// session.sendVerifyBudget, which scales with the prompt rather than
+	// sitting at a flat 5s. That budget is checked
 	// between attempts, so the real ceiling is roughly budget plus one full
 	// attempt.
 	//

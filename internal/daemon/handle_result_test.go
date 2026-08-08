@@ -8,6 +8,8 @@ import (
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/agent/agenttest"
+	"github.com/takaaki-s/jind-ai/internal/agent/opencode"
+	"github.com/takaaki-s/jind-ai/internal/procgroup"
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/transcript"
 )
@@ -23,6 +25,12 @@ type recordingSource struct {
 	workDir, sessID string
 	since           string
 }
+
+// CheapEnoughToPoll makes the stub stand in for a file-backed reader, which is
+// what the preview path requires of a source before it will call it. Without
+// this, every preview assertion would pass for the wrong reason — see
+// internal/session's TestAttachLastMessages_SkipsAReaderThatIsNotCheapToPoll.
+func (s *recordingSource) CheapEnoughToPoll() {}
 
 func (s *recordingSource) ReadEntries(workDir, sessionID, since string) ([]transcript.Entry, error) {
 	s.calls++
@@ -221,5 +229,70 @@ func TestHandleResult_LastTruncatesFromTheEnd(t *testing.T) {
 	}
 	if len(got.Entries) != 2 || got.Entries[0].Blocks[0].Text != "two" {
 		t.Errorf("entries = %+v, want the last two", got.Entries)
+	}
+}
+
+// TestHandleResult_EntriesIsAlwaysAnArray pins the wire shape.
+//
+// A reader that found nothing returns nil, and filterResultEntries passes nil
+// straight through when neither filter is set, so `entries` marshalled as
+// `null`. The agent-facing docs tell an orchestrator to run
+// `jq '.entries[] | select(.type=="system")'` to tell "recorded nothing" from
+// "lost the conversation" — and jq dies on null at exactly that moment.
+func TestHandleResult_EntriesIsAlwaysAnArray(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		req  ResultRequest
+	}{
+		{"no filters", ResultRequest{}},
+		{"tool filter", ResultRequest{Tool: "Bash"}},
+		{"errors only", ResultRequest{ErrorsOnly: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newAsyncTestServer(t)
+			// A source that succeeds and returns nil — "the agent has not
+			// written anything", which is a state, not a failure.
+			kind := "nilsource-" + tt.name
+			agent.Register(&agenttest.StubAgent{KindStr: kind, TranscriptSrc: &recordingSource{entries: nil}})
+			info := reserveSession(t, srv, kind)
+
+			tt.req.ID = info.ID
+			data, err := json.Marshal(tt.req)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			resp := srv.handleResult(data)
+			if !resp.Success {
+				t.Fatalf("handleResult failed: %s", resp.Error)
+			}
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(resp.Data, &raw); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := string(raw["entries"]); got != "[]" {
+				t.Errorf("entries = %s, want [] — jq cannot iterate over null", got)
+			}
+		})
+	}
+}
+
+// TestExportTimeoutFitsInsideTheClientBudget holds a relationship that two
+// comments in two packages assert to each other and nothing enforces.
+//
+// `session result` on an opencode session runs a subprocess bounded by the
+// adapter's own timeout. If that ever grows past what the client waits for,
+// the client reports a timeout while the daemon is still working and may yet
+// answer — the failure mode the client's own budget comment was written to
+// avoid. The margin covers the teardown: a process that ignores SIGTERM is
+// killed a grace period later, and Wait can hold on a little past that.
+func TestExportTimeoutFitsInsideTheClientBudget(t *testing.T) {
+	// TeardownBudget, not GracePeriod: Wait can hold on past the SIGKILL for
+	// I/O, and budgeting against the smaller number leaves the inequality two
+	// seconds optimistic — enough for an exportTimeout that looks safe here to
+	// hold the handler past the point the client has given up.
+	worst := opencode.ExportTimeout + procgroup.TeardownBudget
+	if worst >= defaultRequestTimeout {
+		t.Errorf("an opencode result can take up to %s (export %s + teardown %s), but the client gives up at %s",
+			worst, opencode.ExportTimeout, procgroup.TeardownBudget, defaultRequestTimeout)
 	}
 }

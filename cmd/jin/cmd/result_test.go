@@ -108,3 +108,23 @@ func TestShortID(t *testing.T) {
 		t.Errorf("expected truncated to 8, got %q", got)
 	}
 }
+
+// TestResultResponse_EntriesSurviveTheCLIReEncode covers the second marshal.
+//
+// The CLI does not pass the daemon's bytes through: it decodes the response and
+// re-encodes the struct, so the daemon getting `entries: []` right is only half
+// the guarantee. Before ResultResponse owned its own MarshalJSON, this half held
+// only because a round trip happens to turn `[]` into a non-nil empty slice.
+func TestResultResponse_EntriesSurviveTheCLIReEncode(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeJSON(&buf, &daemon.ResultResponse{SessionID: "s"}); err != nil {
+		t.Fatalf("writeJSON: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(buf.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := string(raw["entries"]); got != "[]" {
+		t.Errorf("entries = %s, want [] — jq cannot iterate over null", got)
+	}
+}

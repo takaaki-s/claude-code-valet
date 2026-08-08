@@ -229,7 +229,7 @@ func TestRunner_Run_TimeoutKillsGroup(t *testing.T) {
 
 // TestRunner_Run_TimeoutSigKillsGroup verifies the SIGKILL escalation: if the
 // hook's process group ignores SIGTERM (via bash trap on TERM), the runner
-// must still take it down within killGracePeriod. Without an explicit group-
+// must still take it down within procgroup.GracePeriod. Without an explicit group-
 // wide SIGKILL, exec.CommandContext / Cmd.WaitDelay only SIGKILLs the leader,
 // and the grandchild survives — this test would then time out at the outer
 // deadline.
@@ -245,7 +245,7 @@ func TestRunner_Run_TimeoutSigKillsGroup(t *testing.T) {
 	scriptPath := writeScript(t, t.TempDir(), script)
 	logPath := filepath.Join(t.TempDir(), "hook.log")
 
-	// Outer deadline must exceed killGracePeriod (5s) so the SIGKILL path
+	// Outer deadline must exceed procgroup.GracePeriod (5s) so the SIGKILL path
 	// actually fires within Run — otherwise cmd.Wait would return on ctx
 	// timeout before AfterFunc gets a chance to run.
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -263,9 +263,9 @@ func TestRunner_Run_TimeoutSigKillsGroup(t *testing.T) {
 		t.Fatal("Run should error on timeout")
 	}
 	// Run should return once cmd.Wait unblocks after SIGKILL — well within
-	// killGracePeriod + a small margin.
+	// procgroup.GracePeriod + a small margin.
 	if elapsed >= 10*time.Second {
-		t.Errorf("Run took %s, expected SIGKILL escalation within killGracePeriod", elapsed)
+		t.Errorf("Run took %s, expected SIGKILL escalation within procgroup.GracePeriod", elapsed)
 	}
 
 	pidBytes, readErr := os.ReadFile(pidFile)
