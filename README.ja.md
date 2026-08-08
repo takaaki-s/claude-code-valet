@@ -229,7 +229,7 @@ jin session wait my-session --timeout 300
 jin session output my-session --last 1
 
 # wait が `permission` を返した場合、子はプロンプト待ちで止まっています。send は
-# ブロック中のセッションを拒否します。respond はダイアログを操作し、それが消えて
+# idle のセッションしか受け付けません。respond はダイアログを操作し、それが消えて
 # から返ります。選択肢は pane ではなく transcript から読んでください。
 jin session result my-session --json
 jin session respond my-session --option 1 --json

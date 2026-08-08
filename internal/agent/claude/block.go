@@ -24,11 +24,13 @@ import (
 //	just answered             0/3                    0/3
 //	turn settled              0/3                    0/3
 //
-// Every round ran on top of the previous rounds' output, so each capture had
-// earlier menus sitting in scrollback — and they contributed nothing (6/6).
-// That is the property the whole approach rests on: the OPTIONS of a finished
+// Every round ran on top of the previous rounds' output, so each capture still
+// showed earlier menus — their option rows were on the VISIBLE screen, not
+// scrolled away, which is what makes the 6/6 mean anything: CapturePane reads
+// the visible pane only, so a menu that had scrolled off would prove nothing.
+// That is the property the whole approach rests on. The OPTIONS of a finished
 // menu stay on screen, so matching those would confuse a menu that is over
-// with one that is waiting, but the hint line goes when the dialog goes.
+// with one that is waiting; the hint line goes when the dialog goes.
 const (
 	// hintPermission marks a tool-approval dialog.
 	hintPermission = "Esc to cancel · Tab to amend"
@@ -124,9 +126,15 @@ func (a *Agent) AnswerBlockKeys(kind agent.BlockKind, capture string, ans agent.
 			"answer that never landed. Attach the session (jin attach <selector>) and " +
 			"answer it there")
 	case session.BlockQuestionSubmit:
-		return nil, fmt.Errorf("this prompt is a multi-question form waiting for its " +
+		// Hedged on purpose. Unlike the hint lines, this kind is matched on
+		// body text that is not known to disappear with its screen, so the
+		// verdict can be stale — see anchorSubmit. Attaching is the right
+		// move either way, and a message that named the screen with
+		// certainty would send the operator looking for a form that is not
+		// there.
+		return nil, fmt.Errorf("the pane looks like a multi-question form waiting for its " +
 			"submit confirmation, which jin does not drive. Attach the session " +
-			"(jin attach <selector>) and confirm it there")
+			"(jin attach <selector>) and finish it there")
 	case session.BlockPermission, session.BlockQuestion:
 		// handled below
 	default:
@@ -162,8 +170,21 @@ func (a *Agent) freeTextKeys(kind agent.BlockKind, capture, text string) ([]agen
 	}
 	n, ok := freeTextOption(capture)
 	if !ok {
-		return nil, fmt.Errorf("this question offers no free-text entry (no %q option): "+
-			"pass --option <n> to choose one of the numbered answers", freeTextLabel)
+		return nil, fmt.Errorf("could not find the free-text entry (%q) in the pane, "+
+			"so jin does not know which number selects it: pass --option <n> to choose one "+
+			"of the numbered answers, or attach the session and type the answer yourself",
+			freeTextLabel)
+	}
+	// The number came off the screen, so it needs the same bound a
+	// caller-supplied one gets. An answer is addressed by ONE keystroke — a
+	// two-digit number would go out as two, and by this file's own
+	// measurement the first of them selects and commits an answer on its own.
+	// "10" would therefore commit option 1 and drop a stray "0" into whatever
+	// replaced the dialog.
+	if n > maxAddressableOption {
+		return nil, fmt.Errorf("the free-text entry is numbered %d, which jin cannot select: "+
+			"an answer is sent as a single keystroke, so only 1-%d are addressable. "+
+			"Attach the session and answer it there", n, maxAddressableOption)
 	}
 	return []agent.KeyStep{
 		{Literal: strconv.Itoa(n)},
@@ -171,6 +192,14 @@ func (a *Agent) freeTextKeys(kind agent.BlockKind, capture, text string) ([]agen
 		{Key: "Enter"},
 	}, nil
 }
+
+// maxAddressableOption is the largest choice a single keystroke can name.
+//
+// It mirrors the daemon's bound on a caller-supplied --option, and exists
+// separately because the two numbers arrive by different routes: one is typed
+// by an operator and validated at the edge, the other is read off the pane and
+// would otherwise reach the keyboard unchecked.
+const maxAddressableOption = 9
 
 // freeTextOption returns the on-screen number of the free-text entry.
 //
@@ -192,9 +221,15 @@ func freeTextOption(capture string) (int, bool) {
 // numberedLabel parses a rendered option row of the form "❯ 4. Type
 // something." and returns its number when the label matches.
 //
-// The comparison is normalized on both sides so the leading cursor glyph,
-// the indentation Claude Code varies with selection state, and a row the pane
-// wrapped all stop mattering.
+// The comparison is normalized on both sides so the leading cursor glyph and
+// the indentation Claude Code varies with selection state stop mattering.
+//
+// It is NOT wrap-tolerant, and that is worth stating because DetectBlock
+// above is: DetectBlock normalizes the whole capture, so a hint line broken
+// across two rows rejoins, while this sees one line at a time and a wrapped
+// row cannot be put back together. A wrapped free-text row therefore reads as
+// absent — which costs a refusal, not a wrong keystroke, and the caller is
+// told jin could not FIND the entry rather than that none exists.
 func numberedLabel(line, label string) (int, bool) {
 	norm := session.NormalizeForVerify(line)
 	dot := strings.Index(norm, ".")

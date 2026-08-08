@@ -342,6 +342,11 @@ func (c *Client) Get(id string) (*session.Info, error) {
 	return &info, nil
 }
 
+// ErrRespondNotCleared reports that a prompt was still on screen after its
+// answer was sent. The CLI maps it to the timeout exit code, which the README
+// and the embedded exit-codes doc both promise for this case.
+var ErrRespondNotCleared = errors.New("the prompt did not clear")
+
 // Respond answers a prompt the session's agent is blocked on and returns the
 // sort of prompt that was answered. Exactly one of option and text carries
 // the answer; the daemon rejects a call that sets both or neither.
@@ -352,6 +357,11 @@ func (c *Client) Respond(id string, option int, text string) (string, error) {
 		return "", err
 	}
 	if !resp.Success {
+		// Restore the classification the daemon tagged on, and hand the caller
+		// a message without it. The prefix exists only to survive the wire.
+		if msg, ok := strings.CutPrefix(resp.Error, RespondNotClearedPrefix); ok {
+			return "", fmt.Errorf("%w: %s", ErrRespondNotCleared, msg)
+		}
 		return "", errors.New(resp.Error)
 	}
 	var out RespondResponse

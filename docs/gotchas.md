@@ -1157,10 +1157,13 @@ Common pitfalls and caveats that agents tend to fall into.
   dialog is live.** Sampled at five points per round (idle, mid-turn before
   the dialog, dialog live, just answered, turn settled), three rounds per
   dialog: the matching hint appears exactly while the dialog is up and nowhere
-  else (3/3 each), and rounds ran on top of earlier rounds' output so finished
-  menus were in scrollback throughout, contributing nothing (6/6). The
-  *options* of a finished menu do stay on screen — matching those instead is
-  the trap this avoids.
+  else (3/3 each). Rounds ran on top of earlier rounds' output, and the earlier
+  menus' option rows were still on the visible screen — not scrolled away —
+  while contributing nothing to detection (6/6). That distinction is what makes
+  the number mean anything, since `CapturePane(_, false)` reads the visible
+  pane only and a menu that had scrolled off would have proved nothing. The
+  *options* of a finished menu staying on screen is exactly the trap that
+  matching on them would walk into.
 
 - **AskUserQuestion has more than one form, and they take different keys.**
   Four screens were observed: a single question; a multi-question form; a
@@ -1178,6 +1181,14 @@ Common pitfalls and caveats that agents tend to fall into.
   form from an answer that never landed. The submit confirmation draws no hint
   line at all, so it is matched on body text; a stale match there costs a
   refusal, never a keystroke.
+
+- **Not measured: a second dialog appearing inside the clear budget.** The
+  post-condition is `BlockNone`, so if answering one dialog immediately raises
+  another — approve tool A, tool B asks next — and no frame between them falls
+  on a 200ms poll, `respond` reports exit 4 for an answer that did land.
+  `DetectBlock` cannot tell "still the old dialog" from "a new one", so this is
+  inherent to the post-condition rather than a defect in it. It has not been
+  observed, and it has not been ruled out.
 
 - **Codex and OpenCode are opted out, for different reasons.** Codex's
   approval dialog could not be reached (the account was over its usage limit

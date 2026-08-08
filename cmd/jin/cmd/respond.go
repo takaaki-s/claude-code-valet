@@ -1,10 +1,10 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
@@ -20,10 +20,6 @@ type respondResult struct {
 	// read the pane.
 	Kind string `json:"kind,omitempty"`
 }
-
-// respondMaxOption mirrors the daemon's bound. An answer is one keystroke, so
-// a two-digit choice cannot be addressed at all.
-const respondMaxOption = 9
 
 var respondCmd = &cobra.Command{
 	Use:   "respond <selector> (--option <n> | --text <answer>)",
@@ -71,14 +67,20 @@ still there — the keys went out, so attach and look before answering again.`,
 		case !optionSet && !textSet:
 			return usageError(cmd, "an answer is required: pass --option <n> or --text <answer>")
 		}
-		if optionSet && (option < 1 || option > respondMaxOption) {
+		if optionSet && (option < 1 || option > daemon.RespondMaxOption) {
 			return usageError(cmd,
-				"--option must be between 1 and %d (an answer is one keystroke)", respondMaxOption)
+				"--option must be between 1 and %d (an answer is one keystroke)", daemon.RespondMaxOption)
 		}
 		// Rejected by the same rule as an unverifiable prompt, and for the
 		// same reason: RespondToBlock confirms free text rendered before it
 		// presses the key that submits it, and text that normalizes to
 		// nothing would pass that check without any evidence.
+		if textSet && len(text) > daemon.RespondMaxTextBytes {
+			return fmt.Errorf("--text is %d bytes; answers over %d cannot be verified, because "+
+				"the agent folds a write that large into a placeholder and jin would have "+
+				"nothing to check for. Attach the session for a longer answer",
+				len(text), daemon.RespondMaxTextBytes)
+		}
 		if textSet && !session.PromptVerifiable(text) {
 			return fmt.Errorf("--text has no verifiable content (only whitespace or box-drawing characters)")
 		}
@@ -98,10 +100,12 @@ still there — the keys went out, so attach and look before answering again.`,
 
 		kind, err := client.Respond(sessionID, option, text)
 		if err != nil {
-			// The daemon reports a prompt that never cleared in the words
-			// RespondToBlock chose; map it to the timeout code so a caller can
-			// branch on "the outcome is unknown" without matching text.
-			if strings.Contains(err.Error(), "still on screen") {
+			// One failure gets its own exit code: the prompt did not clear, so
+			// the answer may or may not have been taken. The classification
+			// rides a sentinel rather than the message text — the wording is
+			// chosen for a person to read, while the exit code is promised to
+			// scripts by the README and the exit-codes doc.
+			if errors.Is(err, daemon.ErrRespondNotCleared) {
 				return exitcode.Errorf(exitcode.Timeout, "%s", err.Error())
 			}
 			return err

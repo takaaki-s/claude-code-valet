@@ -288,7 +288,8 @@ jin session wait work --until idle,permission   # right
 jin session wait work --status idle             # hangs on a blocked session
 ```
 
-`send` will refuse it — it only takes `idle` sessions, because a dialog does
+`send` only takes `idle` sessions, so it will usually refuse a blocked one — and
+a dialog does
 not draw what you type into it and `send` proves delivery by finding the text
 on screen. Use `respond`, and read the choices from the transcript rather than
 the pane:

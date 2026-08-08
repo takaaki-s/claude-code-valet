@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -285,6 +286,9 @@ func TestNumberedLabel(t *testing.T) {
 	}{
 		{"❯ 4. Type something.", 4, true},
 		{"  4. Type something.", 4, true},
+		// Parsed, but AnswerBlockKeys refuses it — see
+		// TestAnswerBlockKeysTextRefusesUnaddressableOption. numberedLabel is
+		// a parser, not the policy.
 		{"  12. Type something.", 12, true},
 		{"  4. Chat about this", 0, false},
 		{"Ready to submit your answers?", 0, false},
@@ -299,5 +303,60 @@ func TestNumberedLabel(t *testing.T) {
 				t.Errorf("numberedLabel(%q) = (%d, %v), want (%d, %v)", tc.line, n, ok, tc.want, tc.found)
 			}
 		})
+	}
+}
+
+// TestAnswerBlockKeysTextRefusesUnaddressableOption is the fix for the one
+// real bug the review found. The number comes off the SCREEN, so the bound the
+// daemon puts on a caller-supplied --option does not cover it, and an answer
+// is sent as a single keystroke: "12" would go out as "1" then "2", and by
+// this package's own measurement the "1" selects and commits an answer on its
+// own. Refusing is the only safe reading.
+func TestAnswerBlockKeysTextRefusesUnaddressableOption(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(" ☐ pick one\n")
+	for i := 1; i <= 11; i++ {
+		b.WriteString(fmt.Sprintf("  %d. option %d\n", i, i))
+	}
+	b.WriteString("  12. Type something.\n")
+	b.WriteString("Enter to select · ↑/↓ to navigate · Esc to cancel\n")
+	capture := b.String()
+
+	if got := New().DetectBlock(capture); got != session.BlockQuestion {
+		t.Fatalf("fixture does not read as a single question (%q)", got)
+	}
+	if n, ok := freeTextOption(capture); !ok || n != 12 {
+		t.Fatalf("freeTextOption = (%d, %v), want (12, true) — the premise of this test", n, ok)
+	}
+
+	steps, err := New().AnswerBlockKeys(session.BlockQuestion, capture, session.BlockAnswer{Text: "hello"})
+	if err == nil {
+		t.Fatalf("AnswerBlockKeys returned nil error and steps=%+v, want a refusal", steps)
+	}
+	if steps != nil {
+		t.Errorf("steps = %+v on a refusal, want nil", steps)
+	}
+	if !strings.Contains(err.Error(), "single keystroke") {
+		t.Errorf("error = %q, want it to explain why the number is unusable", err)
+	}
+}
+
+// TestAnswerBlockKeysTextAcceptsTheBoundary keeps the check above from being
+// satisfied by a rule that refuses everything.
+func TestAnswerBlockKeysTextAcceptsTheBoundary(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(" ☐ pick one\n")
+	for i := 1; i <= 8; i++ {
+		b.WriteString(fmt.Sprintf("  %d. option %d\n", i, i))
+	}
+	b.WriteString("  9. Type something.\n")
+	b.WriteString("Enter to select · ↑/↓ to navigate · Esc to cancel\n")
+
+	steps, err := New().AnswerBlockKeys(session.BlockQuestion, b.String(), session.BlockAnswer{Text: "hello"})
+	if err != nil {
+		t.Fatalf("AnswerBlockKeys returned err=%v, want nil at the boundary", err)
+	}
+	if len(steps) == 0 || steps[0].Literal != "9" {
+		t.Errorf("steps = %+v, want the first step to address option 9", steps)
 	}
 }

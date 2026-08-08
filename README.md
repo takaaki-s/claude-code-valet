@@ -265,7 +265,7 @@ jin session wait my-session --timeout 300
 jin session output my-session --last 1
 
 # If the wait came back `permission`, the child is blocked on a prompt. `send`
-# refuses a blocked session; `respond` drives the dialog and returns only once
+# only takes `idle` sessions; `respond` drives the dialog and returns only once
 # it is gone. Read the choices from the transcript, not the pane.
 jin session result my-session --json
 jin session respond my-session --option 1 --json

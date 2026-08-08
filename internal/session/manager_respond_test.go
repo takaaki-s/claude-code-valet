@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -259,8 +260,16 @@ func TestRespondToBlock_VerifyFailureWithholdsEnter(t *testing.T) {
 	if err == nil {
 		t.Fatal("RespondToBlock returned nil, want an error")
 	}
-	if !strings.Contains(err.Error(), "nothing was submitted") {
-		t.Errorf("error = %q, want it to say nothing was submitted", err)
+	// The message must warn that the field may already hold the text. It used
+	// to say "nothing was submitted; the prompt should still be waiting",
+	// which reads as an invitation to answer again — and answering again types
+	// into the same field, where the second attempt's tail could verify
+	// against both answers run together.
+	if !strings.Contains(err.Error(), "may already hold") {
+		t.Errorf("error = %q, want it to warn that the field may already hold the answer", err)
+	}
+	if strings.Contains(err.Error(), "answering again") == false {
+		t.Errorf("error = %q, want it to steer away from answering again", err)
 	}
 	if n := countCallsWithArgs(f.mock, "SendKeys", f.pane, "Enter"); n != 0 {
 		t.Errorf("Enter sent %d times, want 0 — the answer was never on screen", n)
@@ -316,5 +325,88 @@ func TestRespondToBlock_SessionNotFound(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 	if _, err := mgr.RespondToBlock("nope", BlockAnswer{Option: 1}); err == nil {
 		t.Fatal("RespondToBlock returned nil, want an error")
+	}
+}
+
+// TestRespondToBlock_VerifyIgnoresTextAlreadyOnScreen is the test the review
+// found missing, and the case is realistic: `--text "紫"` answering a question
+// whose options already list 紫.
+//
+// The baseline capture is what makes the check mean anything — sendVerifyAppeared
+// requires the occurrence count to RISE. Discard the baseline and verification
+// passes on text the step never drew, and the Enter after it commits whatever
+// the dialog was pointing at instead of the answer.
+func TestRespondToBlock_VerifyIgnoresTextAlreadyOnScreen(t *testing.T) {
+	const answer = "紫"
+	// Present from the very first frame and never redrawn.
+	pane := "❯ 1. 紫\n  2. 青\n" + somePane
+	steps := []KeyStep{
+		{Literal: "3"},
+		{Literal: answer, Verify: true},
+		{Key: "Enter"},
+	}
+	f := newRespondFixture(t, BlockQuestion, steps, nil)
+	f.mock.captured[f.pane] = pane
+	setForTest(t, &respondVerifyLooks, 2)
+
+	if _, err := f.mgr.RespondToBlock(f.sess.ID, BlockAnswer{Text: answer}); err == nil {
+		t.Fatal("RespondToBlock returned nil; the answer was never drawn, only already present")
+	}
+	if n := countCallsWithArgs(f.mock, "SendKeys", f.pane, "Enter"); n != 0 {
+		t.Errorf("Enter sent %d times, want 0", n)
+	}
+}
+
+// TestRespondToBlock_RejectsMalformedPlans covers adapter bugs that must be
+// caught from the plan alone. Finding one halfway through would mean finding
+// it with keys already in the pane, so all of these must send nothing.
+func TestRespondToBlock_RejectsMalformedPlans(t *testing.T) {
+	tests := []struct {
+		name  string
+		steps []KeyStep
+	}{
+		{"empty step", []KeyStep{{}}},
+		{"both key and literal", []KeyStep{{Key: "Enter", Literal: "2"}}},
+		{"verify with nothing to look for", []KeyStep{{Literal: "1"}, {Key: "Enter", Verify: true}}},
+		{"verify on whitespace", []KeyStep{{Literal: "   ", Verify: true}}},
+		{"no steps at all", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRespondFixture(t, BlockPermission, tc.steps, nil)
+			_, err := f.mgr.RespondToBlock(f.sess.ID, BlockAnswer{Option: 1})
+			if err == nil {
+				t.Fatal("RespondToBlock returned nil, want an error")
+			}
+			if n := f.keyCalls(); n != 0 {
+				t.Errorf("%d keys sent, want 0", n)
+			}
+			// Asserting only that an error came back is not enough, and the
+			// empty-plan case shows why: without its guard the call falls
+			// through to the clear poll and still errors — but with
+			// ErrBlockNotCleared, whose message tells the operator the keys
+			// went out and the outcome is unknown. Nothing went out. A
+			// refusal that lies about what it did is worse than the bug.
+			if errors.Is(err, ErrBlockNotCleared) {
+				t.Errorf("error = %q; a malformed plan must not be reported as an answer "+
+					"whose outcome is unknown — no key was sent", err)
+			}
+		})
+	}
+}
+
+// TestRespondToBlock_NotClearedIsTyped pins the sentinel rather than the
+// sentence. The CLI turns exactly this failure into the timeout exit code that
+// the README and the embedded exit-codes doc promise, and it must not depend
+// on wording chosen for a person to read.
+func TestRespondToBlock_NotClearedIsTyped(t *testing.T) {
+	f := newRespondFixture(t, BlockPermission, []KeyStep{{Literal: "1"}}, nil)
+
+	_, err := f.mgr.RespondToBlock(f.sess.ID, BlockAnswer{Option: 1})
+	if err == nil {
+		t.Fatal("RespondToBlock returned nil, want a not-cleared error")
+	}
+	if !errors.Is(err, ErrBlockNotCleared) {
+		t.Errorf("error %v does not wrap ErrBlockNotCleared", err)
 	}
 }

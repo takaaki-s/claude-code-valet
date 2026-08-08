@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -594,13 +595,52 @@ type RespondResponse struct {
 	Kind string `json:"kind"`
 }
 
-// respondMaxOption is the largest answer a caller can name.
+// RespondNotClearedPrefix tags the one "respond" failure the CLI maps to the
+// timeout exit code: the prompt was still on screen after the answer went out.
+//
+// A prefix rather than a shared phrase because the wire format has no room for
+// an error code, and rather than a substring match on the message because that
+// couples an exit code the docs promise to wording nobody would think to keep
+// stable. Callers strip it before display.
+const RespondNotClearedPrefix = "not-cleared: "
+
+// RespondMaxTextBytes bounds free-text answers.
+//
+// Not a policy choice — a consequence of how the answer is verified. The text
+// goes out as ONE SendKeysLiteral write, and Claude Code folds a single
+// oversized read into a "[Pasted Content N chars]" placeholder at a measured
+// 801 bytes (see sendChunkMaxBytes in internal/session). A folded answer hides
+// its own text from capture-pane, which is precisely what RespondToBlock looks
+// for before pressing the key that submits it — so anything past the fold
+// fails verification deterministically, and the error would name the pane
+// rather than the length.
+//
+// Bounded here instead, well under the threshold, so an answer that cannot
+// work is refused with a reason. Chunking it the way SendPrompt does was not
+// done: that path clears the input between attempts, and nothing measured says
+// what a clear key does to this dialog.
+const RespondMaxTextBytes = 700
+
+// RespondMaxOption is the largest answer a caller can name.
 //
 // It is not a guess about how many choices a prompt has: an answer is
 // delivered as a single keystroke, so a two-digit choice is not addressable
 // at all. Bounding it here turns "10" into an immediate, explicit error
 // instead of a keystroke that types "1" and then "0" into a dialog.
-const respondMaxOption = 9
+const RespondMaxOption = 9
+
+// tagRespondError flattens a RespondToBlock failure into the wire's one error
+// string, marking the single case the CLI turns into a distinct exit code.
+//
+// Split out from the handler because it is the whole of that contract and the
+// handler is not reachable in a test without a live tmux pane. A classifier
+// nothing can exercise is a classifier that silently stops classifying.
+func tagRespondError(err error) string {
+	if errors.Is(err, session.ErrBlockNotCleared) {
+		return RespondNotClearedPrefix + err.Error()
+	}
+	return err.Error()
+}
 
 func (s *Server) handleRespond(data json.RawMessage) Response {
 	var req RespondRequest
@@ -620,14 +660,20 @@ func (s *Server) handleRespond(data json.RawMessage) Response {
 	case !hasOption && !hasText:
 		return Response{Success: false, Error: "an answer is required: pass an option or text"}
 	}
-	if hasOption && (req.Option < 1 || req.Option > respondMaxOption) {
+	if hasOption && (req.Option < 1 || req.Option > RespondMaxOption) {
 		return Response{Success: false, Error: fmt.Sprintf(
-			"option must be between 1 and %d (an answer is one keystroke)", respondMaxOption)}
+			"option must be between 1 and %d (an answer is one keystroke)", RespondMaxOption)}
 	}
 	// Reject text the verify step could not search the pane for, by the same
 	// rule and for the same reason as "send" — RespondToBlock confirms free
 	// text rendered before it presses the key that submits it, and text that
 	// normalizes to nothing would satisfy that check without evidence.
+	if hasText && len(req.Text) > RespondMaxTextBytes {
+		return Response{Success: false, Error: fmt.Sprintf(
+			"text is %d bytes; answers over %d cannot be verified because the agent folds a "+
+				"write that large into a placeholder, hiding the text jin checks for",
+			len(req.Text), RespondMaxTextBytes)}
+	}
 	if hasText && !session.PromptVerifiable(req.Text) {
 		return Response{Success: false, Error: "text has no verifiable content " +
 			"(only whitespace or box-drawing characters)"}
@@ -635,7 +681,12 @@ func (s *Server) handleRespond(data json.RawMessage) Response {
 
 	kind, err := s.manager.RespondToBlock(req.ID, session.BlockAnswer{Option: req.Option, Text: req.Text})
 	if err != nil {
-		return Response{Success: false, Error: err.Error()}
+		// The protocol carries errors as strings, so the one distinction the
+		// CLI has to make — "the prompt never cleared", which becomes the
+		// timeout exit code — is tagged here while the typed error still
+		// exists. Matching the message text on the far side would make a
+		// reworded sentence silently change an exit code.
+		return Response{Success: false, Error: tagRespondError(err)}
 	}
 	// Unlike "send", success here means the prompt left the pane — not merely
 	// that keys were delivered. That is why this action has no equivalent of

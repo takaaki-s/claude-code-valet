@@ -1354,6 +1354,16 @@ var (
 	respondVerifyLooks = 10
 )
 
+// ErrBlockNotCleared reports that a prompt was still on screen after its
+// answer was sent.
+//
+// It is a sentinel rather than a phrase to match because the CLI maps exactly
+// this case to the timeout exit code, and the two live in different packages.
+// A reworded message would otherwise turn a documented exit 4 into a generic
+// exit 1 with nothing failing — the README, the Japanese README and the
+// embedded exit-codes doc all promise the 4.
+var ErrBlockNotCleared = errors.New("the prompt was still on screen")
+
 // NormalizeForVerify strips every rune that the TUI may inject into — or
 // around — the prompt while rendering it, so a needle taken from the
 // prompt still matches the captured pane.
@@ -1938,6 +1948,32 @@ func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) 
 		return kind, fmt.Errorf("internal: adapter planned no keys for %q", kind)
 	}
 
+	// Validate the whole plan before any of it runs. A malformed step found
+	// halfway through would be found with keys already in the pane, and the
+	// error would then have to describe a dialog in an unknown state — so the
+	// checks that can be made from the plan alone are made here, where a
+	// refusal still means nothing was typed.
+	for _, step := range steps {
+		switch {
+		case step.Key != "" && step.Literal != "":
+			// KeyStep documents these as exclusive. Picking one silently
+			// would drop the other, and on this path the dropped half is
+			// usually the answer itself.
+			return kind, fmt.Errorf("internal: adapter planned a step with both a key (%q) and text for %q",
+				step.Key, kind)
+		case step.Key == "" && step.Literal == "":
+			return kind, fmt.Errorf("internal: adapter planned an empty key step for %q", kind)
+		}
+		// A Verify step whose text normalizes to nothing leaves no needle,
+		// and sendVerifyAppeared accepts an empty needle unconditionally — so
+		// the check would pass without evidence and the committing steps
+		// after it would run on it. This is PromptVerifiable's rule applied
+		// to the adapter's own plan rather than to the caller's input.
+		if step.Verify && promptTail(step.Literal, sendVerifyTailBytes) == "" {
+			return kind, fmt.Errorf("internal: adapter asked to verify a step with nothing to look for")
+		}
+	}
+
 	for _, step := range steps {
 		// A Verify step is checked against a baseline taken immediately
 		// before it, so what the check reports is what THIS step drew rather
@@ -1956,12 +1992,10 @@ func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) 
 			if err := m.tmuxClient.SendKeys(paneID, step.Key); err != nil {
 				return kind, fmt.Errorf("failed to send key %q: %w", step.Key, err)
 			}
-		case step.Literal != "":
+		default:
 			if err := m.tmuxClient.SendKeysLiteral(paneID, step.Literal); err != nil {
 				return kind, fmt.Errorf("failed to send %q: %w", step.Literal, err)
 			}
-		default:
-			return kind, fmt.Errorf("internal: adapter planned an empty key step for %q", kind)
 		}
 
 		if !step.Verify {
@@ -1987,9 +2021,17 @@ func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) 
 			// unsent are the ones that commit, so stopping means nothing was
 			// answered — which is a far better outcome than committing
 			// whatever the dialog happened to be pointing at.
+			//
+			// The message deliberately does NOT invite a retry. The text was
+			// typed; only its appearance could not be confirmed, so the field
+			// may well be holding it. Answering again types into the same
+			// field, and the second attempt's tail could then verify against
+			// a field holding both answers run together.
 			return kind, fmt.Errorf(
-				"answer text did not appear in the pane, so the remaining keys were not sent " +
-					"and nothing was submitted; the prompt should still be waiting")
+				"the answer text was typed but never appeared in the pane, so the keys that " +
+					"would submit it were not sent. The prompt is still waiting, and its " +
+					"free-text field may already hold part of the answer — attach the session " +
+					"and look rather than answering again")
 		}
 	}
 
@@ -2007,10 +2049,9 @@ func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) 
 			return kind, nil
 		}
 		if time.Now().After(deadline) {
-			return kind, fmt.Errorf(
-				"the prompt was still on screen %s after the answer was sent; the keys went out, "+
-					"so whether the agent took them is unknown — attach the session and look "+
-					"before answering again", respondClearBudget)
+			return kind, fmt.Errorf("%w after %s; the keys went out, so whether the agent "+
+				"took them is unknown — attach the session and look before answering again",
+				ErrBlockNotCleared, respondClearBudget)
 		}
 		time.Sleep(respondClearPollDelay)
 	}
