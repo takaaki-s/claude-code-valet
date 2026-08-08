@@ -98,7 +98,7 @@ type KeybindingsConfig struct {
 
 // WorktreeConfig represents settings for the git-worktree session option.
 type WorktreeConfig struct {
-	BaseDir       string `mapstructure:"base_dir,omitempty"`       // Placement template. Empty → paths.State()/worktrees/{name}
+	BaseDir       string `mapstructure:"base_dir,omitempty"`       // Placement template. Empty → worktrees/{name} under the session manager's state dir
 	BranchPrefix  string `mapstructure:"branch_prefix,omitempty"`  // Auto-generated branch name prefix (default: "jin/")
 	DefaultBranch string `mapstructure:"default_branch,omitempty"` // Fallback when origin/HEAD detection fails
 	HookEnabled   *bool  `mapstructure:"hook_enabled,omitempty"`   // nil = default(true)
@@ -191,9 +191,11 @@ func defaultConfig() *Config {
 }
 
 // DefaultWorktreeConfig returns the default worktree configuration.
-// BaseDir is left empty to signal "resolve at runtime from paths.State()" — this
-// avoids importing internal/paths here (which would create an import cycle when
-// paths eventually needs config).
+// BaseDir is left empty to signal "the caller resolves this" — filling it in
+// here would need internal/paths (an import cycle when paths eventually needs
+// config), and would name a directory this package cannot know is the right
+// one: the resolver is session.worktreeTemplate, which uses the state dir its
+// Manager was built over rather than the process-wide default.
 func DefaultWorktreeConfig() WorktreeConfig {
 	tru := true
 	return WorktreeConfig{
@@ -423,8 +425,8 @@ func (m *Manager) Get() *Config {
 
 // GetWorktreeConfig returns the worktree configuration, filling unset fields
 // from DefaultWorktreeConfig so callers can rely on non-empty defaults.
-// BaseDir is intentionally kept empty when unset — the caller resolves it via
-// paths.State() to avoid a config→paths import cycle.
+// BaseDir is intentionally kept empty when unset — see DefaultWorktreeConfig
+// for why the default cannot be filled in here.
 func (m *Manager) GetWorktreeConfig() WorktreeConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

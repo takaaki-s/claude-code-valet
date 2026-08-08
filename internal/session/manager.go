@@ -603,6 +603,9 @@ func (m *Manager) provisionWorktree(sessionID string, opts CreateOptions) (workt
 	originalRepoDir := opts.WorkDir
 	repoBasename := filepath.Base(originalRepoDir)
 	baseName := deriveWorktreeName(sessionID, opts.WorktreeName)
+	// Resolved once so the collision probe below and the final path below that
+	// cannot disagree about where worktrees go.
+	pathTemplate := worktreeTemplate(cfg.BaseDir, m.stateDir)
 
 	// Clear orphan worktree registrations (`.git/worktrees/<name>/` metadata
 	// left after a manual `rm -rf` of the worktree directory) so the
@@ -628,7 +631,7 @@ func (m *Manager) provisionWorktree(sessionID string, opts CreateOptions) (workt
 		}
 	} else {
 		collides := func(candidate string) bool {
-			candidatePath, err := expandBaseDir(cfg.BaseDir, candidate, repoBasename)
+			candidatePath, err := expandBaseDir(pathTemplate, candidate, repoBasename)
 			if err != nil {
 				return true
 			}
@@ -646,7 +649,7 @@ func (m *Manager) provisionWorktree(sessionID string, opts CreateOptions) (workt
 		branch = deriveBranchName(finalName, cfg.BranchPrefix, opts.WorktreeBranch)
 	}
 
-	worktreePath, err := expandBaseDir(cfg.BaseDir, finalName, repoBasename)
+	worktreePath, err := expandBaseDir(pathTemplate, finalName, repoBasename)
 	if err != nil {
 		return out, err
 	}

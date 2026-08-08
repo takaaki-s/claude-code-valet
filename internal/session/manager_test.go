@@ -3297,10 +3297,13 @@ func TestManager_CreateWithOptions_Worktree_RejectsNonGitRepo(t *testing.T) {
 func TestManager_CreateWithOptions_Worktree_HappyPath(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 
-	// Redirect worktree base dir to a scratch location so the test does not
-	// leak files into the user's real $XDG_STATE_HOME.
-	stateDir := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", stateDir)
+	// A decoy. Worktree placement comes from the state dir this Manager was
+	// built over, so pointing the process-wide one somewhere else and asserting
+	// against mgr.stateDir below fails if that ever goes back to being read
+	// globally. This test used to set the variable for the opposite reason —
+	// to stop the leak into the developer's own state dir that reading it
+	// caused.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	workDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(workDir, ".git"), 0o755); err != nil {
@@ -3337,7 +3340,7 @@ func TestManager_CreateWithOptions_Worktree_HappyPath(t *testing.T) {
 		t.Fatalf("CreateWithOptions: %v", err)
 	}
 
-	wantPrefix := filepath.Join(stateDir, "jind-ai", "worktrees", "jin-")
+	wantPrefix := filepath.Join(mgr.stateDir, "worktrees", "jin-")
 	if !strings.HasPrefix(sess.WorkDir, wantPrefix) {
 		t.Errorf("WorkDir = %q, want prefix %q", sess.WorkDir, wantPrefix)
 	}
@@ -3395,16 +3398,17 @@ func TestManager_CreateWithOptions_Worktree_HappyPath(t *testing.T) {
 func TestManager_CreateWithOptions_Worktree_RollsBackOnWorkDirCollision(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 
-	stateDir := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", stateDir)
+	// A decoy — see the same line in the happy-path test.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	workDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(workDir, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir .git: %v", err)
 	}
 
-	// Default base_dir template resolves to $XDG_STATE_HOME/jind-ai/worktrees/{name}.
-	predictablePath := filepath.Join(stateDir, "jind-ai", "worktrees", "collide-wt")
+	// An unset base_dir resolves to worktrees/{name} under the Manager's own
+	// state dir, which is what makes this path predictable.
+	predictablePath := filepath.Join(mgr.stateDir, "worktrees", "collide-wt")
 
 	// Pre-create a session whose WorkDir is exactly the worktree path we'll
 	// try to create below, so the re-lock WorkDir uniqueness check trips.

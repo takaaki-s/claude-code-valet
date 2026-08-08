@@ -1,8 +1,15 @@
 package session
 
 import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/takaaki-s/jind-ai/internal/config"
+	"github.com/takaaki-s/jind-ai/internal/git"
 )
 
 func TestDeriveWorktreeName(t *testing.T) {
@@ -51,9 +58,56 @@ func TestDeriveBranchName(t *testing.T) {
 	}
 }
 
+// TestWorktreeTemplate pins where an unset worktree.base_dir lands. The state
+// dir is the Manager's, not the process-wide one, so a Manager built over a
+// different state dir keeps its worktrees inside it — see worktreeTemplate for
+// what reading the global cost.
+func TestWorktreeTemplate(t *testing.T) {
+	cases := []struct {
+		name       string
+		cfgBaseDir string
+		stateDir   string
+		want       string
+	}{
+		{
+			name:       "unset base_dir resolves under the state dir it is given",
+			cfgBaseDir: "",
+			stateDir:   "/state/jind-ai",
+			want:       "/state/jind-ai/worktrees/{name}",
+		},
+		{
+			name:       "a configured base_dir wins over the state dir",
+			cfgBaseDir: "/tmp/wt/{name}",
+			stateDir:   "/state/jind-ai",
+			want:       "/tmp/wt/{name}",
+		},
+		{
+			// Not an absolute path, so expandBaseDir rejects it. The
+			// alternative is a worktree in the process's working directory.
+			name:       "no state dir yields something expandBaseDir refuses",
+			cfgBaseDir: "",
+			stateDir:   "",
+			want:       "worktrees/{name}",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := worktreeTemplate(tc.cfgBaseDir, tc.stateDir)
+			if got != tc.want {
+				t.Errorf("worktreeTemplate(%q, %q) = %q, want %q",
+					tc.cfgBaseDir, tc.stateDir, got, tc.want)
+			}
+			if tc.stateDir == "" {
+				if _, err := expandBaseDir(got, "jin-abc", "repo"); err == nil {
+					t.Error("expandBaseDir accepted the relative template; it must reject it")
+				}
+			}
+		})
+	}
+}
+
 func TestExpandBaseDir(t *testing.T) {
 	t.Setenv("HOME", "/home/testuser")
-	t.Setenv("XDG_STATE_HOME", "/state")
 
 	cases := []struct {
 		name         string
@@ -64,11 +118,13 @@ func TestExpandBaseDir(t *testing.T) {
 		wantErr      bool
 	}{
 		{
-			name:         "empty template uses XDG_STATE_HOME + worktrees/{name}",
+			// The default lives in worktreeTemplate, so an empty template
+			// arriving here means a caller skipped it.
+			name:         "empty template errors instead of defaulting",
 			template:     "",
 			worktreeName: "jin-abc",
 			repoBasename: "myrepo",
-			wantPath:     "/state/jind-ai/worktrees/jin-abc",
+			wantErr:      true,
 		},
 		{
 			name:         "explicit {name} substitution",
@@ -167,5 +223,75 @@ func TestFindAvailableWorktreeName_ThirdSuffix(t *testing.T) {
 	}
 	if got != "jin-abc-3" {
 		t.Errorf("got %q, want %q", got, "jin-abc-3")
+	}
+}
+
+// recordingWorktreeRunner captures the path handed to `git worktree add` and
+// then fails, so provisionWorktree returns before the post-create machinery
+// runs. The path is the whole point of the test; nothing after the add call
+// bears on it.
+type recordingWorktreeRunner struct {
+	addPath string
+}
+
+func (r *recordingWorktreeRunner) Run(dir string, args ...string) ([]byte, error) {
+	joined := strings.Join(args, " ")
+	switch {
+	case joined == "symbolic-ref refs/remotes/origin/HEAD":
+		return []byte("refs/remotes/origin/main\n"), nil
+	case len(args) >= 2 && args[0] == "worktree" && args[1] == "prune":
+		return nil, nil
+	case len(args) >= 1 && args[0] == "rev-parse":
+		return nil, errors.New("exit status 1") // branch does not exist
+	case len(args) >= 2 && args[0] == "worktree" && args[1] == "add":
+		// `git worktree add -b <branch> <path> <baseRef>`
+		r.addPath = args[4]
+		return nil, errors.New("exit status 128")
+	}
+	return nil, fmt.Errorf("unexpected git call: %s", joined)
+}
+
+// TestProvisionWorktree_PlacesWorktreesUnderTheStateDirTheManagerWasBuiltOver
+// pins the wiring, not just the helper: NewManager's stateDir argument has to
+// reach the path `git worktree add` is given.
+//
+// It bites on a real defect rather than a hypothetical one. Resolving that path
+// from the process-wide state dir instead meant a Manager built over a temp dir
+// still wrote into the developer's own — measured at two directories per full
+// test-suite run, which accumulated into four figures before anyone noticed.
+// Nothing failed when it happened, so only a test that reads the path back can
+// hold it.
+func TestProvisionWorktree_PlacesWorktreesUnderTheStateDirTheManagerWasBuiltOver(t *testing.T) {
+	configDir := t.TempDir()
+	configMgr, err := config.NewManager(configDir)
+	if err != nil {
+		t.Fatalf("config.NewManager: %v", err)
+	}
+	// Distinct from every other temp dir, so the assertion below can only pass
+	// if this specific argument is what the path was built from.
+	stateDir := t.TempDir()
+	mgr, err := NewManager(t.TempDir(), stateDir, configMgr)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	runner := &recordingWorktreeRunner{}
+	mgr.SetGitClient(git.NewClientWithRunner(runner))
+
+	_, err = mgr.provisionWorktree("3f9a2b4c-1111-2222-3333-444444444444", CreateOptions{
+		WorkDir:  repo,
+		Worktree: true,
+	})
+	if err == nil {
+		t.Fatal("provisionWorktree succeeded; the scripted `worktree add` was supposed to fail it")
+	}
+
+	want := filepath.Join(stateDir, "worktrees", "jin-3f9a2b4c")
+	if runner.addPath != want {
+		t.Errorf("`git worktree add` path = %q, want %q", runner.addPath, want)
 	}
 }
