@@ -1182,6 +1182,25 @@ Common pitfalls and caveats that agents tend to fall into.
   line at all, so it is matched on body text; a stale match there costs a
   refusal, never a keystroke.
 
+- **Declining a tool leaves the session's status stale at `thinking`.** The
+  rejection reaches the agent — `session result` shows the tool_result saying
+  the user declined — but the turn it abandons produces no `Stop`, so nothing
+  moves the session off `thinking`. Measured on a live session: still
+  `thinking` 90s after the decline, pane idle, and the 60s idle notification
+  did not fire either (it appears to key off the `Stop` that never came).
+  Approving does not have this shape: the turn continues and ends normally.
+  This is Claude Code behaviour rather than something `respond` introduced,
+  but `respond` is what makes it reachable from a script.
+
+- **The approval dialog's hint line changes as the cursor moves.**
+  "Tab to amend" is drawn for options 1 and 3 and not for option 2 (3/3 across
+  the three positions), so an anchor containing it stops matching the moment
+  anything moves the selection. This was found by answering a live dialog, not
+  by the fixtures — every fixture had captured the cursor-on-first-option
+  state, the one state where such an anchor works. `hintPermission` is now
+  `ctrl+e to explain`, which held across all three positions and vanished with
+  the dialog along with every other fragment of the line (4/4).
+
 - **Not measured: a second dialog appearing inside the clear budget.** The
   post-condition is `BlockNone`, so if answering one dialog immediately raises
   another — approve tool A, tool B asks next — and no frame between them falls

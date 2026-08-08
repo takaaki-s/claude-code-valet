@@ -33,7 +33,25 @@ import (
 // with one that is waiting; the hint line goes when the dialog goes.
 const (
 	// hintPermission marks a tool-approval dialog.
-	hintPermission = "Esc to cancel · Tab to amend"
+	//
+	// "ctrl+e to explain" and not the fuller "Esc to cancel · Tab to amend ·
+	// ctrl+e to explain", because that line is not fixed while the dialog is
+	// up: measured against a live dialog, "Tab to amend" is drawn for options
+	// 1 and 3 and NOT for option 2, so an anchor containing it stops matching
+	// the moment the cursor moves. That was found by answering a real dialog
+	// rather than by reading — the fixtures had only ever captured the
+	// cursor-on-first-option state, where the fuller line is present.
+	//
+	// "Esc to cancel" alone would be wrong in the other direction: the
+	// question dialogs below print it too, and this anchor is tested before
+	// theirs, so it would swallow them.
+	//
+	// Present for all three cursor positions (3/3) and gone once the dialog
+	// closes, along with every other fragment of the line (4/4 checked). What
+	// is NOT measured is whether every tool's approval dialog offers "explain"
+	// at all; one that does not would read as no dialog, which costs a refusal
+	// rather than a keystroke.
+	hintPermission = "ctrl+e to explain"
 	// hintQuestion marks a single question. It is also a PREFIX of the
 	// multi-question form's hint, which is why detectBlock checks the
 	// multi-question anchors first — see there.

@@ -304,6 +304,14 @@ jin session respond work --text "use bun"       # where free text is offered
 the answer was taken. Exit 4 means it is still there: the keys went out, so
 attach and look before answering again.
 
+**Declining leaves the status stale.** Choosing the "No" option answers the
+prompt correctly — the tool is rejected, and the transcript records it — but
+the agent files no turn-end for a turn it abandoned, so jin goes on reporting
+`thinking`. Measured: still `thinking` 90s later, with the pane idle. A
+`wait --until idle,permission` after a decline will therefore burn its whole
+timeout. Read `session result` to see the rejection, and drive the child with
+a fresh `send` rather than waiting for a status that is not coming.
+
 Two limits, both of which refuse without sending anything:
 
 - **Claude Code sessions only.** Other kinds say so; attach and answer those.

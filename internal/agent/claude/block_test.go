@@ -390,3 +390,23 @@ func TestAnswerBlockKeysOptionIsBounded(t *testing.T) {
 		}
 	}
 }
+
+// TestDetectBlockPermissionWithCursorMoved is a regression fixture, and the
+// bug it pins was found on a live session rather than here.
+//
+// Claude Code redraws the approval dialog's hint line as the cursor moves:
+// "Tab to amend" is present for options 1 and 3 and absent for option 2. The
+// original anchor contained it, so answering a dialog after any cursor
+// movement reported "nothing to answer" — safe, and useless. Every fixture had
+// captured the cursor-on-first-option state, which is the one state where the
+// old anchor worked.
+func TestDetectBlockPermissionWithCursorMoved(t *testing.T) {
+	capture := loadCapture(t, "permission_cursor_moved.txt")
+	if strings.Contains(capture, "Tab to amend") {
+		t.Fatal("fixture still carries 'Tab to amend'; it no longer covers the case it exists for")
+	}
+	if got := New().DetectBlock(capture); got != session.BlockPermission {
+		t.Errorf("DetectBlock = %q, want %q — the anchor must not depend on where the cursor sits",
+			got, session.BlockPermission)
+	}
+}
