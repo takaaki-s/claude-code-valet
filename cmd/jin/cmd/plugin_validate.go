@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/takaaki-s/jind-ai/internal/exitcode"
+	"github.com/takaaki-s/jind-ai/internal/procgroup"
 	"github.com/takaaki-s/jind-ai/pkg/plugin/manifest"
 )
 
@@ -183,6 +184,15 @@ func loadRegistryLookup(url string) (manifest.RegistryLookup, error) {
 	return registryLookupAdapter{doc: doc}, nil
 }
 
+// Build gets its own timeout floor rather than the manifest's run timeout: a
+// plugin that answers an action in milliseconds can still take minutes to
+// compile, so a short run timeout must not be read as a short build budget.
+// Kept as vars so tests can shorten them.
+var (
+	buildTimeoutFloor   = time.Minute
+	buildTimeoutDefault = 5 * time.Minute
+)
+
 // runBuildChecks executes install.source.build in the plugin directory and
 // asserts the declared entrypoint materialises. Any build command failure is
 // a hard rule #13 ERROR — the remaining commands are skipped because a broken
@@ -192,8 +202,8 @@ func runBuildChecks(out io.Writer, m *manifest.Manifest, pluginDir string) []man
 		return nil
 	}
 	timeout := m.EffectiveTimeout()
-	if timeout < time.Minute {
-		timeout = 5 * time.Minute
+	if timeout < buildTimeoutFloor {
+		timeout = buildTimeoutDefault
 	}
 	for _, cmdStr := range m.BuildCommands() {
 		fmt.Fprintf(out, "[build] %s\n", cmdStr)
@@ -202,6 +212,12 @@ func runBuildChecks(out io.Writer, m *manifest.Manifest, pluginDir string) []man
 		c.Dir = pluginDir
 		c.Stdout = out
 		c.Stderr = out
+		// A build command is a shell script, and shell scripts start things.
+		// exec.CommandContext signals the leader alone, so without this a
+		// timeout leaves whatever the script spawned still running — and
+		// because out is not an *os.File, os/exec puts a pipe between them,
+		// so a survivor holding it keeps Run from returning at all.
+		procgroup.KillOnCancel(c)
 		runErr := c.Run()
 		cancel()
 		if runErr != nil {
