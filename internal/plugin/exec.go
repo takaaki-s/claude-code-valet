@@ -129,13 +129,12 @@ func ExecPlugin(ctx context.Context, opts ExecOptions) error {
 	_, _ = fmt.Fprintf(out, "--- %s %s session=%s ---\n",
 		time.Now().Format(time.RFC3339), opts.Env.Name, opts.Env.SessionID)
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", opts.Run)
+	cmd := procgroup.CommandContext(ctx, "bash", "-c", opts.Run)
 	cmd.Dir = opts.PluginDir
 	cmd.Env = buildEnv(opts)
 	cmd.Stdin = bytes.NewReader(payload)
 	cmd.Stdout = out
 	cmd.Stderr = out
-	procgroup.KillOnCancel(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start plugin: %w", err)

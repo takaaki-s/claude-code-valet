@@ -206,3 +206,26 @@ func TestTeardownBudget_OutlastsTheEscalation(t *testing.T) {
 			cmd.WaitDelay, TeardownBudget)
 	}
 }
+
+// TestCommandContext_WiresTheGroupUp is the guarantee that makes the linter
+// rule meaningful: forbidding exec.CommandContext only helps if the sanctioned
+// replacement actually does what the direct call was being forbidden for.
+func TestCommandContext_WiresTheGroupUp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := CommandContext(ctx, "true")
+
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
+		t.Error("Setpgid not set — a cancel would signal the leader alone")
+	}
+	if cmd.WaitDelay != TeardownBudget {
+		t.Errorf("WaitDelay = %v, want %v", cmd.WaitDelay, TeardownBudget)
+	}
+	if cmd.Cancel == nil {
+		t.Error("Cancel not set — nothing signals the group")
+	}
+	if cmd.Path == "" || len(cmd.Args) == 0 {
+		t.Error("the command itself was not built")
+	}
+}

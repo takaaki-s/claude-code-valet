@@ -1,6 +1,7 @@
 package register_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
@@ -137,5 +138,99 @@ func TestRegisterInit_PollableWiring(t *testing.T) {
 				t.Fatalf("pollable = %v, want %v — %s", got, tt.pollable, tt.why)
 			}
 		})
+	}
+}
+
+// hostileSessionIDs are values that were executable once recorded. Manager
+// splices SpawnPlan.Command into `SHELL -ic '...'`, so a value an adapter
+// concatenates there is interpreted — at the unrelated later moment the session
+// resumes, in that session's working directory.
+//
+// The "ses_" variants matter as much as the bare ones: an adapter that gates its
+// resume on a prefix only reaches the dangerous branch for an id that carries it,
+// so an id without one would exercise the fresh-spawn path and prove nothing.
+var hostileSessionIDs = []string{
+	"x$(touch /tmp/jin-should-not-exist)",
+	"x;touch /tmp/jin-should-not-exist",
+	"x`touch /tmp/jin-should-not-exist`",
+	"x'; touch /tmp/jin-should-not-exist; '",
+	"ses_x$(touch /tmp/jin-should-not-exist)",
+	"ses_x;touch /tmp/jin-should-not-exist",
+	"0198f1b2-4c3d-7a1e-8b2f-000000000abc$(touch /tmp/jin-should-not-exist)",
+}
+
+// TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand is the conformance
+// check for the one rule that, if forgotten, restores arbitrary code execution.
+//
+// It is written over agent.Kinds() rather than per adapter, and that is the
+// whole point. Manager validates an id before recording it, but validation and
+// this rule defend different things: a record written by an older jind-ai, or
+// edited by hand, reaches SpawnCommand having passed no gate. An adapter that
+// writes `cmd += " --resume " + opts.AgentSessionID` compiles, and a per-package
+// test cannot fail for a package that does not exist yet — so a fourth adapter
+// would reintroduce the defect with nothing to catch it. Registering a kind is
+// what enrols it here.
+//
+// This lives in register_test because package register_test imports both
+// internal/agent and internal/session, so it can reach every adapter at once.
+// An adapter's own package cannot: internal/agent imports internal/session, so
+// the Manager-side half of the proof (that an ExtraEnv value is not interpreted
+// — see TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted) cannot be imported
+// into it.
+func TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand(t *testing.T) {
+	for _, kind := range agent.Kinds() {
+		a, err := agent.Lookup(kind)
+		if err != nil {
+			t.Fatalf("Lookup(%s): %v", kind, err)
+		}
+		for _, id := range hostileSessionIDs {
+			for _, started := range []bool{false, true} {
+				plan := a.SpawnCommand(session.SpawnOptions{
+					AgentSessionID:      id,
+					AgentSessionStarted: started,
+					WorkDir:             t.TempDir(),
+				})
+				if strings.Contains(plan.Command, id) {
+					t.Errorf("%s.SpawnCommand(started=%v) spliced the session id into Command: %q",
+						kind, started, plan.Command)
+				}
+				// Catches a partial splice too — an adapter that escaped or
+				// trimmed the value still hands the shell something to run.
+				if strings.Contains(plan.Command, "touch") {
+					t.Errorf("%s.SpawnCommand(started=%v) put a payload fragment into Command: %q",
+						kind, started, plan.Command)
+				}
+				// Whatever an adapter chooses to carry, it carries verbatim:
+				// Manager quotes every ExtraEnv value, so pre-escaping here
+				// would double-escape at the shell.
+				for k, v := range plan.ExtraEnv {
+					if strings.Contains(v, "touch") && v != id {
+						t.Errorf("%s.SpawnCommand(started=%v) pre-escaped the id in ExtraEnv[%s] = %q, want %q",
+							kind, started, k, v, id)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestRecognizesSessionID_NoAdapterAcceptsEverything is the companion for the
+// second gate. An adapter that answers true unconditionally satisfies the
+// interface and compiles, and Manager's own safety gate would still stand — so
+// the failure is a quiet one: ids belonging to a different agent become
+// recordable, and a session's identity can be pointed at a conversation that is
+// not its own.
+func TestRecognizesSessionID_NoAdapterAcceptsEverything(t *testing.T) {
+	for _, kind := range agent.Kinds() {
+		a, err := agent.Lookup(kind)
+		if err != nil {
+			t.Fatalf("Lookup(%s): %v", kind, err)
+		}
+		// Safe by every character test and shaped like no agent's id.
+		for _, id := range []string{"not-a-session-id", "x"} {
+			if a.RecognizesSessionID(id) {
+				t.Errorf("%s.RecognizesSessionID(%q) = true; the adapter recognises anything", kind, id)
+			}
+		}
 	}
 }

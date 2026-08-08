@@ -6,6 +6,18 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/agent"
 )
 
+// sessionArgEnv carries the id that --session-id / --resume names, so that id
+// never reaches a shell as text. The rule and the reasoning behind it are the
+// shell-safety contract on session.SpawnPlan; this is one adapter obeying it.
+//
+// Worth restating only for what is specific here: the id is not a value this
+// adapter chooses. It is re-keyed from a hook payload, and while Manager
+// validates one before recording it, a record written by an older jind-ai — or
+// edited by hand — reaches SpawnCommand having passed no gate at all.
+// TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand (internal/agent/register)
+// enforces the rule for every registered adapter.
+const sessionArgEnv = "JIN_CLAUDE_SESSION"
+
 // SpawnCommand builds the `claude ...` command line the daemon splices into
 // its fixed shell wrapper. The wrapper handles cwd + JIN_SESSION_ID + env -u
 // TMUX; we only own the agent-specific pieces:
@@ -13,11 +25,12 @@ import (
 //   - `--settings <path>` when Setup successfully wrote the hooks file.
 //     Omitted otherwise so the CLI still starts (with default settings) and
 //     the user gets a working session, just without status hooks.
-//   - `--session-id <uuid>` on the very first spawn, or `--resume <uuid>`
-//     when the session has already been started at least once. Falling
-//     through both branches (empty AgentSessionID) yields a plain `claude`
-//     invocation, which is the intended fallback for adapters that ever get
-//     invoked without a pre-minted id.
+//   - `--session-id "$JIN_CLAUDE_SESSION"` on the very first spawn, or
+//     `--resume "$JIN_CLAUDE_SESSION"` when the session has already been
+//     started at least once. Falling through both branches (empty
+//     AgentSessionID) yields a plain `claude` invocation, which is the
+//     intended fallback for adapters that ever get invoked without a
+//     pre-minted id. The id itself travels in ExtraEnv — see sessionArgEnv.
 //
 // UnsetEnv includes CLAUDECODE because Claude Code sets it when it runs jin
 // via a hook, and we must strip it before spawning a *new* CC to avoid the
@@ -27,15 +40,22 @@ func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 	if a.hooksPath != "" {
 		cmd = fmt.Sprintf("claude --settings %s", a.hooksPath)
 	}
+
+	var extraEnv map[string]string
 	if opts.AgentSessionID != "" {
+		flag := "--session-id"
 		if opts.AgentSessionStarted {
-			cmd += fmt.Sprintf(" --resume %s", opts.AgentSessionID)
-		} else {
-			cmd += fmt.Sprintf(" --session-id %s", opts.AgentSessionID)
+			flag = "--resume"
 		}
+		// The id goes through the environment, never into this string, and
+		// unescaped — see sessionArgEnv.
+		cmd += " " + flag + ` "$` + sessionArgEnv + `"`
+		extraEnv = map[string]string{sessionArgEnv: opts.AgentSessionID}
 	}
+
 	return agent.SpawnPlan{
-		Command: cmd,
+		Command:  cmd,
+		ExtraEnv: extraEnv,
 		// Every Claude Code var that leaks in from a CC-parent environment
 		// gets cleared here, so the spawned CC starts as a top-level
 		// session with a fresh transcript. Missing any of these is not

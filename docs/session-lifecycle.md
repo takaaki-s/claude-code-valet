@@ -100,7 +100,9 @@ Legacy `Name` field is migrated on daemon startup: `store.Load()` reads the raw 
    `EnsureHooksSettingsFile()` (once per daemon) plus `EnsureTrustState()`,
    which sets `projects[<workDir>].hasTrustDialogAccepted` in `~/.claude.json`
    (not a settings file — see docs/gotchas.md)
-5. Creates an inner tmux session and runs `claude --session-id {ID}`
+5. Creates an inner tmux session and runs `claude --session-id "$JIN_CLAUDE_SESSION"`.
+   The id travels in the environment rather than in the command text — see the
+   shell-safety contract on `session.SpawnPlan`
 6. `TagManagedPane()` tags the pane for remain-on-exit
 7. Starts `captureOutputTmux()` goroutine for polling
 
@@ -150,6 +152,20 @@ stdout/stderr are saved to `~/.local/state/jind-ai/hook-logs/<session-id>.log` r
      (or permission when persisted, indistinguishable from the transcript
      alone), last entry user → thinking. Unknown/no transcript keeps the
      step-1 decision
+   - "Last entry user" means a user entry the agent owes a reply to: one
+     carrying a promptSource stamp, or a tool_result. Claude Code also writes
+     entries in the user's voice that nobody submitted — the stdout of a local
+     slash command, the notice raised when one is invoked, the echo of a `!`
+     bash line — and those are skipped so the entry underneath decides. An
+     interruption ends the turn outright (→ idle), taking the entries before it
+     with it. Without this, a transcript ending on any of them read as a fresh
+     prompt and pinned an idle session to "thinking", which closes SendPrompt's
+     idle gate with no way to reopen it from jin: "thinking" is only left
+     through a hook, every hook needs the agent to act, and the gate is what
+     refuses to ask it to. Recovery re-reads the same transcript on the next
+     daemon start and reaches the same verdict, so restarting does not clear it
+     either — only driving the agent by hand does (attaching to the pane, or
+     stopping and restarting the session, whose SessionStart writes idle)
 4. Pane dead → StatusStopped (TmuxWindowName preserved for RespawnPane).
    Killed sessions land here too, since a kill leaves the pane dead rather
    than destroying it
@@ -206,7 +222,11 @@ Inside `captureOutputTmux()`, detects pane death within 10 seconds of startup:
 
 `HandleHookEvent()` is agent-agnostic wiring: it looks the session up, updates
 CWD / AgentSessionStarted invariants, and then hands the raw event to
-`Agent.StatusSource.Interpret()`. Every adapter owns its own event vocabulary
+`Agent.StatusSource.Interpret()`. The one value it takes from the payload
+rather than deriving — the adapter-side session id — passes a safety gate and
+the adapter's `RecognizesSessionID` before it is recorded; a refusal drops that
+write alone and leaves the rest of the event intact (see docs/gotchas.md under
+Hook). Every adapter owns its own event vocabulary
 and Status mapping — the Claude Code mapping lives in
 `internal/agent/claude/status.go`; other adapters plug their own
 `StatusSource` into the same slot without touching `session/manager.go`.

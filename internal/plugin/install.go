@@ -474,12 +474,11 @@ func runBuilds(stagingDir, stateDir, name string, cmds []string, timeout time.Du
 	for i, cmdStr := range cmds {
 		fmt.Fprintf(out, "\n--- build step %d/%d: %s ---\n", i+1, len(cmds), cmdStr)
 
-		cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
+		cmd := procgroup.CommandContext(ctx, "bash", "-c", cmdStr)
 		cmd.Dir = stagingDir
 		cmd.Env = env
 		cmd.Stdout = out
 		cmd.Stderr = out
-		procgroup.KillOnCancel(cmd)
 
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start build step %q: %w", cmdStr, err)

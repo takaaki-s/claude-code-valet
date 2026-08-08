@@ -3023,7 +3023,8 @@ func (m *Manager) FindByAgentSessionID(agentSessionID string) (*Session, bool) {
 // status) is owned by the adapter — this function is agent-agnostic wiring:
 //
 //  1. resolve the session (jin id preferred, adapter-side id as fallback)
-//  2. update the adapter session id if the adapter has re-keyed it
+//  2. update the adapter session id if the adapter has re-keyed it — and only
+//     if the reported id passes both gates (see rejectAgentSessionID)
 //  3. run agent-agnostic side effects (CWD tracking, AgentSessionStarted)
 //  4. hand the raw event to the adapter's StatusSource for interpretation
 //  5. dispatch notifications the adapter requested
@@ -3045,7 +3046,11 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 	}
 
 	if !ok {
-		debugLog("[HOOK] Unknown session: jin=%s agent=%s", jinSessionID, agentSessionID)
+		// Both values are caller-chosen and neither has been gated yet — this
+		// branch is reached before any of that. It is also the branch a payload
+		// naming a session that does not exist always takes.
+		debugLog("[HOOK] Unknown session: jin=%s agent=%s",
+			debug.Untrusted(jinSessionID, maxAgentSessionIDLen), debug.Untrusted(agentSessionID, maxAgentSessionIDLen))
 		return
 	}
 
@@ -3078,16 +3083,54 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 	// event.
 	cwdPersistable := isPersistableWorkDir(cwd)
 
+	// Settled here for the same reason, and for a sharper one: rejectAgentSessionID
+	// calls into the adapter, and this function holds m.mu without a deferred
+	// unlock. An adapter whose predicate blocked or panicked under the lock would
+	// not cost one event, it would wedge the daemon — and adapters are an
+	// extension surface, so "it is a cheap pure function today" is a property of
+	// the three that ship, not of the interface. Every other adapter call on this
+	// path (StatusSource().Interpret, above) is already made outside the lock; the
+	// answer only depends on the event, so keeping that rule costs nothing.
+	//
+	// Computed unconditionally rather than only for an id that differs from the
+	// record: the comparison needs the lock, and taking it to decide whether to
+	// do work outside it is the wrong way round. The scan is bounded by
+	// maxAgentSessionIDLen, and an empty id is refused without reaching the
+	// adapter.
+	rekeyRefusal := rejectAgentSessionID(ag, agentSessionID)
+
 	m.mu.Lock()
 	oldStatus := session.Status
 	sessionID := session.ID
 	sessionName := session.Description
 
 	// Update AgentSessionID if it changed (adapter may re-key it, e.g. CC
-	// assigns its own UUID when we started with an empty one).
+	// assigns its own UUID when we started with an empty one). This write is
+	// the one place a value from outside jind-ai becomes a session's identity,
+	// so it is gated — the id arrives in a hook payload, and anything that can
+	// reach the daemon socket or run `jin hook` with JIN_SESSION_ID set can
+	// choose it, for any session, not only its own.
+	//
+	// A rejection drops the WRITE and nothing else. The event keeps its status
+	// verdict, its CWD tracking and its SessionStart bookkeeping, and the id
+	// already recorded is left in place rather than cleared. Dropping the whole
+	// event instead would hand the same payload a second power — send one with
+	// a malformed id and status tracking stops — which turns the defence into
+	// the outage it was meant to prevent.
+	//
+	// The verdict was reached before the lock (see rekeyRefusal). The
+	// agentSessionID != "" test is kept even though safeAgentSessionID refuses
+	// "" on its own: it is what makes "the agent said nothing about its id"
+	// distinct from "the agent reported an id we would not take", and only the
+	// second is worth a log line.
 	if agentSessionID != "" && session.AgentSessionID != agentSessionID {
-		debugLog("[HOOK] Updating AgentSessionID for %s: %s -> %s", sessionName, session.AgentSessionID, agentSessionID)
-		session.AgentSessionID = agentSessionID
+		if rekeyRefusal != "" {
+			debugLog("[HOOK] Session %s: refusing the reported agent session id (%s): %s",
+				sessionName, rekeyRefusal, debug.Untrusted(agentSessionID, maxAgentSessionIDLen))
+		} else {
+			debugLog("[HOOK] Updating AgentSessionID for %s: %s -> %s", sessionName, session.AgentSessionID, agentSessionID)
+			session.AgentSessionID = agentSessionID
+		}
 	}
 
 	// Update CWD from the agent's actual working directory.

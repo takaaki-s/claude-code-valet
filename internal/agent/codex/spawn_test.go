@@ -32,6 +32,11 @@ func TestSpawnCommand_Fresh_IgnoresPreMintUUID(t *testing.T) {
 	}
 }
 
+// resumeBase is what `codex resume` looks like once the UUID travels in
+// ExtraEnv instead of in the command text. Spelled once so the assertions
+// below cannot drift from the builder.
+const resumeBase = `codex resume "$` + sessionArgEnv + `"`
+
 func TestSpawnCommand_Resume(t *testing.T) {
 	uuid := "01900000-0000-7000-8000-000000000abc"
 	plan := SpawnCommand(agent.SpawnOptions{
@@ -39,9 +44,25 @@ func TestSpawnCommand_Resume(t *testing.T) {
 		AgentSessionStarted: true,
 	}, testExecPath)
 
-	want := "codex resume " + uuid + " "
-	if !strings.HasPrefix(plan.Command, want) {
-		t.Errorf("resume Command = %q, want prefix %q", plan.Command, want)
+	if !strings.HasPrefix(plan.Command, resumeBase+" ") {
+		t.Errorf("resume Command = %q, want prefix %q", plan.Command, resumeBase+" ")
+	}
+	if got := plan.ExtraEnv[sessionArgEnv]; got != uuid {
+		t.Errorf("%s = %q, want %q", sessionArgEnv, got, uuid)
+	}
+}
+
+// TestRecognizesSessionID checks the wiring, not the lexicon: this adapter
+// answers with agent.LooksLikeUUID, whose own tests own the accept/reject
+// corpus. Codex learns its id only from a hook payload, so the delegation being
+// the right one is what matters here.
+func TestRecognizesSessionID(t *testing.T) {
+	a := New()
+	if id := "01900000-0000-7000-8000-000000000abc"; !a.RecognizesSessionID(id) {
+		t.Errorf("RecognizesSessionID(%q) = false; a real Codex id was refused", id)
+	}
+	if id := "ses_084426f78ffeXBrPh5ABEu2dNX"; a.RecognizesSessionID(id) {
+		t.Errorf("RecognizesSessionID(%q) = true; that is opencode's shape, not this adapter's", id)
 	}
 }
 
@@ -134,10 +155,13 @@ func TestSpawnCommand_ConfigArgsFollowBase(t *testing.T) {
 		AgentSessionStarted: true,
 	}, testExecPath)
 
-	resumeIdx := strings.Index(plan.Command, "codex resume "+uuid)
+	resumeIdx := strings.Index(plan.Command, resumeBase)
 	cfgIdx := strings.Index(plan.Command, "-c 'disable_paste_burst=true'")
 	if resumeIdx < 0 || cfgIdx < 0 {
 		t.Fatalf("both segments must be present: %q", plan.Command)
+	}
+	if plan.ExtraEnv[sessionArgEnv] != uuid {
+		t.Fatalf("%s = %v, want %q", sessionArgEnv, plan.ExtraEnv, uuid)
 	}
 	if resumeIdx > cfgIdx {
 		t.Errorf("`codex resume UUID` must precede the -c overrides: %q", plan.Command)
@@ -176,10 +200,11 @@ func TestSpawnCommand_UnsetEnvOmitsAuthKeys(t *testing.T) {
 	}
 }
 
-func TestSpawnCommand_NoExtraEnv(t *testing.T) {
-	// JIN_SESSION_ID is injected by Manager's shared wrapper (see
-	// manager.go:957), so the adapter must not double up. Any adapter-side
-	// ExtraEnv here would be an error signal for future maintenance.
+func TestSpawnCommand_NoExtraEnvOnAFreshSpawn(t *testing.T) {
+	// JIN_SESSION_ID is injected by Manager's shared wrapper, so the adapter
+	// must not double up. A resume adds exactly one variable of its own (the
+	// session id, which must not be spliced into the command text); a fresh
+	// spawn has no id to carry, so anything here would be an error signal.
 	plan := SpawnCommand(agent.SpawnOptions{}, testExecPath)
 	if len(plan.ExtraEnv) != 0 {
 		t.Errorf("ExtraEnv = %v, want empty (JIN_SESSION_ID is Manager's job)", plan.ExtraEnv)
@@ -196,10 +221,13 @@ func TestSpawnCommand_ResumePlusHooks(t *testing.T) {
 		AgentSessionStarted: true,
 	}, testExecPath)
 
-	resumeIdx := strings.Index(plan.Command, "codex resume "+uuid)
+	resumeIdx := strings.Index(plan.Command, resumeBase)
 	enableIdx := strings.Index(plan.Command, "--enable hooks")
 	if resumeIdx < 0 || enableIdx < 0 {
 		t.Fatalf("both segments must be present: %q", plan.Command)
+	}
+	if plan.ExtraEnv[sessionArgEnv] != uuid {
+		t.Fatalf("%s = %v, want %q", sessionArgEnv, plan.ExtraEnv, uuid)
 	}
 	if resumeIdx > enableIdx {
 		t.Errorf("`codex resume UUID` must precede `--enable hooks`: %q", plan.Command)

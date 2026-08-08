@@ -1035,6 +1035,62 @@ Common pitfalls and caveats that agents tend to fall into.
   tmux's `pane_current_path` is also polled, but the hook takes priority.
   (Added in commit a705a80)
 
+- **A hook's `session_id` is validated before it can become
+  `Session.AgentSessionID`, and a refusal drops only that write.** The re-key
+  path cannot be closed — Codex and opencode both mint their own id and report
+  it through a hook, so a session that refused every re-key could never be
+  resumed — but it is the one place a value chosen outside jind-ai becomes a
+  session's identity, and it decides what a later `--resume` names.
+
+  Two gates, in this order (`HandleHookEvent`):
+
+  1. `safeAgentSessionID` — kind-independent, and the exact rules live with it
+     in `internal/session/session_id.go` rather than being restated here. In
+     outline: a conservative character set, a length bound, and two shapes
+     refused on top of the set. The second of those is the non-obvious one — a
+     leading `-` makes an id read as a flag once it lands in argv (`--resume
+     <id>`), which needs no shell at all, and `--dangerously-skip-permissions`
+     is spelled entirely inside any character set a session id needs.
+  2. `Agent.RecognizesSessionID` — the adapter's own shape test. Claude Code
+     and Codex accept anything written as a UUID; opencode accepts the `ses_`
+     prefix, deliberately the same loose predicate its resume path already
+     gates on.
+
+  A refusal keeps the id already on file (it does not clear it) and applies the
+  rest of the event — status verdict, CWD tracking, `SessionStart`
+  bookkeeping — unchanged. Dropping the whole event instead would let one
+  malformed payload stop status tracking for that session, which is the outage
+  the gate exists to prevent. Refusals are logged under `JIN_DEBUG=1`.
+
+  Why this matters beyond a malformed record: `JIN_SESSION_ID` names the
+  session a hook acts on and is read from the hook process's own environment,
+  so anything that can run `jin hook` — including an agent inside some *other*
+  session — can report an id for a session that is not its own.
+
+  **The gate narrows the value, not which session an event may speak for.** A
+  well-formed payload still drives another session's status: a `SessionEnd`
+  stops it, a `SessionStart` clears a stale stop and sets `AgentSessionStarted`.
+  Nor can `RecognizesSessionID` tell one live session's id from another's of the
+  same kind — it answers a question about shape. Authenticating the hook channel
+  is a separate problem and is not addressed.
+
+- **Adapters must never concatenate the session id into `SpawnPlan.Command`,
+  and `TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand`
+  (`internal/agent/register`) enforces it for every registered kind.** It is
+  written over `agent.Kinds()` rather than per adapter because a per-package
+  test cannot fail for a package that does not exist yet: a fourth adapter
+  would otherwise reintroduce this with nothing to catch it. Registering a kind
+  is what enrols it. Manager splices `Command` into `SHELL -ic '...'`, so
+  the inner shell interprets it and `$(...)`, backticks and `;` are live — at
+  the unrelated later moment the session resumes, in that session's working
+  directory. All three adapters pass the id through `ExtraEnv` (which Manager
+  quotes) and name it from the command: `--resume "$JIN_CLAUDE_SESSION"`,
+  `codex resume "$JIN_CODEX_SESSION"`, `opencode --session
+  "$JIN_OPENCODE_SESSION"`. This is independent of the validation above, and it
+  has to be: a record written by an older jind-ai, or edited by hand, reaches
+  `SpawnCommand` having passed no gate. See the shell-safety contract on
+  `session.SpawnPlan`.
+
 - **`stopped` has no automatic exit, so a stop written by mistake persists
   until a hook happens to disagree.** Nothing re-derives the status from the
   world: `captureOutputTmux` returns the moment it reads `StatusStopped`
@@ -1553,18 +1609,42 @@ Common pitfalls and caveats that agents tend to fall into.
   so this passes on a newer local toolchain and fails on the version in
   `go.mod`. Use `testutil.SocketPath(t, name)`.
 
-- **Running the suite from inside a jind-ai session corrupts that session.**
-  `cmd/jin/cmd/hook_test.go` runs the real `hook` command against the real
-  daemon socket with `{"session_id":"abc"}`, and it inherits the `JIN_SESSION_ID`
-  the pane exported — so the hook fires on whichever session is running the
-  tests. Observed twice: the session's status flips to `stopped` and its
-  `agent_session_id` becomes `"abc"`, which breaks resume. Nothing in the test
-  says it is talking to a live daemon, and the damage is silent.
+- **Running the suite from inside a jind-ai session used to corrupt that
+  session, and `cmd/jin/cmd/main_test.go` is what stops it.**
+  `cmd/jin/cmd/hook_test.go` runs the real `hook` command with
+  `{"session_id":"abc"}`, and the command resolves its target from the ambient
+  environment: `JIN_SESSION_ID` names the session and `JIN_SOCKET` names the
+  daemon, both inherited from whoever ran `go test`. The fixtures include a
+  `SessionEnd`, so the hook fired on whichever session was running the tests —
+  status flipped to `stopped` and `agent_session_id` became `"abc"`, which
+  breaks resume. Observed many times before it was fixed, each time reading as
+  a live session having died.
 
-  Until the test is isolated, run it as `env -u JIN_SESSION_ID make test`, or
-  point `JIN_SOCKET` at a path that does not exist. This bites anything that
-  runs the suite repeatedly — a mutation-testing loop re-runs it once per
-  mutation.
+  That package's `TestMain` now calls `isolateFromRealDaemon`, which unsets
+  `JIN_SESSION_ID` and points `JIN_SOCKET` at a directory it never creates. It
+  is a `TestMain` rather than a `t.Setenv` per test on purpose: the failure is
+  invisible from inside the suite — every assertion passes, because the damage
+  lands on a process no test looks at — so a test added later would reintroduce
+  it with nothing to catch the mistake.
+
+  The isolation is split out of `TestMain` so `TestIsolateFromRealDaemon` can
+  feed it a hostile environment (`t.Setenv` with a live session id and a socket
+  that exists) and check both halves take effect. Asserting the ambient
+  environment instead would not work: on a clean machine `JIN_SESSION_ID` is
+  already unset and no socket exists, so such a test passes whether the
+  isolation ran or not — green on CI, and only ever red where the damage had
+  already been noticed. For the same reason it compares `getSocketPath()`
+  against the expected path rather than checking that the path is absent.
+  `TestPackageIsIsolatedFromARealDaemon` is the companion check that the
+  isolation is still in force at run time, which catches a test that clobbers
+  the environment for everyone after it.
+
+  Validation is a separate defence and does not replace this one. Manager
+  refuses to record a malformed `session_id` (see Hook), but `SessionEnd` is a
+  legitimate event and stopping a session is what it is for; only isolation
+  keeps a fixture from being believed. When adding a package that shells out to
+  jin, or that builds a daemon client from `getSocketPath()`, isolate it the
+  same way.
 
 - **`make test-e2e` covers two packages**, `./test/e2e/` and `./internal/tui/`.
   The TUI's tmux-backed tests (`model_tmux_e2e_test.go`, build tag `e2e`) drive

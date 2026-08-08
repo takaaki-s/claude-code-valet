@@ -271,9 +271,8 @@ func runExport(workDir, sessionID string) ([]byte, error) {
 // to reach the whole group. The standard library would signal only the leader
 // and leave the rest running past the timeout that exists to stop them.
 func newExportCmd(ctx context.Context, bin, workDir, sessionID string, stdout, stderr io.Writer) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, bin, exportArgs(sessionID)...)
+	cmd := procgroup.CommandContext(ctx, bin, exportArgs(sessionID)...)
 	cmd.Dir = runnableDir(workDir)
-	procgroup.KillOnCancel(cmd)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd
@@ -303,6 +302,14 @@ func runnableDir(workDir string) string {
 // and an event handler on a path whose only job is to print a session — and
 // would do it once per read. Dropping the flag breaks nothing a parser test
 // would notice.
+//
+// sessionID arrives as a bare positional argument, so what keeps it from being
+// read as a flag is the caller: ReadEntries checks isSessionID first, and that
+// predicate anchors on the "ses_" prefix. A leading "-" would otherwise make
+// the id an option to `opencode export` — argument injection needs no shell.
+// Manager refuses to record such an id (safeAgentSessionID), so this is the
+// second of two lines rather than the only one; loosening isSessionID at its
+// front is what would matter here.
 func exportArgs(sessionID string) []string {
 	return []string{"export", "--pure", sessionID}
 }
