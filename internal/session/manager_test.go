@@ -31,7 +31,10 @@ func newTestManager(t *testing.T) (*Manager, *mockTmuxRunner, *mockHookRunner) {
 	if err != nil {
 		t.Fatalf("config.NewManager failed: %v", err)
 	}
-	mgr, err := NewManager(dir, configDir, configMgr)
+	// A state dir of its own, not configDir reused. Anything asserting against
+	// mgr.stateDir — worktree placement, hook logs, bin/jin — cannot tell a
+	// state-dir bug from a config-dir one while the two are the same path.
+	mgr, err := NewManager(dir, t.TempDir(), configMgr)
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
@@ -2864,8 +2867,8 @@ func TestManager_RepoName_ProvisionAsync(t *testing.T) {
 	}
 	mgr, _, _ := newTestManager(t)
 
-	stateDir := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", stateDir)
+	// A decoy — see the same line in setupHookTest.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	repoDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(repoDir, ".git"), 0o755); err != nil {
@@ -3297,10 +3300,11 @@ func TestManager_CreateWithOptions_Worktree_RejectsNonGitRepo(t *testing.T) {
 func TestManager_CreateWithOptions_Worktree_HappyPath(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 
-	// Redirect worktree base dir to a scratch location so the test does not
-	// leak files into the user's real $XDG_STATE_HOME.
-	stateDir := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", stateDir)
+	// A decoy: worktree placement comes from the state dir this Manager was
+	// built over, so pointing the process-wide one elsewhere makes the
+	// mgr.stateDir assertion below fail if placement ever goes back to reading
+	// the global.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	workDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(workDir, ".git"), 0o755); err != nil {
@@ -3337,7 +3341,7 @@ func TestManager_CreateWithOptions_Worktree_HappyPath(t *testing.T) {
 		t.Fatalf("CreateWithOptions: %v", err)
 	}
 
-	wantPrefix := filepath.Join(stateDir, "jind-ai", "worktrees", "jin-")
+	wantPrefix := filepath.Join(mgr.stateDir, "worktrees", "jin-")
 	if !strings.HasPrefix(sess.WorkDir, wantPrefix) {
 		t.Errorf("WorkDir = %q, want prefix %q", sess.WorkDir, wantPrefix)
 	}
@@ -3395,16 +3399,17 @@ func TestManager_CreateWithOptions_Worktree_HappyPath(t *testing.T) {
 func TestManager_CreateWithOptions_Worktree_RollsBackOnWorkDirCollision(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 
-	stateDir := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", stateDir)
+	// A decoy — see the same line in the happy-path test.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	workDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(workDir, ".git"), 0o755); err != nil {
 		t.Fatalf("mkdir .git: %v", err)
 	}
 
-	// Default base_dir template resolves to $XDG_STATE_HOME/jind-ai/worktrees/{name}.
-	predictablePath := filepath.Join(stateDir, "jind-ai", "worktrees", "collide-wt")
+	// An unset base_dir resolves to worktrees/{name} under the Manager's own
+	// state dir, which is what makes this path predictable.
+	predictablePath := filepath.Join(mgr.stateDir, "worktrees", "collide-wt")
 
 	// Pre-create a session whose WorkDir is exactly the worktree path we'll
 	// try to create below, so the re-lock WorkDir uniqueness check trips.

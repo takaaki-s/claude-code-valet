@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/takaaki-s/jind-ai/internal/paths"
 )
 
 // maxWorktreeNameAttempts caps the number of suffixes (-2, -3, ...) tried
@@ -46,15 +44,32 @@ func deriveBranchName(worktreeName, prefix, override string) string {
 	return prefix + strings.TrimPrefix(worktreeName, "jin-")
 }
 
-// expandBaseDir expands {name}, {repo}, and ${ENV} in the base_dir template.
-// An empty template resolves to $XDG_STATE_HOME/jind-ai/worktrees/{name}.
-// Returns an absolute path, or an error if the template contains an unknown
-// {xxx} variable or does not resolve to an absolute path.
-func expandBaseDir(template, worktreeName, repoBasename string) (string, error) {
-	if template == "" {
-		template = filepath.Join(paths.State(), "worktrees", "{name}")
+// worktreeTemplate returns the placement template for a new worktree: the
+// user's worktree.base_dir when set, otherwise worktrees/{name} under the state
+// dir the Manager was built over.
+//
+// The state dir is threaded in rather than read from paths.State(), because a
+// Manager honours the one it was given for every other artifact it writes —
+// hooks-settings.json, and bin/jin, which hookBinaryPath already describes as a
+// sibling of worktrees/. Reading the global instead left worktrees outside that
+// set, silently, for every Manager not built over the process's own state dir.
+//
+// An empty stateDir yields a relative template, which expandBaseDir rejects.
+// That is the intended failure — the alternative is a worktree in whatever the
+// working directory happens to be.
+func worktreeTemplate(cfgBaseDir, stateDir string) string {
+	if cfgBaseDir != "" {
+		return cfgBaseDir
 	}
+	return filepath.Join(stateDir, "worktrees", "{name}")
+}
 
+// expandBaseDir expands {name}, {repo}, and ${ENV} in a base_dir template.
+// Returns an absolute path, or an error if the template contains an unknown
+// {xxx} variable or does not resolve to an absolute path. worktreeTemplate owns
+// the default for an unset base_dir; an empty template arriving here is a
+// caller bug.
+func expandBaseDir(template, worktreeName, repoBasename string) (string, error) {
 	expanded := os.ExpandEnv(template)
 	replaced := strings.ReplaceAll(expanded, "{name}", worktreeName)
 	replaced = strings.ReplaceAll(replaced, "{repo}", repoBasename)

@@ -34,15 +34,17 @@ func hookHappyPathGitRunner() *scriptedGitRunner {
 	}
 }
 
-// setupHookTest builds a Manager configured for worktree hook tests.
-// It pins XDG_STATE_HOME to a temp dir, initializes an empty .git in workDir,
-// and wires the given scripted git runner into the manager.
+// setupHookTest builds a Manager configured for worktree hook tests. It
+// initializes an empty .git in workDir and wires the given scripted git runner
+// into the manager.
 func setupHookTest(t *testing.T, gitRunner *scriptedGitRunner) (mgr *Manager, hookMock *mockHookRunner, workDir string) {
 	t.Helper()
 	mgr, _, hookMock = newTestManager(t)
 
-	stateDir := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", stateDir)
+	// A decoy. Nothing under test reads this any more — state-relative paths
+	// come from the Manager's own state dir — so pointing it at a scratch
+	// directory catches a regression to reading the global.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	workDir = t.TempDir()
 	if err := os.Mkdir(filepath.Join(workDir, ".git"), 0o755); err != nil {
