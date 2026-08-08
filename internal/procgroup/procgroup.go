@@ -12,13 +12,35 @@
 // Three call sites arrived at this independently before it was a package. The
 // point of having one now is that the reasoning below is stated once, and a
 // fourth caller inherits it instead of rediscovering it.
+//
+// Build commands with CommandContext, not exec.CommandContext. The first
+// version of this package offered only KillOnCancel, to be remembered after
+// building the command — and a fourth call site was missed, because forgetting
+// it produces a process that works. The linter forbids exec.CommandContext
+// outside this package so that the safe form is the one you get by default;
+// see .golangci.yml.
 package procgroup
 
 import (
+	"context"
 	"os/exec"
 	"syscall"
 	"time"
 )
+
+// CommandContext is exec.CommandContext with KillOnCancel already applied. It
+// is the way to build a child process in this project.
+//
+// The returned command is ready for the caller to set Dir, Env, Stdin, Stdout
+// and Stderr on before Start — none of which this package touches. It writes
+// only SysProcAttr, WaitDelay and Cancel, and a caller that needs its own
+// SysProcAttr fields (Credential, Pdeathsig) must add them to the struct this
+// installed rather than replacing it.
+func CommandContext(ctx context.Context, name string, arg ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, arg...) //nolint:forbidigo // the one sanctioned call
+	KillOnCancel(cmd)
+	return cmd
+}
 
 // GracePeriod is how long a process group has to exit after SIGTERM before
 // KillOnCancel escalates to a group-wide SIGKILL. Long enough for a shell trap
@@ -44,6 +66,9 @@ const TeardownBudget = GracePeriod + waitMargin
 // KillOnCancel places cmd in a new process group and wires context
 // cancellation to signal that whole group: SIGTERM first, then SIGKILL after
 // GracePeriod for anything that ignored it.
+//
+// Prefer CommandContext, which calls this for you. Reach for KillOnCancel
+// directly only when the command comes from somewhere else already built.
 //
 // Call it before Start. cmd.Cancel is read by the context-watcher goroutine
 // Start spawns, so setting it afterwards is a data race; the closure reads

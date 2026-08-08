@@ -26,6 +26,32 @@ run:
     - render
 
 linters:
+  enable:
+    # Enforces internal/procgroup. See settings.forbidigo below.
+    - forbidigo
+
+  settings:
+    forbidigo:
+      forbid:
+        # exec.CommandContext cancels by signalling the leader PID, and every
+        # process this project starts is a script or CLI that starts more, so
+        # "the leader is gone" and "the work has stopped" are different
+        # statements. internal/procgroup.CommandContext is the same call with
+        # the process group wired up.
+        #
+        # This is a linter rather than a note in docs/conventions.md because
+        # the note was already there and did not hold: procgroup began as a
+        # KillOnCancel you were meant to remember after building the command,
+        # and a call site was missed for a release — forgetting it produces a
+        # process that works, so nothing failed until someone went looking.
+        #
+        # It also makes the audit decidable. Grepping for exec.CommandContext
+        # used to hit every correct site too, so each one had to be read
+        # forward a few lines; now any hit outside internal/procgroup is the
+        # finding.
+        - pattern: '^exec\.CommandContext$'
+          msg: use procgroup.CommandContext, which puts the child in its own process group
+
   exclusions:
     presets:
       # Restores v1's built-in EXC0001, which matched (case-insensitively)
@@ -39,6 +65,15 @@ linters:
       - std-error-handling
 
     rules:
+      # internal/procgroup is where the sanctioned call lives, and its own
+      # tests have to build a bare command to have something to compare
+      # against — a negative control that went through the constructor would
+      # prove nothing. Scoped to this one package: anywhere else, a test that
+      # starts a process leaks it exactly like production would.
+      - linters:
+          - forbidigo
+        path: 'internal/procgroup/'
+
       # staticcheck's QF ("quickfix") checks are refactoring suggestions, not
       # defect detection, and we do not gate CI on them anywhere in the repo.
       # v1 never ran them; v2 folded gosimple, stylecheck and quickfix into the
