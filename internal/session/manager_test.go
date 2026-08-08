@@ -114,8 +114,13 @@ func (fakeStatusSource) Interpret(sig StatusSignal) (StatusUpdate, bool) {
 		return StatusUpdate{}, false
 	}
 	switch sig.Payload["event"] {
-	case "UserPromptSubmit", "PreToolUse", "PostToolUse":
+	case "UserPromptSubmit":
 		return StatusUpdate{Status: StatusThinking, ClearError: true, Notify: NotifyNone}, true
+	case "PreToolUse", "PostToolUse":
+		// Liveness mirrors the real adapter: a tool hook cannot open a turn.
+		// Without it the tests below would exercise a Manager rule no shipped
+		// adapter asks for.
+		return StatusUpdate{Status: StatusThinking, ClearError: true, Notify: NotifyNone, Liveness: true}, true
 	case "Stop":
 		return StatusUpdate{Status: StatusIdle, ClearError: true, Notify: NotifyTaskComplete}, true
 	case "StopFailure":

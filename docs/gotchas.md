@@ -1120,6 +1120,115 @@ Common pitfalls and caveats that agents tend to fall into.
   `pane_current_command` on the session's pane says whether the agent process
   is there.
 
+- **A subagent's tool hooks fire in the parent's session and keep arriving
+  after the parent's turn ended, where they used to write `thinking` over a
+  session that was finished and waiting.** Claude Code raises `PostToolUse` in
+  the parent `session_id` for tools its subagents run, not only for the main
+  agent's own. Counted on one session: 174 `PostToolUse` hooks against 134 tool
+  calls in the parent transcript and 175 across parent plus subagents.
+
+  A subagent whose `Agent` call returns to the parent immediately then outlives
+  the turn that spawned it. The parent finishes, `Stop` fires, and the
+  subagent's tools go on completing — each raising a hook on a session whose
+  main agent is sitting at the prompt.
+
+  Measured on a real hook-event log (3587 events, 26 jin sessions / 30 agent
+  sessions, 158 turns): **8 of 158 turns (5.1%)** had a `PostToolUse` land
+  after the `Stop` that ended them with no `UserPromptSubmit` in between, 1.1s
+  to 5.3s late, and 78 such hooks arrived across the log. Cross-referencing
+  every one against the transcripts put **78 of 78** within 0.01s of a
+  *subagent's* tool result, against a median 57.8s to the nearest tool result of
+  the main agent's own. Those turns were genuinely over: Claude Code's own idle
+  notification fired **60.04s after the `Stop`** (n=5, spread 8ms) in every case
+  that reached it before the next prompt, so its idle clock had been running
+  since the `Stop`.
+
+  Hook delivery lag was the first reading and it was wrong — 0 of 78. So was
+  backgrounded `Bash`: `run_in_background` and `BashOutput` appear 0 times in
+  the whole dataset. And a subagent finishing does not raise a second `Stop`
+  (0 of 158 turns carry two): its completion is injected into the parent as a
+  user message, which raises `UserPromptSubmit`, so the shape stays
+  prompt-then-stop.
+
+  **The status this protects is "can the main agent take a prompt", and a
+  background worker's tool says nothing about that.** That is what makes
+  withholding the verdict correct here rather than merely convenient.
+
+  The cost was the same shape as the stale `stopped` above, on a different
+  status. `session wait --status idle` returns on the `Stop`, correctly; the
+  `send` behind it was then refused by a `thinking` that no longer described
+  anything. Replaying the old behaviour over the log gives **12 stretches**
+  where the record said `thinking` and the agent was idle: 5 ended when the
+  agent's own idle notification corrected them (54.7–58.9s), and the other 7
+  lasted until the next prompt — **5.3s to 191.3s**, and what ended those was
+  someone typing into the pane, which is the one path the `idle` gate does not
+  block. `send --wait-running` could be satisfied by a straggler too, reporting
+  a prompt as picked up when nothing had submitted it.
+
+  **The fix is `StatusUpdate.Liveness`.** An adapter marks the verdicts that
+  report the agent is alive rather than that a turn began — for Claude Code,
+  `PreToolUse` and `PostToolUse` — and `Manager.HandleHookEvent` refuses to let
+  one take a session out of `idle`. Every other transition still applies:
+  `permission` → `thinking` is how an approved tool resumes a session, and
+  `stopped` → `thinking` still contradicts a stale stop. The rule is enforced
+  under `m.mu` rather than in the adapter because `Interpret` runs before the
+  lock is taken, so a verdict that reasoned about the current status would be
+  reasoning about a value that may already be gone.
+
+  **What it gives up:** a turn whose `UserPromptSubmit` never arrives is no
+  longer rescued by the tool hooks that follow it and reads `idle` while it
+  runs. All 158 turns in the log contained a `UserPromptSubmit`, and in 150 of
+  them it was the first event that would have moved the session off `idle` (the
+  8 exceptions are the stragglers above). So what is traded away is a rescue
+  for a case that has not been observed — but "not observed" is not "cannot
+  happen".
+
+  Nothing here distinguishes which writer produced the `idle`, so the rescue is
+  gone for every one of them: the `Stop` above, Claude Code's own `idle_prompt`
+  notification, a recovery verdict after a daemon restart, the `SessionStart`
+  stale-stop correction described earlier in this section, and the
+  running→`idle` fallback in `captureOutputTmux`.
+
+  Replaying the rule over every session withholds **78** tool hooks — **53**
+  against an `idle` written by a `Stop` and **25** against one written by the
+  agent's own idle notification — and **0 of 78** were hiding a turn that was
+  observably open: each was followed by the next `UserPromptSubmit` with no
+  `Stop` in between, so there was no turn for the withheld hook to belong to.
+  That bounds the cost on the traffic that was measured; it says nothing about
+  a `UserPromptSubmit` going missing, which is the case that has not been.
+
+  Ignoring tool hooks for some interval after the `idle` instead would close
+  what the rule gives up, and is deliberately not done. Two reasons, and the
+  second is the one that settles it: such a threshold would be fitted to a
+  handful of observations, and no interval fits anyway — those 78 hooks land
+  0.2s to 178.8s after the `idle` they hit (median 18.0s), 8 of them more than
+  a minute later.
+
+  **The direction the remaining risk points, and what is known about it.** A
+  session was twice observed reading `idle` while its pane was working, both
+  times during subagent work (n=2, two different sessions, no hook log
+  retained). Before this rule, a `PostToolUse` would have moved such a session
+  back to `thinking` within seconds; after it, a wrong `idle` from any source
+  stays until a real prompt or a `Stop` arrives — `wait --status idle` returns
+  on it and `send` is accepted into a pane that is busy.
+
+  What has been measured against that: a session was polled every 2s while a
+  subagent ran synchronously for 10m19s, and all **251 of 251** samples inside
+  that window read `thinking` (308 of 308 across the whole run; the `idle` that
+  followed was the agent stopping, confirmed against its transcript). So the
+  mechanism is not "a synchronous subagent makes the parent read idle" — that
+  was tested and did not reproduce. It is also not the stragglers above, which
+  land on sessions whose main agent had genuinely finished.
+
+  Neither measurement explains the two observations, and no mechanism is
+  proposed here for them. What is recorded is the direction: this rule removes
+  a repair path, so if a wrong `idle` is ever written while an agent works, it
+  now persists rather than self-correcting.
+
+  Only the Claude Code adapter sets the flag. Codex maps `PreToolUse` /
+  `PostToolUse` to `thinking` the same way and has the same shape of hole, but
+  no equivalent measurement exists for it, so its verdicts are unchanged.
+
 ## Claude Code adapter
 
 - **Workspace trust lives in `~/.claude.json`, which is not a settings file.**

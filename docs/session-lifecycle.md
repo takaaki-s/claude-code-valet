@@ -231,8 +231,20 @@ and Status mapping — the Claude Code mapping lives in
 `internal/agent/claude/status.go`; other adapters plug their own
 `StatusSource` into the same slot without touching `session/manager.go`.
 
-**One status decision is the Manager's and not an adapter's: `SessionStart`
-clears a `stopped`, and touches no other status.** Its premise is process
+**Two status decisions are the Manager's and not an adapter's.** What they share
+is why the *policy* lives here: both are conditional on the status a session is
+already in, and only the Manager can read that without racing.
+
+They differ in who decides the rule applies. The first is the Manager's whole:
+it keys off an event name directly, because its premise — a process announced
+itself — belongs to no adapter's vocabulary. The second splits, because its
+premise does: only the adapter knows which of its events can occur outside a
+turn, so the adapter classifies (`StatusUpdate.Liveness`) and the Manager
+enforces. A third rule of this kind should take the first shape only if it can
+be stated without naming any adapter's events.
+
+The first: **`SessionStart` clears a `stopped`, and touches no other status.**
+Its premise is process
 liveness — something announced it is running — which belongs to no
 vocabulary, and the Manager already draws that inference from that event to
 set `AgentSessionStarted`. Placement is also what makes it safe: `Interpret`
@@ -248,6 +260,17 @@ resume, `/clear` and `/compact`, so an unconditional verdict would drop a
 session to `idle` mid-turn the moment an auto-compaction ran. See the
 `stopped` note under [gotchas.md](gotchas.md#hook) for why the stale stop
 exists at all.
+
+The second: **a verdict an adapter marked `StatusUpdate.Liveness` is withheld
+from a session sitting `idle`.** Such a verdict reports that the agent is
+alive rather than that a turn began — a tool hook, which can only fire inside
+a turn something else opened — and hooks do not arrive in the order their
+events happened, so one can land after the `Stop` that ended the turn and
+write `thinking` over a session that is finished. Every other transition it
+asks for still applies, including `permission` → `thinking` and the
+contradiction of a stale stop; on an `idle` session the verdict is withheld
+whole, error field included. What the rule gives up, and the measurement
+behind it, are in [gotchas.md](gotchas.md#hook).
 
 `StatusSignal.Kind` currently has two values: `"hook"` (live hook callback)
 and `"recover"` (daemon-restart recovery, see above). Adapters ignore kinds

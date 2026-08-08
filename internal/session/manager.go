@@ -2990,25 +2990,54 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 		return
 	}
 
+	// A liveness verdict reports that the agent is alive, not that a turn
+	// began, so it does not apply to a session sitting idle. It still applies
+	// everywhere else: recovering a session from permission once the user
+	// answers a prompt, and contradicting a stale stop, both run through it.
+	//
+	// The whole verdict is withheld, not just its Status. ClearError means
+	// "the agent took a new turn" (see the Claude Code adapter's invariant),
+	// which is exactly the claim being rejected — and since nothing downstream
+	// saves a record whose status did not move, clearing the message here
+	// would drop it from memory while the session file kept it.
+	//
+	// It is enforced here, under m.mu, rather than in the adapter, for the
+	// reason the SessionStart correction above gives: Interpret runs before
+	// the lock is taken, so a verdict that reasoned about the current status
+	// would be reasoning about a value that may already be gone.
+	//
+	// What this gives up, deliberately: a turn whose UserPromptSubmit hook
+	// never arrives is no longer rescued by the tool hooks that follow it, and
+	// reads idle while it runs — the same lie this fixes, pointed the other
+	// way. Nothing here distinguishes which writer produced the idle, so a
+	// recovery verdict's idle and the stale-stop correction 40 lines above
+	// lose the rescue too. All of it stays unguarded on purpose; the
+	// alternative is a threshold fitted to a handful of observations. The
+	// measurements behind that trade are in docs/gotchas.md ("Hook").
+	suppressed := updOK && upd.Liveness && session.Status == StatusIdle
+
 	// Fold in the adapter's status verdict. A missing verdict (updOK=false)
 	// still lets us persist CWD / SessionStart changes, but leaves Status
 	// alone. ErrorMessage uses the tri-state documented on StatusUpdate:
 	// non-empty means set, ClearError means clear, both zero means leave.
-	if updOK {
+	if updOK && !suppressed {
 		session.Status = upd.Status
 		if upd.ErrorMessage != "" {
 			session.ErrorMessage = upd.ErrorMessage
 		} else if upd.ClearError {
 			session.ErrorMessage = ""
 		}
-		session.LastOutputTime = time.Now()
 		if upd.Status == StatusStopped {
 			session.LastActiveAt = time.Now()
 		}
-	} else if eventName == "CwdChanged" || eventName == "SessionStart" {
-		// Non-status events that we still track internally: keep
-		// LastOutputTime moving so the "no hook for 30s" fallback in
-		// captureOutputTmux doesn't fire.
+	}
+
+	// Separately, and whatever came of the verdict: a hook we could make sense
+	// of is evidence the agent is alive, which is what the "no hook for 30s"
+	// fallback in captureOutputTmux reads. That holds for the events we track
+	// without a verdict, and for a verdict withheld above — the hook still
+	// arrived.
+	if updOK || eventName == "CwdChanged" || eventName == "SessionStart" {
 		session.LastOutputTime = time.Now()
 	}
 
@@ -3024,6 +3053,14 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 	// CwdChanged: immediately check git branch outside the lock
 	if eventName == "CwdChanged" && cwd != "" {
 		m.updateGitBranch(session, cwd, "")
+	}
+
+	// Leave a trace of the transition that did not happen. A status that
+	// silently declines to move is exactly the kind of thing the next person
+	// has to guess at from the outside, and this log is the difference between
+	// measuring that and reasoning about it.
+	if suppressed {
+		debugLog("[HOOK] Session %s: stayed %s (hook: %s reports liveness, not a turn)", sessionName, saved.Status, eventName)
 	}
 
 	// Persist status/CWD/session-started changes

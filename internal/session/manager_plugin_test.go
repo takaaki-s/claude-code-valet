@@ -98,6 +98,29 @@ func TestManager_HandleHookEvent_NoPublishWithoutTransition(t *testing.T) {
 	}
 }
 
+// A liveness verdict withheld from an idle session is a transition that did
+// not happen, so nothing is announced. The publish is gated on the status
+// actually moving rather than on the verdict existing, which is what makes
+// this fall out — this test keeps that coupling from being unpicked, since a
+// plugin told the session started thinking would be told a lie the record
+// itself no longer carries.
+func TestManager_HandleHookEvent_NoPublishForWithheldLiveness(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	disp := &mockDispatcher{}
+	mgr.SetPluginDispatcher(disp)
+
+	// idleSession asserts the Stop actually produced idle, so this test cannot
+	// quietly degrade into asserting that a no-op publishes nothing.
+	sess := idleSession(t, mgr, "/tmp/plug-liveness")
+	before := len(disp.all())
+
+	mgr.HandleHookEvent(sess.AgentSessionID, sess.ID, "PostToolUse", "", "", "")
+
+	if got := len(disp.all()); got != before {
+		t.Fatalf("published %d events, want %d — the status did not move", got, before)
+	}
+}
+
 func TestManager_HandleHookEvent_NilDispatcher(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 
