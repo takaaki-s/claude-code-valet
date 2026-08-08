@@ -546,14 +546,15 @@ func shortSHA(s string) string {
 	return s
 }
 
-// pluginBuildTimeout resolves plugins.build_timeout (seconds) into a Duration
-// for InstallPlan.Commit.
+// pluginBuildTimeout resolves this user's plugins.build_timeout into a
+// Duration for InstallPlan.Commit. `plugin validate --run-build` deliberately
+// does not come through here — see validateBuildTimeout.
 func pluginBuildTimeout() (time.Duration, error) {
 	mgr, err := config.NewManager(getConfigDir())
 	if err != nil {
 		return 0, err
 	}
-	return time.Duration(mgr.GetPluginsConfig().BuildTimeout) * time.Second, nil
+	return mgr.GetPluginsConfig().BuildTimeoutDuration(), nil
 }
 
 func loadPluginEntries() ([]plugin.Entry, error) {

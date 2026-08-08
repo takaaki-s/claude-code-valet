@@ -725,7 +725,9 @@ git からの install/update では、何かに触れる前にマニフェスト
 
 - **Shell / 単一ファイル** — スクリプトを repo に commit し `entrypoint` から直接指して `install.source.build` は省略。スクリプトが生成物であるか実行権限が git 上で保持されない場合のみ、`chmod +x` の 1 要素を build に追加してください。
 - **Node.js / TypeScript** — `dist/`（esbuild 等）にバンドルするビルドステップを 1 つ書いてください。ランタイム依存解決（bun/deno）も動作しますが、dispatch は fail-open のため初回 dispatch 時のネットワーク取得が黙って失敗することがあります — 事前ビルド済みバンドルの方が予測可能です。
-- **Go / Rust などのコンパイル言語** — `install.source.build` にビルド手順を宣言してください。各要素は独立プロセスとして実行され（要素をまたぐパイプは不可）、ユーザーのプラットフォーム/アーキテクチャに合わせたバイナリを生成できます（`go.sum` / `Cargo.lock` は再現性のために有用）。ビルドは install/update ごとに一度だけ実行されます。jind-ai は依存解決やツールチェーンの検出を代行しないため、必要なものはプラグイン自身の README に明記してください。非ゼロ終了した場合 install/update はアトミックに失敗し（中途半端な状態は残りません）、出力は `~/.local/state/jind-ai/plugin-logs/<name>-build.log` に保存されます。jind-ai はデフォルトでビルド環境に `npm_config_ignore_scripts=true` を注入します（サプライチェーン対策で、自分のビルドステップ内で上書き可能）。ビルド自体はサンドボックス化されておらず、ユーザー自身の権限で実行されます。
+- **Go / Rust などのコンパイル言語** — `install.source.build` にビルド手順を宣言してください。各要素は独立プロセスとして実行され（要素をまたぐパイプは不可）、ユーザーのプラットフォーム/アーキテクチャに合わせたバイナリを生成できます（`go.sum` / `Cargo.lock` は再現性のために有用）。ビルドは install/update ごとに一度だけ実行されます。jind-ai は依存解決やツールチェーンの検出を代行しないため、必要なものはプラグイン自身の README に明記してください。非ゼロ終了した場合 install/update はアトミックに失敗し（中途半端な状態は残りません）、出力は `~/.local/state/jind-ai/plugin-logs/<name>-build.log` に保存されます。制限時間はステップごとではなくシーケンス全体で 1 つです（`plugins.build_timeout`、既定 300 秒）。
+
+  **ビルド環境は allowlist です。** ビルドステップに渡るのは、起動元プロセスから引き継いだ `PATH` / `HOME` / `USER` / `SHELL` / `LANG` / `TERM` / `LC_*` と、`npm_config_ignore_scripts=true`（サプライチェーン対策で、自分のビルドステップ内で上書き可能）だけです。`JAVA_HOME` や `CARGO_HOME`、レジストリのトークンなどが必要な場合は、継承を当てにせずビルドステップ内で導出してください。`jin plugin validate --run-build` は同じフィルタと同じ既定予算を適用し、あなた自身の `plugins.build_timeout`（この設定はプラグインを入れる側のものです）も manifest の `timeout:`（これは dispatch の応答時間であってコンパイル時間ではありません）も参照しません。したがって install が許す以上を必要とするビルドは、ユーザーの手元ではなくあなたの手元で落ちます。ただし通過した変数の**中身**までは保証できません。`PATH` はあなたのものなので、あなたにしか入っていないツールチェーンはローカルでは問題なくビルドできてしまいます。プラグインが必要とするものは自分の README に明記してください。ビルド自体はサンドボックス化されておらず、ユーザー自身の権限で実行されます。
 
 ### 制約
 
@@ -740,7 +742,7 @@ git からの install/update では、何かに触れる前にマニフェスト
 plugins:
   enabled: true          # デフォルト true。false にすると全プラグインのディスパッチを無効化
   disabled: ["notifier"] # 個別プラグインを名前で無効化
-  build_timeout: 300  # 秒。install/update 時のビルドステップ（デフォルト 300）
+  build_timeout: 300  # 秒。install/update のビルドシーケンス全体の予算（デフォルト 300）
   debounce: 3          # 秒。ディスパッチのデバウンス窓（デフォルト 3）
 ```
 

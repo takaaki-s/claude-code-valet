@@ -909,10 +909,25 @@ are decided once at install time and honoured by every later update.
   toolchain for you — document what's required in your plugin's own README.
   A non-zero exit fails the install/update atomically (nothing is left
   half-installed), with output kept at
-  `~/.local/state/jind-ai/plugin-logs/<name>-build.log`. jind-ai injects
-  `npm_config_ignore_scripts=true` into the build environment by default (a
-  supply-chain guard you can override inside your own build step); the
-  build itself runs with your own user privileges — it is not sandboxed.
+  `~/.local/state/jind-ai/plugin-logs/<name>-build.log`. The whole sequence
+  shares one budget (`plugins.build_timeout`, default 300s), not one budget
+  per step.
+
+  **The build environment is an allowlist.** A build step receives `PATH`,
+  `HOME`, `USER`, `SHELL`, `LANG`, `TERM` and `LC_*` from the process that
+  started it, plus `npm_config_ignore_scripts=true` (a supply-chain guard you
+  can override inside your own build step) — nothing else. If your build needs
+  `JAVA_HOME`, `CARGO_HOME`, a registry token or any other variable, derive it
+  inside the build step; do not assume it is inherited. `jin plugin validate
+  --run-build` applies the same filter and the same default budget, and it
+  reads neither your own `plugins.build_timeout` (that setting belongs to
+  whoever installs your plugin) nor your manifest's `timeout:` (that one
+  bounds a dispatch, not a compile) — so a build needing more than an install
+  grants fails at your desk instead of theirs. It cannot vouch for what does
+  get through: your `PATH` is still yours, so a toolchain only you have
+  installed still builds fine locally. Name what your plugin requires in its
+  own README. The build runs with your own user privileges — it is not
+  sandboxed.
 
 ### Constraints
 
@@ -942,7 +957,7 @@ are decided once at install time and honoured by every later update.
 plugins:
   enabled: true          # default true; false disables all plugin dispatch
   disabled: ["notifier"] # disable individual plugins by name
-  build_timeout: 300  # seconds, install/update build step (default 300)
+  build_timeout: 300  # seconds for an install/update's whole build sequence (default 300)
   debounce: 3          # seconds, dispatch debounce window (default 3)
 ```
 
