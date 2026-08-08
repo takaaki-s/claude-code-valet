@@ -1054,10 +1054,14 @@ func (m *Manager) List() []Info {
 // its own, which is exactly why the guard has to be here rather than in either
 // of them.
 //
-// The guard sits in here rather than at the callers because every caller is a
-// polling path: List refreshes the TUI on a timer, and handleGet is polled by
-// `session wait` and `send`. A one-shot caller would want the read even at a
-// second and a half, and would have to lift the check out to get it.
+// The guard sits in here rather than at the callers, which is a trade rather
+// than a deduction: List refreshes the TUI on a timer, but handleGet also
+// serves one-shot commands — `session info`, `session output`,
+// `set-description`, the action popup — and those would happily pay a second
+// and a half for a preview. They lose it too. That is the accepted answer for
+// opencode specifically, where the preview is not wanted; a kind that both
+// needs previews and costs a subprocess would have to lift this check out to
+// the callers and let the one-shot ones through.
 func (m *Manager) AttachLastMessages(info *Info) {
 	if info.AgentSessionID == "" || info.WorkDir == "" {
 		return

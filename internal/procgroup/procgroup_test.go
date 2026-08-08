@@ -141,3 +141,44 @@ func asExitError(err error, target **exec.ExitError) bool {
 	}
 	return ok
 }
+
+// TestKillOnCancel_ReturnsEvenWhenADescendantEscapes is the half a process
+// group cannot cover on its own.
+//
+// setsid puts the grandchild in a session of its own, out of reach of a
+// group-wide signal, and it inherits the stderr pipe os/exec built because the
+// writer is not an *os.File. Wait then blocks on that pipe with the child
+// already dead. Measured before WaitDelay was set: Run had not returned after
+// 15 seconds against a 1-second context. A handler that set a timeout has to
+// get control back even when something outlives the kill.
+func TestKillOnCancel_ReturnsEvenWhenADescendantEscapes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out the WaitDelay")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", "setsid sleep 120 &\nsleep 120")
+	// Not an *os.File on purpose: that is what makes os/exec wait on a pipe.
+	cmd.Stderr = discardWriter{}
+	KillOnCancel(cmd)
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Run() }()
+	select {
+	case <-done:
+	case <-time.After(GracePeriod + waitMargin + 10*time.Second):
+		t.Fatal("Run never returned; a descendant outside the group is holding the pipe open")
+	}
+	// It must also not return early, before the escalation had its chance.
+	if elapsed := time.Since(start); elapsed < GracePeriod {
+		t.Errorf("Run returned after %s, before the SIGKILL escalation at %s could work", elapsed, GracePeriod)
+	}
+	// The escapee is deliberately out of reach; do not leave it running.
+	_ = exec.Command("pkill", "-f", "^sleep 120$").Run()
+}
+
+type discardWriter struct{}
+
+func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }

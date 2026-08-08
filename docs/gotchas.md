@@ -722,6 +722,14 @@ Common pitfalls and caveats that agents tend to fall into.
   said nothing". Claude Code has no equivalent, since one line is one entry
   there. Read whole when completeness matters.
 
+  **This is not codex-only, and it is not addressed here.** The opencode reader
+  applies the bound the same way — per row, before grouping — so it splits a
+  group across two polls for the same reason. Both readers do it because the
+  bound is a property of a row and grouping is a property of the read, and
+  making it entry-level would mean deciding a group is closed before knowing
+  whether the next row joins it. Worth fixing once, for both kinds, rather than
+  per adapter; nothing in this section does.
+
   **Known degeneration:** a human turn arriving directly after a tool result
   would land in the same `user` Entry as that result. The measured corpus never
   produces that ordering (an assistant turn always sits between them), and the
@@ -915,7 +923,9 @@ Common pitfalls and caveats that agents tend to fall into.
   session ran, so a codex or opencode row's second line was blank forever, and
   because the read error was discarded, blank was indistinguishable from a
   session that had not spoken. Both now call `Manager.AttachLastMessages`,
-  which resolves the adapter through `m.resolveAgent(info.AgentKind)`.
+  which resolves the adapter through `m.resolveAgent(info.AgentKind)`. A codex
+  row gained its previews that way; an opencode row did not, and still does not
+  — see the fifth reason below.
 
   `Manager` cannot use `agent.Lookup` the way `handleResult` does —
   `internal/session` must not import `internal/agent` — but it already carried
@@ -925,8 +935,11 @@ Common pitfalls and caveats that agents tend to fall into.
 
 - **Here an unreadable transcript is silent, unlike `session result`.** These
   decorate a row that has to render either way, so every failure — no adapter,
-  no reader, a read error, nothing said yet — leaves the previews empty and the
-  command succeeds. A `session list` that failed because one session's
+  no reader, a read error, nothing said yet, or a reader too expensive to call
+  on this path — leaves the previews empty and the command succeeds. That last
+  one is why an opencode row is always blank: its reader runs a subprocess, so
+  it does not implement `PollableTranscriptSource` and this path skips it. See
+  "Session result" above. A `session list` that failed because one session's
   transcript was unreadable would be worse than a row with an empty second
   line. The consequence is that **an empty preview still means nothing in
   particular**; `session result` is the call that distinguishes the cases.
@@ -1436,6 +1449,19 @@ Common pitfalls and caveats that agents tend to fall into.
   `bind: invalid argument`. Go 1.26 truncates the pattern and Go 1.24 does not,
   so this passes on a newer local toolchain and fails on the version in
   `go.mod`. Use `testutil.SocketPath(t, name)`.
+
+- **Running the suite from inside a jind-ai session corrupts that session.**
+  `cmd/jin/cmd/hook_test.go` runs the real `hook` command against the real
+  daemon socket with `{"session_id":"abc"}`, and it inherits the `JIN_SESSION_ID`
+  the pane exported — so the hook fires on whichever session is running the
+  tests. Observed twice: the session's status flips to `stopped` and its
+  `agent_session_id` becomes `"abc"`, which breaks resume. Nothing in the test
+  says it is talking to a live daemon, and the damage is silent.
+
+  Until the test is isolated, run it as `env -u JIN_SESSION_ID make test`, or
+  point `JIN_SOCKET` at a path that does not exist. This bites anything that
+  runs the suite repeatedly — a mutation-testing loop re-runs it once per
+  mutation.
 
 - **`make test-e2e` covers two packages**, `./test/e2e/` and `./internal/tui/`.
   The TUI's tmux-backed tests (`model_tmux_e2e_test.go`, build tag `e2e`) drive

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -24,6 +25,7 @@ const (
 	fixtureEmpty     = "testdata/export-empty.json"
 	fixtureTruncated = "testdata/export-truncated.json"
 	fixtureDropped   = "testdata/export-dropped-part-clock.json"
+	fixtureOdd       = "testdata/export-odd-metadata.json"
 )
 
 // readerOver returns a reader that answers with a fixture instead of running
@@ -34,7 +36,7 @@ func readerOver(t *testing.T, path string) *TranscriptReader {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	return &TranscriptReader{export: func(string) ([]byte, error) { return doc, nil }}
+	return &TranscriptReader{export: func(_, _ string) ([]byte, error) { return doc, nil }}
 }
 
 func entriesFrom(t *testing.T, path, since string) []transcript.Entry {
@@ -290,7 +292,7 @@ func TestReadEntries_SinceIsExclusive(t *testing.T) {
 
 func TestReadEntries_ExportFailureIsNotAnEmptyConversation(t *testing.T) {
 	boom := errors.New("opencode: export of ses_x failed: exit status 1")
-	r := &TranscriptReader{export: func(string) ([]byte, error) { return nil, boom }}
+	r := &TranscriptReader{export: func(_, _ string) ([]byte, error) { return nil, boom }}
 	entries, err := r.ReadEntries("", "ses_fixture0000000000000001", "")
 	if err == nil {
 		t.Fatalf("a failed export answered %v and success", shape(entries))
@@ -298,11 +300,12 @@ func TestReadEntries_ExportFailureIsNotAnEmptyConversation(t *testing.T) {
 }
 
 // TestReadEntries_PreMintedIDNeverRunsAnything covers the window every session
-// passes through, and the reason it must not cost a process: until opencode
-// reports its own id, Session.AgentSessionID is a UUID that names no session.
+// passes through: until opencode reports its own id, Session.AgentSessionID is
+// a UUID that names no session, and asking about it must cost nothing and read
+// as "not started" rather than as a failure.
 func TestReadEntries_PreMintedIDNeverRunsAnything(t *testing.T) {
 	ran := false
-	r := &TranscriptReader{export: func(string) ([]byte, error) {
+	r := &TranscriptReader{export: func(_, _ string) ([]byte, error) {
 		ran = true
 		return nil, errors.New("should not have been called")
 	}}
@@ -310,8 +313,6 @@ func TestReadEntries_PreMintedIDNeverRunsAnything(t *testing.T) {
 		"",
 		"0198f1b2-0000-7000-8000-000000000000", // the pre-minted UUID
 		"ses_",
-		"ses_with.dot",
-		"ses_with/slash",
 		"session_notthisprefix",
 	} {
 		entries, err := r.ReadEntries("", id, "")
@@ -321,6 +322,29 @@ func TestReadEntries_PreMintedIDNeverRunsAnything(t *testing.T) {
 	}
 	if ran {
 		t.Error("an id that cannot name a session still spawned an export")
+	}
+}
+
+// TestReadEntries_AMalformedIDIsLoud is the other half of the split.
+//
+// An id carrying opencode's prefix but not its shape is not the pre-mint
+// window — something went wrong — so it must not share that window's quiet
+// answer. Empty-and-successful is the one reply this whole feature exists to
+// stop a caller from reading as "the child said nothing".
+func TestReadEntries_AMalformedIDIsLoud(t *testing.T) {
+	ran := false
+	r := &TranscriptReader{export: func(_, _ string) ([]byte, error) {
+		ran = true
+		return []byte(`{"messages":[]}`), nil
+	}}
+	for _, id := range []string{"ses_with.dot", "ses_with/slash", "ses_with space"} {
+		entries, err := r.ReadEntries("", id, "")
+		if err == nil {
+			t.Errorf("ReadEntries(%q) = (%v, nil), want an error", id, shape(entries))
+		}
+	}
+	if ran {
+		t.Error("a malformed id was handed to a subprocess anyway")
 	}
 }
 
@@ -338,7 +362,7 @@ func TestAgent_TranscriptIsAlwaysReadable(t *testing.T) {
 // resolves a version manager's shims, while the daemon's own PATH may not.
 func TestRunExport_ReportsAMissingBinaryRatherThanNothing(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	_, err := runExport("ses_fixture0000000000000001")
+	_, err := runExport("", "ses_fixture0000000000000001")
 	if err == nil {
 		t.Fatal("a missing opencode binary answered with no error")
 	}
@@ -394,19 +418,20 @@ func TestStderrTail_KeepsTheEndAndBoundsMemory(t *testing.T) {
 	}
 }
 
-// TestReadEntries_ADroppedPartDoesNotMoveTheClock pins what a part the reader
-// refuses is allowed to affect: nothing.
+// TestReadEntries_WhatIsDroppedDoesNotMoveTheClock pins what content the
+// reader refuses is allowed to affect: nothing.
 //
-// An injected part carries a real timestamp, and the clock only moves forward,
-// so letting one advance it would stamp the next genuine entry with a moment
-// from content the reader had just decided nobody said. The fixture puts an
-// injected part 8 seconds ahead of the user turn that follows it, which is the
-// only arrangement where the two behaviours differ.
-func TestReadEntries_ADroppedPartDoesNotMoveTheClock(t *testing.T) {
+// Injected content carries real timestamps, and the clock only moves forward,
+// so letting any of it advance would stamp the next genuine entry with a moment
+// from something the reader had just decided nobody said. The fixture puts both
+// shapes 7 seconds ahead of the user turn that follows them — an injected part
+// inside a message that does emit, and a whole message that emits nothing at
+// all — because that is the only arrangement where the behaviours differ.
+func TestReadEntries_WhatIsDroppedDoesNotMoveTheClock(t *testing.T) {
 	entries := entriesFrom(t, fixtureDropped, "")
-	eq(t, "dropped part", shape(entries), []string{"assistant:text", "user:text"})
+	eq(t, "dropped content", shape(entries), []string{"assistant:text", "user:text"})
 	if got, want := entries[1].Timestamp, "2026-08-06T07:06:42.000Z"; got != want {
-		t.Errorf("user entry = %q, want its own message's %q — an injected part dragged the clock", got, want)
+		t.Errorf("user entry = %q, want its own message's %q — dropped content dragged the clock", got, want)
 	}
 }
 
@@ -418,11 +443,124 @@ func TestReadEntries_ADroppedPartDoesNotMoveTheClock(t *testing.T) {
 // timeout would return while the work it was meant to stop carried on. No
 // parse test touches it, and a real export never reaches the timeout.
 func TestNewExportCmd_TearsDownTheWholeGroup(t *testing.T) {
-	cmd := newExportCmd(context.Background(), "/bin/true", "ses_x", io.Discard, io.Discard)
+	cmd := newExportCmd(context.Background(), "/bin/true", t.TempDir(), "ses_x", io.Discard, io.Discard)
 	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
 		t.Error("the child is not in its own process group, so a signal cannot reach what it started")
 	}
 	if cmd.Cancel == nil {
 		t.Error("cancellation falls back to killing the leader only")
+	}
+}
+
+// TestNewExportCmd_RunsSomewhereThatExists covers a failure that takes out
+// every opencode read at once rather than one.
+//
+// A command inherits the daemon's working directory when Dir is empty, and the
+// daemon's is wherever it was first auto-started and never changes — while
+// jind-ai creates and removes worktrees under exactly that kind of path. A
+// process launched from a removed directory does not start at all, so one
+// deleted worktree would end opencode transcript reads for good, with an error
+// that names nothing to suggest why.
+func TestNewExportCmd_RunsSomewhereThatExists(t *testing.T) {
+	sessionDir := t.TempDir()
+	cmd := newExportCmd(context.Background(), "/bin/true", sessionDir, "ses_x", io.Discard, io.Discard)
+	if cmd.Dir != sessionDir {
+		t.Errorf("Dir = %q, want the session's own %q", cmd.Dir, sessionDir)
+	}
+
+	// A worktree can be removed while the session record outlives it, so the
+	// session's directory is not a guarantee either.
+	gone := filepath.Join(t.TempDir(), "removed")
+	if err := os.Mkdir(gone, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	for _, dir := range []string{"", gone} {
+		cmd := newExportCmd(context.Background(), "/bin/true", dir, "ses_x", io.Discard, io.Discard)
+		if cmd.Dir == "" || cmd.Dir == dir {
+			t.Errorf("Dir = %q for input %q, want a directory that exists", cmd.Dir, dir)
+		}
+		if fi, err := os.Stat(cmd.Dir); err != nil || !fi.IsDir() {
+			t.Errorf("Dir = %q is not a usable directory: %v", cmd.Dir, err)
+		}
+	}
+}
+
+// TestRunExport_StartsEvenWhenTheProcessCwdIsGone is the same thing end to
+// end: the *caller's* working directory is deleted, which is the state a
+// long-lived daemon actually gets into.
+func TestRunExport_StartsEvenWhenTheProcessCwdIsGone(t *testing.T) {
+	stub := filepath.Join(t.TempDir(), "opencode")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '{\"messages\":[]}'\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	t.Setenv("PATH", filepath.Dir(stub))
+
+	restore, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	doomed := filepath.Join(t.TempDir(), "doomed")
+	if err := os.Mkdir(doomed, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chdir(doomed); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(restore) })
+	if err := os.Remove(doomed); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	if _, err := runExport(t.TempDir(), "ses_fixture0000000000000001"); err != nil {
+		t.Errorf("export failed because the daemon's own cwd was gone: %v", err)
+	}
+}
+
+// TestReadEntries_OddMetadataDoesNotLoseTheSession is about blast radius.
+//
+// opencode types tool metadata as an untyped record, so a value this reader did
+// not expect is not a malformed document — but decoding it into a typed field
+// makes encoding/json fail for the whole thing, and this reader reports a
+// document that will not parse as a truncated read. One tool writing
+// `"exit": true` would then lose the entire conversation and blame the wrong
+// cause. Every row below is a shape that used to do exactly that.
+func TestReadEntries_OddMetadataDoesNotLoseTheSession(t *testing.T) {
+	entries := entriesFrom(t, fixtureOdd, "")
+	results := map[string]transcript.Block{}
+	for _, e := range entries {
+		for _, b := range e.Blocks {
+			if b.Kind == "tool_result" {
+				results[b.ToolUseID] = b
+			}
+		}
+	}
+	if len(results) != 7 {
+		t.Fatalf("got %d tool results, want all 7 — an odd value took the session with it", len(results))
+	}
+
+	for _, tc := range []struct {
+		callID  string
+		isError bool
+		output  string
+		why     string
+	}{
+		{"call_bool", false, "x", "a boolean exit is not a number, so jind-ai cannot tell"},
+		{"call_word", false, "x", "neither is a word"},
+		{"call_object", false, "x", "nor an object"},
+		{"call_float", true, "x", "1.0 is a non-zero exit however it was written"},
+		{"call_zerof", false, "x", "0.0 is still success"},
+		{"call_numout", false, "42", "a non-string output is kept as its own JSON, not dropped"},
+		{"call_nullout", false, "", "a null output is nothing, and says so"},
+	} {
+		b := results[tc.callID]
+		if b.IsError != tc.isError {
+			t.Errorf("%s: IsError = %v, want %v — %s", tc.callID, b.IsError, tc.isError, tc.why)
+		}
+		if b.Output != tc.output {
+			t.Errorf("%s: Output = %q, want %q — %s", tc.callID, b.Output, tc.output, tc.why)
+		}
 	}
 }

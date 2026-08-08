@@ -31,6 +31,24 @@
     },
     {
       "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000009000
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "more injected context",
+          "synthetic": true,
+          "time": {
+            "start": 1786000009500
+          }
+        }
+      ]
+    },
+    {
+      "info": {
         "role": "user",
         "time": {
           "created": 1786000002000

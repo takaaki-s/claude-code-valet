@@ -1,0 +1,148 @@
+{
+  "info": {
+    "id": "ses_fixture0000000000000001"
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1786000000000
+        }
+      },
+      "parts": [
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_bool",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "v"
+            },
+            "time": {
+              "start": 1786000000010,
+              "end": 1786000000020
+            },
+            "output": "x",
+            "metadata": {
+              "exit": true
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_word",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "v"
+            },
+            "time": {
+              "start": 1786000000030,
+              "end": 1786000000040
+            },
+            "output": "x",
+            "metadata": {
+              "exit": "killed"
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_object",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "v"
+            },
+            "time": {
+              "start": 1786000000050,
+              "end": 1786000000060
+            },
+            "output": "x",
+            "metadata": {
+              "exit": {
+                "code": 1
+              }
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_float",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "v"
+            },
+            "time": {
+              "start": 1786000000070,
+              "end": 1786000000080
+            },
+            "output": "x",
+            "metadata": {
+              "exit": 1.0
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_zerof",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "v"
+            },
+            "time": {
+              "start": 1786000000090,
+              "end": 1786000000100
+            },
+            "output": "x",
+            "metadata": {
+              "exit": 0.0
+            }
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_numout",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "v"
+            },
+            "time": {
+              "start": 1786000000110,
+              "end": 1786000000120
+            },
+            "output": 42,
+            "metadata": {}
+          }
+        },
+        {
+          "type": "tool",
+          "tool": "read",
+          "callID": "call_nullout",
+          "state": {
+            "status": "completed",
+            "input": {
+              "arg": "v"
+            },
+            "time": {
+              "start": 1786000000130,
+              "end": 1786000000140
+            },
+            "output": null,
+            "metadata": {}
+          }
+        }
+      ]
+    }
+  ]
+}

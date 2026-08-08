@@ -31,6 +31,11 @@ const exportBinary = "opencode"
 // that grace still leaves room under the client's 60s.
 const exportTimeout = 30 * time.Second
 
+// ExportTimeout is exportTimeout, exported so the daemon can assert the
+// relationship its own client timeout depends on. Prose in two packages
+// pointing at each other does not fail a build; a test does.
+const ExportTimeout = exportTimeout
+
 // exportStderrLimit caps how much of an export's stderr jind-ai keeps. The
 // tail is what is kept, because opencode writes a progress line on every run
 // and the reason a failed one gives comes after it.
@@ -97,7 +102,7 @@ func (t *stderrTail) String() string {
 type TranscriptReader struct {
 	// export runs the command and returns the document. Replaced in tests so
 	// the parsing can be exercised without a real opencode install.
-	export func(sessionID string) ([]byte, error)
+	export func(workDir, sessionID string) ([]byte, error)
 }
 
 // NewTranscriptReader returns a reader that shells out to opencode.
@@ -108,52 +113,81 @@ func NewTranscriptReader() *TranscriptReader {
 // ReadEntries returns the conversation opencode holds for sessionID, keeping
 // only entries whose Timestamp is strictly greater than since.
 //
-// workDir is ignored: opencode finds the session by id in its own database.
-// The parameter stays because session.TranscriptSource is shared with Claude
-// Code, where it does help.
+// workDir does not decide which session is read — opencode finds that by id,
+// and the same session exported from two directories comes back byte for byte
+// identical. It is used as the directory to run the subprocess in, because a
+// process has to start somewhere and the daemon's own working directory is a
+// bad answer: it is wherever the daemon was first auto-started and never
+// changes, jind-ai creates and removes worktrees under it, and a command
+// launched from a directory that has been removed fails outright ("The current
+// working directory was deleted"). That would take out every opencode read on
+// the box, permanently, with an error naming nothing that suggests why.
 //
-// An id that is not an opencode session id returns (nil, nil) rather than an
-// error. That is the window every session passes through: jind-ai pre-mints
-// Session.AgentSessionID as a UUID and only learns opencode's own `ses_` id
-// when the plugin reports session.created. Asking opencode about a UUID would
-// fail, and "the agent has not started yet" is not a failure. The Codex
-// adapter has the same window; see docs/gotchas.md.
+// An id without opencode's own prefix returns (nil, nil) rather than an error.
+// That is the window every session passes through: jind-ai pre-mints
+// Session.AgentSessionID as a UUID and only learns opencode's `ses_` id when
+// the plugin reports session.created. Asking opencode about a UUID would fail,
+// and "the agent has not started yet" is not a failure. The Codex adapter has
+// the same window; see docs/gotchas.md.
 //
-// Everything past that point is loud. Once the id is opencode's own, a session
-// opencode cannot produce is a genuine read failure, and this returns the
-// error rather than an empty conversation.
-func (r *TranscriptReader) ReadEntries(_, sessionID, since string) ([]transcript.Entry, error) {
-	if !isSessionID(sessionID) {
+// Everything past that point is loud — an id that carries the prefix but is
+// malformed, and a session opencode cannot produce, are both read failures and
+// come back as errors rather than as an empty conversation.
+func (r *TranscriptReader) ReadEntries(workDir, sessionID, since string) ([]transcript.Entry, error) {
+	// No id from opencode yet: the window every session passes through, and
+	// not a failure.
+	if !hasSessionIDPrefix(sessionID) {
 		return nil, nil
 	}
-	doc, err := r.export(sessionID)
+	// It claims to be an opencode id but is not shaped like one. That is not
+	// the window above, so answering "nothing recorded" would hide it — the
+	// caller would read an empty conversation and a success.
+	if !isSessionID(sessionID) {
+		return nil, fmt.Errorf("opencode: %q is not shaped like a session id, so there is nothing to ask opencode for", sessionID)
+	}
+	doc, err := r.export(workDir, sessionID)
 	if err != nil {
 		return nil, err
 	}
 	return entriesFromExport(doc, since)
 }
 
-// isSessionID reports whether s is shaped like an opencode session id: the
-// ses_ prefix followed by base62 characters.
+// hasSessionIDPrefix reports whether opencode has told jind-ai its own id yet.
 //
-// It is the test that separates the pre-minted UUID from opencode's own id, and
-// it is the only one: SpawnCommand calls it too, to tell "resumable" from
-// "spawned once". Two predicates for one question is how the resume path and
-// the read path come to disagree about what an id is.
+// This is the loose question, and it stays loose on purpose. jind-ai pre-mints
+// Session.AgentSessionID as a UUID and only replaces it when the plugin reports
+// session.created, so the prefix is what separates "not started" from "here is
+// the real id". Nothing about the rest of the string changes that answer.
+func hasSessionIDPrefix(s string) bool {
+	rest, ok := strings.CutPrefix(s, sessionIDPrefix)
+	return ok && rest != ""
+}
+
+// isSessionID reports whether s is an opencode session id in full: the ses_
+// prefix followed by base62 characters.
 //
-// It also keeps an unexpected value out of a subprocess's argv. Nothing here
-// builds a shell string, so this is not guarding against quoting; it is
-// guarding against spending a second and an error message on a value that
-// cannot name a session.
+// Two predicates for what looks like one question, and the split is the point.
+// They are asked by callers whose failure modes are opposites.
 //
-// An allow-list rather than a deny-list, because the alphabet is known: across
-// 877 real ids (sessions, messages and parts) every character after the prefix
-// is base62 and every body is exactly 26 characters. The length is evidence
-// that the alphabet is settled, not a rule this applies — pinning a width would
-// reject a longer real id, which fails the quiet way. Rejecting a real id would
-// be its own quiet failure — the read would answer empty and successful — so
-// if opencode ever widens the alphabet this is the line to change, and the
-// count is what makes that a measurement rather than a matter of taste.
+//   - SpawnCommand asks the loose one, because being wrong there is silent and
+//     unrecoverable: refusing to resume starts a NEW opencode session, and the
+//     operator's conversation is simply not there, with nothing saying why. So
+//     it fails open — attempt the resume, and let opencode complain if the id
+//     is nonsense.
+//   - This one guards a value about to become a subprocess's argv. Being wrong
+//     here costs a second and a confusing error message, which is recoverable,
+//     so it can afford to be strict.
+//
+// Collapsing them into the strict one, as an earlier revision did, gave the
+// resume path the strict predicate's failure mode — the worse of the two.
+//
+// The alphabet is known: across 877 real ids (sessions, messages and parts)
+// every character after the prefix is base62 and every body is exactly 26
+// characters. The length is evidence that the alphabet is settled, not a rule
+// this applies — pinning a width would reject a longer real id. If opencode
+// ever widens the alphabet, a read fails loudly (see ReadEntries) rather than
+// answering empty, which is the whole reason the strict test is allowed here
+// and not on the resume path.
 func isSessionID(s string) bool {
 	rest, ok := strings.CutPrefix(s, sessionIDPrefix)
 	if !ok || rest == "" {
@@ -177,7 +211,7 @@ func isSessionID(s string) bool {
 // truncation produced invalid JSON, so it would have been caught rather than
 // returned as a short conversation — but a read that fails 80% of the time is
 // not a read.
-func runExport(sessionID string) ([]byte, error) {
+func runExport(workDir, sessionID string) ([]byte, error) {
 	bin, err := exec.LookPath(exportBinary)
 	if err != nil {
 		// Worth spelling out, because the session itself works: jind-ai
@@ -198,7 +232,7 @@ func runExport(sessionID string) ([]byte, error) {
 	defer cancel()
 
 	var stderr stderrTail
-	cmd := newExportCmd(ctx, bin, sessionID, f, &stderr)
+	cmd := newExportCmd(ctx, bin, workDir, sessionID, f, &stderr)
 	if err := cmd.Run(); err != nil {
 		// The exit status is the verdict, not stderr: opencode writes a
 		// progress line there on every run, successful ones included.
@@ -208,7 +242,24 @@ func runExport(sessionID string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("opencode: export of %s failed: %w: %s", sessionID, err, msg)
 	}
-	return os.ReadFile(f.Name())
+	// Read back through the handle rather than by name. The offset is at the
+	// end after the child wrote through this same descriptor, so it has to be
+	// rewound; reading the path again would re-resolve a name that something
+	// else could have taken over in the meantime, and would open the file
+	// twice for no gain. Size comes from Stat so the buffer is allocated once
+	// instead of grown.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("opencode: rewind export output: %w", err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("opencode: size export output: %w", err)
+	}
+	doc := make([]byte, fi.Size())
+	if _, err := io.ReadFull(f, doc); err != nil {
+		return nil, fmt.Errorf("opencode: read export output: %w", err)
+	}
+	return doc, nil
 }
 
 // newExportCmd builds the command, separately from running it, so a test can
@@ -218,12 +269,30 @@ func runExport(sessionID string) ([]byte, error) {
 // starts more processes than the one named here, so cancelling the context has
 // to reach the whole group. The standard library would signal only the leader
 // and leave the rest running past the timeout that exists to stop them.
-func newExportCmd(ctx context.Context, bin, sessionID string, stdout, stderr io.Writer) *exec.Cmd {
+func newExportCmd(ctx context.Context, bin, workDir, sessionID string, stdout, stderr io.Writer) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, bin, exportArgs(sessionID)...)
+	cmd.Dir = runnableDir(workDir)
 	procgroup.KillOnCancel(cmd)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd
+}
+
+// runnableDir picks a directory the subprocess can actually start in.
+//
+// The session's own is the honest first choice, but it is not guaranteed to be
+// there: a worktree can be removed while the session record outlives it. The
+// temp directory is the fallback because it is the one place already assumed
+// to exist — the export writes its output there. Leaving Dir empty is what
+// must not happen; that inherits the daemon's, which is set once at start-up
+// and may be a worktree jind-ai has since deleted.
+func runnableDir(workDir string) string {
+	if workDir != "" {
+		if fi, err := os.Stat(workDir); err == nil && fi.IsDir() {
+			return workDir
+		}
+	}
+	return os.TempDir()
 }
 
 // exportArgs is the command line, split out so a test can pin it.
@@ -301,16 +370,19 @@ type partRow struct {
 	Tool   string `json:"tool"`
 	CallID string `json:"callID"`
 	State  struct {
-		Status   string          `json:"status"`
-		Input    json.RawMessage `json:"input"`
-		Output   string          `json:"output"`
+		Status string          `json:"status"`
+		Input  json.RawMessage `json:"input"`
+		// Output and Exit are held raw and interpreted afterwards, which is
+		// not fussiness. encoding/json reports a type mismatch for the whole
+		// document, and this reader treats a document that will not parse as a
+		// truncated read — so one tool writing something unexpected into either
+		// field would lose the entire session and blame the wrong cause.
+		// opencode's own schema types metadata as an untyped record, so the
+		// shape of what arrives there is not something jind-ai gets to assume.
+		Output   json.RawMessage `json:"output"`
 		Error    string          `json:"error"`
 		Metadata struct {
-			// Exit is the process exit status for tools that run one.
-			// json.Number is a string underneath, so an absent field and a
-			// null both arrive as "" while a real zero arrives as "0" —
-			// which is the distinction nonZeroExit needs, with no pointer.
-			Exit json.Number `json:"exit"`
+			Exit json.RawMessage `json:"exit"`
 		} `json:"metadata"`
 		Time struct {
 			Start *int64 `json:"start"`
@@ -337,12 +409,18 @@ func entriesFromExport(doc []byte, since string) ([]transcript.Entry, error) {
 		for j := range m.Parts {
 			b.addPart(&m.Info, i, &m.Parts[j], since)
 		}
-		// The clock moves to the message's own time whether or not the turn
-		// failed, so a later message cannot inherit a stamp from before it.
-		ts := b.stamp(m.Info.Time.Created)
 		// A turn that ended in failure is reported after the content it
 		// interrupted, which is where opencode itself records it.
-		if e, ok := turnFailureEntry(&m.Info, ts); ok && transcript.Newer(e.Timestamp, since) {
+		//
+		// The clock is only read when there is something to stamp. A message
+		// that ended without one contributes nothing, and moving the clock for
+		// it would let a turn whose parts the reader dropped push the next
+		// real entry forward — the same rule addPart applies to a part, for
+		// the same reason.
+		if m.Info.Error == nil {
+			continue
+		}
+		if e, ok := turnFailureEntry(&m.Info, b.stamp(m.Info.Time.Created)); ok && transcript.Newer(e.Timestamp, since) {
 			b.emit(e)
 		}
 	}
@@ -410,7 +488,7 @@ func toolBlocks(p *partRow) []transcript.Block {
 	res := transcript.Block{Kind: "tool_result", ToolUseID: p.CallID}
 	switch p.State.Status {
 	case "completed":
-		res.Output = p.State.Output
+		res.Output = asText(p.State.Output)
 		res.IsError = nonZeroExit(p)
 	case "error":
 		// The error message, not state.output. Whether opencode ever fills
@@ -447,9 +525,37 @@ func toolBlocks(p *partRow) []transcript.Block {
 // therefore trustworthy for bash and blind for everything else, which is
 // stated in docs/gotchas.md rather than papered over.
 func nonZeroExit(p *partRow) bool {
-	// An absent or null exit parses as an error, which lands on "cannot tell".
-	n, err := p.State.Metadata.Exit.Int64()
-	return err == nil && n != 0
+	// Absent, null, or anything that is not a number: the tool did not report
+	// an exit status this reader understands, which lands on "cannot tell".
+	// Parsed as a float rather than an integer so a status written as 1.0
+	// still counts as a failure — writing it that way would be odd, and
+	// treating odd as success is the direction that hides a failure.
+	var f float64
+	if err := json.Unmarshal(p.State.Metadata.Exit, &f); err != nil {
+		return false
+	}
+	return f != 0
+}
+
+// asText renders a tool's output, which the schema types as a string and this
+// reader does not require to be one.
+//
+// A shape nobody has seen comes back as its own JSON rather than as nothing:
+// it keeps the content readable and visibly unusual, which is what the Codex
+// reader does with the same problem. Returning "" would read as a tool that
+// answered nothing.
+func asText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	if string(raw) == "null" {
+		return ""
+	}
+	return string(raw)
 }
 
 // turnFailureEntry converts a message that ended in an error into a standalone

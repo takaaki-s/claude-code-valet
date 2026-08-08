@@ -8,6 +8,8 @@ import (
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/agent/agenttest"
+	"github.com/takaaki-s/jind-ai/internal/agent/opencode"
+	"github.com/takaaki-s/jind-ai/internal/procgroup"
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/transcript"
 )
@@ -271,5 +273,22 @@ func TestHandleResult_EntriesIsAlwaysAnArray(t *testing.T) {
 				t.Errorf("entries = %s, want [] — jq cannot iterate over null", got)
 			}
 		})
+	}
+}
+
+// TestExportTimeoutFitsInsideTheClientBudget holds a relationship that two
+// comments in two packages assert to each other and nothing enforces.
+//
+// `session result` on an opencode session runs a subprocess bounded by the
+// adapter's own timeout. If that ever grows past what the client waits for,
+// the client reports a timeout while the daemon is still working and may yet
+// answer — the failure mode the client's own budget comment was written to
+// avoid. The margin covers the teardown: a process that ignores SIGTERM is
+// killed a grace period later, and Wait can hold on a little past that.
+func TestExportTimeoutFitsInsideTheClientBudget(t *testing.T) {
+	worst := opencode.ExportTimeout + procgroup.GracePeriod
+	if worst >= defaultRequestTimeout {
+		t.Errorf("an opencode result can take up to %s (export %s + teardown %s), but the client gives up at %s",
+			worst, opencode.ExportTimeout, procgroup.GracePeriod, defaultRequestTimeout)
 	}
 }

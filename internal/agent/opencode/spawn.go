@@ -57,7 +57,7 @@ const rootSessionEnv = "JIN_OPENCODE_ROOT_SESSION"
 // This is the same fail-open posture the Codex adapter takes when it has no
 // executable path to build hook arguments from.
 func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
-	resuming := opts.AgentSessionStarted && isSessionID(opts.AgentSessionID)
+	resuming := opts.AgentSessionStarted && hasSessionIDPrefix(opts.AgentSessionID)
 
 	cmd := "opencode"
 	if resuming {

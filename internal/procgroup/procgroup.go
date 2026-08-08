@@ -26,6 +26,13 @@ import (
 // left wondering.
 const GracePeriod = 5 * time.Second
 
+// waitMargin is how much longer than GracePeriod Wait will hold on before it
+// stops waiting for the child's I/O and returns anyway. It has to be the
+// larger of the two: the SIGKILL escalation is the thing that normally ends
+// this, and cutting Wait short of it would report a timeout while the kill
+// that was about to work had not yet fired.
+const waitMargin = 2 * time.Second
+
 // KillOnCancel places cmd in a new process group and wires context
 // cancellation to signal that whole group: SIGTERM first, then SIGKILL after
 // GracePeriod for anything that ignored it.
@@ -42,8 +49,19 @@ const GracePeriod = 5 * time.Second
 //
 // The negated PID is the whole mechanism — kill(2) treats -pid as "every
 // process in the group led by pid", which is why Setpgid has to be set as well.
+//
+// WaitDelay is the second half, and it is not redundant with the first. When
+// Stdout or Stderr is anything other than an *os.File, os/exec builds a pipe
+// and a copying goroutine, and Wait does not return until every descendant
+// holding the write end has closed it. A descendant that leaves the group —
+// setsid does exactly that — is out of reach of the signals above while still
+// holding that pipe, so Wait blocks with the process already dead. Measured:
+// with a group kill and no WaitDelay, Run had not returned after 15 seconds
+// against a 1-second context; with WaitDelay it returned as soon as the delay
+// elapsed. A caller that set a timeout is entitled to get control back.
 func KillOnCancel(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = GracePeriod + waitMargin
 	cmd.Cancel = func() error {
 		pid := cmd.Process.Pid
 		time.AfterFunc(GracePeriod, func() {

@@ -128,3 +128,34 @@ func TestSpawnCommand_Resume_PinsRootSession(t *testing.T) {
 		t.Errorf("%s = %q, want %q", rootSessionEnv, got, id)
 	}
 }
+
+// TestSpawnCommand_ResumesOnThePrefixAlone pins the looser of the two id
+// predicates to the path that needs it.
+//
+// Getting this wrong is silent and unrecoverable: refusing to resume starts a
+// NEW opencode session, so the operator's conversation is simply not there and
+// nothing says why. The read path can afford to be strict because being wrong
+// there costs an error message; this one cannot, so it asks only whether
+// opencode has reported an id at all.
+func TestSpawnCommand_ResumesOnThePrefixAlone(t *testing.T) {
+	// Shapes the strict predicate rejects. If opencode ever widens its
+	// alphabet, resume has to keep working.
+	for _, id := range []string{
+		"ses_0425f0107ffe2ruNWlf2QIqBEJ", // today's shape
+		"ses_with-a-dash",
+		"ses_with.dot",
+		"ses_UPPER_and_under",
+	} {
+		plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: id, AgentSessionStarted: true}, "")
+		want := "opencode --session " + id
+		if plan.Command != want {
+			t.Errorf("SpawnCommand(%q) = %q, want %q — a resume was silently turned into a new session", id, plan.Command, want)
+		}
+	}
+
+	// And the pre-minted UUID still means "not resumable".
+	plan := SpawnCommand(agent.SpawnOptions{AgentSessionID: "0198f1b2-0000-7000-8000-000000000000", AgentSessionStarted: true}, "")
+	if plan.Command != "opencode" {
+		t.Errorf("SpawnCommand(uuid) = %q, want a fresh start", plan.Command)
+	}
+}
