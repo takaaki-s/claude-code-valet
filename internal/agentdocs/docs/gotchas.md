@@ -217,7 +217,8 @@ in the corpus. jin reads `metadata.exit`, the real exit status, for those.
 
 **Only `bash` carries that field.** 32 of its 33 calls in the corpus record an
 exit number and 1 records null; `read`, `grep`, `glob`, `task`, `skill`,
-`websearch` and `write` have no exit field at all — 0 of 158 calls.
+`websearch` and `write` have no exit field at all — 0 of 161 calls, which is
+every tool call in the corpus that is not bash.
 
 So `is_error: false` on a `completed` opencode tool result means one of two
 different things, and you cannot tell which from the result: the tool reported

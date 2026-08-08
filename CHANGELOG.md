@@ -44,7 +44,7 @@ log.
   `bash` and partial elsewhere: it catches whatever opencode flagged as an
   error, plus a shell command that exited non-zero (opencode records those as
   `completed`, so the flag comes from the exit status recorded alongside it) —
-  and no other tool records an exit status at all (0 of 158 calls). Timestamps
+  and no other tool records an exit status at all (0 of 161 calls). Timestamps
   are opencode's own except where its clock disagrees with the order of the
   conversation — parallel tool calls, 13 of 620 blocks measured — where the
   previous value is carried forward, so two entries can share a stamp and

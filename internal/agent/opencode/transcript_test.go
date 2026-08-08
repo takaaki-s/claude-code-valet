@@ -1,9 +1,11 @@
 package opencode
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
@@ -405,5 +407,22 @@ func TestReadEntries_ADroppedPartDoesNotMoveTheClock(t *testing.T) {
 	eq(t, "dropped part", shape(entries), []string{"assistant:text", "user:text"})
 	if got, want := entries[1].Timestamp, "2026-08-06T07:06:42.000Z"; got != want {
 		t.Errorf("user entry = %q, want its own message's %q — an injected part dragged the clock", got, want)
+	}
+}
+
+// TestNewExportCmd_TearsDownTheWholeGroup pins the teardown, which nothing
+// else can see.
+//
+// opencode starts more processes than the one jind-ai names, and the standard
+// library's cancellation reaches only the leader — so without this the 30s
+// timeout would return while the work it was meant to stop carried on. No
+// parse test touches it, and a real export never reaches the timeout.
+func TestNewExportCmd_TearsDownTheWholeGroup(t *testing.T) {
+	cmd := newExportCmd(context.Background(), "/bin/true", "ses_x", io.Discard, io.Discard)
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
+		t.Error("the child is not in its own process group, so a signal cannot reach what it started")
+	}
+	if cmd.Cancel == nil {
+		t.Error("cancellation falls back to killing the leader only")
 	}
 }

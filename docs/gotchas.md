@@ -884,7 +884,8 @@ Common pitfalls and caveats that agents tend to fall into.
   project already documents for codex, reintroduced. The reader now reads
   `metadata.exit`, the real exit status. **Only `bash` carries it** (32 of 33
   as a number, 1 as null); `read`, `grep`, `glob`, `task`, `skill`, `websearch`
-  and `write` have no exit field at all — 0 of 158. So on a `completed` call
+  and `write` have no exit field at all — 0 of 161, every call that is not
+  bash. So on a `completed` call
   `IsError == false` means either "exited zero" or "jind-ai cannot tell", and
   `--errors-only` is exact for bash and partial for everything else. A
   `state.status` of `"error"` still sets `IsError` for any tool — the single

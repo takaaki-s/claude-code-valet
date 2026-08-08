@@ -12,35 +12,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
-
-// killGracePeriod is how long a plugin's process group has to exit after
-// SIGTERM before ExecPlugin escalates to a group-wide SIGKILL. Mirrors the
-// worktreehook runner's escalation window.
-const killGracePeriod = 5 * time.Second
-
-// setProcessGroupKill wires cmd so that ctx cancellation SIGTERMs the whole
-// process group (Setpgid places children in a fresh group) and escalates to a
-// group-wide SIGKILL after killGracePeriod. Shared by ExecPlugin and the build
-// step so both get identical, leak-free teardown of a run that ignores SIGTERM.
-//
-// Cancel must be set before Start to avoid a data race with the ctx-watcher
-// goroutine Start spawns; it reads cmd.Process.Pid, which Start populates first.
-// The AfterFunc timer is fire-and-forget: once Cancel fires the escalation is
-// unconditional — a wasted SIGKILL to an already-reaped group is harmless
-// (ESRCH) and avoids sharing a *Timer across goroutines.
-func setProcessGroupKill(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		pid := cmd.Process.Pid
-		time.AfterFunc(killGracePeriod, func() {
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
-		})
-		return syscall.Kill(-pid, syscall.SIGTERM)
-	}
-}
 
 // inheritedEnvKeys is the minimal set of parent-process env vars forwarded to a
 // plugin run. It covers what interpreters / toolchains need to bootstrap without
@@ -123,7 +98,7 @@ func LogPath(stateDir, pluginName string) string {
 //
 // Signal escalation on ctx cancellation: cmd.Cancel sends SIGTERM to the run's
 // whole process group (Setpgid places children in a fresh group). A deferred
-// timer then sends SIGKILL to the same group after killGracePeriod so a run that
+// timer then sends SIGKILL to the same group after procgroup.GracePeriod so a run that
 // ignores SIGTERM cannot outlive the escalation. We drive this ourselves rather
 // than relying on cmd.WaitDelay, which only SIGKILLs the leader PID and leaves
 // grandchildren alive.
@@ -157,7 +132,7 @@ func ExecPlugin(ctx context.Context, opts ExecOptions) error {
 	cmd.Stdin = bytes.NewReader(payload)
 	cmd.Stdout = out
 	cmd.Stderr = out
-	setProcessGroupKill(cmd)
+	procgroup.KillOnCancel(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start plugin: %w", err)

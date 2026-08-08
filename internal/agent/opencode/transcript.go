@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/takaaki-s/jind-ai/internal/procgroup"
 	"github.com/takaaki-s/jind-ai/internal/transcript"
 )
 
@@ -24,6 +26,9 @@ const exportBinary = "opencode"
 // holding the daemon's handler, not to police a slow one. It has an upper
 // bound too — daemon.defaultRequestTimeout, the 60s the client waits — because
 // past that the client reports a timeout while the daemon is still exporting.
+// A wedged export can take procgroup.GracePeriod longer than this to unblock
+// Wait, since a process that ignores SIGTERM is only killed after it; 30s plus
+// that grace still leaves room under the client's 60s.
 const exportTimeout = 30 * time.Second
 
 // exportStderrLimit caps how much of an export's stderr jind-ai keeps. The
@@ -192,10 +197,8 @@ func runExport(sessionID string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), exportTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, bin, exportArgs(sessionID)...)
-	cmd.Stdout = f
 	var stderr stderrTail
-	cmd.Stderr = &stderr
+	cmd := newExportCmd(ctx, bin, sessionID, f, &stderr)
 	if err := cmd.Run(); err != nil {
 		// The exit status is the verdict, not stderr: opencode writes a
 		// progress line there on every run, successful ones included.
@@ -206,6 +209,21 @@ func runExport(sessionID string) ([]byte, error) {
 		return nil, fmt.Errorf("opencode: export of %s failed: %w: %s", sessionID, err, msg)
 	}
 	return os.ReadFile(f.Name())
+}
+
+// newExportCmd builds the command, separately from running it, so a test can
+// see how it was wired without an opencode to run.
+//
+// procgroup.KillOnCancel is the part worth naming: opencode is a runtime that
+// starts more processes than the one named here, so cancelling the context has
+// to reach the whole group. The standard library would signal only the leader
+// and leave the rest running past the timeout that exists to stop them.
+func newExportCmd(ctx context.Context, bin, sessionID string, stdout, stderr io.Writer) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, bin, exportArgs(sessionID)...)
+	procgroup.KillOnCancel(cmd)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd
 }
 
 // exportArgs is the command line, split out so a test can pin it.
@@ -420,7 +438,8 @@ func toolBlocks(p *partRow) []transcript.Block {
 //
 // metadata.exit is the real exit status, and Codex records nothing like it.
 // Only bash carries it (32 of 33 as a number, 1 as null); read, grep, glob,
-// task, skill, websearch and write have no exit field at all — 0 of 158.
+// task, skill, websearch and write have no exit field at all — 0 of 161,
+// which is every tool call in the corpus that is not bash.
 //
 // So false here means one of two different things, and callers must not read
 // it as the second: either the tool reported an exit status and it was zero, or
