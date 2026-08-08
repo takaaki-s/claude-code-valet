@@ -216,9 +216,19 @@ jin session send fix-login "the test still fails on line 42; fix that too" --wai
 jin session wait fix-login --until idle,permission
 ```
 
-Answer a session that sits in `permission` with `respond`. Escalate to the
-human when `respond` refuses — a multi-question form, or an agent kind it does
-not drive — or when two rounds of correction have not moved the session.
+Answer a session that sits in `permission` with `respond`. What is safe to
+answer depends on what is being asked, and only you can tell:
+
+- **A tool approval** — "may I run this command?" — is a capability you already
+  have. Answer it.
+- **A question about the work** — which approach, whether to keep going — is a
+  decision. Answer it when it is yours to make. Escalate when it is not:
+  spending the operator's resources, changing what was agreed, anything that
+  cannot be undone. `respond` cannot tell these apart, so this is your
+  judgment, not a check it performs.
+
+Escalate also when `respond` refuses — a multi-question form, or an agent kind
+it does not drive — or when two rounds of correction have not moved the session.
 
 ## Running several at once
 

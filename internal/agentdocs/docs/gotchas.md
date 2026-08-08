@@ -289,10 +289,9 @@ jin session wait work --status idle             # hangs on a blocked session
 ```
 
 `send` only takes `idle` sessions, so it will usually refuse a blocked one — and
-a dialog does
-not draw what you type into it and `send` proves delivery by finding the text
-on screen. Use `respond`, and read the choices from the transcript rather than
-the pane:
+it could not drive a dialog anyway: it proves delivery by finding the text on
+screen, and a dialog draws none of what you type. Use `respond`, and read the
+choices from the transcript rather than the pane:
 
 ```bash
 jin session result work --json                  # the question and its options
