@@ -38,6 +38,10 @@ func NewHookStatusSource() *HookStatusSource {
 // invariant: hooks that mean "the agent recovered / took a new turn" clear
 // the previous StopFailure message, while hooks that only report presence
 // (SessionEnd / Notification) leave whatever the field held.
+//
+// The Liveness flag separates the one event that opens a turn
+// (UserPromptSubmit) from the ones that can only occur inside a turn already
+// open (PreToolUse / PostToolUse); see the arm below for why that matters.
 func (h *HookStatusSource) Interpret(sig agent.StatusSignal) (agent.StatusUpdate, bool) {
 	if sig.Kind == "recover" {
 		return h.interpretRecover(sig)
@@ -47,8 +51,23 @@ func (h *HookStatusSource) Interpret(sig agent.StatusSignal) (agent.StatusUpdate
 	}
 	event := sig.Payload["event"]
 	switch event {
-	case "UserPromptSubmit", "PreToolUse", "PostToolUse":
+	case "UserPromptSubmit":
 		return agent.StatusUpdate{Status: session.StatusThinking, ClearError: true, Notify: agent.NotifyNone}, true
+	case "PreToolUse", "PostToolUse":
+		// Liveness, not a turn start: a tool can only run inside a turn
+		// something else opened — but not necessarily this session's turn.
+		// Claude Code raises these in the parent's session for tools its
+		// subagents run, and a subagent that outlives the turn that spawned it
+		// goes on raising them after Stop. Without the flag that writes
+		// "thinking" over a session whose agent is sitting at the prompt,
+		// measured at 8 of 158 turns. UserPromptSubmit is deliberately not in
+		// this arm: it is the one event that does open a turn, and it opened
+		// all but those 8.
+		//
+		// See Manager.HandleHookEvent for what the flag does with this, and
+		// docs/gotchas.md ("Hook") for the measurement, which lives there
+		// rather than here so it has one place to be updated from.
+		return agent.StatusUpdate{Status: session.StatusThinking, ClearError: true, Notify: agent.NotifyNone, Liveness: true}, true
 	case "Stop":
 		return agent.StatusUpdate{Status: session.StatusIdle, ClearError: true, Notify: agent.NotifyTaskComplete}, true
 	case "StopFailure":
@@ -86,6 +105,11 @@ func (h *HookStatusSource) Interpret(sig agent.StatusSignal) (agent.StatusUpdate
 // these transitions correct stale state, not live events, so they must not
 // fire notifications or mutate the error field. A false verdict keeps whatever
 // status Manager already decided.
+//
+// Liveness is left unset for the same reason it is set on a tool hook: it
+// answers "may this verdict open a turn?", and a recovery verdict is not a
+// report that something happened at all — it is this package's best reading
+// of where the session already stands, and Manager applies it as such.
 func (h *HookStatusSource) interpretRecover(sig agent.StatusSignal) (agent.StatusUpdate, bool) {
 	sessionID := sig.Payload["agent_session_id"]
 	if sessionID == "" {

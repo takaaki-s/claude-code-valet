@@ -101,7 +101,9 @@ type StatusSignal struct {
 	// Contract for "recover" verdicts: Manager applies only
 	// StatusUpdate.Status — stale-state correction must not fire
 	// notifications or touch the error field, so Notify / ErrorMessage /
-	// ClearError are ignored.
+	// ClearError are ignored, and so is Liveness: a recovery verdict re-derives
+	// where a session already stands, it does not report that something
+	// happened.
 	Kind string
 	// Payload is an untyped key/value bag; the exact keys depend on Kind
 	// and are adapter-defined. For "hook" the Manager fills in "event",
@@ -130,7 +132,30 @@ type StatusUpdate struct {
 	Status       Status
 	ErrorMessage string
 	ClearError   bool
-	Notify       NotifyKind
+	// Liveness marks a verdict that reports the agent is alive rather than
+	// that a turn began — a tool finishing, say, which can only happen inside
+	// a turn something else already opened. On the "hook" path Manager honours
+	// it by withholding such a verdict from a session sitting idle; every
+	// other transition it asks for still applies, including the ones that
+	// recover a session from permission and from a stale stop. The "recover"
+	// path ignores it, along with everything else but Status — see
+	// StatusSignal.Kind.
+	//
+	// The flag exists because an agent can raise a hook for work that is not
+	// the turn this session is waiting on — a subagent's tool, finishing after
+	// the parent's turn ended — and a verdict is otherwise applied in full
+	// whenever it lands. See Manager.HandleHookEvent for the enforcement and
+	// what it costs, and docs/gotchas.md ("Hook") for the measurement.
+	//
+	// This is not the Manager's own "the process is alive" inference, which
+	// belongs to no adapter and is drawn from SessionStart (see
+	// HandleHookEvent). This one is an adapter classifying its own vocabulary,
+	// and the two rules are owned in different places on purpose.
+	//
+	// The zero value is "this verdict may open a turn", so an adapter that
+	// does not set it keeps the unconditional behaviour.
+	Liveness bool
+	Notify   NotifyKind
 }
 
 // NotifyKind is the abstract notification category an adapter attaches to
