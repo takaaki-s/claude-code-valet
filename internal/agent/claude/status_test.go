@@ -18,11 +18,22 @@ func TestInterpret_HookEventMap(t *testing.T) {
 		wantStatus      session.Status
 		wantNotify      agent.NotifyKind
 		wantErrMsg      string
+		// wantLiveness pins which events may open a turn. Manager refuses to
+		// let a liveness verdict take a session out of idle, so a row that
+		// gains or loses the flag changes what a late hook does to a finished
+		// session — see Manager.HandleHookEvent.
+		wantLiveness bool
+		// wantClearError pins the invariant this file's doc comment states:
+		// the hooks that mean the agent recovered or took a new turn clear the
+		// previous StopFailure message, and the ones that only report presence
+		// leave it. Splitting the thinking arm in two duplicated that decision,
+		// so the column exists to keep the halves from drifting apart.
+		wantClearError bool
 	}{
-		{name: "UserPromptSubmit → thinking", event: "UserPromptSubmit", wantOK: true, wantStatus: session.StatusThinking, wantNotify: agent.NotifyNone},
-		{name: "PreToolUse → thinking", event: "PreToolUse", wantOK: true, wantStatus: session.StatusThinking, wantNotify: agent.NotifyNone},
-		{name: "PostToolUse → thinking", event: "PostToolUse", wantOK: true, wantStatus: session.StatusThinking, wantNotify: agent.NotifyNone},
-		{name: "Stop → idle + task-complete", event: "Stop", wantOK: true, wantStatus: session.StatusIdle, wantNotify: agent.NotifyTaskComplete},
+		{name: "UserPromptSubmit → thinking", event: "UserPromptSubmit", wantOK: true, wantStatus: session.StatusThinking, wantNotify: agent.NotifyNone, wantClearError: true},
+		{name: "PreToolUse → thinking, liveness", event: "PreToolUse", wantOK: true, wantStatus: session.StatusThinking, wantNotify: agent.NotifyNone, wantLiveness: true, wantClearError: true},
+		{name: "PostToolUse → thinking, liveness", event: "PostToolUse", wantOK: true, wantStatus: session.StatusThinking, wantNotify: agent.NotifyNone, wantLiveness: true, wantClearError: true},
+		{name: "Stop → idle + task-complete", event: "Stop", wantOK: true, wantStatus: session.StatusIdle, wantNotify: agent.NotifyTaskComplete, wantClearError: true},
 		{name: "StopFailure carries reason", event: "StopFailure", stopReason: "rate_limit", wantOK: true, wantStatus: session.StatusIdle, wantNotify: agent.NotifyError, wantErrMsg: "rate_limit"},
 		{name: "SessionEnd → stopped", event: "SessionEnd", wantOK: true, wantStatus: session.StatusStopped, wantNotify: agent.NotifyNone},
 		{name: "Notification permission_prompt → permission", event: "Notification", notificationTyp: "permission_prompt", wantOK: true, wantStatus: session.StatusPermission, wantNotify: agent.NotifyPermission},
@@ -58,6 +69,13 @@ func TestInterpret_HookEventMap(t *testing.T) {
 			}
 			if upd.ErrorMessage != tc.wantErrMsg {
 				t.Errorf("ErrorMessage = %q, want %q", upd.ErrorMessage, tc.wantErrMsg)
+			}
+			if upd.Liveness != tc.wantLiveness {
+				t.Errorf("Liveness = %v, want %v — the flag decides whether this event "+
+					"may take a session out of idle", upd.Liveness, tc.wantLiveness)
+			}
+			if upd.ClearError != tc.wantClearError {
+				t.Errorf("ClearError = %v, want %v", upd.ClearError, tc.wantClearError)
 			}
 		})
 	}
@@ -117,6 +135,15 @@ func TestInterpret_RecoverTurnStateMap(t *testing.T) {
 			}
 			if upd.ErrorMessage != "" || upd.ClearError {
 				t.Errorf("recover must not touch error fields: ErrorMessage=%q ClearError=%v", upd.ErrorMessage, upd.ClearError)
+			}
+			// The recover branch re-derives where a session already stands
+			// rather than reporting that something just happened, and Manager
+			// applies it verbatim on a path that never consults Liveness. A
+			// verdict that set the flag would be asking the hook path's
+			// question in a place that does not ask it — and would quietly
+			// change what happens if that ever stops being true.
+			if upd.Liveness {
+				t.Error("recover verdicts must leave Liveness unset")
 			}
 		})
 	}
