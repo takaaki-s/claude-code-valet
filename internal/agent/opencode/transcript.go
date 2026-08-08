@@ -302,6 +302,14 @@ func runnableDir(workDir string) string {
 // and an event handler on a path whose only job is to print a session — and
 // would do it once per read. Dropping the flag breaks nothing a parser test
 // would notice.
+//
+// sessionID arrives as a bare positional argument, so what keeps it from being
+// read as a flag is the caller: ReadEntries checks isSessionID first, and that
+// predicate anchors on the "ses_" prefix. A leading "-" would otherwise make
+// the id an option to `opencode export` — argument injection needs no shell.
+// Manager refuses to record such an id (safeAgentSessionID), so this is the
+// second of two lines rather than the only one; loosening isSessionID at its
+// front is what would matter here.
 func exportArgs(sessionID string) []string {
 	return []string{"export", "--pure", sessionID}
 }

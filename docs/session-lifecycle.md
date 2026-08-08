@@ -100,7 +100,9 @@ Legacy `Name` field is migrated on daemon startup: `store.Load()` reads the raw 
    `EnsureHooksSettingsFile()` (once per daemon) plus `EnsureTrustState()`,
    which sets `projects[<workDir>].hasTrustDialogAccepted` in `~/.claude.json`
    (not a settings file — see docs/gotchas.md)
-5. Creates an inner tmux session and runs `claude --session-id {ID}`
+5. Creates an inner tmux session and runs `claude --session-id "$JIN_CLAUDE_SESSION"`.
+   The id travels in the environment rather than in the command text — see the
+   shell-safety contract on `session.SpawnPlan`
 6. `TagManagedPane()` tags the pane for remain-on-exit
 7. Starts `captureOutputTmux()` goroutine for polling
 
@@ -206,7 +208,11 @@ Inside `captureOutputTmux()`, detects pane death within 10 seconds of startup:
 
 `HandleHookEvent()` is agent-agnostic wiring: it looks the session up, updates
 CWD / AgentSessionStarted invariants, and then hands the raw event to
-`Agent.StatusSource.Interpret()`. Every adapter owns its own event vocabulary
+`Agent.StatusSource.Interpret()`. The one value it takes from the payload
+rather than deriving — the adapter-side session id — passes a safety gate and
+the adapter's `RecognizesSessionID` before it is recorded; a refusal drops that
+write alone and leaves the rest of the event intact (see docs/gotchas.md under
+Hook). Every adapter owns its own event vocabulary
 and Status mapping — the Claude Code mapping lives in
 `internal/agent/claude/status.go`; other adapters plug their own
 `StatusSource` into the same slot without touching `session/manager.go`.

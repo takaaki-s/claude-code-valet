@@ -31,6 +31,11 @@ func (e2eAgent) StatusSource() StatusSource          { return fakeStatusSource{}
 func (e2eAgent) ClearInputKeys() []string            { return nil }
 func (e2eAgent) PastePlaceholder(string) string      { return "" }
 
+// RecognizesSessionID accepts everything: these tests drive kill / recovery and
+// never re-key a session id, so a gate here would only add a way for them to
+// fail for an unrelated reason.
+func (e2eAgent) RecognizesSessionID(string) bool { return true }
+
 // DismissOverlayKeys returns nil: these tests drive a pane running `sleep`,
 // which has no input area and so no overlay to close.
 func (e2eAgent) DismissOverlayKeys(string) []string { return nil }

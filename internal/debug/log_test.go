@@ -86,3 +86,52 @@ func TestNewLogger_NoopWhenDisabled(t *testing.T) {
 	// Should not panic
 	log("this should be a no-op")
 }
+
+// TestUntrusted covers both halves of the one verb: the bound and the quoting.
+// They are one function because they only work together — a bound alone leaves
+// newlines intact, and a value carrying them forges whole entries in a log read
+// as jind-ai's own.
+func TestUntrusted(t *testing.T) {
+	short := "ses_084426f78ffeXBrPh5ABEu2dNX"
+	if got, want := Untrusted(short, 128), `"`+short+`"`; got != want {
+		t.Errorf("Untrusted(%q, 128) = %s, want %s", short, got, want)
+	}
+	if got, want := Untrusted(short, len(short)), `"`+short+`"`; got != want {
+		t.Errorf("Untrusted at exactly len = %s, want %s", got, want)
+	}
+	// The quote is what a bound cannot do: without it a single value ends the
+	// line and starts one that reads as jind-ai's own.
+	if got := Untrusted("a\n[HOOK] forged", 128); strings.Contains(got, "\n") {
+		t.Errorf("Untrusted left a raw newline in %s", got)
+	}
+	// Quoting adds two characters, so the bound applies to the value, not the
+	// rendering: 512 in, 128 of value plus the quotes out.
+	long := strings.Repeat("a", 512)
+	if got := Untrusted(long, 128); len(got) != 130 {
+		t.Errorf("Untrusted(512 chars, 128) rendered %d chars, want 130 (128 + two quotes)", len(got))
+	}
+	if got, want := Untrusted("", 128), `""`; got != want {
+		t.Errorf("Untrusted(\"\", 128) = %s, want %s", got, want)
+	}
+	// A negative bound means "no bound" rather than a panic: a logger has no
+	// business crashing the process it was recording for.
+	if got, want := Untrusted(long, -1), `"`+long+`"`; got != want {
+		t.Errorf("Untrusted with a negative bound truncated to %d chars", len(got))
+	}
+}
+
+// TestUntrustedBytes exists because the string conversion is the expensive
+// half: converting first copies the whole payload onto the heap before the
+// bound throws it away, on precisely the input the bound exists to survive.
+func TestUntrustedBytes(t *testing.T) {
+	if got, want := UntrustedBytes([]byte("abc"), 128), `"abc"`; got != want {
+		t.Errorf("UntrustedBytes = %s, want %s", got, want)
+	}
+	big := []byte(strings.Repeat("b", 1<<20))
+	if got := UntrustedBytes(big, 64); len(got) != 66 {
+		t.Errorf("UntrustedBytes(1MiB, 64) rendered %d chars, want 66", len(got))
+	}
+	if got := UntrustedBytes(nil, 64); got != `""` {
+		t.Errorf("UntrustedBytes(nil, 64) = %s, want %s", got, `""`)
+	}
+}

@@ -35,6 +35,10 @@ type StubAgent struct {
 	// read a transcript", which is the answer `jin session result` turns
 	// into an error — tests covering the readable path must set it.
 	TranscriptSrc session.TranscriptSource
+	// RecognizesFn decides which ids the hook re-key gate accepts; see
+	// session.Agent.RecognizesSessionID. Nil (the default) accepts every
+	// id, which is what tests unconcerned with the gate want.
+	RecognizesFn func(id string) bool
 }
 
 func (s *StubAgent) Kind() string {
@@ -56,6 +60,20 @@ func (s *StubAgent) SpawnCommand(opts session.SpawnOptions) session.SpawnPlan {
 		return s.SpawnFn(opts)
 	}
 	return session.SpawnPlan{Command: s.Kind()}
+}
+
+// RecognizesSessionID accepts every id by default, so a test that does not
+// care about the hook re-key gate sees the pre-gate behaviour.
+//
+// Accept-all is the right default here and not in production: a stub exists to
+// hold one variable still while a test moves another, and a stub that refused
+// ids would make every unrelated test assert a refusal it never asked for.
+// Tests that mean to exercise the gate set RecognizesFn.
+func (s *StubAgent) RecognizesSessionID(id string) bool {
+	if s.RecognizesFn == nil {
+		return true
+	}
+	return s.RecognizesFn(id)
 }
 
 func (s *StubAgent) StatusSource() session.StatusSource { return statusSourceFn(s.InterpretFn) }

@@ -55,6 +55,15 @@ func New() *Agent {
 // Kind is the identifier jind-ai persists in Session.AgentKind.
 func (a *Agent) Kind() string { return "codex" }
 
+// RecognizesSessionID accepts anything written as a UUID. Codex has no
+// --session-id equivalent, so the real id only ever arrives through the
+// SessionStart hook payload and this predicate is what stands between that
+// payload and the record. Refusing a genuine id leaves the pre-minted UUID in
+// place, which `codex resume` rejects within seconds — the quick-fail retry
+// then starts a fresh session, so the cost is a visible restart rather than a
+// session that quietly turns out to be empty.
+func (a *Agent) RecognizesSessionID(id string) bool { return agent.LooksLikeUUID(id) }
+
 // Setup captures os.Executable() so SpawnCommand can wire the `-c` hook
 // payload back to `jin hook`. Unlike the Claude adapter, Setup writes no
 // files: Codex hooks are injected per-invocation on the command line, so

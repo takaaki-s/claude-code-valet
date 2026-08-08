@@ -1,39 +1,24 @@
 package codex
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
 )
 
-// SpawnCommand builds the `codex ...` command line the daemon splices into
-// its fixed shell wrapper. Manager handles cwd + JIN_SESSION_ID + env -u
-// TMUX; we only own the agent-specific pieces:
+// sessionArgEnv carries the id that `codex resume` names, so that id never
+// reaches a shell as text. The rule and the reasoning behind it are the
+// shell-safety contract on session.SpawnPlan; this is one adapter obeying it.
 //
-//   - `codex` on the first spawn — Codex has no `--session-id`
-//     equivalent, so we spawn fresh and let SessionStart's hook stdin
-//     write the actual UUID back into Session.AgentSessionID. The
-//     pre-mint UUID Manager set on Session.AgentSessionID is
-//     intentionally ignored here — see "Codex adapter" in
-//     docs/gotchas.md for why.
-//   - `codex resume <UUID>` once AgentSessionStarted is true and
-//     AgentSessionID has been re-keyed to the real Codex UUID. `codex
-//     resume` fails fast on an unknown UUID (~3s in Codex 0.144.1, well
-//     within the existing 10s quick-fail auto-recovery window), so a
-//     stale UUID does not require a defensive glob check up front.
-//   - Hook injection via `--enable hooks` + one `-c 'hooks.X=[...]'`
-//     per managedEvent. See hook_args.go.
-//   - The behaviour overrides in configArgs, injected per spawn rather
-//     than written into the user's Codex config.
-//
-// UnsetEnv clears three Codex sandbox markers so a jind-ai session
-// spawned from inside a Codex-created sandbox does not inherit "we're
-// already inside a sandbox" state. The three variables mirror the
-// [[cc-child-session-env]] discipline the Claude adapter follows;
-// authentication vars (CODEX_API_KEY / CODEX_ACCESS_TOKEN /
-// OPENAI_API_KEY) are intentionally left set so the spawned Codex can
-// authenticate.
+// Codex has the weakest claim of the three adapters to trust this value: with no
+// --session-id equivalent, every id it resumes arrived from a hook payload
+// rather than from jind-ai. Manager validates one before recording it, but a
+// record written by an older jind-ai — or edited by hand — reaches SpawnCommand
+// having passed no gate.
+// TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand (internal/agent/register)
+// enforces the rule for every registered adapter.
+const sessionArgEnv = "JIN_CODEX_SESSION"
+
 // configArgs returns the `-c` overrides jind-ai forces on every spawned
 // Codex. They are passed per spawn — the user's own Codex config is never
 // rewritten, so a Codex started outside jind-ai keeps its normal
@@ -74,10 +59,42 @@ func isResume(opts agent.SpawnOptions) bool {
 	return opts.AgentSessionID != "" && opts.AgentSessionStarted
 }
 
+// SpawnCommand builds the `codex ...` command line the daemon splices into
+// its fixed shell wrapper. Manager handles cwd + JIN_SESSION_ID + env -u
+// TMUX; we only own the agent-specific pieces:
+//
+//   - `codex` on the first spawn — Codex has no `--session-id`
+//     equivalent, so we spawn fresh and let SessionStart's hook stdin
+//     write the actual UUID back into Session.AgentSessionID. The
+//     pre-mint UUID Manager set on Session.AgentSessionID is
+//     intentionally ignored here — see "Codex adapter" in
+//     docs/gotchas.md for why.
+//   - `codex resume "$JIN_CODEX_SESSION"` once AgentSessionStarted is true
+//     and AgentSessionID has been re-keyed to the real Codex UUID. `codex
+//     resume` fails fast on an unknown UUID (~3s in Codex 0.144.1, well
+//     within the existing 10s quick-fail auto-recovery window), so a
+//     stale UUID does not require a defensive glob check up front. The
+//     UUID itself travels in ExtraEnv — see sessionArgEnv.
+//   - Hook injection via `--enable hooks` + one `-c 'hooks.X=[...]'`
+//     per managedEvent. See hook_args.go.
+//   - The behaviour overrides in configArgs, injected per spawn rather
+//     than written into the user's Codex config.
+//
+// UnsetEnv clears three Codex sandbox markers so a jind-ai session
+// spawned from inside a Codex-created sandbox does not inherit "we're
+// already inside a sandbox" state. The three variables mirror the
+// [[cc-child-session-env]] discipline the Claude adapter follows;
+// authentication vars (CODEX_API_KEY / CODEX_ACCESS_TOKEN /
+// OPENAI_API_KEY) are intentionally left set so the spawned Codex can
+// authenticate.
 func SpawnCommand(opts agent.SpawnOptions, execPath string) agent.SpawnPlan {
 	base := "codex"
+	var extraEnv map[string]string
 	if isResume(opts) {
-		base = fmt.Sprintf("codex resume %s", opts.AgentSessionID)
+		// The id goes through the environment, never into this string, and
+		// unescaped — see sessionArgEnv.
+		base = `codex resume "$` + sessionArgEnv + `"`
+		extraEnv = map[string]string{sessionArgEnv: opts.AgentSessionID}
 	}
 	args := configArgs()
 	args = append(args, HookArgs(execPath)...)
@@ -86,7 +103,8 @@ func SpawnCommand(opts agent.SpawnOptions, execPath string) agent.SpawnPlan {
 		cmd = base + " " + strings.Join(args, " ")
 	}
 	return agent.SpawnPlan{
-		Command: cmd,
+		Command:  cmd,
+		ExtraEnv: extraEnv,
 		UnsetEnv: []string{
 			"CODEX_SANDBOX",
 			"CODEX_SANDBOX_NETWORK_DISABLED",
