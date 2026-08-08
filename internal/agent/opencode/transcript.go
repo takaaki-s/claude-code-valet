@@ -271,9 +271,8 @@ func runExport(workDir, sessionID string) ([]byte, error) {
 // to reach the whole group. The standard library would signal only the leader
 // and leave the rest running past the timeout that exists to stop them.
 func newExportCmd(ctx context.Context, bin, workDir, sessionID string, stdout, stderr io.Writer) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, bin, exportArgs(sessionID)...)
+	cmd := procgroup.CommandContext(ctx, bin, exportArgs(sessionID)...)
 	cmd.Dir = runnableDir(workDir)
-	procgroup.KillOnCancel(cmd)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd

@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
@@ -17,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/takaaki-s/jind-ai/internal/exitcode"
+	"github.com/takaaki-s/jind-ai/internal/procgroup"
 	"github.com/takaaki-s/jind-ai/pkg/plugin/manifest"
 )
 
@@ -131,7 +131,7 @@ func collectValidateFindings(out io.Writer, manifestPath, pluginDir, registryURL
 	findings = append(findings, manifest.Check(m, opts)...)
 
 	if runBuild {
-		findings = append(findings, runBuildChecks(out, m, pluginDir)...)
+		findings = append(findings, runBuildChecks(out, m, pluginDir, buildTimeout(m))...)
 	}
 	return findings
 }
@@ -183,22 +183,44 @@ func loadRegistryLookup(url string) (manifest.RegistryLookup, error) {
 	return registryLookupAdapter{doc: doc}, nil
 }
 
+// Build gets a floor under the manifest's run timeout: a plugin that answers
+// an action in milliseconds can still take minutes to compile, so a short run
+// timeout must not be read as a short build budget.
+const (
+	buildTimeoutFloor   = time.Minute
+	buildTimeoutDefault = 5 * time.Minute
+)
+
+// buildTimeout is the budget one build command gets.
+//
+// Note the shape: a run timeout under the floor is replaced outright rather
+// than raised to it, so 59s yields 5min while 61s yields 61s. That is the
+// behaviour this inherited, kept deliberately — a manifest asking for more
+// than a minute is stating a considered figure, and one asking for less is
+// describing how long its action takes to answer, which says nothing about
+// its compile.
+func buildTimeout(m *manifest.Manifest) time.Duration {
+	if d := m.EffectiveTimeout(); d >= buildTimeoutFloor {
+		return d
+	}
+	return buildTimeoutDefault
+}
+
 // runBuildChecks executes install.source.build in the plugin directory and
 // asserts the declared entrypoint materialises. Any build command failure is
 // a hard rule #13 ERROR — the remaining commands are skipped because a broken
 // pipeline cannot produce a meaningful entrypoint check.
-func runBuildChecks(out io.Writer, m *manifest.Manifest, pluginDir string) []manifest.Finding {
+//
+// timeout is per command, and is a parameter rather than derived here so a
+// test can pick one it can wait out.
+func runBuildChecks(out io.Writer, m *manifest.Manifest, pluginDir string, timeout time.Duration) []manifest.Finding {
 	if m.Install.Source == nil {
 		return nil
-	}
-	timeout := m.EffectiveTimeout()
-	if timeout < time.Minute {
-		timeout = 5 * time.Minute
 	}
 	for _, cmdStr := range m.BuildCommands() {
 		fmt.Fprintf(out, "[build] %s\n", cmdStr)
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		c := exec.CommandContext(ctx, "bash", "-c", cmdStr)
+		c := procgroup.CommandContext(ctx, "bash", "-c", cmdStr)
 		c.Dir = pluginDir
 		c.Stdout = out
 		c.Stderr = out

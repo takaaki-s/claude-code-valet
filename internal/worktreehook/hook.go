@@ -122,13 +122,12 @@ func (r *runner) Run(ctx context.Context, opts RunOptions) error {
 		out = io.MultiWriter(logFile, os.Stderr)
 	}
 
-	cmd := exec.CommandContext(ctx, "bash", opts.ScriptPath)
+	cmd := procgroup.CommandContext(ctx, "bash", opts.ScriptPath)
 	cmd.Dir = opts.WorktreePath
 	cmd.Env = buildEnv(opts)
 	cmd.Stdin = devNull
 	cmd.Stdout = out
 	cmd.Stderr = out
-	procgroup.KillOnCancel(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start hook: %w", err)
