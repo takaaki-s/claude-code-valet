@@ -113,6 +113,32 @@ log.
   build step that fails to *start* now names the build log, as every other
   build failure already did.
 
+### Bug Fixes
+
+- **A session's agent is now told which daemon to call back to.** Its hooks
+  used to find one by inheritance: a tmux pane is handed the tmux *server's*
+  environment, and that server outlives any one daemon, so an agent reached
+  whichever daemon happened to start the server. When the daemon had started
+  it the value was right — by accident. When something else had, the hooks
+  reached no daemon at all, and when an earlier daemon on a different socket
+  had, they reached that one's address. All three were measured. The failure
+  is silent by construction: `jin hook` exits 0 whether or not anyone answered,
+  so the only symptom is a live session whose status never moves. Only
+  installs that run the daemon on a non-default socket (`JIN_SOCKET`, `jin
+  daemon --socket`) were affected.
+
+- **Plugins now receive `JIN_DEBUG`.** A plugin calls back into jind-ai
+  through `$JIN_BIN`, and that process decides for itself whether to record
+  what it does — so `JIN_DEBUG=1 jin daemon start` used to turn on only
+  jind-ai's own half of the exchange, leaving the callbacks silent. The
+  variable is omitted, not set to `0`, when debugging is off.
+
+  Both were the same gap: which jin a child should call back into is now
+  answered in one place (`internal/jinenv`) rather than at each spawn site,
+  which is also why an agent now gets `JIN_BIN` — the daemon's stable binary
+  copy, so an agent that shells out to `jin` reaches the version that started
+  it rather than whatever is first on `PATH`.
+
 ## 0.9.0
 
 ### Features

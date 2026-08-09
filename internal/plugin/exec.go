@@ -15,8 +15,15 @@ import (
 	"time"
 
 	"github.com/takaaki-s/jind-ai/internal/debug"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
+
+// debugEnabled reports whether to tell a plugin to record what it does. A
+// variable so tests can drive the branch: the real flag is read once at process
+// start, long before a test could set it. Its counterpart in internal/session
+// carries the same seam for the same reason.
+var debugEnabled = debug.Enabled
 
 // inheritedEnvKeys is the minimal set of parent-process env vars forwarded to a
 // plugin run. It covers what interpreters / toolchains need to bootstrap without
@@ -193,7 +200,6 @@ func buildEnv(opts ExecOptions) []string {
 		"JIN_NOTIFY_KIND="+opts.Env.NotifyKind,
 		"JIN_ACTION_ID="+opts.ActionID,
 		"JIN_PLUGIN_DEPTH="+strconv.Itoa(opts.Depth),
-		"JIN_SOCKET="+opts.SocketPath,
 	)
 	// Caller tmux context exists only for action runs launched from inside a
 	// tmux client; unlike the JIN_* event vars above these are omitted (not set
@@ -204,12 +210,19 @@ func buildEnv(opts ExecOptions) []string {
 	if opts.Caller.TmuxPane != "" {
 		env = append(env, "JIN_CALLER_TMUX_PANE="+opts.Caller.TmuxPane)
 	}
-	// JIN_BIN points at the daemon's own binary so plugins can call back into
-	// the exact version that dispatched them. A `jin` found on PATH may be an
-	// older install that lacks newer subcommands (daemon/CLI version skew).
-	if exe, err := os.Executable(); err == nil {
-		env = append(env, "JIN_BIN="+exe)
-	}
+	// Which jin dispatched this run: the daemon to reach, the binary to
+	// re-enter, and whether to record. BinPath is the daemon's own executable
+	// so a plugin calls back into the exact version that dispatched it — a
+	// `jin` found on PATH may be an older install that lacks newer subcommands
+	// (daemon/CLI version skew). os.Executable's error is folded into an empty
+	// path, which Identity omits, leaving that PATH fallback as the only
+	// option; it is what plugins had before JIN_BIN existed.
+	exe, _ := os.Executable()
+	env = append(env, jinenv.Identity{
+		SocketPath: opts.SocketPath,
+		BinPath:    exe,
+		Debug:      debugEnabled(),
+	}.Environ()...)
 	if opts.PopupWidth != "" {
 		env = append(env, "JIN_PLUGIN_POPUP_WIDTH="+opts.PopupWidth)
 	}

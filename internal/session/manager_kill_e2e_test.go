@@ -72,7 +72,7 @@ func killFixture(t *testing.T) (*Manager, *tmux.Client, string, string) {
 	if err != nil {
 		t.Fatalf("config.NewManager: %v", err)
 	}
-	mgr, err := NewManager(stateDir, configDir, configMgr)
+	mgr, err := NewManager(stateDir, configDir, testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestE2E_KilledSessionSurvivesDaemonRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.NewManager: %v", err)
 	}
-	restarted, err := NewManager(stateDir, configDir, configMgr)
+	restarted, err := NewManager(stateDir, configDir, testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager after restart: %v", err)
 	}

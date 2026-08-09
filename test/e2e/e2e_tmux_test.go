@@ -365,7 +365,7 @@ func TestE2E_SessionRecovery(t *testing.T) {
 		t.Fatalf("NewConfigManager: %v", err)
 	}
 
-	mgr, err := session.NewManager(dataDir, configDir, configMgr)
+	mgr, err := session.NewManager(dataDir, configDir, testutil.SocketPath(t, "recover.sock"), configMgr)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}

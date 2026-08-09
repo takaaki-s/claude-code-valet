@@ -20,6 +20,12 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
+// testSocketPath is the daemon socket newTestManager tells a Manager to hand
+// its agents. Deliberately not a temp dir: a test asserting on what reaches an
+// agent's environment must be able to tell this value from sessionsDir,
+// stateDir, and the config dir, and nothing here ever dials it.
+const testSocketPath = "/nonexistent/test-daemon.sock"
+
 // newTestManager creates a Manager backed by temporary directories, a mock
 // tmux runner, and a mock hook runner. Both mocks are pre-wired via their
 // setters; tests that don't care about the hook runner discard it with `_`.
@@ -33,8 +39,9 @@ func newTestManager(t *testing.T) (*Manager, *mockTmuxRunner, *mockHookRunner) {
 	}
 	// A state dir of its own, not configDir reused. Anything asserting against
 	// mgr.stateDir — worktree placement, hook logs, bin/jin — cannot tell a
-	// state-dir bug from a config-dir one while the two are the same path.
-	mgr, err := NewManager(dir, t.TempDir(), configMgr)
+	// state-dir bug from a config-dir one while the two are the same path. The
+	// socket is a literal for the same reason, one no test ever connects to.
+	mgr, err := NewManager(dir, t.TempDir(), testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
@@ -286,7 +293,7 @@ func TestManager_RepoNameReachesInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.NewManager failed: %v", err)
 	}
-	mgr, err := NewManager(stateDir, configDir, configMgr)
+	mgr, err := NewManager(stateDir, configDir, testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
@@ -319,7 +326,7 @@ func TestManager_RepoNameReachesInfo(t *testing.T) {
 	// Restart: RepoName is json:"-", so only the load-time recovery can put it
 	// back. Stopped sessions never reach captureOutputTmux, which is why the
 	// poll cannot be relied on here.
-	restarted, err := NewManager(stateDir, configDir, configMgr)
+	restarted, err := NewManager(stateDir, configDir, testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager (restart) failed: %v", err)
 	}
@@ -1841,7 +1848,7 @@ func TestManager_RecoverTmuxSessions_AfterReload(t *testing.T) {
 		t.Fatalf("config.NewManager failed: %v", err)
 	}
 
-	mgr1, err := NewManager(dir, configDir, configMgr)
+	mgr1, err := NewManager(dir, configDir, testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
@@ -1857,7 +1864,7 @@ func TestManager_RecoverTmuxSessions_AfterReload(t *testing.T) {
 		t.Fatalf("save failed: %v", err)
 	}
 
-	mgr2, err := NewManager(dir, configDir, configMgr)
+	mgr2, err := NewManager(dir, configDir, testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager (reload) failed: %v", err)
 	}
@@ -2376,7 +2383,7 @@ func TestManager_EnsureTmuxClient_NotSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.NewManager failed: %v", err)
 	}
-	mgr, err := NewManager(dir, configDir, configMgr)
+	mgr, err := NewManager(dir, configDir, testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
@@ -2599,7 +2606,7 @@ func TestNewManager_LoadAll_MigratesEmptyFleet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.NewManager failed: %v", err)
 	}
-	mgr, err := NewManager(dataDir, configDir, configMgr)
+	mgr, err := NewManager(dataDir, configDir, testSocketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
@@ -2641,7 +2648,7 @@ func TestNewManager_LoadAll_WritesBackMigratedJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.NewManager failed: %v", err)
 	}
-	if _, err := NewManager(dataDir, configDir, configMgr); err != nil {
+	if _, err := NewManager(dataDir, configDir, testSocketPath, configMgr); err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
 

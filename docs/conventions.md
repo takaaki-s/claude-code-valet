@@ -80,8 +80,11 @@ var debugLog = debug.NewLogger("daemon-debug.log")   // one per log file
   debugging is off, when the caller is a test binary, or when the state dir
   cannot be resolved, so callers need no guard of their own.
 - `debug.Enabled()` is the answer to "is debugging on" for code that has to do
-  something other than write a line — routing a child's output, or passing the
-  flag to a process jind-ai starts. Do not re-read the environment variable.
+  something other than write a line — routing a child's output, for instance.
+  Do not re-read the environment variable. Code that is *starting* a process
+  does not ask it directly: `internal/jinenv` carries the flag alongside the
+  socket and the binary path, because a child needs all three to call back into
+  the jin that started it and each spawn site used to answer only part of that.
 - `debug.Untrusted` / `debug.UntrustedBytes` bound and quote any value the
   local process did not choose, so one payload cannot forge entries or fill the
   file.

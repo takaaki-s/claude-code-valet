@@ -671,6 +671,7 @@ actions:
 | `JIN_PLUGIN_DEPTH` | チェーンの深さ — [制約](#制約) を参照 |
 | `JIN_SOCKET` | デーモンソケットのパス。プラグインが呼び出す `jin` CLI はこれを自動的に読み取ります |
 | `JIN_BIN` | デーモン自身の `jin` バイナリの絶対パス。PATH 上の `jin` は新しいサブコマンドを持たない古いインストールである可能性があるため、素の `jin` より `"${JIN_BIN:-jin}"` を優先してください |
+| `JIN_DEBUG` | デーモンがデバッグログ有効で動作している場合に `1`。プラグインが呼び戻す `jin` も自身の動作を記録します。無効時は `0` ではなく未設定 |
 | `JIN_CALLER_TMUX_SOCKET` | action 実行時のみ: 呼び出し元 CLI がいた tmux サーバのソケットパス（呼び出し元の `$TMUX` 由来）。呼び出し元が tmux 外の場合は未設定（空文字ではない） |
 | `JIN_CALLER_TMUX_PANE` | action 実行時のみ: 呼び出し元 CLI のペイン ID（`$TMUX_PANE` 由来）。不明な場合は未設定 |
 
@@ -759,6 +760,10 @@ export JIN_DEBUG=1
 tail -f ~/.local/state/jind-ai/plugin-debug.log        # ディスパッチャーの判断ログ
 tail -f ~/.local/state/jind-ai/plugin-logs/<name>.log  # プラグイン自身の stdout/stderr
 ```
+
+フラグは `JIN_DEBUG=1` としてプラグインにも届くため、プラグインが呼び戻した
+`jin` も記録を残します — `jin hook` なら `hook-debug.log`、それ以外のデーモン側は
+`daemon-debug.log` です。
 
 ## デバッグ
 

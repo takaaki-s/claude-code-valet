@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/takaaki-s/jind-ai/internal/debug"
 )
 
 // sampleEvent is a fully-populated Event used across exec tests.
@@ -268,6 +270,48 @@ func TestBuildEnv_ExportsActionID(t *testing.T) {
 	}), "\n")
 	if !strings.Contains(withoutID, "JIN_ACTION_ID=\n") {
 		t.Errorf("JIN_ACTION_ID should be exported empty when unset; env:\n%s", withoutID)
+	}
+}
+
+// TestBuildEnv_PassesTheDebugFlagToThePlugin pins the half of the callback
+// identity a plugin used to be denied. A plugin reaches back into jind-ai
+// through $JIN_BIN, and that process decides for itself whether to record what
+// it does — so with the flag stopping at the daemon, running the daemon under
+// it turned on only jind-ai's own side of the exchange. Measured: 3/3 runs
+// where the daemon's log filled up and the callback's stayed empty, and the
+// same callback with the flag forced on wrote its line.
+func TestBuildEnv_PassesTheDebugFlagToThePlugin(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		on   bool
+	}{
+		{"on, so a plugin's own callback records too", true},
+		{"off, so nothing is injected", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := debugEnabled
+			debugEnabled = func() bool { return tt.on }
+			t.Cleanup(func() { debugEnabled = orig })
+
+			env := strings.Join(buildEnv(ExecOptions{
+				Env:        sampleEvent(),
+				SocketPath: "/run/jin.sock",
+			}), "\n")
+
+			if got := strings.Contains(env, "JIN_DEBUG=1"); got != tt.on {
+				t.Errorf("JIN_DEBUG=1 present = %v, want %v; env:\n%s", got, tt.on, env)
+			}
+		})
+	}
+}
+
+// TestDebugEnabled_IsWiredToTheRealFlag guards the link the test above cannot:
+// it replaces debugEnabled, so a constant false would satisfy both its cases.
+// Its counterpart in internal/session carries the note on why the reach of this
+// shape of test is limited to a process that has the flag on.
+func TestDebugEnabled_IsWiredToTheRealFlag(t *testing.T) {
+	if got, want := debugEnabled(), debug.Enabled(); got != want {
+		t.Errorf("debugEnabled() = %v, but debug.Enabled() = %v — the seam has been disconnected from the flag it stands for", got, want)
 	}
 }
 
