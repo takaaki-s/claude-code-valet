@@ -4,15 +4,26 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/takaaki-s/jind-ai/internal/debug"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 )
+
+// testIdentity is the jin a test's dispatch claims to come from. Every field is
+// distinctive and none is derivable from this process, so a buildEnv that
+// answers "which jin am I" for itself — with os.Executable(), with the live
+// debug flag — renders something this file never named.
+func testIdentity() jinenv.Identity {
+	return jinenv.Identity{
+		SocketPath: "/run/jin.sock",
+		BinPath:    "/run/jin-test-only/bin/jin",
+		Debug:      true,
+	}
+}
 
 // sampleEvent is a fully-populated Event used across exec tests.
 func sampleEvent() Event {
@@ -41,14 +52,14 @@ func TestExecPlugin_Success(t *testing.T) {
 	t.Setenv("JIN_SHOULD_NOT_LEAK", "secret")
 
 	err := ExecPlugin(context.Background(), ExecOptions{
-		PluginDir:  pluginDir,
-		Run:        run,
-		ActionID:   "notify",
-		Env:        sampleEvent(),
-		Depth:      0,
-		SocketPath: "/run/jin.sock",
-		LogPath:    logPath,
-		Timeout:    5 * time.Second,
+		PluginDir: pluginDir,
+		Run:       run,
+		ActionID:  "notify",
+		Env:       sampleEvent(),
+		Depth:     0,
+		Identity:  testIdentity(),
+		LogPath:   logPath,
+		Timeout:   5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("ExecPlugin: %v", err)
@@ -71,7 +82,7 @@ func TestExecPlugin_Success(t *testing.T) {
 		"JIN_NOTIFY_KIND=task-complete",
 		"JIN_ACTION_ID=notify",
 		"JIN_PLUGIN_DEPTH=0",
-		"JIN_SOCKET=/run/jin.sock",
+		"JIN_SOCKET=" + testIdentity().SocketPath,
 	}
 	for _, want := range wantEnv {
 		if !strings.Contains(env, want) {
@@ -83,10 +94,11 @@ func TestExecPlugin_Success(t *testing.T) {
 	if strings.Contains(env, "JIN_PLUGIN_API_VERSION") {
 		t.Errorf("JIN_PLUGIN_API_VERSION should not be exported anymore; env:\n%s", env)
 	}
-	// JIN_BIN carries os.Executable() of the dispatching process — here the
-	// test binary — so assert presence and non-emptiness, not an exact path.
-	if !regexp.MustCompile(`(?m)^JIN_BIN=.+$`).MatchString(env) {
-		t.Errorf("env missing non-empty JIN_BIN; env:\n%s", env)
+	// JIN_BIN is whatever the caller named, not a path this process resolves
+	// for itself. Asserting the exact value is the point: os.Executable() here
+	// would be the test binary, which is also a non-empty path.
+	if want := "JIN_BIN=" + testIdentity().BinPath; !strings.Contains(env, want) {
+		t.Errorf("env missing %q; env:\n%s", want, env)
 	}
 	if strings.Contains(env, "JIN_SHOULD_NOT_LEAK") {
 		t.Errorf("curated env leaked JIN_SHOULD_NOT_LEAK; env:\n%s", env)
@@ -256,17 +268,17 @@ func TestLogPath(t *testing.T) {
 // are omitted entirely when absent).
 func TestBuildEnv_ExportsActionID(t *testing.T) {
 	withID := strings.Join(buildEnv(ExecOptions{
-		Env:        sampleEvent(),
-		ActionID:   "send-dm",
-		SocketPath: "/run/jin.sock",
+		Env:      sampleEvent(),
+		ActionID: "send-dm",
+		Identity: testIdentity(),
 	}), "\n")
 	if !strings.Contains(withID, "JIN_ACTION_ID=send-dm") {
 		t.Errorf("missing JIN_ACTION_ID=send-dm; env:\n%s", withID)
 	}
 
 	withoutID := strings.Join(buildEnv(ExecOptions{
-		Env:        sampleEvent(),
-		SocketPath: "/run/jin.sock",
+		Env:      sampleEvent(),
+		Identity: testIdentity(),
 	}), "\n")
 	if !strings.Contains(withoutID, "JIN_ACTION_ID=\n") {
 		t.Errorf("JIN_ACTION_ID should be exported empty when unset; env:\n%s", withoutID)
@@ -280,6 +292,9 @@ func TestBuildEnv_ExportsActionID(t *testing.T) {
 // it turned on only jind-ai's own side of the exchange. Measured: 3/3 runs
 // where the daemon's log filled up and the callback's stayed empty, and the
 // same callback with the flag forced on wrote its line.
+//
+// The flag arrives in the identity now, so the case is driven by the argument
+// rather than by a package-level seam standing in for the real flag.
 func TestBuildEnv_PassesTheDebugFlagToThePlugin(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -289,13 +304,12 @@ func TestBuildEnv_PassesTheDebugFlagToThePlugin(t *testing.T) {
 		{"off, so nothing is injected", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			orig := debugEnabled
-			debugEnabled = func() bool { return tt.on }
-			t.Cleanup(func() { debugEnabled = orig })
+			id := testIdentity()
+			id.Debug = tt.on
 
 			env := strings.Join(buildEnv(ExecOptions{
-				Env:        sampleEvent(),
-				SocketPath: "/run/jin.sock",
+				Env:      sampleEvent(),
+				Identity: id,
 			}), "\n")
 
 			if got := strings.Contains(env, "JIN_DEBUG=1"); got != tt.on {
@@ -305,20 +319,10 @@ func TestBuildEnv_PassesTheDebugFlagToThePlugin(t *testing.T) {
 	}
 }
 
-// TestDebugEnabled_IsWiredToTheRealFlag guards the link the test above cannot:
-// it replaces debugEnabled, so a constant false would satisfy both its cases.
-// Its counterpart in internal/session carries the note on why the reach of this
-// shape of test is limited to a process that has the flag on.
-func TestDebugEnabled_IsWiredToTheRealFlag(t *testing.T) {
-	if got, want := debugEnabled(), debug.Enabled(); got != want {
-		t.Errorf("debugEnabled() = %v, but debug.Enabled() = %v — the seam has been disconnected from the flag it stands for", got, want)
-	}
-}
-
 func TestBuildEnv_ExportsPopupSize_WhenSet(t *testing.T) {
 	env := buildEnv(ExecOptions{
 		Env:         sampleEvent(),
-		SocketPath:  "/run/jin.sock",
+		Identity:    testIdentity(),
 		PopupWidth:  "40%",
 		PopupHeight: "20%",
 	})
@@ -333,8 +337,8 @@ func TestBuildEnv_ExportsPopupSize_WhenSet(t *testing.T) {
 
 func TestBuildEnv_OmitsPopupSize_WhenEmpty(t *testing.T) {
 	env := buildEnv(ExecOptions{
-		Env:        sampleEvent(),
-		SocketPath: "/run/jin.sock",
+		Env:      sampleEvent(),
+		Identity: testIdentity(),
 	})
 	joined := strings.Join(env, "\n")
 	if strings.Contains(joined, "JIN_PLUGIN_POPUP_WIDTH") {
@@ -348,7 +352,7 @@ func TestBuildEnv_OmitsPopupSize_WhenEmpty(t *testing.T) {
 func TestBuildEnv_OmitsWidthOnlyWhenHeightUnset(t *testing.T) {
 	env := buildEnv(ExecOptions{
 		Env:        sampleEvent(),
-		SocketPath: "/run/jin.sock",
+		Identity:   testIdentity(),
 		PopupWidth: "40%",
 	})
 	joined := strings.Join(env, "\n")

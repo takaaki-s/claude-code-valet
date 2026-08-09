@@ -8,21 +8,32 @@ import (
 )
 
 // EstablishHookBinary copies the running daemon's executable to a stable,
-// jin-owned path and upgrades m.hookExecPath (defaulted to the live
-// os.Executable() in NewManager) to point at that copy. It is best-effort: on
-// any failure the field keeps its default, which is no worse than the pre-copy
-// behaviour.
+// jin-owned path under stateDir and returns that path — the BinPath every child
+// this daemon spawns is given. It is best-effort: on a failed copy it returns
+// the live os.Executable() instead, which is no worse than the pre-copy
+// behaviour, and "" if even that cannot be resolved.
 //
-// Why a copy exists at all. The path handed to each agent's hook wiring —
-// Claude Code's --settings file, Codex's `-c hooks.X=[...]` injection — is read
-// once when the agent starts and never revisited. Baking os.Executable()
-// directly means that path points at wherever the daemon happened to launch
-// from. A developer who runs jin out of a git worktree, then deletes that
-// worktree, leaves every already-running session's hook pointing at a path that
-// now 404s: the hook fails with "not found", no status update reaches the
-// daemon, and the session looks frozen in the TUI. Copying to a path under
-// stateDir (the parent of worktrees/, never itself a worktree) removes that
-// coupling.
+// Why a copy exists at all. The path handed to a child that calls back into
+// jind-ai — an agent's hook wiring, a plugin's $JIN_BIN — is read once when that
+// child starts and never revisited. Baking os.Executable() directly means the
+// path points at wherever the daemon happened to launch from, and neither of the
+// two ways that path stops describing the running daemon is exotic:
+//
+//   - Rebuilding. `go build -o` over a running binary unlinks it and creates a
+//     new file at the same path, so it succeeds against a live daemon and
+//     afterwards /proc/<pid>/exe reads "… (deleted)" while the path holds the
+//     new build. One rebuild during development is the whole setup; measured
+//     3/3. Where the IPC shape had changed the child's call then failed with the
+//     protocol-version message — loud, and correct. Where it had not, the call
+//     succeeded against a binary nobody chose.
+//   - Deleting the launch directory. A developer who runs jin out of a git
+//     worktree and then removes that worktree leaves the path gone outright:
+//     callbacks exit 127, measured 3/3. `"${JIN_BIN:-jin}"`, the form documented
+//     for plugin authors, does not rescue it — `:-` substitutes only when a
+//     variable is unset or empty, and a dead path is neither.
+//
+// Copying to a path under stateDir (the parent of worktrees/, never itself a
+// worktree) removes that coupling.
 //
 // Why at startup, from the daemon's own executable. Running this once, here,
 // makes the copy byte-identical to the running daemon for the daemon's whole
@@ -36,26 +47,29 @@ import (
 // This only helps sessions started after it runs; a session already running
 // holds whatever path it read at startup, so recovering a frozen one still
 // needs a restart.
-func (m *Manager) EstablishHookBinary() {
+// It is a free function, and returns the path rather than storing it, so that
+// the caller cannot build anything that names a jin binary before this has run:
+// the value is the argument, not an ordering to remember.
+func EstablishHookBinary(stateDir string) string {
 	src, err := os.Executable()
 	if err != nil {
-		debugLog("[HOOKBIN] os.Executable failed, hooks use the live path: %v", err)
-		return
+		debugLog("[HOOKBIN] os.Executable failed, children get no JIN_BIN: %v", err)
+		return ""
 	}
-	dst := m.hookBinaryPath()
+	dst := hookBinaryPath(stateDir)
 	if err := copyExecutable(src, dst); err != nil {
-		debugLog("[HOOKBIN] copy %s -> %s failed, hooks use the live path: %v", src, dst, err)
-		return
+		debugLog("[HOOKBIN] copy %s -> %s failed, children get the live path: %v", src, dst, err)
+		return src
 	}
-	m.hookExecPath = dst
 	debugLog("[HOOKBIN] hook binary established at %s", dst)
+	return dst
 }
 
 // hookBinaryPath is the stable location EstablishHookBinary copies to. It sits
 // directly under stateDir, a sibling of worktrees/ and hooks-settings.json, so
 // it is never inside a worktree the daemon might later remove.
-func (m *Manager) hookBinaryPath() string {
-	return filepath.Join(m.stateDir, "bin", "jin")
+func hookBinaryPath(stateDir string) string {
+	return filepath.Join(stateDir, "bin", "jin")
 }
 
 // copyExecutable copies src to dst, publishing it atomically: it writes to a

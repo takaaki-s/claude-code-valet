@@ -37,14 +37,19 @@ package jinenv
 //     stops there, for the same reason.
 //   - JIN_BIN, because a `jin` found on PATH may be an older install that
 //     predates the subcommand the child is trying to call.
+//
+// One value serves every spawn site, and the whole of it travels together.
+// Assembling it per site is what let the answers disagree — see BinPath.
 type Identity struct {
 	// SocketPath is the daemon's listening socket — what a child's `jin`
 	// resolves instead of falling back to the default path.
 	SocketPath string
-	// BinPath is the jin binary a child should re-enter. Callers differ on
-	// which one that is: a spawn whose environment outlives the daemon's own
-	// executable wants the stable copy, a short-lived one can use the running
-	// binary.
+	// BinPath is the jin binary a child should re-enter. The requirement is not
+	// "some jin": it must stay valid, and stay matched to the daemon serving the
+	// socket above, for as long as that child may call back — which is the whole
+	// life of a session, long after the caller has stopped watching. The
+	// daemon's own executable does not meet that; session.EstablishHookBinary
+	// says what goes wrong and how often.
 	BinPath string
 	// Debug is whether the child should write its own debug log. Callers pass
 	// what debug.Enabled() reports rather than re-reading the variable, so a

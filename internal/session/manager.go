@@ -28,12 +28,6 @@ import (
 
 var debugLog = debug.NewLogger("daemon-debug.log")
 
-// debugEnabled reports whether to pass the debug flag on to a spawned agent.
-// A variable only so tests can drive both branches: whether an agent logs is
-// not something a test can arrange through the environment, because the flag is
-// read once when the process starts. Production never reassigns it.
-var debugEnabled = debug.Enabled
-
 // ErrWorktreeDirty is returned when a git worktree has uncommitted changes
 // and force removal was not requested.
 var ErrWorktreeDirty = errors.New("worktree has uncommitted changes")
@@ -60,24 +54,19 @@ type Manager struct {
 	paneSlotMu     sync.Mutex // serializes named-slot pane operations (find-then-split is check-then-act; see PaneSplit/PaneClose)
 	tmuxInitMu     sync.Mutex // serializes lazy tmux init AND its recovery pass (see ensureTmuxClient)
 	stateDir       string
-	socketPath     string // daemon socket this Manager's agents call back to; travels into their environment, never re-derived from the process
-	hookExecPath   string // jin-binary path baked into agent hook wiring; defaulted to os.Executable() in NewManager, upgraded to a stable copy by EstablishHookBinary
-	tmuxSocketName string // "" ⇒ tmux.SocketName; tests set an isolated name so ensureTmuxClient does not touch the shared "jin" server
+	identity       jinenv.Identity // the jin the agents this Manager starts are told to call back into; handed in whole, never re-derived from the process
+	tmuxSocketName string          // "" ⇒ tmux.SocketName; tests set an isolated name so ensureTmuxClient does not touch the shared "jin" server
 }
 
-// AgentIdentity is the jin that an agent this Manager starts is told to call
-// back into. buildAgentShellCmd writes it into the agent's environment; the
-// daemon that constructed the Manager is what decided the socket.
+// Identity is the jin the agents this Manager starts are told to call back
+// into — whatever NewManager was handed, unchanged.
 //
-// Exported so the wiring is checkable from where it is made: nothing inside
-// this package can tell a Manager built over the right socket from one built
-// over the wrong one.
-func (m *Manager) AgentIdentity() jinenv.Identity {
-	return jinenv.Identity{
-		SocketPath: m.socketPath,
-		BinPath:    m.hookExecPath,
-		Debug:      debugEnabled(),
-	}
+// Exported so the hand-off is checkable from where it is made: nothing inside
+// this package can tell a Manager built over the daemon's identity from one
+// built over a value that daemon assembled a second time, and assembling it a
+// second time is the defect this argument exists to prevent.
+func (m *Manager) Identity() jinenv.Identity {
+	return m.identity
 }
 
 // SetTmuxClient sets the tmux client for tmux-based session management.
@@ -506,38 +495,28 @@ func (m *Manager) configureInnerTmux() {
 // NewManager creates a new session manager.
 //
 // sessionsDir is where per-session JSON files live; stateDir is where generated
-// artifacts such as hooks-settings.json are written; socketPath is the daemon
-// socket the agents this Manager starts are told to call back to.
+// artifacts such as hooks-settings.json are written; identity is the jin the
+// agents this Manager starts are told to call back into.
 //
-// socketPath is an argument rather than something buildAgentShellCmd looks up,
+// identity is an argument rather than something buildAgentShellCmd assembles,
 // for the same reason stateDir is: a Manager honours what it was handed for
 // every other artifact it owns, and a value read from the process instead would
 // describe whichever daemon the reader happens to be, not the one that started
-// the agent. The plugin dispatcher is built from the same value one line away
-// in daemon.NewServer.
-func NewManager(sessionsDir, stateDir, socketPath string, configMgr *config.Manager) (*Manager, error) {
+// the agent. Its caller gives the same value to the plugin dispatcher, which is
+// how an agent and a plugin cannot be told to re-enter different binaries.
+func NewManager(sessionsDir, stateDir string, identity jinenv.Identity, configMgr *config.Manager) (*Manager, error) {
 	store, err := NewStore(sessionsDir)
 	if err != nil {
 		return nil, err
 	}
 
-	// Default the hook exec path to the live binary; EstablishHookBinary
-	// upgrades it to a stable copy at daemon startup. Resolving it here — not
-	// in buildAgentShellCmd — keeps that builder pure (no environment probing)
-	// and gives every code path a single unconditional field to read.
-	execPath, execErr := os.Executable()
-	if execErr != nil {
-		debugLog("[AGENT] Warning: failed to get executable path: %v", execErr)
-	}
-
 	m := &Manager{
-		sessions:     make(map[string]*Session),
-		store:        store,
-		configMgr:    configMgr,
-		gitClient:    git.NewClient(),
-		stateDir:     stateDir,
-		socketPath:   socketPath,
-		hookExecPath: execPath,
+		sessions:  make(map[string]*Session),
+		store:     store,
+		configMgr: configMgr,
+		gitClient: git.NewClient(),
+		stateDir:  stateDir,
+		identity:  identity,
 	}
 
 	// Load existing sessions
@@ -2615,13 +2594,12 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 		return "", fmt.Errorf("resolve agent %q: %w", snap.AgentKind, err)
 	}
 
-	// hookExecPath is resolved once in NewManager and upgraded to the stable
-	// startup copy by EstablishHookBinary. Passing it to every adapter's Setup
-	// is what makes the path baked into hook wiring survive the launch binary
-	// moving or being deleted — see EstablishHookBinary.
+	// Passing the identity's binary to every adapter's Setup is what makes the
+	// path baked into hook wiring survive the launch binary being rebuilt or
+	// deleted — see EstablishHookBinary.
 	if err := ag.Setup(SetupContext{
 		StateDir: m.stateDir,
-		ExecPath: m.hookExecPath,
+		ExecPath: m.identity.BinPath,
 		WorkDir:  snap.ExpandedWorkDir,
 	}); err != nil {
 		debugLog("[AGENT] Setup returned error: %v", err)
@@ -2657,14 +2635,12 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	//
 	// It belongs here rather than in an adapter because nothing about it is
 	// agent-specific: every kind is launched through this wrapper and every kind
-	// calls the same hook binary. BinPath is hookExecPath — the stable copy, not
-	// os.Executable() — because this environment outlives the daemon's own
-	// executable; EstablishHookBinary has why that matters. Each assignment is
-	// quoted whole, which `env` reads the same as quoting the value: these are
-	// paths now, and a path may contain a space. It is all written before
-	// customEnv so that a user who names one of these in their own config still
-	// wins — `env` applies assignments left to right.
-	for _, kv := range m.AgentIdentity().Environ() {
+	// calls the same hook binary. Each assignment is quoted whole, which `env`
+	// reads the same as quoting the value: these are paths, and a path may
+	// contain a space. It is all written before customEnv so that a user who
+	// names one of these in their own config still wins — `env` applies
+	// assignments left to right.
+	for _, kv := range m.identity.Environ() {
 		envVars += " " + shellEscape(kv)
 	}
 	if customEnv != "" {

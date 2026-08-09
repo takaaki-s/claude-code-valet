@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/takaaki-s/jind-ai/internal/config"
-	"github.com/takaaki-s/jind-ai/internal/debug"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 )
 
 // probeShellCmd returns the shell command Manager would run to start a session,
@@ -31,15 +31,8 @@ func probeShellCmd(t *testing.T, mgr *Manager) string {
 	return cmd
 }
 
-// withDebugEnabled drives the flag Manager reads, which no test can arrange
-// through the real environment: the process decides once at startup.
-func withDebugEnabled(t *testing.T, on bool) {
-	t.Helper()
-	setForTest(t, &debugEnabled, func() bool { return on })
-}
-
 // TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo pins the wiring from
-// NewManager's socketPath argument through to the agent's environment.
+// NewManager's identity argument through to the agent's environment.
 //
 // The value is unique per run so that an implementation which hands out a
 // constant — the default socket path, or the state dir it sits next to —
@@ -56,7 +49,7 @@ func withDebugEnabled(t *testing.T, on bool) {
 // run.
 func TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "this-run-only.sock")
-	mgr, _, _ := newTestManagerOn(t, socket)
+	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{SocketPath: socket})
 
 	cmd := probeShellCmd(t, mgr)
 
@@ -66,18 +59,19 @@ func TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo(t *testing.T) {
 }
 
 // TestBuildAgentShellCmd_NamesTheBinaryTheAgentReEnters pins that the agent is
-// pointed at the stable copy of the jin binary, not at the daemon's live
-// executable.
+// pointed at the binary its identity names, not at a path this process resolves
+// for itself.
 //
-// The distinction is the whole reason the copy exists: this environment is read
-// once, when the agent starts, and is never revisited, so a path into whatever
-// directory the daemon launched from can stop existing while the session is
-// still running. EstablishHookBinary has the full account; what is checked here
-// is only that the field it upgrades is the field this builder reads.
+// The distinction is the whole reason a stable copy exists: this environment is
+// read once, when the agent starts, and is never revisited, so a path into
+// whatever directory the daemon launched from can stop describing the running
+// daemon — or stop existing — while the session is still going.
+// EstablishHookBinary has the full account. os.Executable() is checked for
+// explicitly because it is also a plausible non-empty path, so an assertion on
+// presence alone would accept it.
 func TestBuildAgentShellCmd_NamesTheBinaryTheAgentReEnters(t *testing.T) {
-	mgr, _, _ := newTestManager(t)
 	stable := filepath.Join(t.TempDir(), "bin", "jin")
-	mgr.hookExecPath = stable
+	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{BinPath: stable})
 
 	cmd := probeShellCmd(t, mgr)
 
@@ -89,7 +83,37 @@ func TestBuildAgentShellCmd_NamesTheBinaryTheAgentReEnters(t *testing.T) {
 		t.Fatalf("os.Executable: %v", err)
 	}
 	if strings.Contains(cmd, "'JIN_BIN="+live+"'") {
-		t.Errorf("command names the live executable rather than the stable copy\ncommand: %s", cmd)
+		t.Errorf("command names the live executable rather than the identity's binary\ncommand: %s", cmd)
+	}
+}
+
+// TestBuildAgentShellCmd_TellsTheAdapterTheSameBinary pins the other half of
+// the agent's hook wiring. The environment this builder writes is only what the
+// agent process sees; an adapter separately bakes ExecPath into the settings
+// file or CLI injection the agent's hooks are launched from, and a session
+// whose hooks name a different binary than its environment does is exactly the
+// split this identity exists to prevent.
+func TestBuildAgentShellCmd_TellsTheAdapterTheSameBinary(t *testing.T) {
+	stable := filepath.Join(t.TempDir(), "bin", "jin")
+	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{BinPath: stable})
+
+	var seen SetupContext
+	mgr.SetAgentResolver(&fakeAgentResolver{agents: map[string]Agent{
+		"probe": &fakeAgent{
+			spawnFn: func(SpawnOptions) SpawnPlan { return SpawnPlan{Command: "true"} },
+			setupFn: func(ctx SetupContext) error { seen = ctx; return nil },
+		},
+	}})
+	if _, err := mgr.buildAgentShellCmd(spawnSnapshot{
+		JinSessionID: "probe-session",
+		AgentKind:    "probe",
+		StartDir:     t.TempDir(),
+	}); err != nil {
+		t.Fatalf("buildAgentShellCmd: %v", err)
+	}
+
+	if seen.ExecPath != stable {
+		t.Errorf("adapter is told to wire hooks through %q, want %q", seen.ExecPath, stable)
 	}
 }
 
@@ -98,8 +122,7 @@ func TestBuildAgentShellCmd_NamesTheBinaryTheAgentReEnters(t *testing.T) {
 // consumer as no socket at all, so writing one adds nothing except a claim to
 // know something.
 func TestBuildAgentShellCmd_OmitsWhatItDoesNotKnow(t *testing.T) {
-	mgr, _, _ := newTestManagerOn(t, "")
-	mgr.hookExecPath = ""
+	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{})
 
 	cmd := probeShellCmd(t, mgr)
 
@@ -122,9 +145,7 @@ func TestBuildAgentShellCmd_PassesTheDebugFlagToTheAgent(t *testing.T) {
 		{"off, so nothing is injected", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			withDebugEnabled(t, tt.on)
-
-			mgr, _, _ := newTestManager(t)
+			mgr, _, _ := newTestManagerOn(t, jinenv.Identity{Debug: tt.on})
 			cmd := probeShellCmd(t, mgr)
 
 			if got := strings.Contains(cmd, "'JIN_DEBUG=1'"); got != tt.on {
@@ -134,30 +155,11 @@ func TestBuildAgentShellCmd_PassesTheDebugFlagToTheAgent(t *testing.T) {
 	}
 }
 
-// TestDebugEnabled_IsWiredToTheRealFlag guards the one link the tests above
-// cannot: they replace debugEnabled, so a version defined as a constant false
-// would satisfy every one of them.
-//
-// Its reach is limited and saying so is the point — it can only fail in a
-// process that has the flag on, because with it off a disconnected default
-// agrees with the real answer by accident. So it bites under `JIN_DEBUG=1 go
-// test` and is silent otherwise. That is still worth having: the mutation it
-// exists for is the kind that produces a working binary, and the only signal
-// would otherwise be someone noticing months later that a log they turned on
-// was never written.
-func TestDebugEnabled_IsWiredToTheRealFlag(t *testing.T) {
-	if got, want := debugEnabled(), debug.Enabled(); got != want {
-		t.Errorf("debugEnabled() = %v, but debug.Enabled() = %v — the seam has been disconnected from the flag it stands for", got, want)
-	}
-}
-
 // TestBuildAgentShellCmd_ConfiguredDebugValueWinsOverThePropagatedOne pins the
 // ordering buildAgentShellCmd's comment claims: an operator who names JIN_DEBUG
 // in their own config is deciding something about the child, and jind-ai's
 // propagation must not quietly override it.
 func TestBuildAgentShellCmd_ConfiguredDebugValueWinsOverThePropagatedOne(t *testing.T) {
-	withDebugEnabled(t, true)
-
 	configDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"),
 		[]byte("env:\n  JIN_DEBUG: \"0\"\n"), 0644); err != nil {
@@ -167,7 +169,7 @@ func TestBuildAgentShellCmd_ConfiguredDebugValueWinsOverThePropagatedOne(t *test
 	if err != nil {
 		t.Fatalf("config.NewManager: %v", err)
 	}
-	mgr, _, _ := newTestManager(t)
+	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{Debug: true})
 	mgr.configMgr = configMgr
 
 	cmd := probeShellCmd(t, mgr)

@@ -802,7 +802,7 @@ Environment variables:
 | `JIN_NOTIFY_KIND` | Notification kind for this transition: `task-complete`, `error`, `permission`, or empty when the transition triggers no notification |
 | `JIN_PLUGIN_DEPTH` | Chain depth — see [Constraints](#constraints) |
 | `JIN_SOCKET` | Daemon socket path; the `jin` CLI a plugin invokes picks this up automatically |
-| `JIN_BIN` | Absolute path of the daemon's own `jin` binary. Prefer `"${JIN_BIN:-jin}"` over a bare `jin` — a `jin` found on PATH may be an older install that lacks newer subcommands |
+| `JIN_BIN` | Absolute path of a `jin` matching the running daemon — a copy jind-ai keeps under its state directory, so it stays valid even if the binary the daemon was launched from is rebuilt or removed. Prefer `"${JIN_BIN:-jin}"` over a bare `jin` — a `jin` found on PATH may be an older install that lacks newer subcommands |
 | `JIN_DEBUG` | `1` when the daemon is running with debug logging on, so a `jin` the plugin calls back into records what it does too. Omitted — not set to `0` — otherwise |
 | `JIN_CALLER_TMUX_SOCKET` | Action runs only: socket path of the tmux server the invoking CLI ran inside (from its `$TMUX`). Unset — not empty — when the caller was outside tmux |
 | `JIN_CALLER_TMUX_PANE` | Action runs only: the invoking CLI's pane ID (from its `$TMUX_PANE`). Unset when unknown |

@@ -19,12 +19,6 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
 
-// debugEnabled reports whether to tell a plugin to record what it does. A
-// variable so tests can drive the branch: the real flag is read once at process
-// start, long before a test could set it. Its counterpart in internal/session
-// carries the same seam for the same reason.
-var debugEnabled = debug.Enabled
-
 // inheritedEnvKeys is the minimal set of parent-process env vars forwarded to a
 // plugin run. It covers what interpreters / toolchains need to bootstrap without
 // leaking arbitrary daemon state. LC_* is handled separately by prefix match.
@@ -77,6 +71,9 @@ type ActionContext struct {
 //
 // ActionID is the manifest action being run, exported as JIN_ACTION_ID so a
 // shared entrypoint script can tell which of its plugin's actions invoked it.
+//
+// Identity is which jin dispatched the run — the daemon to reach, the binary to
+// re-enter, whether to record.
 type ExecOptions struct {
 	PluginDir   string
 	Run         string
@@ -84,7 +81,7 @@ type ExecOptions struct {
 	Env         Event
 	Caller      ActionContext
 	Depth       int
-	SocketPath  string
+	Identity    jinenv.Identity
 	LogPath     string
 	Timeout     time.Duration
 	PopupWidth  string
@@ -129,6 +126,9 @@ func ExecPlugin(ctx context.Context, opts ExecOptions) error {
 	}
 	defer logFile.Close()
 
+	// This process's own flag, not opts.Identity.Debug: where the plugin's
+	// output goes is a decision jind-ai makes about itself, while the identity
+	// says what the plugin is told. In production they agree.
 	var out io.Writer = logFile
 	if debug.Enabled() {
 		out = io.MultiWriter(logFile, os.Stderr)
@@ -210,19 +210,10 @@ func buildEnv(opts ExecOptions) []string {
 	if opts.Caller.TmuxPane != "" {
 		env = append(env, "JIN_CALLER_TMUX_PANE="+opts.Caller.TmuxPane)
 	}
-	// Which jin dispatched this run: the daemon to reach, the binary to
-	// re-enter, and whether to record. BinPath is the daemon's own executable
-	// so a plugin calls back into the exact version that dispatched it — a
-	// `jin` found on PATH may be an older install that lacks newer subcommands
-	// (daemon/CLI version skew). os.Executable's error is folded into an empty
-	// path, which Identity omits, leaving that PATH fallback as the only
-	// option; it is what plugins had before JIN_BIN existed.
-	exe, _ := os.Executable()
-	env = append(env, jinenv.Identity{
-		SocketPath: opts.SocketPath,
-		BinPath:    exe,
-		Debug:      debugEnabled(),
-	}.Environ()...)
+	// Which jin dispatched this run. Taken whole from the caller — os.Executable
+	// used to stand in for BinPath here, which is answering "which jin am I" a
+	// second time, and the two answers were measured to differ.
+	env = append(env, opts.Identity.Environ()...)
 	if opts.PopupWidth != "" {
 		env = append(env, "JIN_PLUGIN_POPUP_WIDTH="+opts.PopupWidth)
 	}

@@ -37,7 +37,7 @@ func newTestDispatcher(t *testing.T, cfg config.PluginsConfig) (*EventDispatcher
 	pluginsDir := t.TempDir()
 	stateDir := t.TempDir()
 	reg := NewRegistry(pluginsDir, stateDir, cfg)
-	d := NewDispatcher(reg, pluginsDir, stateDir, "/tmp/test.sock", 500*time.Millisecond, nil)
+	d := NewDispatcher(reg, pluginsDir, stateDir, testIdentity(), 500*time.Millisecond, nil)
 	return d, pluginsDir, stateDir
 }
 
@@ -203,6 +203,52 @@ func TestRunActionBypassesMatcherAndDebounce(t *testing.T) {
 	}
 }
 
+const identityDumpManifest = `schema_version: 1
+name: identdump
+version: 0.1.0
+description: dumps the identity it was handed
+jin: ">=0.0.0"
+install:
+  source:
+    build: ["true"]
+    entrypoint: bash -c 'echo "sock=$JIN_SOCKET bin=$JIN_BIN debug=${JIN_DEBUG-unset}" >> out.txt'
+on:
+  - status_changed:idle
+`
+
+// TestPublishHandsThePluginTheIdentityItWasBuiltWith pins the whole chain a
+// plugin's callback depends on: the identity given to NewDispatcher is the one
+// that reaches the plugin's environment.
+//
+// Every value is compared exactly rather than for presence. JIN_BIN is why:
+// os.Executable() of the dispatching process — what this used to render — is
+// also a non-empty path, and session.EstablishHookBinary has what goes wrong
+// when a child gets it.
+func TestPublishHandsThePluginTheIdentityItWasBuiltWith(t *testing.T) {
+	d, pluginsDir, stateDir := newTestDispatcher(t, config.PluginsConfig{})
+	installTestPlugin(t, pluginsDir, stateDir, "identdump", identityDumpManifest)
+
+	d.Publish(idleEvent())
+
+	out := filepath.Join(pluginsDir, "identdump", "out.txt")
+	if !waitForFile(t, out) {
+		t.Fatal("plugin did not run")
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := testIdentity()
+	debug := "unset"
+	if id.Debug {
+		debug = "1"
+	}
+	want := fmt.Sprintf("sock=%s bin=%s debug=%s", id.SocketPath, id.BinPath, debug)
+	if got := strings.TrimSpace(string(data)); got != want {
+		t.Errorf("plugin saw %q, want %q", got, want)
+	}
+}
+
 const callerDumpManifest = `schema_version: 1
 name: callerdump
 version: 0.1.0
@@ -307,7 +353,7 @@ func TestNewDispatcher_NilResolver_UsesDefault(t *testing.T) {
 	stateDir := t.TempDir()
 	reg := NewRegistry(pluginsDir, stateDir, config.PluginsConfig{})
 
-	d := NewDispatcher(reg, pluginsDir, stateDir, "/tmp/test.sock", 500*time.Millisecond, nil)
+	d := NewDispatcher(reg, pluginsDir, stateDir, testIdentity(), 500*time.Millisecond, nil)
 
 	w, h := d.popupResolver("any-plugin", "any-action", nil)
 	if w != "" || h != "" {
@@ -329,7 +375,7 @@ func TestDispatcher_CallsPopupResolver_WithManifestPopup(t *testing.T) {
 	}
 
 	reg := NewRegistry(pluginsDir, stateDir, config.PluginsConfig{})
-	d := NewDispatcher(reg, pluginsDir, stateDir, "/tmp/test.sock", 500*time.Millisecond, resolver)
+	d := NewDispatcher(reg, pluginsDir, stateDir, testIdentity(), 500*time.Millisecond, resolver)
 
 	envDump := filepath.Join(pluginsDir, "envcap", "env.txt")
 	body := fmt.Sprintf(`schema_version: 1
