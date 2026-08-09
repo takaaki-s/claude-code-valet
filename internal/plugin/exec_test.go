@@ -82,7 +82,7 @@ func TestExecPlugin_Success(t *testing.T) {
 		"JIN_NOTIFY_KIND=task-complete",
 		"JIN_ACTION_ID=notify",
 		"JIN_PLUGIN_DEPTH=0",
-		"JIN_SOCKET=/run/jin.sock",
+		"JIN_SOCKET=" + testIdentity().SocketPath,
 	}
 	for _, want := range wantEnv {
 		if !strings.Contains(env, want) {

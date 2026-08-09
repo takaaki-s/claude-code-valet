@@ -73,9 +73,7 @@ type ActionContext struct {
 // shared entrypoint script can tell which of its plugin's actions invoked it.
 //
 // Identity is which jin dispatched the run — the daemon to reach, the binary to
-// re-enter, whether to record. It is supplied by the caller rather than read
-// from this process, so a plugin and an agent started by the same daemon get
-// the same answer.
+// re-enter, whether to record.
 type ExecOptions struct {
 	PluginDir   string
 	Run         string
@@ -128,6 +126,9 @@ func ExecPlugin(ctx context.Context, opts ExecOptions) error {
 	}
 	defer logFile.Close()
 
+	// This process's own flag, not opts.Identity.Debug: where the plugin's
+	// output goes is a decision jind-ai makes about itself, while the identity
+	// says what the plugin is told. In production they agree.
 	var out io.Writer = logFile
 	if debug.Enabled() {
 		out = io.MultiWriter(logFile, os.Stderr)
@@ -209,9 +210,9 @@ func buildEnv(opts ExecOptions) []string {
 	if opts.Caller.TmuxPane != "" {
 		env = append(env, "JIN_CALLER_TMUX_PANE="+opts.Caller.TmuxPane)
 	}
-	// Which jin dispatched this run. Taken whole from the caller: deriving any
-	// part of it here would mean answering "which jin am I" a second time, and
-	// the two answers were measured to differ.
+	// Which jin dispatched this run. Taken whole from the caller — os.Executable
+	// used to stand in for BinPath here, which is answering "which jin am I" a
+	// second time, and the two answers were measured to differ.
 	env = append(env, opts.Identity.Environ()...)
 	if opts.PopupWidth != "" {
 		env = append(env, "JIN_PLUGIN_POPUP_WIDTH="+opts.PopupWidth)

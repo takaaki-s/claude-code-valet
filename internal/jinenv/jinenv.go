@@ -38,28 +38,18 @@ package jinenv
 //   - JIN_BIN, because a `jin` found on PATH may be an older install that
 //     predates the subcommand the child is trying to call.
 //
-// One value serves every spawn site. Assembling it per site is what let the two
-// disagree: the agent was pointed at the stable copy of the binary while a
-// plugin was pointed at the daemon's live executable, which is not the same
-// file for long — see BinPath.
+// One value serves every spawn site, and the whole of it travels together.
+// Assembling it per site is what let the answers disagree — see BinPath.
 type Identity struct {
 	// SocketPath is the daemon's listening socket — what a child's `jin`
 	// resolves instead of falling back to the default path.
 	SocketPath string
-	// BinPath is the jin binary a child should re-enter — the stable copy under
-	// the state dir, not the daemon's live executable.
-	//
-	// The distinction is not cosmetic. `go build -o` over a running binary
-	// unlinks it and creates a new file at the same path, so the daemon keeps
-	// running the old inode while that path holds a different build: after one
-	// `make build` a child pointed at the live path re-enters a jin the daemon
-	// never was (3/3). Where the wire shape changed, the child's call fails
-	// with the protocol-mismatch message (3/3) — recoverable, and the user is
-	// told to restart; where it did not, the call succeeds against a binary
-	// nobody chose. Delete the directory the daemon launched from instead and
-	// the path is simply gone: callbacks exit 127 (3/3), and `${JIN_BIN:-jin}`
-	// does not rescue them — `:-` substitutes only when unset or empty, and a
-	// dead path is neither.
+	// BinPath is the jin binary a child should re-enter. The requirement is not
+	// "some jin": it must stay valid, and stay matched to the daemon serving the
+	// socket above, for as long as that child may call back — which is the whole
+	// life of a session, long after the caller has stopped watching. The
+	// daemon's own executable does not meet that; session.EstablishHookBinary
+	// says what goes wrong and how often.
 	BinPath string
 	// Debug is whether the child should write its own debug log. Callers pass
 	// what debug.Enabled() reports rather than re-reading the variable, so a

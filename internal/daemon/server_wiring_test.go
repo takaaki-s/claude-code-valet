@@ -32,10 +32,11 @@ func TestNewServer_TellsItsChildrenWhichJinStartedThem(t *testing.T) {
 		t.Errorf("children are told to re-enter %q, want the stable copy at %q", got, wantBin)
 	}
 	// Agents and plugins are separate spawn sites that once answered "which jin
-	// am I" separately, and the answers diverged: the agent was given the stable
-	// copy while a plugin was given the daemon's live executable, which stops
-	// being the same file after one rebuild. One value now, checked here because
-	// this is the only place both sides are visible at once.
+	// am I" separately, and diverged. Checked here because this is the only
+	// place both sides are visible at once — and it is also the only thing
+	// enforcing that EstablishHookBinary runs before the dispatcher is built:
+	// deferring that call leaves the assertion above passing and this one
+	// failing.
 	if got := s.pluginDisp.Identity(); got != s.manager.Identity() {
 		t.Errorf("plugins are told %+v, agents %+v — the two spawn sites disagree", got, s.manager.Identity())
 	}

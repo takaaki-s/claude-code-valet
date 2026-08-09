@@ -60,22 +60,19 @@ type Manager struct {
 	paneSlotMu     sync.Mutex // serializes named-slot pane operations (find-then-split is check-then-act; see PaneSplit/PaneClose)
 	tmuxInitMu     sync.Mutex // serializes lazy tmux init AND its recovery pass (see ensureTmuxClient)
 	stateDir       string
-	socketPath     string // daemon socket this Manager's agents call back to; travels into their environment, never re-derived from the process
-	hookExecPath   string // jin-binary path baked into agent hook wiring; defaulted to os.Executable() in NewManager, upgraded to a stable copy by EstablishHookBinary
+	socketPath     string // daemon socket the children this daemon spawns call back to; travels into their environment, never re-derived from the process
+	hookExecPath   string // jin-binary path those children re-enter; defaulted to os.Executable() in NewManager, upgraded to a stable copy by EstablishHookBinary
 	tmuxSocketName string // "" ⇒ tmux.SocketName; tests set an isolated name so ensureTmuxClient does not touch the shared "jin" server
 }
 
 // Identity is the jin that a process this daemon spawns is told to call back
 // into. buildAgentShellCmd writes it into an agent's environment, and
-// daemon.NewServer hands the same value to the plugin dispatcher, so an agent
-// and a plugin cannot be told to re-enter different binaries.
+// daemon.NewServer hands the same value to the plugin dispatcher.
 //
-// The Manager answers this because it owns the answer's hardest part: the
-// stable copy of the binary lives under its stateDir and is established by its
-// own EstablishHookBinary, which is best-effort — on failure the field keeps
-// the live path. A second caller deriving <stateDir>/bin/jin for itself would
-// have the right answer only when that copy succeeded, and would hand out a
-// path that does not exist when it did not.
+// Callers take it from here rather than deriving <stateDir>/bin/jin for
+// themselves because EstablishHookBinary is best-effort: on failure this keeps
+// the live path, and a second derivation would hand out a path that does not
+// exist.
 //
 // Exported so the wiring is checkable from where it is made: nothing inside
 // this package can tell a Manager built over the right socket from one built
@@ -515,14 +512,14 @@ func (m *Manager) configureInnerTmux() {
 //
 // sessionsDir is where per-session JSON files live; stateDir is where generated
 // artifacts such as hooks-settings.json are written; socketPath is the daemon
-// socket the agents this Manager starts are told to call back to.
+// socket the children this Manager starts are told to call back to — see
+// Identity.
 //
 // socketPath is an argument rather than something buildAgentShellCmd looks up,
 // for the same reason stateDir is: a Manager honours what it was handed for
 // every other artifact it owns, and a value read from the process instead would
 // describe whichever daemon the reader happens to be, not the one that started
-// the agent. The plugin dispatcher is built from the same value one line away
-// in daemon.NewServer.
+// the agent.
 func NewManager(sessionsDir, stateDir, socketPath string, configMgr *config.Manager) (*Manager, error) {
 	store, err := NewStore(sessionsDir)
 	if err != nil {

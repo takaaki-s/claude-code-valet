@@ -13,16 +13,27 @@ import (
 // any failure the field keeps its default, which is no worse than the pre-copy
 // behaviour.
 //
-// Why a copy exists at all. The path handed to each agent's hook wiring —
-// Claude Code's --settings file, Codex's `-c hooks.X=[...]` injection — is read
-// once when the agent starts and never revisited. Baking os.Executable()
-// directly means that path points at wherever the daemon happened to launch
-// from. A developer who runs jin out of a git worktree, then deletes that
-// worktree, leaves every already-running session's hook pointing at a path that
-// now 404s: the hook fails with "not found", no status update reaches the
-// daemon, and the session looks frozen in the TUI. Copying to a path under
-// stateDir (the parent of worktrees/, never itself a worktree) removes that
-// coupling.
+// Why a copy exists at all. The path handed to a child that calls back into
+// jind-ai — an agent's hook wiring, a plugin's $JIN_BIN — is read once when that
+// child starts and never revisited. Baking os.Executable() directly means the
+// path points at wherever the daemon happened to launch from, and neither of the
+// two ways that path stops describing the running daemon is exotic:
+//
+//   - Rebuilding. `go build -o` over a running binary unlinks it and creates a
+//     new file at the same path, so it succeeds against a live daemon and
+//     afterwards /proc/<pid>/exe reads "… (deleted)" while the path holds the
+//     new build. One rebuild during development is the whole setup; measured
+//     3/3. Where the IPC shape had changed the child's call then failed with the
+//     protocol-version message — loud, and correct. Where it had not, the call
+//     succeeded against a binary nobody chose.
+//   - Deleting the launch directory. A developer who runs jin out of a git
+//     worktree and then removes that worktree leaves the path gone outright:
+//     callbacks exit 127, measured 3/3. `"${JIN_BIN:-jin}"`, the form documented
+//     for plugin authors, does not rescue it — `:-` substitutes only when a
+//     variable is unset or empty, and a dead path is neither.
+//
+// Copying to a path under stateDir (the parent of worktrees/, never itself a
+// worktree) removes that coupling.
 //
 // Why at startup, from the daemon's own executable. Running this once, here,
 // makes the copy byte-identical to the running daemon for the daemon's whole

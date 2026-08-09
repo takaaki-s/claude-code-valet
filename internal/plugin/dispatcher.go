@@ -63,9 +63,8 @@ type EventDispatcher struct {
 // A nil popupResolver is replaced with one that always returns empty strings
 // (no popup size hints exported).
 //
-// identity is passed in rather than assembled here because the daemon and its
-// agents must hand out the same one; session.Manager.Identity is where it comes
-// from in production.
+// identity is supplied by the caller so that a plugin and an agent started by
+// the same daemon get the same one.
 func NewDispatcher(registry *Registry, pluginsDir, stateDir string, identity jinenv.Identity, debounce time.Duration, popupResolver PopupSizeResolver) *EventDispatcher {
 	if debounce <= 0 {
 		debounce = DefaultDebounce
@@ -87,11 +86,10 @@ func NewDispatcher(registry *Registry, pluginsDir, stateDir string, identity jin
 
 // Identity is the jin this dispatcher tells its plugins to call back into.
 //
-// Exported for the same reason session.Manager.Identity is: the value is set by
-// the daemon that wires both, and from inside either package a dispatcher built
-// over the right one is indistinguishable from a dispatcher built over its own
-// executable. daemon's wiring test is the only place the two are visible at
-// once, and it is where they diverged.
+// Exported only so daemon's wiring test can compare it against the value the
+// same daemon gave its agents: nothing inside this package can tell a
+// dispatcher built over the right identity from one built over its own
+// executable.
 func (d *EventDispatcher) Identity() jinenv.Identity {
 	return d.identity
 }
