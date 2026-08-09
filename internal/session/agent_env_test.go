@@ -38,6 +38,78 @@ func withDebugEnabled(t *testing.T, on bool) {
 	setForTest(t, &debugEnabled, func() bool { return on })
 }
 
+// TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo pins the wiring from
+// NewManager's socketPath argument through to the agent's environment.
+//
+// The value is unique per run so that an implementation which hands out a
+// constant — the default socket path, or the state dir it sits next to —
+// cannot pass by coincidence. Nothing but this argument produces it.
+//
+// Leaving it to inheritance is what this replaces: a tmux pane is handed the
+// tmux server's environment, and that server outlives any one daemon, so the
+// socket an agent saw was whichever daemon happened to start the server. When
+// none had, the agent's hooks reached no daemon at all and said nothing about
+// it — exit 0, status unchanged.
+//
+// The quoting is part of the assertion. These values are paths, and a path may
+// contain a space; left bare, `env` would read the remainder as the command to
+// run.
+func TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "this-run-only.sock")
+	mgr, _, _ := newTestManagerOn(t, socket)
+
+	cmd := probeShellCmd(t, mgr)
+
+	if want := "'JIN_SOCKET=" + socket + "'"; !strings.Contains(cmd, want) {
+		t.Errorf("command does not carry %s\ncommand: %s", want, cmd)
+	}
+}
+
+// TestBuildAgentShellCmd_NamesTheBinaryTheAgentReEnters pins that the agent is
+// pointed at the stable copy of the jin binary, not at the daemon's live
+// executable.
+//
+// The distinction is the whole reason the copy exists: this environment is read
+// once, when the agent starts, and is never revisited, so a path into whatever
+// directory the daemon launched from can stop existing while the session is
+// still running. EstablishHookBinary has the full account; what is checked here
+// is only that the field it upgrades is the field this builder reads.
+func TestBuildAgentShellCmd_NamesTheBinaryTheAgentReEnters(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	stable := filepath.Join(t.TempDir(), "bin", "jin")
+	mgr.hookExecPath = stable
+
+	cmd := probeShellCmd(t, mgr)
+
+	if want := "'JIN_BIN=" + stable + "'"; !strings.Contains(cmd, want) {
+		t.Errorf("command does not carry %s\ncommand: %s", want, cmd)
+	}
+	live, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	if strings.Contains(cmd, "'JIN_BIN="+live+"'") {
+		t.Errorf("command names the live executable rather than the stable copy\ncommand: %s", cmd)
+	}
+}
+
+// TestBuildAgentShellCmd_OmitsWhatItDoesNotKnow pins that an unknown value is
+// left out rather than assigned empty. An empty JIN_SOCKET reads to every
+// consumer as no socket at all, so writing one adds nothing except a claim to
+// know something.
+func TestBuildAgentShellCmd_OmitsWhatItDoesNotKnow(t *testing.T) {
+	mgr, _, _ := newTestManagerOn(t, "")
+	mgr.hookExecPath = ""
+
+	cmd := probeShellCmd(t, mgr)
+
+	for _, key := range []string{"JIN_SOCKET", "JIN_BIN"} {
+		if strings.Contains(cmd, key) {
+			t.Errorf("%s is assigned despite having no value\ncommand: %s", key, cmd)
+		}
+	}
+}
+
 // TestBuildAgentShellCmd_PassesTheDebugFlagToTheAgent pins that the flag
 // reaches the process that runs `jin hook`, and only when it is on.
 // buildAgentShellCmd's comment has the why.
@@ -55,8 +127,8 @@ func TestBuildAgentShellCmd_PassesTheDebugFlagToTheAgent(t *testing.T) {
 			mgr, _, _ := newTestManager(t)
 			cmd := probeShellCmd(t, mgr)
 
-			if got := strings.Contains(cmd, "JIN_DEBUG=1"); got != tt.on {
-				t.Errorf("JIN_DEBUG=1 present = %v, want %v\ncommand: %s", got, tt.on, cmd)
+			if got := strings.Contains(cmd, "'JIN_DEBUG=1'"); got != tt.on {
+				t.Errorf("JIN_DEBUG present = %v, want %v\ncommand: %s", got, tt.on, cmd)
 			}
 		})
 	}
@@ -100,9 +172,7 @@ func TestBuildAgentShellCmd_ConfiguredDebugValueWinsOverThePropagatedOne(t *test
 
 	cmd := probeShellCmd(t, mgr)
 
-	// The configured value is shell-quoted by buildEnvString; the propagated
-	// one is a literal jind-ai chose itself and needs no quoting.
-	propagated := strings.Index(cmd, "JIN_DEBUG=1")
+	propagated := strings.Index(cmd, "'JIN_DEBUG=1'")
 	configured := strings.Index(cmd, "JIN_DEBUG='0'")
 	if propagated < 0 || configured < 0 {
 		t.Fatalf("expected both assignments on the command line\ncommand: %s", cmd)

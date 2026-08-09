@@ -68,7 +68,10 @@ func newAsyncTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("config.NewStateManager: %v", err)
 	}
-	mgr, err := session.NewManager(sessionsDir, stateDir, configMgr)
+	// A socket no test dials: these handlers never reach a daemon, but the
+	// Manager passes the value on to the agents it starts, so it must not be
+	// one that could collide with a real one.
+	mgr, err := session.NewManager(sessionsDir, stateDir, "/nonexistent/handler-test.sock", configMgr)
 	if err != nil {
 		t.Fatalf("session.NewManager: %v", err)
 	}

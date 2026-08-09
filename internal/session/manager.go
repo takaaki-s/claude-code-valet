@@ -18,6 +18,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/debug"
 	"github.com/takaaki-s/jind-ai/internal/git"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/plugin"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 	"github.com/takaaki-s/jind-ai/internal/transcript"
@@ -59,8 +60,24 @@ type Manager struct {
 	paneSlotMu     sync.Mutex // serializes named-slot pane operations (find-then-split is check-then-act; see PaneSplit/PaneClose)
 	tmuxInitMu     sync.Mutex // serializes lazy tmux init AND its recovery pass (see ensureTmuxClient)
 	stateDir       string
+	socketPath     string // daemon socket this Manager's agents call back to; travels into their environment, never re-derived from the process
 	hookExecPath   string // jin-binary path baked into agent hook wiring; defaulted to os.Executable() in NewManager, upgraded to a stable copy by EstablishHookBinary
 	tmuxSocketName string // "" ⇒ tmux.SocketName; tests set an isolated name so ensureTmuxClient does not touch the shared "jin" server
+}
+
+// AgentIdentity is the jin that an agent this Manager starts is told to call
+// back into. buildAgentShellCmd writes it into the agent's environment; the
+// daemon that constructed the Manager is what decided the socket.
+//
+// Exported so the wiring is checkable from where it is made: nothing inside
+// this package can tell a Manager built over the right socket from one built
+// over the wrong one.
+func (m *Manager) AgentIdentity() jinenv.Identity {
+	return jinenv.Identity{
+		SocketPath: m.socketPath,
+		BinPath:    m.hookExecPath,
+		Debug:      debugEnabled(),
+	}
 }
 
 // SetTmuxClient sets the tmux client for tmux-based session management.
@@ -488,9 +505,17 @@ func (m *Manager) configureInnerTmux() {
 
 // NewManager creates a new session manager.
 //
-// sessionsDir is where per-session JSON files live; stateDir is where
-// generated artifacts such as hooks-settings.json are written.
-func NewManager(sessionsDir, stateDir string, configMgr *config.Manager) (*Manager, error) {
+// sessionsDir is where per-session JSON files live; stateDir is where generated
+// artifacts such as hooks-settings.json are written; socketPath is the daemon
+// socket the agents this Manager starts are told to call back to.
+//
+// socketPath is an argument rather than something buildAgentShellCmd looks up,
+// for the same reason stateDir is: a Manager honours what it was handed for
+// every other artifact it owns, and a value read from the process instead would
+// describe whichever daemon the reader happens to be, not the one that started
+// the agent. The plugin dispatcher is built from the same value one line away
+// in daemon.NewServer.
+func NewManager(sessionsDir, stateDir, socketPath string, configMgr *config.Manager) (*Manager, error) {
 	store, err := NewStore(sessionsDir)
 	if err != nil {
 		return nil, err
@@ -511,6 +536,7 @@ func NewManager(sessionsDir, stateDir string, configMgr *config.Manager) (*Manag
 		configMgr:    configMgr,
 		gitClient:    git.NewClient(),
 		stateDir:     stateDir,
+		socketPath:   socketPath,
 		hookExecPath: execPath,
 	}
 
@@ -2612,30 +2638,34 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	shellDir := workDirForShell(snap.StartDir)
 	customEnv := buildEnvString(m.configMgr.GetEnv())
 	envVars := fmt.Sprintf("JIN_SESSION_ID=%s TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1", snap.JinSessionID)
-	// JIN_DEBUG rides along for the same reason JIN_SESSION_ID does: the
-	// process this launches will run `jin hook`, and that hook is jind-ai's own
-	// binary deciding whether to record what it was handed. Starting the daemon
-	// with the flag used to turn on only half the exchange — the daemon logged
-	// the status transitions it chose, while the hook side stayed silent,
-	// because the flag reached the daemon's environment and stopped there. A
-	// tmux pane inherits the tmux server's environment, not the daemon's, so
-	// nothing carried it across on its own.
+	// The jin that started this agent, for the same reason JIN_SESSION_ID rides
+	// along: the process this launches will run `jin hook`, and that hook is
+	// jind-ai's own binary deciding which daemon to notify and whether to record
+	// what it was handed. None of it carries across on its own — jinenv.Identity
+	// has the mechanism.
 	//
-	// What was lost is the half that says why: the hook payload holds the
-	// stop_reason behind a failed turn, the notification_type that separates a
-	// permission prompt from an idle timer, and the agent session id that fired
-	// — and the daemon only writes a line when a hook changes the status, so a
-	// hook that changed nothing left no trace at all. Anyone who turned the
-	// flag on to investigate got a file that had been empty long enough to look
-	// like the events themselves were missing.
+	// Both halves were measured. Starting the daemon under the flag used to turn
+	// on only half the exchange: the daemon logged the status transitions it
+	// chose while the hook side stayed silent, losing the half that says why —
+	// the stop_reason behind a failed turn, the notification_type that separates
+	// a permission prompt from an idle timer, the agent session id that fired —
+	// and because the daemon only writes a line when a hook changes the status, a
+	// hook that changed nothing left no trace at all. And an agent whose pane
+	// came from a tmux server the daemon did not fork reached either no daemon
+	// (3/3: hook exits 0, status never moves) or an older daemon's socket still
+	// held by that server.
 	//
 	// It belongs here rather than in an adapter because nothing about it is
 	// agent-specific: every kind is launched through this wrapper and every kind
-	// calls the same hook binary. It is written before customEnv so that a user
-	// who names JIN_DEBUG in their own config still wins — `env` applies
-	// assignments left to right.
-	if debugEnabled() {
-		envVars += " JIN_DEBUG=1"
+	// calls the same hook binary. BinPath is hookExecPath — the stable copy, not
+	// os.Executable() — because this environment outlives the daemon's own
+	// executable; EstablishHookBinary has why that matters. Each assignment is
+	// quoted whole, which `env` reads the same as quoting the value: these are
+	// paths now, and a path may contain a space. It is all written before
+	// customEnv so that a user who names one of these in their own config still
+	// wins — `env` applies assignments left to right.
+	for _, kv := range m.AgentIdentity().Environ() {
+		envVars += " " + shellEscape(kv)
 	}
 	if customEnv != "" {
 		envVars += " " + customEnv

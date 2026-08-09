@@ -102,7 +102,7 @@ func NewServer(socketPath, sessionsDir, configDir, stateDir string) (*Server, er
 		return nil, err
 	}
 
-	mgr, err := session.NewManager(sessionsDir, stateDir, configMgr)
+	mgr, err := session.NewManager(sessionsDir, stateDir, socketPath, configMgr)
 	if err != nil {
 		return nil, err
 	}

@@ -803,6 +803,7 @@ Environment variables:
 | `JIN_PLUGIN_DEPTH` | Chain depth — see [Constraints](#constraints) |
 | `JIN_SOCKET` | Daemon socket path; the `jin` CLI a plugin invokes picks this up automatically |
 | `JIN_BIN` | Absolute path of the daemon's own `jin` binary. Prefer `"${JIN_BIN:-jin}"` over a bare `jin` — a `jin` found on PATH may be an older install that lacks newer subcommands |
+| `JIN_DEBUG` | `1` when the daemon is running with debug logging on, so a `jin` the plugin calls back into records what it does too. Omitted — not set to `0` — otherwise |
 | `JIN_CALLER_TMUX_SOCKET` | Action runs only: socket path of the tmux server the invoking CLI ran inside (from its `$TMUX`). Unset — not empty — when the caller was outside tmux |
 | `JIN_CALLER_TMUX_PANE` | Action runs only: the invoking CLI's pane ID (from its `$TMUX_PANE`). Unset when unknown |
 
@@ -984,6 +985,10 @@ export JIN_DEBUG=1
 tail -f ~/.local/state/jind-ai/plugin-debug.log        # dispatcher decisions
 tail -f ~/.local/state/jind-ai/plugin-logs/<name>.log  # a plugin's own stdout/stderr
 ```
+
+The flag reaches the plugin as `JIN_DEBUG=1`, so a `jin` the plugin calls back
+into logs as well — `hook-debug.log` for `jin hook`, `daemon-debug.log` for the
+daemon side of anything else it asks for.
 
 ## Debugging
 
