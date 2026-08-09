@@ -94,9 +94,10 @@ const pluginTmpPattern = ".jin-plugin-*.tmp"
 // The file is rewritten on every call rather than only when missing, which
 // makes it self-healing: a plugin the user deleted, truncated or edited by
 // hand is restored on the next session start. (It does not exist to track a
-// moved binary — ExecPath is fixed for the daemon's lifetime, resolved once at
-// startup; a new binary means a new daemon.) The write costs well under a
-// millisecond next to spawning tmux and the agent itself.
+// moved binary: execPath is a parameter here, not a value this package
+// remembers, so a caller that resolves a different one simply passes it.) The
+// write costs well under a millisecond next to spawning tmux and the agent
+// itself.
 func WritePlugin(stateDir, execPath string) (string, error) {
 	if stateDir == "" {
 		return "", fmt.Errorf("opencode: empty state dir")

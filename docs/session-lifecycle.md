@@ -97,8 +97,9 @@ Legacy `Name` field is migrated on daemon startup: `store.Load()` reads the raw 
 2. `Manager.StartBackground()` → `startSessionTmux()` (under `m.mu`)
 3. `ensureTmuxClient()` initializes the inner tmux (`-L jin`)
 4. The adapter's `Setup()` runs — for Claude Code that is
-   `EnsureHooksSettingsFile()` (once per daemon) plus `EnsureTrustState()`,
-   which sets `projects[<workDir>].hasTrustDialogAccepted` in `~/.claude.json`
+   `EnsureHooksSettingsFile()` (rewritten on every start, so a deleted or
+   hand-edited file recovers) plus `EnsureTrustState()`, which sets
+   `projects[<workDir>].hasTrustDialogAccepted` in `~/.claude.json`
    (not a settings file — see docs/gotchas.md)
 5. Creates an inner tmux session and runs `claude --session-id "$JIN_CLAUDE_SESSION"`.
    The id travels in the environment rather than in the command text — see the

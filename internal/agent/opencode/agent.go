@@ -39,9 +39,11 @@ var opencodeLog = debug.NewLogger("daemon-debug.log")
 //   - statusSrc is cached so hot-path StatusSource() calls on every hook
 //     don't reallocate.
 //
-// setupMu guards configDir because Setup runs once per session start (not
-// once per process): the plugin is rewritten whenever the jin executable
-// path changes, so a sync.Once would pin a stale path after a reinstall.
+// setupMu guards configDir on both sides because the directory belongs to the
+// Manager whose SetupContext named it, while this adapter belongs to the
+// process. Setup runs per spawn, from a per-session goroutine, and a process
+// hosting two Managers — the e2e suite builds a daemon per test — writes two
+// different directories into this one field while SpawnCommand reads it.
 type Agent struct {
 	setupMu   sync.Mutex
 	configDir string
@@ -84,13 +86,20 @@ func (a *Agent) RecognizesSessionID(id string) bool { return hasSessionIDPrefix(
 // the plugin costs live status reporting (the session falls back to
 // pane-death detection), which is strictly better than refusing to launch
 // the agent at all.
-// A failure deliberately leaves the previously recorded directory in
-// place. Setup is called once per session start, from a per-session
-// goroutine, against one shared adapter — so clearing the field here
-// would let a failure on one session silently disable status reporting
-// for every other session already running. StateDir and ExecPath are
-// invariant for the daemon's lifetime, so a directory that worked before
-// is still valid now.
+// A failure deliberately leaves the previously recorded directory in place.
+// Setup is called once per spawn, from a per-session goroutine, against one
+// shared adapter — so clearing the field here would let a failure on one
+// session silently disable status reporting for every other session already
+// running.
+//
+// That directory belongs to the Manager that last succeeded, and the adapter
+// outlives any one of them (see the contract on session.Agent.Setup), so on a
+// failure it can name a state directory this ctx does not own. This adapter
+// keeps it even so, which TestAgent_SetupFailure_KeepsPreviousConfigDir pins;
+// the Claude Code adapter answers the other way, re-deriving inside the ctx's
+// own state directory. What either answer costs opencode has not been measured
+// here, so the difference is a gap left alone rather than a considered
+// asymmetry.
 func (a *Agent) Setup(ctx agent.SetupContext) error {
 	dir, err := WritePlugin(ctx.StateDir, ctx.ExecPath)
 	if err != nil {

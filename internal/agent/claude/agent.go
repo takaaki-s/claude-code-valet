@@ -20,21 +20,21 @@ import (
 // so debug output for CC-specific setup goes to a single logger instance.
 var claudeLog = debug.NewLogger("daemon-debug.log")
 
-// The Claude Code adapter caches a handful of pieces so multiple session
-// starts don't repeatedly perform expensive or racy work:
+// Agent is the Claude Code adapter state. One instance serves every session,
+// because the registry holds one per kind for the whole process
+// (internal/agent/registry.go). Its fields divide into two kinds:
 //
-//   - hooksOnce guards hooks-settings.json generation. The file describes how
-//     Claude Code invokes `jin hook`; it must exist once per daemon process
-//     and it is safe to reuse across every session (the content is
-//     session-independent).
-//   - enhancer is the Layer C description enhancer — it holds a transcript
-//     reader whose only state is the ~/.claude directory path.
-//   - statusSrc is stateless but held as a value so we don't allocate one per
-//     hook event.
+//   - hooksPath is derived from the SetupContext of the most recent Setup, so
+//     it changes whenever that context does. setupMu guards it. A Setup that
+//     recomputes rather than caching is the point — see Setup.
+//   - enhancer and statusSrc answer questions no SetupContext is involved in.
+//     enhancer is the Layer C description enhancer, holding a transcript
+//     reader whose only state is the ~/.claude directory path; statusSrc is
+//     stateless but held as a value so we don't allocate one per hook event.
+//     Both are built in New and never reassigned, so neither needs the mutex.
 type Agent struct {
-	hooksOnce sync.Once
+	setupMu   sync.Mutex
 	hooksPath string
-	hooksErr  error
 
 	enhancer  *CCDescriptionEnhancer
 	statusSrc *HookStatusSource
@@ -76,29 +76,49 @@ func (a *Agent) Description() agent.DescriptionSource { return a.enhancer }
 // the Codex adapter for why caching it buys nothing.
 func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader() }
 
-// Setup writes the process-wide hooks-settings.json (exactly once) and the
-// per-workDir trust flag. Both failures are logged but do not abort the
-// session start — the historical behaviour is "warn and continue", matching
-// what Claude Code itself tolerates.
+// Setup writes hooks-settings.json into ctx.StateDir and the per-workDir trust
+// flag. Both failures are logged but do not abort the session start — the
+// historical behaviour is "warn and continue", matching what Claude Code
+// itself tolerates.
 //
-// SpawnCommand consults a.hooksPath to decide whether to pass --settings; if
-// the hooks file could not be written the flag is simply omitted.
+// It derives from the ctx of each call rather than caching the first. That is
+// the rule session.Agent.Setup states for every adapter, and
+// TestE2E_SecondDaemonGetsItsOwnHooksSettings carries what breaking it was
+// measured to cost. Recomputing also makes the file self-healing, the property
+// opencode.WritePlugin has: one deleted or hand-edited by mistake is rewritten
+// at the next session start rather than staying broken for the daemon's life.
+//
+// A failed write falls back to whatever ctx.StateDir itself still holds, never
+// to the last value the field held. That distinction is the local decision
+// here: the field's last value can name a different state directory, and
+// handing this session that file is the defect the recomputation exists to
+// prevent, arriving through the error path instead. Falling back inside
+// ctx.StateDir costs nothing and keeps one session's transient write failure
+// from stripping --settings off a concurrent session that shares the directory
+// and whose own Setup succeeded — which is every pair of sessions in
+// production. See existingHooksSettings for what it will and will not serve.
+// With nothing usable there the path is empty and SpawnCommand omits
+// --settings: the session starts, without status hooks.
 func (a *Agent) Setup(ctx agent.SetupContext) error {
-	a.hooksOnce.Do(func() {
-		a.hooksPath, a.hooksErr = EnsureHooksSettingsFile(ctx.StateDir, ctx.ExecPath)
-		if a.hooksErr != nil {
-			claudeLog("[HOOKS] Warning: failed to generate hooks settings: %v", a.hooksErr)
-		}
-	})
+	// The write happens outside the lock: it is I/O, and nothing below it
+	// reads adapter state. That keeps setupMu a leaf, which is what
+	// docs/conventions.md requires of a lock reachable from startSessionTmux.
+	path, err := EnsureHooksSettingsFile(ctx.StateDir, ctx.ExecPath)
+	if err != nil {
+		claudeLog("[HOOKS] Warning: failed to generate hooks settings: %v", err)
+		// Assigned here rather than relying on what the helper returns
+		// alongside an error.
+		path = existingHooksSettings(ctx.StateDir)
+	}
+	a.setupMu.Lock()
+	a.hooksPath = path
+	a.setupMu.Unlock()
+
 	if err := EnsureTrustState(ctx.WorkDir); err != nil {
 		claudeLog("[TRUST] Warning: failed to set trust state: %v", err)
 	}
 	return nil
 }
-
-// HooksSettingsPath returns the cached path written by Setup; empty means
-// Setup either hasn't run yet or the write failed.
-func (a *Agent) HooksSettingsPath() string { return a.hooksPath }
 
 // ClearInputKeys returns the tmux key sequence Manager.SendPrompt sends
 // before each attempt to wipe Claude Code's input line to empty, preventing

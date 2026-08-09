@@ -276,13 +276,29 @@ type StatusSource interface {
 	Interpret(StatusSignal) (StatusUpdate, bool)
 }
 
-// SetupContext is the input to Agent.Setup, called once per session start
-// before the shell command is built. Adapters use it to write agent-side
-// config files (Claude Code's hooks-settings.json, trust dialog state, ...).
+// SetupContext is the input to Agent.Setup, called once per spawn — the start
+// path and the quick-fail resume retry both go through it — before the shell
+// command is built. Adapters use it to write agent-side config files (Claude
+// Code's hooks-settings.json, trust dialog state, ...).
 type SetupContext struct {
-	StateDir string // jind-ai's persistent state directory (~/.local/state/jind-ai)
-	ExecPath string // absolute path to the running jin binary (os.Executable())
-	WorkDir  string // absolute working directory the session will start in
+	// StateDir is jind-ai's persistent state directory
+	// (~/.local/state/jind-ai).
+	StateDir string
+	// ExecPath is the jin binary this session's children re-enter to call
+	// back: the command an adapter writes into the agent's hook wiring, and
+	// the path the opencode adapter bakes into the plugin it materialises.
+	// A jind-ai plugin's $JIN_BIN carries the same value but not by this
+	// route — internal/plugin renders that from jinenv.Identity, which is
+	// also where the Manager reads this. It is not os.Executable(): the
+	// Manager passes the stable copy EstablishHookBinary took under its own
+	// state directory, falling back to the live path only when that copy
+	// could not be made, and to empty when even that cannot be resolved.
+	// The value therefore belongs to the calling Manager rather than to the
+	// process, and a second Manager in the same process names a different
+	// file.
+	ExecPath string
+	// WorkDir is the absolute working directory the session will start in.
+	WorkDir string
 }
 
 // BlockKind identifies the sort of blocking prompt an agent's TUI is showing
@@ -389,9 +405,27 @@ type Agent interface {
 	// ("claude", "codex", ...).
 	Kind() string
 	// Setup prepares any agent-global or per-workDir state that must exist
-	// before the process is spawned. Called once per startSessionTmux
-	// invocation. Errors are logged but do not abort the launch — see the
-	// Claude Code adapter for the intended failure semantics.
+	// before the process is spawned. Called once per spawn — the start path
+	// and the quick-fail resume retry both go through it. Errors are logged
+	// but do not abort the launch — see the Claude Code adapter for the
+	// intended failure semantics.
+	//
+	// Derive what the spawn needs from the ctx of THIS call rather than
+	// caching the first one. The registry hands out one adapter instance
+	// for the whole process (internal/agent/registry.go), while a
+	// SetupContext describes the Manager starting this one session, so a
+	// sync.Once here pins whichever Manager got there first — including a
+	// StateDir whose owner has since deleted it. A field derived from ctx
+	// is therefore rewritten on every call and read back by SpawnCommand,
+	// which puts it under the concurrency rule above and means it needs a
+	// mutex; the opencode and Claude Code adapters are the worked examples.
+	//
+	// The rule binds the failure path as well: a value derived from an
+	// earlier SetupContext may survive a failure only where it is still
+	// derivable from this one — see the Claude Code adapter, which falls
+	// back to what ctx.StateDir itself holds rather than to whatever the
+	// field last named. The opencode adapter is the one that does not, and
+	// its own Setup doc says so and says what is unmeasured about it.
 	Setup(SetupContext) error
 	// SpawnCommand returns the shell command + env additions that launch
 	// (or resume) the agent for the given session.
