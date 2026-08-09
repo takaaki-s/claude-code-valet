@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/takaaki-s/jind-ai/internal/debug"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/pkg/plugin/manifest"
 )
 
@@ -48,7 +49,7 @@ type EventDispatcher struct {
 	registry      *Registry
 	pluginsDir    string
 	stateDir      string
-	socketPath    string
+	identity      jinenv.Identity
 	debounce      time.Duration
 	popupResolver PopupSizeResolver
 
@@ -58,10 +59,14 @@ type EventDispatcher struct {
 }
 
 // NewDispatcher returns a dispatcher that resolves plugins through registry
-// and injects socketPath as JIN_SOCKET into every run. debounce <= 0 selects
-// DefaultDebounce. A nil popupResolver is replaced with one that always
-// returns empty strings (no popup size hints exported).
-func NewDispatcher(registry *Registry, pluginsDir, stateDir, socketPath string, debounce time.Duration, popupResolver PopupSizeResolver) *EventDispatcher {
+// and injects identity into every run. debounce <= 0 selects DefaultDebounce.
+// A nil popupResolver is replaced with one that always returns empty strings
+// (no popup size hints exported).
+//
+// identity is passed in rather than assembled here because the daemon and its
+// agents must hand out the same one; session.Manager.Identity is where it comes
+// from in production.
+func NewDispatcher(registry *Registry, pluginsDir, stateDir string, identity jinenv.Identity, debounce time.Duration, popupResolver PopupSizeResolver) *EventDispatcher {
 	if debounce <= 0 {
 		debounce = DefaultDebounce
 	}
@@ -72,12 +77,23 @@ func NewDispatcher(registry *Registry, pluginsDir, stateDir, socketPath string, 
 		registry:      registry,
 		pluginsDir:    pluginsDir,
 		stateDir:      stateDir,
-		socketPath:    socketPath,
+		identity:      identity,
 		debounce:      debounce,
 		popupResolver: popupResolver,
 		lastFired:     make(map[string]time.Time),
 		warned:        make(map[string]bool),
 	}
+}
+
+// Identity is the jin this dispatcher tells its plugins to call back into.
+//
+// Exported for the same reason session.Manager.Identity is: the value is set by
+// the daemon that wires both, and from inside either package a dispatcher built
+// over the right one is indistinguishable from a dispatcher built over its own
+// executable. daemon's wiring test is the only place the two are visible at
+// once, and it is where they diverged.
+func (d *EventDispatcher) Identity() jinenv.Identity {
+	return d.identity
 }
 
 // Publish implements Dispatcher.
@@ -175,7 +191,7 @@ func (d *EventDispatcher) run(e Entry, a *manifest.Action, ev Event, depth int, 
 		Env:         ev,
 		Caller:      actx,
 		Depth:       depth,
-		SocketPath:  d.socketPath,
+		Identity:    d.identity,
 		LogPath:     LogPath(d.stateDir, e.Name),
 		Timeout:     timeout,
 		PopupWidth:  popupWidth,

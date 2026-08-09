@@ -142,7 +142,15 @@ func NewServer(socketPath, sessionsDir, configDir, stateDir string) (*Server, er
 
 	pluginCfg := configMgr.GetPluginsConfig()
 	pluginReg := plugin.NewRegistry(paths.Plugins(), stateDir, pluginCfg)
-	pluginDisp := plugin.NewDispatcher(pluginReg, paths.Plugins(), stateDir, socketPath,
+	// mgr.Identity() rather than a locally assembled one, and read here rather
+	// than above: EstablishHookBinary has run by now, so this carries the
+	// stable copy of the binary — with the Manager's fallback to the live path
+	// when that copy could not be made. A plugin's environment outlives the
+	// daemon's own executable exactly as an agent's does; `make build` while
+	// the daemon runs was enough to make the launch path hold a different
+	// build (3/3), and removing the directory it launched from left the path
+	// gone (3/3, callbacks exiting 127).
+	pluginDisp := plugin.NewDispatcher(pluginReg, paths.Plugins(), stateDir, mgr.Identity(),
 		time.Duration(pluginCfg.Debounce)*time.Second,
 		// actionID is accepted but unused for now: user config keys popup size
 		// by plugin name only, so every action shares the plugin-level setting.

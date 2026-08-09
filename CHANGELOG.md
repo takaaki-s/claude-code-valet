@@ -139,6 +139,19 @@ log.
   copy, so an agent that shells out to `jin` reaches the version that started
   it rather than whatever is first on `PATH`.
 
+- **A plugin's `$JIN_BIN` now points at that same stable copy** instead of the
+  daemon's live executable. The two are not the same file for long: `go build
+  -o` over a running binary unlinks it and creates a new one at the same path,
+  so a single rebuild while the daemon runs left plugins pointed at a build the
+  daemon never was (measured 3/3). Where the IPC shape had changed, a callback
+  failed with the protocol-mismatch message; where it had not, it succeeded
+  against a binary nobody chose. Deleting the directory the daemon was launched
+  from — a worktree, say — left the path gone outright and callbacks exiting
+  127 (3/3); `"${JIN_BIN:-jin}"` does not fall back to `PATH` there, because
+  `:-` substitutes only when a variable is unset or empty and a dead path is
+  neither. Agents were already immune, which is the point: the two spawn sites
+  now take the same value rather than each deciding.
+
 ## 0.9.0
 
 ### Features

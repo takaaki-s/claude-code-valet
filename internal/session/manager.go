@@ -65,14 +65,22 @@ type Manager struct {
 	tmuxSocketName string // "" ⇒ tmux.SocketName; tests set an isolated name so ensureTmuxClient does not touch the shared "jin" server
 }
 
-// AgentIdentity is the jin that an agent this Manager starts is told to call
-// back into. buildAgentShellCmd writes it into the agent's environment; the
-// daemon that constructed the Manager is what decided the socket.
+// Identity is the jin that a process this daemon spawns is told to call back
+// into. buildAgentShellCmd writes it into an agent's environment, and
+// daemon.NewServer hands the same value to the plugin dispatcher, so an agent
+// and a plugin cannot be told to re-enter different binaries.
+//
+// The Manager answers this because it owns the answer's hardest part: the
+// stable copy of the binary lives under its stateDir and is established by its
+// own EstablishHookBinary, which is best-effort — on failure the field keeps
+// the live path. A second caller deriving <stateDir>/bin/jin for itself would
+// have the right answer only when that copy succeeded, and would hand out a
+// path that does not exist when it did not.
 //
 // Exported so the wiring is checkable from where it is made: nothing inside
 // this package can tell a Manager built over the right socket from one built
 // over the wrong one.
-func (m *Manager) AgentIdentity() jinenv.Identity {
+func (m *Manager) Identity() jinenv.Identity {
 	return jinenv.Identity{
 		SocketPath: m.socketPath,
 		BinPath:    m.hookExecPath,
@@ -2664,7 +2672,7 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	// paths now, and a path may contain a space. It is all written before
 	// customEnv so that a user who names one of these in their own config still
 	// wins — `env` applies assignments left to right.
-	for _, kv := range m.AgentIdentity().Environ() {
+	for _, kv := range m.Identity().Environ() {
 		envVars += " " + shellEscape(kv)
 	}
 	if customEnv != "" {
