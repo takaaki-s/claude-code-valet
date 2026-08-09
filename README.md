@@ -844,6 +844,17 @@ taken. The daemon serializes named-slot calls; `--here` runs without that
 arbitration, so concurrent calls for the same slot name are not guaranteed
 idempotent.
 
+**What a pane opened by `jin pane popup` / `jin pane split` receives**:
+`JIN_SOCKET`, `JIN_BIN`, `JIN_DEBUG` and `JIN_SESSION_ID` — the same jin you
+were told to call back into, and the session the pane's work belongs to. Call
+back from inside a popup or a split pane exactly as you would from the plugin
+itself, `"${JIN_BIN:-jin}"` included. Every pane gets them: by selector or
+`--here`, a slot restarted with `--if-exists respawn`, and a split with no
+command at all. A value jind-ai does not know arrives empty rather than
+omitted, because a key left out of a pane's environment is one tmux fills in
+from its server. That is also why `JIN_DEBUG` is empty here when debug logging
+is off rather than absent as it is above; it is never `0` in either place.
+
 **Compatibility contract**: treat any environment variable, JSON field, or CLI
 flag you don't recognize as something to ignore, not an error. jind-ai only
 adds to this surface within a `schema_version`; breaking removals happen
@@ -936,12 +947,6 @@ are decided once at install time and honoured by every later update.
   tears it down; don't build a long-running daemon into `entrypoint`. If you
   need one, run it yourself (manually, or as a systemd user unit) and keep
   the plugin a thin per-event client to it (e.g. `curl`).
-- **Popups don't inherit `JIN_*` env vars.** `jin pane popup` / `jin pane
-  split` run their command in a process tmux spawns fresh — pass any data
-  the popup needs as arguments on its command line (or as env-assignment
-  prefixes in the command string, e.g.
-  `jin pane popup "$JIN_SESSION_ID" -- "JIN_BIN=$JIN_BIN inner.sh --id $JIN_SESSION_ID"`),
-  not as inherited env vars.
 - **Fail-open.** A plugin that errors, times out, or hangs never blocks a
   session's status pipeline — it's logged and the pipeline moves on. Timeout
   defaults to 30s (`timeout:` in the manifest).

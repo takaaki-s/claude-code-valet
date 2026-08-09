@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"os"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -302,5 +305,103 @@ func TestRunCloseHere_NoTmuxClient(t *testing.T) {
 
 	if err := runCloseHere("demo"); err == nil {
 		t.Fatal("expected error when no tmux client is resolvable, got nil")
+	}
+}
+
+// TestCallerPaneEnv_ForwardsWhatItWasTold is the --here counterpart of the
+// daemon path's hand-off test. What it pins is that nothing here is worked out
+// locally: --here never reaches the daemon, so the only correct source for
+// which jin and which session is the environment this process was started with.
+//
+// JIN_DEBUG is not driven here. internal/debug reads it into a package
+// variable at init, so t.Setenv cannot move it; that the flag is carried at all
+// is pinned in internal/jinenv's own table.
+func TestCallerPaneEnv_ForwardsWhatItWasTold(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
+	t.Setenv("JIN_BIN", "/nonexistent/told-bin/jin")
+	t.Setenv("JIN_SESSION_ID", "told-session")
+
+	want := []string{
+		"JIN_SOCKET=/nonexistent/told.sock",
+		"JIN_BIN=/nonexistent/told-bin/jin",
+		"JIN_DEBUG=",
+		"JIN_SESSION_ID=told-session",
+	}
+	if got := callerPaneEnv(); !reflect.DeepEqual(got, want) {
+		t.Errorf("callerPaneEnv() = %q, want %q", got, want)
+	}
+}
+
+// TestCallerPaneEnv_NeverGuessesTheBinary is the one that has to fail if
+// someone reaches for os.Executable() here. A caller with no JIN_BIN is a
+// caller jind-ai did not start, and the honest answer is that we do not know
+// which binary it should re-enter — an empty assignment, which
+// "${JIN_BIN:-jin}" resolves to the PATH copy. The path of *this* process is
+// not an answer to that question, and the test binary's path is what a
+// derivation would produce.
+func TestCallerPaneEnv_NeverGuessesTheBinary(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
+	t.Setenv("JIN_BIN", "")
+	t.Setenv("JIN_SESSION_ID", "")
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable failed: %v", err)
+	}
+	for _, kv := range callerPaneEnv() {
+		if kv == "JIN_BIN="+self {
+			t.Fatalf("callerPaneEnv() derived JIN_BIN from this process (%s)", self)
+		}
+	}
+	if got := callerPaneEnv(); !slices.Contains(got, "JIN_BIN=") {
+		t.Errorf("callerPaneEnv() = %q, want an empty JIN_BIN assignment: leaving the key out lets the pane inherit the tmux server's", got)
+	}
+}
+
+// TestCallerPaneEnv_SocketFlagWins pins that --here uses the same answer to
+// "which daemon" as every other subcommand, rather than reading JIN_SOCKET on
+// its own and quietly ignoring --socket.
+func TestCallerPaneEnv_SocketFlagWins(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/from-env.sock")
+	t.Setenv("JIN_BIN", "")
+	t.Setenv("JIN_SESSION_ID", "")
+
+	prev := socketPathFlag
+	socketPathFlag = "/nonexistent/from-flag.sock"
+	t.Cleanup(func() { socketPathFlag = prev })
+
+	if got := callerPaneEnv(); !slices.Contains(got, "JIN_SOCKET=/nonexistent/from-flag.sock") {
+		t.Errorf("callerPaneEnv() = %q, want the --socket value", got)
+	}
+}
+
+// TestPopupHereOptions_CarriesTheEnv and its split twin cover the wiring the
+// runners hide. Without them, deleting the Env field from either assembly is a
+// change no test can see.
+func TestPopupHereOptions_CarriesTheEnv(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
+	t.Setenv("JIN_BIN", "/nonexistent/told-bin/jin")
+	t.Setenv("JIN_SESSION_ID", "told-session")
+
+	opts := popupHereOptions("%3", "less /tmp/x", "T", "80%", "50%")
+	if !reflect.DeepEqual(opts.Env, callerPaneEnv()) {
+		t.Errorf("popup Env = %q, want %q", opts.Env, callerPaneEnv())
+	}
+	if opts.Target != "%3" || opts.Cmd != "less /tmp/x" || opts.Title != "T" || opts.Width != "80%" || opts.Height != "50%" {
+		t.Errorf("popupHereOptions mangled a field: %+v", opts)
+	}
+}
+
+func TestWithCallerPaneEnv_OverwritesWhatTheCallerAsked(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
+	t.Setenv("JIN_BIN", "/nonexistent/told-bin/jin")
+	t.Setenv("JIN_SESSION_ID", "told-session")
+
+	got := withCallerPaneEnv(tmux.SplitOptions{Cmd: "htop", Env: []string{"JIN_SOCKET=/tmp/attacker.sock"}})
+	if !reflect.DeepEqual(got.Env, callerPaneEnv()) {
+		t.Errorf("split Env = %q, want %q", got.Env, callerPaneEnv())
+	}
+	if got.Cmd != "htop" {
+		t.Errorf("withCallerPaneEnv mangled Cmd = %q", got.Cmd)
 	}
 }

@@ -779,7 +779,7 @@ func (m *Model) switchToSession(sessionID string) {
 				sess.Description, sess.Status,
 			)
 		}
-		_ = m.tmuxClient.RespawnPane(m.displayPaneID, placeholderCmd)
+		_ = m.tmuxClient.RespawnPane(m.displayPaneID, placeholderCmd, nil)
 		_ = m.tmuxClient.ClearHistory(m.displayPaneID)
 		m.recordDisplayedSession(sess)
 		return
@@ -807,7 +807,7 @@ func (m *Model) switchToSession(sessionID string) {
 	// DefaultSocketName), so the pane and the Model agree on which inner
 	// server they are talking about.
 	attachCmd := buildInnerAttachCmd(tmux.DefaultSocketName(), sess.TmuxWindowName)
-	_ = m.tmuxClient.RespawnPane(m.displayPaneID, attachCmd)
+	_ = m.tmuxClient.RespawnPane(m.displayPaneID, attachCmd, nil)
 	_ = m.tmuxClient.ClearHistory(m.displayPaneID)
 	m.displayLocalAttach = true
 
@@ -947,7 +947,7 @@ func (m *Model) respawnPlaceholder() {
 	}
 	if m.tmuxClient != nil && m.displayPaneID != "" {
 		m.detachInnerClient()
-		_ = m.tmuxClient.RespawnPane(m.displayPaneID, tmux.PlaceholderCmd)
+		_ = m.tmuxClient.RespawnPane(m.displayPaneID, tmux.PlaceholderCmd, nil)
 		_ = m.tmuxClient.ClearHistory(m.displayPaneID)
 	}
 	// Runs even without a display pane (legacy mode, tests), where it just

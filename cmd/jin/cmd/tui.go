@@ -417,7 +417,7 @@ func createAndAttachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	// NewSessionWithCmd) guarantees the TUI process sees a fully-built layout on its
 	// first look, so its display-pane discovery never times out on a cold start.
 	if tuiPaneID != "" {
-		_ = tc.RespawnPane(tuiPaneID, tuiInnerCmd)
+		_ = tc.RespawnPane(tuiPaneID, tuiInnerCmd, nil)
 		_ = tc.SelectPane(tuiPaneID)
 	}
 
@@ -449,7 +449,7 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	if tuiPaneID != "" {
 		if tc.IsPaneDead(tuiPaneID) {
 			// TUI pane exists but dead → respawn it
-			_ = tc.RespawnPane(tuiPaneID, tuiInnerCmd)
+			_ = tc.RespawnPane(tuiPaneID, tuiInnerCmd, nil)
 		}
 		// Re-apply the border label in case the outer tmux server was
 		// restarted between sessions and cleared the per-pane option. Also the
@@ -460,7 +460,7 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 		_ = tc.SelectPane(tuiPaneID)
 	} else {
 		// No tracked TUI pane → respawn in UI window pane 0
-		_ = tc.RespawnPane(tmux.UITarget(0), tuiInnerCmd)
+		_ = tc.RespawnPane(tmux.UITarget(0), tuiInnerCmd, nil)
 		_ = tc.SelectWindow(tmux.SessionName + ":" + tmux.UIWindowName)
 	}
 
@@ -469,7 +469,7 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	// back wearing the name of whatever session the pane died on.
 	displayPaneID := tc.GetEnvironment(tmux.SessionName, "JIN_DISPLAY_PANE")
 	if displayPaneID != "" && tc.IsPaneDead(displayPaneID) {
-		_ = tc.RespawnPane(displayPaneID, tmux.PlaceholderCmd)
+		_ = tc.RespawnPane(displayPaneID, tmux.PlaceholderCmd, nil)
 		_ = tc.SetPaneOption(displayPaneID, tmux.PaneLabelOption, "")
 	}
 	setTransientAgentEnv(tc, agentFlag)

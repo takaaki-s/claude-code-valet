@@ -12,6 +12,14 @@
 // wrong socket exits 0 and writes nothing; a callback that runs with the flag
 // off simply leaves no line behind. Nothing fails, so nothing is noticed.
 //
+// There are two renderers, and which one a caller wants is decided by the
+// destination rather than by the caller: Environ for a child whose environment
+// jind-ai builds from nothing (os/exec, a shell `env` prefix), TmuxEnviron for
+// one tmux builds from the environment of whichever process forked its server.
+// They differ only in what an unknown value renders as, and they have to,
+// because leaving a key out means "absent" in the first case and "inherit
+// whatever is there" in the second.
+//
 // The worktree post-create hook is a deliberate non-consumer. It runs inside
 // provisioning, before the session's recorded working directory moves to the
 // new worktree, so a hook that could call back would be asking about a session
@@ -66,6 +74,9 @@ type Identity struct {
 // treats an empty JIN_SOCKET as no socket and an empty JIN_BIN as no binary, so
 // an empty assignment carries no information the absence does not — it only
 // makes a child's environment claim to know something it does not.
+//
+// That reasoning holds only where a skipped key is simply absent from the
+// child. Where it is not — tmux — use TmuxEnviron instead.
 func (i Identity) Environ() []string {
 	env := make([]string, 0, 3)
 	if i.SocketPath != "" {
@@ -78,4 +89,45 @@ func (i Identity) Environ() []string {
 		env = append(env, "JIN_DEBUG=1")
 	}
 	return env
+}
+
+// TmuxEnviron renders this identity, plus the session a pane's work belongs to,
+// as the assignments tmux takes one per -e. The session id is an argument
+// rather than a field because it answers a different question than the three
+// above: not which jin, but which of its sessions.
+//
+// It emits every key, empty when the value is unknown, and that is the whole
+// difference from Environ. The rule inverts because the destination does: a key
+// left out of an exec.Cmd environment is absent from the child, but a key left
+// out of tmux's -e is taken from the tmux *server* — which holds whatever
+// process forked it. All three outcomes were measured, 3/3 each: nothing when
+// the daemon forked it, an older daemon's socket when an earlier one did, and
+// another session's id when the server was forked from inside an agent's pane
+// (a `jin daemon start` run there is enough). The last is the one to fear,
+// because a stale id is a plausible UUID and an absent one is not.
+//
+// There is no third choice to reach for: tmux has no unset form for -e. `-e
+// VAR` without a value is ignored, and `-e VAR=` sets it empty — both measured.
+//
+// Emitting empty is safe because jind-ai's own readers already read empty as
+// unknown: debug.Enabled() compares against "1", and an empty JIN_SOCKET or
+// JIN_BIN means no socket and no binary, exactly as their absence does.
+// `"${JIN_BIN:-jin}"`, the form the README recommends, substitutes on empty as
+// well as on unset — unlike a stale path, which is neither and so falls through
+// to a 127.
+//
+// JIN_DEBUG is emitted empty rather than "0" for the reason it is omitted from
+// Environ rather than set to "0": a plugin testing `[ -n "$JIN_DEBUG" ]` would
+// read "0" as on.
+func (i Identity) TmuxEnviron(sessionID string) []string {
+	debugFlag := ""
+	if i.Debug {
+		debugFlag = "1"
+	}
+	return []string{
+		"JIN_SOCKET=" + i.SocketPath,
+		"JIN_BIN=" + i.BinPath,
+		"JIN_DEBUG=" + debugFlag,
+		"JIN_SESSION_ID=" + sessionID,
+	}
 }

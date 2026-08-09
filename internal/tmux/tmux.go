@@ -397,13 +397,24 @@ func (c *Client) ListWindows(session string) ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
-// RespawnPane respawns a dead pane with a new command.
-func (c *Client) RespawnPane(target, shellCmd string) error {
+// buildRespawnArgs translates a respawn into respawn-pane arguments. Kept as a
+// pure function so the flag translation is unit-testable without tmux, as
+// buildSplitArgs and buildPopupArgs are.
+func buildRespawnArgs(target, shellCmd string, env []string) []string {
 	args := []string{"respawn-pane", "-t", target, "-k"}
+	for _, assignment := range env {
+		args = append(args, "-e", assignment)
+	}
 	if shellCmd != "" {
 		args = append(args, shellCmd)
 	}
-	return c.runSilent(args...)
+	return args
+}
+
+// RespawnPane respawns a dead pane with a new command. Runner.RespawnPane says
+// what env carries and what a nil one asserts.
+func (c *Client) RespawnPane(target, shellCmd string, env []string) error {
+	return c.runSilent(buildRespawnArgs(target, shellCmd, env)...)
 }
 
 // ClearHistory wipes both scrollback and the visible screen of the target pane
@@ -425,6 +436,11 @@ type SplitOptions struct {
 	NoFocus   bool   // keep focus on the current pane (-d)
 	Dir       string // working directory for the new pane (-c); empty = tmux default
 	Cmd       string // command to run in the new pane; empty = shell
+	// Env is KEY=VALUE assignments for the new pane, one -e each. Leaving it
+	// empty is not neutral: the pane then takes its environment from the tmux
+	// server, which holds whatever process forked that server.
+	// jinenv.Identity.TmuxEnviron says what jind-ai puts here and why.
+	Env []string
 }
 
 // Validate checks Direction and Size. Percent sizes are limited to 1-99;
@@ -470,6 +486,9 @@ func buildSplitArgs(target string, o SplitOptions) []string {
 	}
 	if o.Size != "" {
 		args = append(args, "-l", o.Size)
+	}
+	for _, assignment := range o.Env {
+		args = append(args, "-e", assignment)
 	}
 	if o.Dir != "" {
 		args = append(args, "-c", o.Dir)
@@ -519,7 +538,7 @@ type PaneSlotOps interface {
 	FindPaneByName(target, name string) (string, error)
 	SplitPane(target string, opts SplitOptions) (string, error)
 	SetPaneOption(target, option, value string) error
-	RespawnPane(target, cmd string) error
+	RespawnPane(target, cmd string, env []string) error
 	KillPane(target string) error
 }
 
@@ -543,7 +562,7 @@ func EnsureNamedPane(ops PaneSlotOps, target, name, ifExists string, opts SplitO
 		if existing != "" {
 			switch ifExists {
 			case IfExistsRespawn:
-				if err := ops.RespawnPane(existing, opts.Cmd); err != nil {
+				if err := ops.RespawnPane(existing, opts.Cmd, opts.Env); err != nil {
 					return "", err
 				}
 				return existing, nil
@@ -1023,28 +1042,43 @@ type DisplayPopupOptions struct {
 	Dir    string // working directory for the command inside the popup (-d)
 	Cmd    string // command to run inside the popup
 	Title  string // popup title (tmux 3.3+)
+	// Env is KEY=VALUE assignments for the popup's command, one -e each.
+	// Leaving it empty is not neutral: the command then takes its environment
+	// from the tmux server, which holds whatever process forked that server.
+	// jinenv.Identity.TmuxEnviron says what jind-ai puts here and why.
+	Env []string
+}
+
+// buildPopupArgs translates DisplayPopupOptions into display-popup arguments.
+// Kept as a pure function so the flag translation is unit-testable without
+// tmux, as buildSplitArgs is.
+func buildPopupArgs(o DisplayPopupOptions) []string {
+	args := []string{"display-popup", "-E"}
+	if o.Target != "" {
+		args = append(args, "-t", o.Target)
+	}
+	if o.Width != "" {
+		args = append(args, "-w", o.Width)
+	}
+	if o.Height != "" {
+		args = append(args, "-h", o.Height)
+	}
+	if o.Dir != "" {
+		args = append(args, "-d", o.Dir)
+	}
+	if o.Title != "" {
+		args = append(args, "-T", o.Title)
+	}
+	for _, assignment := range o.Env {
+		args = append(args, "-e", assignment)
+	}
+	if o.Cmd != "" {
+		args = append(args, o.Cmd)
+	}
+	return args
 }
 
 // DisplayPopup opens a tmux popup that runs a command and closes when it exits.
 func (c *Client) DisplayPopup(opts DisplayPopupOptions) error {
-	args := []string{"display-popup", "-E"}
-	if opts.Target != "" {
-		args = append(args, "-t", opts.Target)
-	}
-	if opts.Width != "" {
-		args = append(args, "-w", opts.Width)
-	}
-	if opts.Height != "" {
-		args = append(args, "-h", opts.Height)
-	}
-	if opts.Dir != "" {
-		args = append(args, "-d", opts.Dir)
-	}
-	if opts.Title != "" {
-		args = append(args, "-T", opts.Title)
-	}
-	if opts.Cmd != "" {
-		args = append(args, opts.Cmd)
-	}
-	return c.runSilent(args...)
+	return c.runSilent(buildPopupArgs(opts)...)
 }

@@ -2138,6 +2138,12 @@ func (m *Manager) PanePopup(id, cmd, title, width, height string) error {
 		Width:  width,
 		Height: height,
 		Dir:    workDir,
+		// The popup is a process this daemon started, so it is told the same
+		// three things every other one is, plus the session it was opened over.
+		// Handed in from the identity this Manager was built with, never
+		// rebuilt here — see EstablishHookBinary for what a second derivation
+		// gets wrong. TmuxEnviron has why every key is emitted even when empty.
+		Env: m.identity.TmuxEnviron(id),
 	})
 }
 
@@ -2164,6 +2170,11 @@ func (m *Manager) PaneSplit(id, name, ifExists string, opts tmux.SplitOptions) (
 	if err != nil {
 		return "", err
 	}
+	// Overwritten, not merged: the working directory above is injected the same
+	// way, and what a caller asked to run in the pane does not get to decide
+	// which jin that pane calls back into. Reaches the respawn branch of a
+	// named slot too, so a restarted slot is told the same thing a fresh one is.
+	opts.Env = m.identity.TmuxEnviron(id)
 
 	// Named-slot idempotency is check-then-act inside EnsureNamedPane, and the
 	// daemon handles connections concurrently — serialize so two simultaneous
@@ -2713,7 +2724,7 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	// Try to revive CC in existing inner tmux session (preserves user panes)
 	if session.TmuxWindowName != "" && m.tmuxClient.HasSession(session.TmuxWindowName) {
 		target := session.TmuxPaneID
-		if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
+		if err := m.tmuxClient.RespawnPane(target, shellCmd, nil); err == nil {
 			session.Status = StatusRunning
 			session.LastOutputTime = time.Now()
 			session.StartedAt = time.Now()
@@ -2926,7 +2937,7 @@ func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) 
 		respawned := false
 		if shellCmd, buildErr := m.buildAgentShellCmd(retrySnap); buildErr != nil {
 			debugLog("[TMUX] Session %s: cannot build retry cmd: %v", sessionName, buildErr)
-		} else if err := m.tmuxClient.RespawnPane(target, shellCmd); err != nil {
+		} else if err := m.tmuxClient.RespawnPane(target, shellCmd, nil); err != nil {
 			debugLog("[TMUX] Session %s respawn failed after quick death", sessionName)
 		} else {
 			respawned = true

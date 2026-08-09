@@ -294,7 +294,7 @@ func TestE2E_AttachTargetsResolvedInnerSocket(t *testing.T) {
 	// pane while the outer server is still up makes tmux kill it for us
 	// (respawn-pane -k). Registered after the fixture's cleanup so it runs
 	// before it — t.Cleanup is LIFO.
-	t.Cleanup(func() { _ = tc.RespawnPane(displayPaneID, tmux.PlaceholderCmd) })
+	t.Cleanup(func() { _ = tc.RespawnPane(displayPaneID, tmux.PlaceholderCmd, nil) })
 
 	got := paneStartCommand(t, tc, displayPaneID)
 	if !strings.Contains(got, "-L "+innerSocket+" ") {

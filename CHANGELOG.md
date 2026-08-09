@@ -152,6 +152,25 @@ log.
   neither. Agents were already immune, which is the point: the two spawn sites
   now take the same value rather than each deciding.
 
+- **A pane opened by `jin pane popup` or `jin pane split` is now told which
+  jin opened it.** It was told nothing, so it took its environment from the
+  tmux server, and what it saw depended on which process had forked that
+  server: no `JIN_*` at all when the daemon or a plain shell had (3/3 each),
+  an earlier daemon's values when that one had (3/3), and another session's
+  `JIN_SESSION_ID` when the server had been forked from inside an agent's
+  pane (3/3) — one `jin daemon start` run there arranges that, and from then
+  on every session's popups carry the one id. That case is worse than the
+  empty one: a stale id is a plausible UUID, so a popup that reads it acts on
+  the wrong session and nothing reports an error. Agent panes were never
+  affected (12/12); they carry the values on their command line already.
+  `JIN_SOCKET`, `JIN_BIN`, `JIN_DEBUG` and `JIN_SESSION_ID` now reach every
+  pane jind-ai opens — popup and split, by selector or `--here`, a slot
+  restarted with `--if-exists respawn`, and a split with no command — and
+  arrive empty when a value is unknown, because a key left out is a key
+  inherited. A `--here` pane is given the caller's own values rather than the
+  daemon's, so it still works with the daemon down. Plugins no longer thread
+  these through a command line by hand.
+
 ## 0.9.0
 
 ### Features

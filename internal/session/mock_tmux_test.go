@@ -151,6 +151,16 @@ type mockTmuxRunner struct {
 	onRespawnPane func(target string)
 
 	calls []mockCall // recorded calls for assertion
+
+	// The options structs, kept whole. record() flattens a call to strings and
+	// keeps only the fields the assertions of the day needed, which is why the
+	// popup's Env — like its Width, Height and Title — is invisible through it.
+	// A pane's environment is exactly the kind of thing that is wrong by being
+	// absent, so it has to be observable as the slice it is, not as a string
+	// some earlier caller decided how to join.
+	popupOpts   []tmux.DisplayPopupOptions
+	splitOpts   []tmux.SplitOptions
+	respawnEnvs [][]string
 }
 
 func newMockTmuxRunner() *mockTmuxRunner {
@@ -224,9 +234,10 @@ func (m *mockTmuxRunner) NewSessionWithCmdInDir(name string, width, height int, 
 	return nil
 }
 
-func (m *mockTmuxRunner) RespawnPane(target, cmd string) error {
+func (m *mockTmuxRunner) RespawnPane(target, cmd string, env []string) error {
 	m.mu.Lock()
 	m.record("RespawnPane", target, cmd)
+	m.respawnEnvs = append(m.respawnEnvs, env)
 	cb := takeHook(&m.onRespawnPane)
 	m.mu.Unlock()
 	if cb != nil {
@@ -379,6 +390,7 @@ func (m *mockTmuxRunner) DisplayPopup(opts tmux.DisplayPopupOptions) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("DisplayPopup", opts.Target, opts.Cmd, opts.Dir)
+	m.popupOpts = append(m.popupOpts, opts)
 	return nil
 }
 
@@ -386,6 +398,7 @@ func (m *mockTmuxRunner) SplitPane(target string, opts tmux.SplitOptions) (strin
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("SplitPane", target, opts.Cmd, opts.Direction, opts.Size, opts.Dir)
+	m.splitOpts = append(m.splitOpts, opts)
 	if id, ok := m.splitPaneIDs[target]; ok {
 		return id, nil
 	}
