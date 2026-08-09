@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
@@ -111,6 +112,14 @@ type PluginsConfig struct {
 	Disabled     []string `mapstructure:"disabled"`      // plugin names to skip dispatch for
 	BuildTimeout int      `mapstructure:"build_timeout"` // seconds, 0 = default(300)
 	Debounce     int      `mapstructure:"debounce"`      // seconds, 0 = default(3)
+}
+
+// BuildTimeoutDuration returns build_timeout as a Duration. The unit lives
+// beside the field that declares it so every reader of the budget counts the
+// same thing: an install spends this user's value, `plugin validate
+// --run-build` spends DefaultPluginsConfig's, and neither restates "seconds".
+func (p PluginsConfig) BuildTimeoutDuration() time.Duration {
+	return time.Duration(p.BuildTimeout) * time.Second
 }
 
 // PopupSizeConfig represents a single popup's percent-based dimensions.

@@ -82,6 +82,37 @@ log.
   Code inherits trust from ancestor directories. Sessions started without
   `--worktree` run elsewhere and are not covered by that.
 
+- **`jin plugin validate --run-build` now builds the way an install builds.**
+  It had its own copy of the build loop, and that copy ran in whatever
+  environment the caller happened to have, under a timeout applied to each
+  command separately and sized from the manifest's `timeout:`. An install
+  runs the build in a curated environment (`PATH`, `HOME`, `USER`, `SHELL`,
+  `LANG`, `TERM`, `LC_*`, plus `npm_config_ignore_scripts=true`) under one
+  `plugins.build_timeout` budget for the whole sequence. So the check that
+  exists to predict the install could disagree with it in both directions: a
+  build leaning on a variable exported in the author's shell — or granted a
+  longer budget by a generous `timeout:` — passed validation and failed on
+  the user's machine, while a build leaning on `npm_config_ignore_scripts`
+  failed validation and installed fine.
+
+  Both commands now go through one implementation, and `--run-build` spends
+  the default `build_timeout` on the whole sequence: not the author's own
+  configured value (that setting belongs to whoever installs the plugin) and
+  not the manifest's `timeout:`, which bounds a dispatch rather than a
+  compile. For plugin authors this means `--run-build` is stricter than it
+  was: if your build needs `JAVA_HOME`, a registry token, longer than the
+  default budget, or anything else outside the allowlist, the install was
+  already going to fail without it. It still cannot vouch for the *contents*
+  of what the allowlist passes — your `PATH` is your own — so keep naming
+  your plugin's requirements in its README. Rule #13 findings now distinguish
+  a timeout from a non-zero exit, where a timeout previously surfaced as
+  `signal: killed`, and build progress prints as `--- build step i/N: … ---`
+  instead of `[build] …`.
+
+  `jin plugin install` / `update` behave as before, save for one message: a
+  build step that fails to *start* now names the build log, as every other
+  build failure already did.
+
 ## 0.9.0
 
 ### Features

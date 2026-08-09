@@ -172,6 +172,7 @@ crawler runs. Use it locally before publishing, and in your plugin repo's CI:
 ```bash
 jin plugin validate                       # defaults to .
 jin plugin validate ./some/plugin/dir
+jin plugin validate --run-build           # also run rules #13/#14 (see below)
 jin plugin validate --github-actions      # emit ::error / ::warning annotations
 jin plugin validate --fail-on-warning     # treat WARN as non-zero exit
 ```
@@ -184,6 +185,29 @@ appended to `$GITHUB_STEP_SUMMARY` when set.
 See the template repo's `.github/workflows/ci.yaml` for a working snippet
 (no separate GitHub Action needed — the workflow downloads a pinned jin
 release and invokes `jin plugin validate` directly).
+
+### `--run-build`
+
+Rules #13/#14 are opt-in because they execute your `install.source.build`
+commands and then check that every action's entrypoint exists. They run
+through the same code path `jin plugin install` uses, so the conditions the
+build gets are the install's, not your session's:
+
+- **The environment is filtered the way an install filters it** — see
+  [the build environment](../README.md#language-specific-guidance) for the
+  allowlist. A build needing anything outside it fails here, which is the
+  point.
+- **The budget is the default `plugins.build_timeout` (300s), covering the
+  whole sequence** rather than each command. Neither your own configured
+  value nor your manifest's `timeout:` is consulted; the README section above
+  says why.
+- The build runs **in the plugin directory** and its artifacts stay there,
+  so run it on a tree you don't mind having built.
+
+What this cannot check is the *contents* of what does get through. `PATH` and
+`HOME` are forwarded from whoever runs the command, so a compiler installed
+only on your machine still builds fine here and is still missing on your
+users'. Name what your plugin needs in its own README.
 
 ## Pre-1.0 break policy
 

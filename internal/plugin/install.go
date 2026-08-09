@@ -8,10 +8,8 @@ package plugin
 // anything durable happens.
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,7 +18,6 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/google/uuid"
-	"github.com/takaaki-s/jind-ai/internal/procgroup"
 	"github.com/takaaki-s/jind-ai/pkg/plugin/manifest"
 )
 
@@ -342,7 +339,7 @@ func (p *InstallPlan) Commit(buildTimeout time.Duration) error {
 	dest := filepath.Join(p.pluginsDir, p.manifest.Name)
 
 	if cmds := p.manifest.BuildCommands(); len(cmds) > 0 {
-		if err := runBuilds(p.staging, p.stateDir, p.manifest.Name, cmds, buildTimeout); err != nil {
+		if err := runStagedBuild(p.staging, p.stateDir, p.manifest.Name, cmds, buildTimeout); err != nil {
 			p.Abort()
 			return err
 		}
@@ -439,64 +436,6 @@ func fetchToStaging(src Source, pluginsDir string) (staging string, m *manifest.
 	}
 	sha, err = gitHeadSHA(staging)
 	return
-}
-
-// runBuilds runs each of the manifest's install.source.build commands via
-// `bash -c` in the staging dir, in order. buildTimeout bounds the entire
-// sequence so a wedged step cannot outlive the caller-supplied window. Each
-// step gets its own process group so an escalated SIGKILL sweeps grandchildren.
-// The environment is the curated base plus npm_config_ignore_scripts=true,
-// a supply-chain guard the author can override inside their own build command.
-// Output from every step is truncated into
-// <stateDir>/plugin-logs/<name>-build.log and teed to stderr so an interactive
-// install shows build progress.
-func runBuilds(stagingDir, stateDir, name string, cmds []string, timeout time.Duration) error {
-	logPath := filepath.Join(stateDir, "plugin-logs", name+"-build.log")
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return fmt.Errorf("mkdir plugin log dir: %w", err)
-	}
-	logFile, err := os.OpenFile(logPath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open build log: %w", err)
-	}
-	defer logFile.Close()
-
-	out := io.MultiWriter(logFile, os.Stderr)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	// Assemble the build environment once — every step uses the same curated
-	// parent env plus npm_config_ignore_scripts=true, and curatedEnv() scans
-	// os.Environ() each call, so pulling it out of the loop avoids repeating
-	// that scan per step.
-	env := append(curatedEnv(), "npm_config_ignore_scripts=true")
-
-	for i, cmdStr := range cmds {
-		fmt.Fprintf(out, "\n--- build step %d/%d: %s ---\n", i+1, len(cmds), cmdStr)
-
-		cmd := procgroup.CommandContext(ctx, "bash", "-c", cmdStr)
-		cmd.Dir = stagingDir
-		cmd.Env = env
-		cmd.Stdout = out
-		cmd.Stderr = out
-
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("start build step %q: %w", cmdStr, err)
-		}
-		runErr := cmd.Wait()
-
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("build timed out after %s (log: %s)", timeout, logPath)
-		}
-		if runErr != nil {
-			var exitErr *exec.ExitError
-			if errors.As(runErr, &exitErr) {
-				return fmt.Errorf("build step %q failed: exit status %d (log: %s)", cmdStr, exitErr.ExitCode(), logPath)
-			}
-			return fmt.Errorf("run build step %q: %w (log: %s)", cmdStr, runErr, logPath)
-		}
-	}
-	return nil
 }
 
 // gitClone clones cloneURL into dest as a full clone (no --depth) so a later

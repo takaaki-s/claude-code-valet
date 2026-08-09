@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -15,8 +14,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 
+	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/exitcode"
-	"github.com/takaaki-s/jind-ai/internal/procgroup"
+	"github.com/takaaki-s/jind-ai/internal/plugin"
 	"github.com/takaaki-s/jind-ai/pkg/plugin/manifest"
 )
 
@@ -30,7 +30,18 @@ manifest is read from jind-ai-plugin.yaml; if it names a file the file is
 treated as the manifest and its directory is the plugin dir.
 
 Findings are ERROR (blocks install) or WARN (visible, non-blocking). Exit
-code is 1 on any ERROR, or on any WARN with --fail-on-warning.`,
+code is 1 on any ERROR, or on any WARN with --fail-on-warning.
+
+--run-build additionally executes install.source.build and checks that every
+action's entrypoint exists afterwards. It builds through the same code an
+install builds through: the same environment filter (only PATH, HOME, USER,
+SHELL, LANG, TERM and LC_* are forwarded, plus npm_config_ignore_scripts) and
+the same default build_timeout, spent on the whole sequence.
+
+So a build that needs a variable outside that set, or longer than the default
+budget, fails here instead of on your users' machines. What it cannot check is
+the value of what does get through: your PATH is still yours, so a toolchain
+only you have installed still builds fine here.`,
 	Args:          cobra.MaximumNArgs(1),
 	RunE:          runPluginValidate,
 	SilenceUsage:  true,
@@ -42,7 +53,7 @@ func init() {
 	pluginValidateCmd.Flags().String("manifest", "", "Explicit manifest file path (overrides positional resolution)")
 	pluginValidateCmd.Flags().String("registry", "", "Registry URL to check name uniqueness against (default: canonical)")
 	pluginValidateCmd.Flags().Bool("skip-uniqueness", false, "Skip registry rules #9/#10 (name ownership, monotonic version)")
-	pluginValidateCmd.Flags().Bool("run-build", false, "Run install.source.build and verify entrypoint (rules #13/#14)")
+	pluginValidateCmd.Flags().Bool("run-build", false, "Run install.source.build in the install-time environment and verify entrypoint (rules #13/#14)")
 	pluginValidateCmd.Flags().Bool("fail-on-warning", false, "Exit 1 if any WARN is emitted")
 	pluginValidateCmd.Flags().Bool("github-actions", false, "Emit GitHub Actions annotations and $GITHUB_STEP_SUMMARY")
 }
@@ -131,7 +142,7 @@ func collectValidateFindings(out io.Writer, manifestPath, pluginDir, registryURL
 	findings = append(findings, manifest.Check(m, opts)...)
 
 	if runBuild {
-		findings = append(findings, runBuildChecks(out, m, pluginDir, buildTimeout(m))...)
+		findings = append(findings, runBuildChecks(out, m, pluginDir, validateBuildTimeout())...)
 	}
 	return findings
 }
@@ -183,57 +194,49 @@ func loadRegistryLookup(url string) (manifest.RegistryLookup, error) {
 	return registryLookupAdapter{doc: doc}, nil
 }
 
-// Build gets a floor under the manifest's run timeout: a plugin that answers
-// an action in milliseconds can still take minutes to compile, so a short run
-// timeout must not be read as a short build budget.
-const (
-	buildTimeoutFloor   = time.Minute
-	buildTimeoutDefault = 5 * time.Minute
-)
-
-// buildTimeout is the budget one build command gets.
+// validateBuildTimeout is the budget --run-build gives the whole build
+// sequence. It is the build_timeout an install defaults to, read from the
+// declaration installs default from, so the two never carry different numbers.
 //
-// Note the shape: a run timeout under the floor is replaced outright rather
-// than raised to it, so 59s yields 5min while 61s yields 61s. That is the
-// behaviour this inherited, kept deliberately — a manifest asking for more
-// than a minute is stating a considered figure, and one asking for less is
-// describing how long its action takes to answer, which says nothing about
-// its compile.
-func buildTimeout(m *manifest.Manifest) time.Duration {
-	if d := m.EffectiveTimeout(); d >= buildTimeoutFloor {
-		return d
-	}
-	return buildTimeoutDefault
+// Neither of the other two candidates survives the question this check exists
+// to answer — will the build succeed where it gets installed?
+//
+//   - Not the local plugins.build_timeout, even though an install reads it.
+//     That is the *installing* user's setting, and an author who raised their
+//     own would certify a build only their config admits — the same shape of
+//     defect as letting the author's environment reach the build.
+//   - Not the manifest's timeout:. That bounds how long an action may take to
+//     answer a dispatch; it says nothing about how long the plugin takes to
+//     compile. Reading it as a build budget meant a manifest declaring a
+//     generous one passed here on a budget no default install would grant it.
+func validateBuildTimeout() time.Duration {
+	return config.DefaultPluginsConfig().BuildTimeoutDuration()
 }
 
 // runBuildChecks executes install.source.build in the plugin directory and
-// asserts the declared entrypoint materialises. Any build command failure is
-// a hard rule #13 ERROR — the remaining commands are skipped because a broken
-// pipeline cannot produce a meaningful entrypoint check.
+// asserts the declared entrypoint materialises. Any build failure is a hard
+// rule #13 ERROR — plugin.RunBuilds stops at the first broken step, because a
+// broken pipeline cannot produce a meaningful entrypoint check.
 //
-// timeout is per command, and is a parameter rather than derived here so a
-// test can pick one it can wait out.
+// The build goes through plugin.RunBuilds, the same code path an install
+// takes, which is what lets this check answer the question it exists to
+// answer: will the install-time build succeed? timeout is a parameter rather
+// than derived here so a test can pick one it can wait out.
 func runBuildChecks(out io.Writer, m *manifest.Manifest, pluginDir string, timeout time.Duration) []manifest.Finding {
 	if m.Install.Source == nil {
 		return nil
 	}
-	for _, cmdStr := range m.BuildCommands() {
-		fmt.Fprintf(out, "[build] %s\n", cmdStr)
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		c := procgroup.CommandContext(ctx, "bash", "-c", cmdStr)
-		c.Dir = pluginDir
-		c.Stdout = out
-		c.Stderr = out
-		runErr := c.Run()
-		cancel()
-		if runErr != nil {
-			return []manifest.Finding{{
-				Rule:     manifest.RuleBuildExec,
-				Severity: manifest.SeverityError,
-				Message:  fmt.Sprintf("build command %q failed: %v", cmdStr, runErr),
-				Field:    "install.source.build",
-			}}
-		}
+	if err := plugin.RunBuilds(m.BuildCommands(), plugin.BuildOptions{
+		Dir:     pluginDir,
+		Timeout: timeout,
+		Out:     out,
+	}); err != nil {
+		return []manifest.Finding{{
+			Rule:     manifest.RuleBuildExec,
+			Severity: manifest.SeverityError,
+			Message:  err.Error(),
+			Field:    "install.source.build",
+		}}
 	}
 	// Every action's entrypoint must materialise, not just the default one —
 	// the dispatcher execs each of them. v1 findings keep the field path the
