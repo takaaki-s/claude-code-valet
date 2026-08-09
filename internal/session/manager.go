@@ -69,10 +69,9 @@ type Manager struct {
 // back into. buildAgentShellCmd writes it into the agent's environment; the
 // daemon that constructed the Manager is what decided the socket.
 //
-// Exported so the wiring is checkable from where it is made: nothing else in
+// Exported so the wiring is checkable from where it is made: nothing inside
 // this package can tell a Manager built over the right socket from one built
-// over the wrong one, and by the time the difference shows it is a hook that
-// went nowhere and said nothing about it.
+// over the wrong one.
 func (m *Manager) AgentIdentity() jinenv.Identity {
 	return jinenv.Identity{
 		SocketPath: m.socketPath,
@@ -2642,31 +2641,31 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	// The jin that started this agent, for the same reason JIN_SESSION_ID rides
 	// along: the process this launches will run `jin hook`, and that hook is
 	// jind-ai's own binary deciding which daemon to notify and whether to record
-	// what it was handed. A tmux pane inherits the tmux *server's* environment,
-	// not the daemon's, so none of it carries across on its own — and the server
-	// is long-lived, so what it holds is whatever the process that first started
-	// it happened to have.
+	// what it was handed. None of it carries across on its own — jinenv.Identity
+	// has the mechanism.
 	//
-	// Both halves of that were measured. With the flag, starting the daemon
-	// under it turned on only half the exchange: the daemon logged the status
-	// transitions it chose while the hook side stayed silent, losing the half
-	// that says why — the stop_reason behind a failed turn, the
-	// notification_type that separates a permission prompt from an idle timer,
-	// the agent session id that fired — and because the daemon only writes a
-	// line when a hook changes the status, a hook that changed nothing left no
-	// trace at all. With the socket, an agent whose pane came from a server the
-	// daemon did not fork reached either no daemon (3/3: hook exits 0, status
-	// never moves) or an older daemon's socket still held by that server.
+	// Both halves were measured. Starting the daemon under the flag used to turn
+	// on only half the exchange: the daemon logged the status transitions it
+	// chose while the hook side stayed silent, losing the half that says why —
+	// the stop_reason behind a failed turn, the notification_type that separates
+	// a permission prompt from an idle timer, the agent session id that fired —
+	// and because the daemon only writes a line when a hook changes the status, a
+	// hook that changed nothing left no trace at all. And an agent whose pane
+	// came from a tmux server the daemon did not fork reached either no daemon
+	// (3/3: hook exits 0, status never moves) or an older daemon's socket still
+	// held by that server.
 	//
 	// It belongs here rather than in an adapter because nothing about it is
 	// agent-specific: every kind is launched through this wrapper and every kind
 	// calls the same hook binary. BinPath is hookExecPath — the stable copy, not
 	// os.Executable() — because this environment outlives the daemon's own
-	// executable; EstablishHookBinary has why that matters. It is all written
-	// before customEnv so that a user who names one of these in their own config
-	// still wins — `env` applies assignments left to right.
-	for _, v := range m.AgentIdentity().Vars() {
-		envVars += fmt.Sprintf(" %s=%s", v.Key, shellEscape(v.Value))
+	// executable; EstablishHookBinary has why that matters. Each assignment is
+	// quoted whole, which `env` reads the same as quoting the value: these are
+	// paths now, and a path may contain a space. It is all written before
+	// customEnv so that a user who names one of these in their own config still
+	// wins — `env` applies assignments left to right.
+	for _, kv := range m.AgentIdentity().Environ() {
+		envVars += " " + shellEscape(kv)
 	}
 	if customEnv != "" {
 		envVars += " " + customEnv

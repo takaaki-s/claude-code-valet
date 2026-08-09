@@ -31,24 +31,6 @@ func probeShellCmd(t *testing.T, mgr *Manager) string {
 	return cmd
 }
 
-// newManagerWithSocket builds a Manager told that its daemon listens on
-// socketPath, so an assertion on the command line is about what travelled from
-// NewManager's argument rather than about whatever default a helper chose.
-func newManagerWithSocket(t *testing.T, socketPath string) *Manager {
-	t.Helper()
-	configMgr, err := config.NewManager(t.TempDir())
-	if err != nil {
-		t.Fatalf("config.NewManager: %v", err)
-	}
-	mgr, err := NewManager(t.TempDir(), t.TempDir(), socketPath, configMgr)
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
-	mgr.SetTmuxClient(newMockTmuxRunner())
-	mgr.SetHookRunner(newMockHookRunner())
-	return mgr
-}
-
 // withDebugEnabled drives the flag Manager reads, which no test can arrange
 // through the real environment: the process decides once at startup.
 func withDebugEnabled(t *testing.T, on bool) {
@@ -68,13 +50,17 @@ func withDebugEnabled(t *testing.T, on bool) {
 // socket an agent saw was whichever daemon happened to start the server. When
 // none had, the agent's hooks reached no daemon at all and said nothing about
 // it — exit 0, status unchanged.
+//
+// The quoting is part of the assertion. These values are paths, and a path may
+// contain a space; left bare, `env` would read the remainder as the command to
+// run.
 func TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "this-run-only.sock")
-	mgr := newManagerWithSocket(t, socket)
+	mgr, _, _ := newTestManagerOn(t, socket)
 
 	cmd := probeShellCmd(t, mgr)
 
-	if want := "JIN_SOCKET='" + socket + "'"; !strings.Contains(cmd, want) {
+	if want := "'JIN_SOCKET=" + socket + "'"; !strings.Contains(cmd, want) {
 		t.Errorf("command does not carry %s\ncommand: %s", want, cmd)
 	}
 }
@@ -89,40 +75,21 @@ func TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo(t *testing.T) {
 // still running. EstablishHookBinary has the full account; what is checked here
 // is only that the field it upgrades is the field this builder reads.
 func TestBuildAgentShellCmd_NamesTheBinaryTheAgentReEnters(t *testing.T) {
-	mgr := newManagerWithSocket(t, testSocketPath)
+	mgr, _, _ := newTestManager(t)
 	stable := filepath.Join(t.TempDir(), "bin", "jin")
 	mgr.hookExecPath = stable
 
 	cmd := probeShellCmd(t, mgr)
 
-	if want := "JIN_BIN='" + stable + "'"; !strings.Contains(cmd, want) {
+	if want := "'JIN_BIN=" + stable + "'"; !strings.Contains(cmd, want) {
 		t.Errorf("command does not carry %s\ncommand: %s", want, cmd)
 	}
 	live, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	if strings.Contains(cmd, "JIN_BIN='"+live+"'") {
+	if strings.Contains(cmd, "'JIN_BIN="+live+"'") {
 		t.Errorf("command names the live executable rather than the stable copy\ncommand: %s", cmd)
-	}
-}
-
-// TestBuildAgentShellCmd_QuotesTheValuesItPropagates guards the one thing that
-// separates these assignments from the literal "1" that used to be the only
-// propagated value: they are now paths, and a path may contain a space. Left
-// bare, `env` would read the remainder as the command to run.
-func TestBuildAgentShellCmd_QuotesTheValuesItPropagates(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "a dir with spaces")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	socket := filepath.Join(dir, "daemon.sock")
-	mgr := newManagerWithSocket(t, socket)
-
-	cmd := probeShellCmd(t, mgr)
-
-	if want := "JIN_SOCKET='" + socket + "'"; !strings.Contains(cmd, want) {
-		t.Errorf("a socket path with a space is not quoted as one word\nwant substring: %s\ncommand: %s", want, cmd)
 	}
 }
 
@@ -131,7 +98,7 @@ func TestBuildAgentShellCmd_QuotesTheValuesItPropagates(t *testing.T) {
 // consumer as no socket at all, so writing one adds nothing except a claim to
 // know something.
 func TestBuildAgentShellCmd_OmitsWhatItDoesNotKnow(t *testing.T) {
-	mgr := newManagerWithSocket(t, "")
+	mgr, _, _ := newTestManagerOn(t, "")
 	mgr.hookExecPath = ""
 
 	cmd := probeShellCmd(t, mgr)
@@ -160,7 +127,7 @@ func TestBuildAgentShellCmd_PassesTheDebugFlagToTheAgent(t *testing.T) {
 			mgr, _, _ := newTestManager(t)
 			cmd := probeShellCmd(t, mgr)
 
-			if got := strings.Contains(cmd, "JIN_DEBUG='1'"); got != tt.on {
+			if got := strings.Contains(cmd, "'JIN_DEBUG=1'"); got != tt.on {
 				t.Errorf("JIN_DEBUG present = %v, want %v\ncommand: %s", got, tt.on, cmd)
 			}
 		})
@@ -205,7 +172,7 @@ func TestBuildAgentShellCmd_ConfiguredDebugValueWinsOverThePropagatedOne(t *test
 
 	cmd := probeShellCmd(t, mgr)
 
-	propagated := strings.Index(cmd, "JIN_DEBUG='1'")
+	propagated := strings.Index(cmd, "'JIN_DEBUG=1'")
 	configured := strings.Index(cmd, "JIN_DEBUG='0'")
 	if propagated < 0 || configured < 0 {
 		t.Fatalf("expected both assignments on the command line\ncommand: %s", cmd)

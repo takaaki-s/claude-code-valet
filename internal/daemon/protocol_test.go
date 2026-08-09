@@ -645,13 +645,22 @@ func TestHandleConnection_ProcessesMatchedRequest(t *testing.T) {
 // listener.
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
+	s, _ := newTestServerIn(t)
+	return s
+}
+
+// newTestServerIn is newTestServer for a caller that also needs the directory
+// tree the Server was built over — so the layout NewServer is handed lives in
+// one place rather than being spelled out again at each assertion.
+func newTestServerIn(t *testing.T) (*Server, string) {
+	t.Helper()
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "daemon.sock")
 	s, err := NewServer(sockPath, filepath.Join(dir, "sessions"), filepath.Join(dir, "config"), filepath.Join(dir, "state"))
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	return s
+	return s, dir
 }
 
 // exchange writes rawReq into one end of an in-memory pipe, runs

@@ -79,12 +79,14 @@ var debugLog = debug.NewLogger("daemon-debug.log")   // one per log file
 - `debug.NewLogger(<file>)` writes to the state dir, and is a no-op when
   debugging is off, when the caller is a test binary, or when the state dir
   cannot be resolved, so callers need no guard of their own.
-- `debug.Enabled()` is the answer to "is debugging on" for code that has to do
-  something other than write a line — routing a child's output, for instance.
-  Do not re-read the environment variable. Code that is *starting* a process
-  does not ask it directly: `internal/jinenv` carries the flag alongside the
-  socket and the binary path, because a child needs all three to call back into
-  the jin that started it and each spawn site used to answer only part of that.
+- `debug.Enabled()` is the answer to "is debugging on" for code deciding what
+  *this* process does — routing a child's output to stderr as well as its log,
+  for instance. Do not re-read the environment variable.
+- Putting the flag into a *child's* environment is a different question and has
+  a different answer: `internal/jinenv`, which carries it alongside the socket
+  and the binary path. A child needs all three to call back into the jin that
+  started it, and while each spawn site answered separately, none answered
+  completely.
 - `debug.Untrusted` / `debug.UntrustedBytes` bound and quote any value the
   local process did not choose, so one payload cannot forge entries or fill the
   file.

@@ -31,6 +31,15 @@ const testSocketPath = "/nonexistent/test-daemon.sock"
 // setters; tests that don't care about the hook runner discard it with `_`.
 func newTestManager(t *testing.T) (*Manager, *mockTmuxRunner, *mockHookRunner) {
 	t.Helper()
+	return newTestManagerOn(t, testSocketPath)
+}
+
+// newTestManagerOn is newTestManager with the daemon socket named, for tests
+// asserting on what reaches an agent's environment. Going through NewManager's
+// argument rather than writing the field afterwards is the point: that hop is
+// what the assertions are about.
+func newTestManagerOn(t *testing.T, socketPath string) (*Manager, *mockTmuxRunner, *mockHookRunner) {
+	t.Helper()
 	dir := t.TempDir()
 	configDir := t.TempDir()
 	configMgr, err := config.NewManager(configDir)
@@ -41,7 +50,7 @@ func newTestManager(t *testing.T) (*Manager, *mockTmuxRunner, *mockHookRunner) {
 	// mgr.stateDir — worktree placement, hook logs, bin/jin — cannot tell a
 	// state-dir bug from a config-dir one while the two are the same path. The
 	// socket is a literal for the same reason, one no test ever connects to.
-	mgr, err := NewManager(dir, t.TempDir(), testSocketPath, configMgr)
+	mgr, err := NewManager(dir, t.TempDir(), socketPath, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}

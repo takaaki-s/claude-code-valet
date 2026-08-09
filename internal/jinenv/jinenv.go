@@ -10,19 +10,15 @@
 //
 // Both gaps were measured, and both are silent. A `jin hook` that resolves the
 // wrong socket exits 0 and writes nothing; a callback that runs with the flag
-// off simply leaves no line behind. Nothing fails, so nothing is noticed —
-// which is why the fix is a shared answer rather than a third conditional at a
-// third spawn site.
+// off simply leaves no line behind. Nothing fails, so nothing is noticed.
+//
+// The worktree post-create hook is a deliberate non-consumer. It runs inside
+// provisioning, before the session's recorded working directory moves to the
+// new worktree, so a hook that could call back would be asking about a session
+// mid-creation; its documented contract is the six JIN_WORKTREE_*/JIN_SESSION_*
+// variables and no callback at all. Wiring one is a product decision, not a
+// gap to close.
 package jinenv
-
-// Var is one environment assignment, kept split rather than pre-joined because
-// the callers render it differently: one appends to an exec.Cmd.Env slice, the
-// other writes a shell command line where the value has to be quoted and the
-// key must not be.
-type Var struct {
-	Key   string
-	Value string
-}
 
 // Identity names the jin a spawned process should call back into: which daemon
 // to talk to, which binary to re-enter, and whether to record what it does.
@@ -56,33 +52,25 @@ type Identity struct {
 	Debug bool
 }
 
-// Vars returns the assignments this identity implies, skipping any whose value
-// is not known.
+// Environ renders this identity as KEY=VALUE assignments, in the form os/exec
+// takes. A caller splicing them into a shell command line can quote each whole
+// assignment: `env` splits its argument at the first `=`, so quoting the word
+// and quoting only the value are equivalent.
 //
-// Skipping rather than emitting an empty is deliberate: every reader treats an
-// empty JIN_SOCKET as no socket and an empty JIN_BIN as no binary, so an empty
-// assignment carries no information the absence does not — it only makes a
-// child's environment claim to know something it does not.
-func (i Identity) Vars() []Var {
-	vars := make([]Var, 0, 3)
+// A value that is not known is skipped rather than assigned empty. Every reader
+// treats an empty JIN_SOCKET as no socket and an empty JIN_BIN as no binary, so
+// an empty assignment carries no information the absence does not — it only
+// makes a child's environment claim to know something it does not.
+func (i Identity) Environ() []string {
+	env := make([]string, 0, 3)
 	if i.SocketPath != "" {
-		vars = append(vars, Var{Key: "JIN_SOCKET", Value: i.SocketPath})
+		env = append(env, "JIN_SOCKET="+i.SocketPath)
 	}
 	if i.BinPath != "" {
-		vars = append(vars, Var{Key: "JIN_BIN", Value: i.BinPath})
+		env = append(env, "JIN_BIN="+i.BinPath)
 	}
 	if i.Debug {
-		vars = append(vars, Var{Key: "JIN_DEBUG", Value: "1"})
-	}
-	return vars
-}
-
-// Environ renders Vars in the KEY=VALUE form os/exec expects.
-func (i Identity) Environ() []string {
-	vars := i.Vars()
-	env := make([]string, 0, len(vars))
-	for _, v := range vars {
-		env = append(env, v.Key+"="+v.Value)
+		env = append(env, "JIN_DEBUG=1")
 	}
 	return env
 }
