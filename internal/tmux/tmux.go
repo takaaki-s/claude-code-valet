@@ -538,6 +538,8 @@ type PaneSlotOps interface {
 	FindPaneByName(target, name string) (string, error)
 	SplitPane(target string, opts SplitOptions) (string, error)
 	SetPaneOption(target, option, value string) error
+	// RespawnPane: see Runner.RespawnPane for what env carries and what a nil
+	// one asserts. This is the interface the --here path reaches.
 	RespawnPane(target, cmd string, env []string) error
 	KillPane(target string) error
 }

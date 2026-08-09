@@ -117,39 +117,59 @@ func TestBuildAgentShellCmd_TellsTheAdapterTheSameBinary(t *testing.T) {
 	}
 }
 
-// TestBuildAgentShellCmd_OmitsWhatItDoesNotKnow pins that an unknown value is
-// left out rather than assigned empty. An empty JIN_SOCKET reads to every
-// consumer as no socket at all, so writing one adds nothing except a claim to
-// know something.
-func TestBuildAgentShellCmd_OmitsWhatItDoesNotKnow(t *testing.T) {
+// TestBuildAgentShellCmd_AssignsEvenWhatItDoesNotKnow pins the opposite of what
+// this test used to. Leaving an unknown value out looked harmless — every
+// consumer reads an empty JIN_SOCKET as no socket, so the assignment seemed to
+// add nothing — but the destination is not a blank environment. `env` without
+// -i adds to what it is handed, and what tmux hands a pane is the tmux server's
+// environment, so an omitted key is not absent, it is the server's. Measured:
+// with the daemon's flag off and a server forked from an environment carrying
+// JIN_DEBUG=1, the agent pane ran with JIN_DEBUG=1, 3/3.
+func TestBuildAgentShellCmd_AssignsEvenWhatItDoesNotKnow(t *testing.T) {
 	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{})
 
 	cmd := probeShellCmd(t, mgr)
 
-	for _, key := range []string{"JIN_SOCKET", "JIN_BIN"} {
-		if strings.Contains(cmd, key) {
-			t.Errorf("%s is assigned despite having no value\ncommand: %s", key, cmd)
+	for _, key := range []string{"JIN_SOCKET", "JIN_BIN", "JIN_DEBUG"} {
+		if !strings.Contains(cmd, "'"+key+"='") {
+			t.Errorf("%s is left out, so the agent inherits the tmux server's\ncommand: %s", key, cmd)
 		}
 	}
 }
 
+// TestBuildAgentShellCmd_NamesTheSessionItStarts pins the id the agent's hooks
+// will report under. Nothing covered it before: the assignment was built inline
+// from the snapshot, and every test that read the command was reading it for
+// some other key. Replacing the snapshot's id with a constant passed the suite.
+func TestBuildAgentShellCmd_NamesTheSessionItStarts(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+
+	cmd := probeShellCmd(t, mgr)
+
+	if !strings.Contains(cmd, "'JIN_SESSION_ID=probe-session'") {
+		t.Errorf("the agent is not told which session it is\ncommand: %s", cmd)
+	}
+}
+
 // TestBuildAgentShellCmd_PassesTheDebugFlagToTheAgent pins that the flag
-// reaches the process that runs `jin hook`, and only when it is on.
-// buildAgentShellCmd's comment has the why.
+// reaches the process that runs `jin hook`, and reaches it as what the daemon
+// decided rather than as silence. Off is an assignment too: buildAgentShellCmd's
+// comment has why an omitted key does not mean off here.
 func TestBuildAgentShellCmd_PassesTheDebugFlagToTheAgent(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		on   bool
+		want string
 	}{
-		{"on, so the hook the agent runs records too", true},
-		{"off, so nothing is injected", false},
+		{"on, so the hook the agent runs records too", true, "'JIN_DEBUG=1'"},
+		{"off, so the agent is told off rather than left to inherit it", false, "'JIN_DEBUG='"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			mgr, _, _ := newTestManagerOn(t, jinenv.Identity{Debug: tt.on})
 			cmd := probeShellCmd(t, mgr)
 
-			if got := strings.Contains(cmd, "'JIN_DEBUG=1'"); got != tt.on {
-				t.Errorf("JIN_DEBUG present = %v, want %v\ncommand: %s", got, tt.on, cmd)
+			if !strings.Contains(cmd, tt.want) {
+				t.Errorf("want %s in the command\ncommand: %s", tt.want, cmd)
 			}
 		})
 	}

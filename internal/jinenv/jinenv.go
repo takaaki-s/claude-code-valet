@@ -13,12 +13,18 @@
 // off simply leaves no line behind. Nothing fails, so nothing is noticed.
 //
 // There are two renderers, and which one a caller wants is decided by the
-// destination rather than by the caller: Environ for a child whose environment
-// jind-ai builds from nothing (os/exec, a shell `env` prefix), TmuxEnviron for
-// one tmux builds from the environment of whichever process forked its server.
-// They differ only in what an unknown value renders as, and they have to,
-// because leaving a key out means "absent" in the first case and "inherit
-// whatever is there" in the second.
+// destination rather than by the caller: Environ where jind-ai builds the
+// child's environment outright, TmuxEnviron where something else does and
+// jind-ai only adds to it. They differ only in what an unknown value renders
+// as, and they have to, because leaving a key out means "absent" in the first
+// case and "keep whatever was already there" in the second.
+//
+// Only the plugin dispatcher qualifies for the first today: it assigns
+// cmd.Env from a curated allowlist that has no JIN_* in it, so a key it does
+// not write is a key the plugin does not have. A shell `env` prefix does not
+// qualify on its own — `env` without -i adds to what it was handed — and the
+// one jind-ai writes is handed to tmux, which starts a pane from its server's
+// environment. That is why the agent's spawn line uses TmuxEnviron too.
 //
 // The worktree post-create hook is a deliberate non-consumer. It runs inside
 // provisioning, before the session's recorded working directory moves to the
@@ -76,7 +82,9 @@ type Identity struct {
 // makes a child's environment claim to know something it does not.
 //
 // That reasoning holds only where a skipped key is simply absent from the
-// child. Where it is not — tmux — use TmuxEnviron instead.
+// child, which is a property of the destination and not of this function. Where
+// the child starts from an environment jind-ai did not build — anything tmux
+// runs, including a shell `env` prefix tmux is given — use TmuxEnviron.
 func (i Identity) Environ() []string {
 	env := make([]string, 0, 3)
 	if i.SocketPath != "" {
@@ -100,11 +108,12 @@ func (i Identity) Environ() []string {
 // difference from Environ. The rule inverts because the destination does: a key
 // left out of an exec.Cmd environment is absent from the child, but a key left
 // out of tmux's -e is taken from the tmux *server* — which holds whatever
-// process forked it. All three outcomes were measured, 3/3 each: nothing when
-// the daemon forked it, an older daemon's socket when an earlier one did, and
-// another session's id when the server was forked from inside an agent's pane
-// (a `jin daemon start` run there is enough). The last is the one to fear,
-// because a stale id is a plausible UUID and an absent one is not.
+// process forked it. Four provenances were measured, 3 trials each: nothing at
+// all when the daemon or a plain shell forked the server, the stale values when
+// the forking environment carried some, and another session's id when the
+// server was forked from inside an agent's pane (a `jin daemon start` run there
+// is enough). The last is the one to fear, because a stale id is a plausible
+// UUID and an absent one is not.
 //
 // There is no third choice to reach for: tmux has no unset form for -e. `-e
 // VAR` without a value is ignored, and `-e VAR=` sets it empty — both measured.
@@ -113,8 +122,8 @@ func (i Identity) Environ() []string {
 // unknown: debug.Enabled() compares against "1", and an empty JIN_SOCKET or
 // JIN_BIN means no socket and no binary, exactly as their absence does.
 // `"${JIN_BIN:-jin}"`, the form the README recommends, substitutes on empty as
-// well as on unset — unlike a stale path, which is neither and so falls through
-// to a 127.
+// well as on unset — unlike a stale path, which is neither, and which
+// session.EstablishHookBinary records exiting 127 instead.
 //
 // JIN_DEBUG is emitted empty rather than "0" for the reason it is omitted from
 // Environ rather than set to "0": a plugin testing `[ -n "$JIN_DEBUG" ]` would

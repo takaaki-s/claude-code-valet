@@ -88,6 +88,15 @@ var debugLog = debug.NewLogger("daemon-debug.log")   // one per log file
   started it. `daemon.NewServer` reads the flag once, there, and hands the
   resulting `jinenv.Identity` to every spawner — do not read it again at a spawn
   site. Each site once answered separately, and no site answered completely.
+
+  One exception, and it is the shape of the exception that matters: `--here`
+  (`callerPaneEnv` in `cmd/jin/cmd/pane.go`) never reaches the daemon, so there
+  is no one to hand it an identity. It forwards its own process's — a plugin's,
+  or an agent pane's shell's — rather than deriving anything, which is the same
+  rule stated from the other side: pass on what you were given. Making it ask
+  the daemon would cost `--here` the property that it works while the daemon is
+  down. A spawn site may read the environment only when nothing upstream of it
+  could have been asked.
 - `debug.Untrusted` / `debug.UntrustedBytes` bound and quote any value the
   local process did not choose, so one payload cannot forge entries or fill the
   file.

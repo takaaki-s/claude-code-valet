@@ -161,10 +161,15 @@ log.
   pane (3/3) — one `jin daemon start` run there arranges that, and from then
   on every session's popups carry the one id. That case is worse than the
   empty one: a stale id is a plausible UUID, so a popup that reads it acts on
-  the wrong session and nothing reports an error. Agent panes were never
-  affected (12/12); they carry the values on their command line already.
+  the wrong session and nothing reports an error. Agent panes carried the three
+  values they knew on their command line already and were unaffected in all
+  four (12/12) — but the same omission reached them through a fourth: with
+  debug logging off, nothing was written for `JIN_DEBUG`, so an agent in a
+  server forked from an environment that had it on ran with it on (3/3). That
+  is closed here too.
   `JIN_SOCKET`, `JIN_BIN`, `JIN_DEBUG` and `JIN_SESSION_ID` now reach every
-  pane jind-ai opens — popup and split, by selector or `--here`, a slot
+  pane `jin pane` opens, and the agent's own — popup and split, by selector or
+  `--here`, a slot
   restarted with `--if-exists respawn`, and a split with no command — and
   arrive empty when a value is unknown, because a key left out is a key
   inherited. A `--here` pane is given the caller's own values rather than the

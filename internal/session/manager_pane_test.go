@@ -320,11 +320,11 @@ func TestManager_PanePopup_TellsThePopupWhichJinAndWhichSession(t *testing.T) {
 		t.Fatalf("PanePopup failed: %v", err)
 	}
 
-	if len(mock.popupOpts) != 1 {
-		t.Fatalf("DisplayPopup called %d times, want 1", len(mock.popupOpts))
+	if len(mock.popupCalls()) != 1 {
+		t.Fatalf("DisplayPopup called %d times, want 1", len(mock.popupCalls()))
 	}
 	want := identity.TmuxEnviron(target.ID)
-	if got := mock.popupOpts[0].Env; !reflect.DeepEqual(got, want) {
+	if got := mock.popupCalls()[0].Env; !reflect.DeepEqual(got, want) {
 		t.Errorf("popup Env = %q, want %q", got, want)
 	}
 }
@@ -342,11 +342,11 @@ func TestManager_PaneSplit_TellsTheNewPaneTheSame(t *testing.T) {
 		t.Fatalf("PaneSplit failed: %v", err)
 	}
 
-	if len(mock.splitOpts) != 1 {
-		t.Fatalf("SplitPane called %d times, want 1", len(mock.splitOpts))
+	if len(mock.splitCalls()) != 1 {
+		t.Fatalf("SplitPane called %d times, want 1", len(mock.splitCalls()))
 	}
 	want := identity.TmuxEnviron(target.ID)
-	if got := mock.splitOpts[0].Env; !reflect.DeepEqual(got, want) {
+	if got := mock.splitCalls()[0].Env; !reflect.DeepEqual(got, want) {
 		t.Errorf("split Env = %q, want %q", got, want)
 	}
 }
@@ -366,7 +366,7 @@ func TestManager_PaneSplit_CallerCannotSupplyTheEnv(t *testing.T) {
 	}
 
 	want := identity.TmuxEnviron(sess.ID)
-	if got := mock.splitOpts[0].Env; !reflect.DeepEqual(got, want) {
+	if got := mock.splitCalls()[0].Env; !reflect.DeepEqual(got, want) {
 		t.Errorf("split Env = %q, want %q", got, want)
 	}
 }
@@ -385,14 +385,14 @@ func TestManager_PaneSplit_RespawnedSlotIsToldToo(t *testing.T) {
 		t.Fatalf("PaneSplit failed: %v", err)
 	}
 
-	if len(mock.respawnEnvs) != 1 {
-		t.Fatalf("RespawnPane called %d times, want 1", len(mock.respawnEnvs))
+	if len(mock.respawnEnvCalls()) != 1 {
+		t.Fatalf("RespawnPane called %d times, want 1", len(mock.respawnEnvCalls()))
 	}
 	want := identity.TmuxEnviron(sess.ID)
-	if got := mock.respawnEnvs[0]; !reflect.DeepEqual(got, want) {
+	if got := mock.respawnEnvCalls()[0]; !reflect.DeepEqual(got, want) {
 		t.Errorf("respawn Env = %q, want %q", got, want)
 	}
-	if len(mock.splitOpts) != 0 {
-		t.Errorf("SplitPane called %d times on a respawn, want 0", len(mock.splitOpts))
+	if len(mock.splitCalls()) != 0 {
+		t.Errorf("SplitPane called %d times on a respawn, want 0", len(mock.splitCalls()))
 	}
 }

@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -158,9 +159,36 @@ type mockTmuxRunner struct {
 	// A pane's environment is exactly the kind of thing that is wrong by being
 	// absent, so it has to be observable as the slice it is, not as a string
 	// some earlier caller decided how to join.
+	//
+	// Read them through popupCalls/splitCalls/respawnEnvCalls, not directly:
+	// RespawnPane is reached from the monitor goroutine (that is what the
+	// onRespawnPane hook is for), so a future concurrent test reading a bare
+	// field would race where every other observation here does not.
 	popupOpts   []tmux.DisplayPopupOptions
 	splitOpts   []tmux.SplitOptions
 	respawnEnvs [][]string
+}
+
+// popupCalls, splitCalls and respawnEnvCalls are the locked readers for the
+// three fields above, matching hasCalledWith and friends.
+func (m *mockTmuxRunner) popupCalls() []tmux.DisplayPopupOptions {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.popupOpts)
+}
+
+func (m *mockTmuxRunner) splitCalls() []tmux.SplitOptions {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.splitOpts)
+}
+
+// respawnEnvCalls clones only the outer slice: each inner one is a fresh
+// TmuxEnviron result that nothing mutates.
+func (m *mockTmuxRunner) respawnEnvCalls() [][]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.respawnEnvs)
 }
 
 func newMockTmuxRunner() *mockTmuxRunner {
