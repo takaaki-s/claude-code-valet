@@ -84,16 +84,6 @@ func NewDispatcher(registry *Registry, pluginsDir, stateDir string, identity jin
 	}
 }
 
-// Identity is the jin this dispatcher tells its plugins to call back into.
-//
-// Exported only so daemon's wiring test can compare it against the value the
-// same daemon gave its agents: nothing inside this package can tell a
-// dispatcher built over the right identity from one built over its own
-// executable.
-func (d *EventDispatcher) Identity() jinenv.Identity {
-	return d.identity
-}
-
 // Publish implements Dispatcher.
 func (d *EventDispatcher) Publish(ev Event) {
 	go d.publish(ev)

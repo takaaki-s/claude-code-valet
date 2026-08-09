@@ -85,8 +85,9 @@ var debugLog = debug.NewLogger("daemon-debug.log")   // one per log file
 - Putting the flag into a *child's* environment is a different question and has
   a different answer: `internal/jinenv`, which carries it alongside the socket
   and the binary path. A child needs all three to call back into the jin that
-  started it, and while each spawn site answered separately, none answered
-  completely.
+  started it. `daemon.NewServer` reads the flag once, there, and hands the
+  resulting `jinenv.Identity` to every spawner — do not read it again at a spawn
+  site. Each site once answered separately, and no site answered completely.
 - `debug.Untrusted` / `debug.UntrustedBytes` bound and quote any value the
   local process did not choose, so one payload cannot forge entries or fill the
   file.

@@ -84,20 +84,44 @@ func TestCopyExecutableMissingSource(t *testing.T) {
 	}
 }
 
+// TestEstablishHookBinary_FallsBackToTheLivePathWhenTheCopyFails pins the
+// promise the rest of the wiring rests on. Every caller takes the returned path
+// instead of deriving <stateDir>/bin/jin for itself precisely because this is
+// best-effort: derive it and you name a file that is not there whenever the
+// copy did not happen. Returning "" would be the same failure by another route
+// — jinenv omits an empty BinPath, so children would silently fall back to
+// whatever `jin` is on PATH.
+func TestEstablishHookBinary_FallsBackToTheLivePathWhenTheCopyFails(t *testing.T) {
+	stateDir := t.TempDir()
+	// A file where the bin directory needs to go, so MkdirAll cannot succeed.
+	if err := os.WriteFile(filepath.Join(stateDir, "bin"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := EstablishHookBinary(stateDir)
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != self {
+		t.Errorf("EstablishHookBinary = %q, want the live executable %q", got, self)
+	}
+}
+
 func TestEstablishHookBinary(t *testing.T) {
 	stateDir := t.TempDir()
-	m := &Manager{stateDir: stateDir}
 
-	m.EstablishHookBinary()
+	got := EstablishHookBinary(stateDir)
 
-	// hookExecPath must point at the stable location under stateDir, and that
+	// The returned path must be the stable location under stateDir, and that
 	// file must exist and be executable — this is the path baked into hook
 	// wiring, so a broken one would silently freeze sessions.
 	want := filepath.Join(stateDir, "bin", "jin")
-	if m.hookExecPath != want {
-		t.Fatalf("hookExecPath = %q, want %q", m.hookExecPath, want)
+	if got != want {
+		t.Fatalf("EstablishHookBinary = %q, want %q", got, want)
 	}
-	info, err := os.Stat(m.hookExecPath)
+	info, err := os.Stat(got)
 	if err != nil {
 		t.Fatalf("stat established binary: %v", err)
 	}
@@ -115,7 +139,7 @@ func TestEstablishHookBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	copyBytes, err := os.ReadFile(m.hookExecPath)
+	copyBytes, err := os.ReadFile(got)
 	if err != nil {
 		t.Fatal(err)
 	}

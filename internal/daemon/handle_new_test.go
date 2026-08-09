@@ -15,6 +15,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/agent/agenttest"
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/git"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/session"
 )
 
@@ -71,7 +72,8 @@ func newAsyncTestServer(t *testing.T) *Server {
 	// A socket no test dials: these handlers never reach a daemon, but the
 	// Manager passes the value on to the agents it starts, so it must not be
 	// one that could collide with a real one.
-	mgr, err := session.NewManager(sessionsDir, stateDir, "/nonexistent/handler-test.sock", configMgr)
+	identity := jinenv.Identity{SocketPath: "/nonexistent/handler-test.sock"}
+	mgr, err := session.NewManager(sessionsDir, stateDir, identity, configMgr)
 	if err != nil {
 		t.Fatalf("session.NewManager: %v", err)
 	}

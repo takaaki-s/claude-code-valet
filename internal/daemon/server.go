@@ -17,6 +17,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/debug"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/paths"
 	"github.com/takaaki-s/jind-ai/internal/plugin"
 	"github.com/takaaki-s/jind-ai/internal/session"
@@ -102,17 +103,25 @@ func NewServer(socketPath, sessionsDir, configDir, stateDir string) (*Server, er
 		return nil, err
 	}
 
-	mgr, err := session.NewManager(sessionsDir, stateDir, socketPath, configMgr)
+	// Which jin every child this daemon spawns — an agent in a tmux pane, a
+	// plugin from the dispatcher — is told to call back into. Assembled once,
+	// here, because this is the only place that knows all three answers, and
+	// answering separately per spawn site is what once let them disagree.
+	//
+	// The binary is a copy taken now, so the path baked into a session's hooks
+	// survives the launch binary being rebuilt or deleted; EstablishHookBinary
+	// has what goes wrong otherwise, and falls back to the live path when the
+	// copy cannot be made.
+	identity := jinenv.Identity{
+		SocketPath: socketPath,
+		BinPath:    session.EstablishHookBinary(stateDir),
+		Debug:      debug.Enabled(),
+	}
+
+	mgr, err := session.NewManager(sessionsDir, stateDir, identity, configMgr)
 	if err != nil {
 		return nil, err
 	}
-
-	// Copy this daemon's binary to a stable path and route agent hook wiring
-	// through it, so the path baked into a session's hooks survives the launch
-	// binary moving or being deleted (e.g. jin run from a worktree that is
-	// later removed). Runs once, here, so the copy stays version-locked to the
-	// running daemon for its lifetime.
-	mgr.EstablishHookBinary()
 
 	// Wire the agent resolver so startSessionTmux / HandleHookEvent can
 	// dispatch to the adapter that owns each session's kind. Layer C
@@ -142,10 +151,7 @@ func NewServer(socketPath, sessionsDir, configDir, stateDir string) (*Server, er
 
 	pluginCfg := configMgr.GetPluginsConfig()
 	pluginReg := plugin.NewRegistry(paths.Plugins(), stateDir, pluginCfg)
-	// Read here, not next to NewManager: EstablishHookBinary has run by now, so
-	// this carries the stable binary rather than the live one. Nothing but
-	// TestNewServer_TellsItsChildrenWhichJinStartedThem enforces that ordering.
-	pluginDisp := plugin.NewDispatcher(pluginReg, paths.Plugins(), stateDir, mgr.Identity(),
+	pluginDisp := plugin.NewDispatcher(pluginReg, paths.Plugins(), stateDir, identity,
 		time.Duration(pluginCfg.Debounce)*time.Second,
 		// actionID is accepted but unused for now: user config keys popup size
 		// by plugin name only, so every action shares the plugin-level setting.

@@ -14,6 +14,7 @@ import (
 
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/testutil"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
@@ -365,7 +366,7 @@ func TestE2E_SessionRecovery(t *testing.T) {
 		t.Fatalf("NewConfigManager: %v", err)
 	}
 
-	mgr, err := session.NewManager(dataDir, configDir, testutil.SocketPath(t, "recover.sock"), configMgr)
+	mgr, err := session.NewManager(dataDir, configDir, jinenv.Identity{SocketPath: testutil.SocketPath(t, "recover.sock")}, configMgr)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}

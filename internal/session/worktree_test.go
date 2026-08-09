@@ -250,7 +250,7 @@ func TestProvisionWorktree_PlacesWorktreesUnderTheStateDirTheManagerWasBuiltOver
 	// Built directly rather than through newTestManager because the state dir
 	// is the subject. hookRunner stays nil, which skips the post-create hook —
 	// provisionWorktree gets to `worktree add` and returns.
-	mgr, err := NewManager(t.TempDir(), stateDir, testSocketPath, configMgr)
+	mgr, err := NewManager(t.TempDir(), stateDir, testIdentity(), configMgr)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
