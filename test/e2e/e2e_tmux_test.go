@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/takaaki-s/jind-ai/internal/agentdocs"
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
 	"github.com/takaaki-s/jind-ai/internal/jinenv"
@@ -41,22 +43,32 @@ func setupE2EWithDataDir(t *testing.T, sessionsDir, configDir string) (*daemon.C
 		_ = server.Start()
 	}()
 
-	// Wait for socket
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.Dial("unix", socketPath)
-		if err == nil {
-			conn.Close()
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitForDaemonSocket(t, socketPath)
 
 	t.Cleanup(func() {
 		server.Stop()
 	})
 
 	return daemon.NewClient(socketPath), server
+}
+
+// waitForDaemonSocket blocks until a daemon accepts a connection on socketPath,
+// and fails the test if none does. Failing here rather than proceeding matters
+// most where a test builds two daemons: a silent timeout surfaces later as the
+// wrong daemon answering, which reads as a defect in what the test asserts
+// rather than in its setup.
+func waitForDaemonSocket(t *testing.T, socketPath string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.Dial("unix", socketPath)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no daemon bound %s within the deadline", socketPath)
 }
 
 // hasTmuxSession checks if a tmux session exists on the jin socket.
@@ -684,4 +696,136 @@ func TestE2E_DeleteWorktreeAlreadyRemoved(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 	waitForSessionGone(t, client, info.ID, 5*time.Second)
+}
+
+// setupE2EWithStateDir brings up a daemon rooted at stateDir and returns a
+// client for it. Unlike setupE2E and setupE2EWithDataDir it names the state
+// directory explicitly, because the state directory is what the caller is
+// asserting about — setupE2EWithDataDir's habit of reusing configDir for it
+// would leave the assertion talking about a directory the call site calls
+// something else.
+//
+// It also does not isolate the tmux socket: a caller building two daemons
+// isolates once for both, so they share one throwaway server the way two real
+// daemons on one machine share the user's. A second isolateTmuxSocket mid-test
+// would leave the daemons bound to different servers while any later
+// tmux.NewClient() saw only the last one.
+func setupE2EWithStateDir(t *testing.T, stateDir string) *daemon.Client {
+	t.Helper()
+
+	socketPath := testutil.SocketPath(t, "e2e-hooks.sock")
+
+	server, err := daemon.NewServer(socketPath,
+		filepath.Join(stateDir, "sessions"),
+		filepath.Join(stateDir, "config"),
+		stateDir)
+	if err != nil {
+		t.Fatalf("NewServer(%s): %v", stateDir, err)
+	}
+
+	go func() {
+		_ = server.Start()
+	}()
+
+	waitForDaemonSocket(t, socketPath)
+
+	t.Cleanup(func() {
+		server.Stop()
+	})
+
+	return daemon.NewClient(socketPath)
+}
+
+// startRunningSession creates one Start:true session and waits for it to reach
+// running. The wait is the barrier that says the adapter's Setup has run for
+// this daemon's state directory: Setup happens inside the start, which the
+// daemon does in a goroutine, so the file it writes need not be on disk when
+// NewWithOptions returns.
+func startRunningSession(t *testing.T, client *daemon.Client, description string) {
+	t.Helper()
+
+	info, _, err := client.NewWithOptions(daemon.NewOptions{
+		Description: description,
+		WorkDir:     t.TempDir(),
+		Start:       true,
+	})
+	if err != nil {
+		t.Fatalf("NewWithOptions(%s): %v", description, err)
+	}
+	waitForStatus(t, client, info.ID, session.StatusRunning, 10*time.Second)
+}
+
+// assertOwnHooksSettings checks that the daemon rooted at stateDir wrote
+// hooks-settings.json there, and that the hook command inside names that
+// daemon's own copy of the jin binary rather than the one under otherStateDir.
+//
+// The binary path is spelled out rather than imported because
+// session.hookBinaryPath is unexported; agentdocs.HookCommand is imported
+// because the command's shape is that package's contract, and re-spelling it
+// here would just be a second copy to keep in step.
+func assertOwnHooksSettings(t *testing.T, stateDir, otherStateDir string) {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(stateDir, "hooks-settings.json"))
+	if err != nil {
+		t.Fatalf("hooks settings for the daemon at %s: %v", stateDir, err)
+	}
+	own := agentdocs.HookCommand(filepath.Join(stateDir, "bin", "jin"), false)
+	if !strings.Contains(string(data), own) {
+		t.Errorf("hooks settings at %s do not wire %q; file is:\n%s", stateDir, own, data)
+	}
+	foreign := filepath.Join(otherStateDir, "bin", "jin")
+	if strings.Contains(string(data), foreign) {
+		t.Errorf("hooks settings at %s name the other daemon's binary %q", stateDir, foreign)
+	}
+}
+
+// TestE2E_SecondDaemonGetsItsOwnHooksSettings pins the one claim the Claude
+// Code adapter's own unit tests cannot make: that a real daemon, resolving the
+// adapter through the real registry, is handed the hooks file belonging to its
+// own state directory — even when another daemon in the same process got there
+// first.
+//
+// The registry holds one adapter instance per kind for the whole process, and
+// Setup used to derive hooks-settings.json under a sync.Once, so it ran for the
+// first SetupContext the process ever saw and never again. Measured on this
+// suite before the fix: 9 Setup calls over 7 state directories, and 8 of the 9
+// were handed a path under the first test's directory — one that test's own
+// cleanup had already deleted, so those sessions were started against a file
+// that did not exist. The suite stayed green throughout, because no test looked
+// at the hook wiring. Production starts one daemon per process (a restart execs
+// a new one), which is why it never showed there.
+//
+// It lives here because this is the only test surface that holds both halves
+// at once: the real registry, from the blank import of internal/agent/register
+// in e2e_test.go, and a real daemon.NewServer. The register package's own tests
+// reach every adapter but build no daemon; internal/daemon's tests build one
+// but do not blank-import the registry, so their Lookup finds only the stubs
+// they register and never one of the three real adapters; and internal/session
+// cannot import an adapter at all without a cycle. A unit test driving the adapter directly shows that Setup recomputes;
+// nothing in it obliges the daemon to resolve the shared instance, which is the
+// half that was broken.
+//
+// Both halves of the assertion do work. Existence alone kills the sync.Once,
+// under which the second state directory got no file at all. It does not kill a
+// variant that writes into the right directory with the first daemon's binary
+// path baked in — hooks that exist and call a deleted binary — and that is what
+// the content check is for.
+func TestE2E_SecondDaemonGetsItsOwnHooksSettings(t *testing.T) {
+	isolateTmuxSocket(t)
+
+	root := t.TempDir()
+	firstDir := filepath.Join(root, "first")
+	secondDir := filepath.Join(root, "second")
+
+	first := setupE2EWithStateDir(t, firstDir)
+	second := setupE2EWithStateDir(t, secondDir)
+
+	// Order matters: the first daemon must run Setup before the second, so
+	// that a cached first context has something to be stale about.
+	startRunningSession(t, first, "hooks-first")
+	startRunningSession(t, second, "hooks-second")
+
+	assertOwnHooksSettings(t, firstDir, secondDir)
+	assertOwnHooksSettings(t, secondDir, firstDir)
 }

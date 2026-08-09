@@ -3,6 +3,7 @@ package claude
 import (
 	"encoding/json"
 	"os"
+	"sync"
 	"testing"
 )
 
@@ -31,10 +32,12 @@ func TestEnsureHooksSettingsFile_NewHooks(t *testing.T) {
 	}
 }
 
-// EnsureHooksSettingsFile is called from Agent.Setup under sync.Once, but the
-// helper itself must be safe to invoke repeatedly (Setup runs per-session-start
-// even though the write itself is guarded). Verify the file content is stable
-// across a second call.
+// Agent.Setup calls EnsureHooksSettingsFile on every session start, so a
+// repeat call is the ordinary path rather than a hypothetical one, and this
+// pins a stronger property than a guarded-write version would need: the second
+// call must resolve to the same path and leave the same contents. Were that
+// not so, a daemon would hand successive sessions different settings for the
+// same state directory.
 func TestEnsureHooksSettingsFile_Idempotent(t *testing.T) {
 	dir := t.TempDir()
 
@@ -136,5 +139,79 @@ func TestEnsureHooksSettingsFile_TimeoutUnchangedBySessionStart(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestEnsureHooksSettingsFile_NeverVisibleHalfWritten pins the property the
+// per-start rewrite needs: a reader sees either the old file or the new one,
+// never a fragment. See EnsureHooksSettingsFile for why writing in place would
+// not give that, and for the size of the window it leaves — the reader here
+// loops without sleeping because that window is measured in microseconds.
+//
+// The ReadDir at the end is the second half, and catches what the read loop
+// cannot: a write that publishes correctly and then leaves its temp sibling
+// behind.
+func TestEnsureHooksSettingsFile_NeverVisibleHalfWritten(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := EnsureHooksSettingsFile(dir, "/usr/local/bin/jin"); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+	path := hooksSettingsPath(dir)
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 60; n++ {
+				if _, err := EnsureHooksSettingsFile(dir, "/usr/local/bin/jin"); err != nil {
+					t.Errorf("EnsureHooksSettingsFile: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	go func() { wg.Wait(); close(done) }()
+
+	// Wait the writers out on every exit path, t.Fatalf included: a goroutine
+	// that reports after its test has returned panics the run.
+	defer func() { <-done }()
+
+	for reads := 1; ; reads++ {
+		select {
+		case <-done:
+			assertOnlyTheHooksFile(t, dir)
+			return
+		default:
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("the published file disappeared mid-rewrite: %v", err)
+		}
+		if !usableHooksSettings(data) {
+			t.Fatalf("read %d saw an empty or partial file", reads)
+		}
+	}
+}
+
+// assertOnlyTheHooksFile fails if anything besides the published file is left
+// in dir — atomicfile.Write creates its temp sibling there. Measured
+// load-bearing: a stray survives the read loop above and is caught only here.
+// atomicfile's own tests catch the same mutation, so this is not the only
+// guard; it is here because nothing sweeps a state directory, so a stray under
+// one is permanent.
+func assertOnlyTheHooksFile(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != hooksSettingsFileName {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("state dir = %v, want exactly [%s]", names, hooksSettingsFileName)
 	}
 }

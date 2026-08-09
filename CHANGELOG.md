@@ -113,6 +113,11 @@ log.
   build step that fails to *start* now names the build log, as every other
   build failure already did.
 
+- **Claude Code's `hooks-settings.json` is rewritten at every session start**
+  instead of once per daemon run, so one deleted or hand-edited by mistake is
+  back in place at the next start rather than staying broken until the daemon
+  is restarted.
+
 ### Bug Fixes
 
 - **A session's agent is now told which daemon to call back to.** Its hooks

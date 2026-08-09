@@ -1,6 +1,7 @@
 package register_test
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -232,5 +233,80 @@ func TestRecognizesSessionID_NoAdapterAcceptsEverything(t *testing.T) {
 				t.Errorf("%s.RecognizesSessionID(%q) = true; the adapter recognises anything", kind, id)
 			}
 		}
+	}
+}
+
+// TestSetup_NoAdapterPinsTheFirstContext is the conformance check for the rule
+// that an adapter derives what a spawn needs from the SetupContext of THIS call
+// rather than from the first one it ever saw (see the contract on
+// session.Agent.Setup).
+//
+// Written over agent.Kinds() for the same reason as the checks above. The
+// registry holds one adapter instance per kind for the whole process while a
+// SetupContext describes one Manager's session, so a sync.Once around Setup
+// pins whichever Manager got there first — including a state directory whose
+// owner has since deleted it. Two of the three adapters did exactly that, and a
+// per-package test cannot fail for a package that does not exist yet, so a
+// fourth adapter would reintroduce it with nothing to catch it. Registering a
+// kind is what enrols it here.
+//
+// Both directions are asserted, and the second is what makes the first mean
+// anything: an adapter that carries nothing at all out of its SetupContext
+// would satisfy "the first directory is absent" vacuously. It therefore fails
+// here, which is the intended cost — an adapter that needs nothing from the
+// context is a claim worth making in this file rather than by silence.
+//
+// ExtraEnv is searched beside Command because an adapter may carry the context
+// through either: the opencode adapter exposes its directory only as
+// OPENCODE_CONFIG_DIR, and a check reading Command alone would pass it blind.
+//
+// It leaves every adapter pointing at a directory this test owns and t.TempDir
+// then deletes: agent.Lookup returns the registry's one instance per kind, so
+// there is no copy to throw away at the end. Nothing else here reads those
+// fields — the only other test that calls SpawnCommand asks whether a session
+// id or a payload fragment came back in it, and a temp directory path is
+// neither — which is why the residue is inert under -shuffle=on as well as in
+// source order.
+func TestSetup_NoAdapterPinsTheFirstContext(t *testing.T) {
+	// The Claude Code adapter's Setup records trust for WorkDir in
+	// ~/.claude.json, so hand the whole test a home of its own.
+	t.Setenv("HOME", t.TempDir())
+
+	for _, kind := range agent.Kinds() {
+		t.Run(kind, func(t *testing.T) {
+			a, err := agent.Lookup(kind)
+			if err != nil {
+				t.Fatalf("Lookup(%s): %v", kind, err)
+			}
+
+			// Two Managers, in the order the process would see them: each
+			// names its own state directory and the hook binary copy it
+			// established inside it (session.EstablishHookBinary).
+			first, second := t.TempDir(), t.TempDir()
+			for _, stateDir := range []string{first, second} {
+				err := a.Setup(session.SetupContext{
+					StateDir: stateDir,
+					ExecPath: filepath.Join(stateDir, "bin", "jin"),
+					WorkDir:  t.TempDir(),
+				})
+				if err != nil {
+					t.Fatalf("%s.Setup(%s): %v", kind, stateDir, err)
+				}
+			}
+
+			plan := a.SpawnCommand(session.SpawnOptions{WorkDir: t.TempDir()})
+			spawn := plan.Command
+			for k, v := range plan.ExtraEnv {
+				spawn += " " + k + "=" + v
+			}
+			if strings.Contains(spawn, first) {
+				t.Errorf("%s.SpawnCommand still names the first Setup's state dir %s: %s",
+					kind, first, spawn)
+			}
+			if !strings.Contains(spawn, second) {
+				t.Errorf("%s.SpawnCommand does not name the last Setup's state dir %s, so nothing in the spawn came from that context: %s",
+					kind, second, spawn)
+			}
+		})
 	}
 }

@@ -5,7 +5,6 @@ package e2e
 import (
 	"encoding/json"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -62,16 +61,7 @@ func setupE2E(t *testing.T) *daemon.Client {
 		server.Start()
 	}()
 
-	// Wait for socket
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.Dial("unix", socketPath)
-		if err == nil {
-			conn.Close()
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitForDaemonSocket(t, socketPath)
 
 	t.Cleanup(func() {
 		server.Stop()

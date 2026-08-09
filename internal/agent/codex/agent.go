@@ -17,13 +17,14 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/agent"
 )
 
-// Agent is the process-wide Codex adapter state. All fields are set once via
-// Setup and read from every subsequent SpawnCommand call, so we protect the
-// write side with a sync.Once and expose the read side without locking.
+// Agent is the Codex adapter state, one instance shared by the whole process
+// (internal/agent/registry.go). Only one field comes from Setup, and it is the
+// only one the mutex covers:
 //
-//   - execPath is os.Executable() captured from the first Setup and reused
-//     by hook_args.go to build the `-c 'hooks.X=[...]'` payloads. It never
-//     changes for the lifetime of the daemon.
+//   - execPath is the jin binary the SetupContext of the most recent Setup
+//     named, reused by hook_args.go to build the `-c 'hooks.X=[...]'`
+//     payloads. It is fixed for a daemon's lifetime but not for the process's,
+//     so setupMu guards both writing and reading it — see Setup.
 //   - locator is built once, from os.UserHomeDir() resolved eagerly at
 //     construction (invariant for a running daemon; tests set CODEX_HOME
 //     directly), and shared by enhancer and every TranscriptReader
@@ -31,8 +32,11 @@ import (
 //     cached for both — see rollout.go's Locator cache.
 //   - enhancer and statusSrc are cached instances so hot-path calls to
 //     Description() / StatusSource() don't reallocate on every hook.
+//
+// The last three are built in New and never reassigned, so they are read
+// without the mutex.
 type Agent struct {
-	setupOnce sync.Once
+	setupMu   sync.Mutex
 	execPath  string
 	locator   *Locator
 	enhancer  *DescriptionEnhancer
@@ -65,33 +69,52 @@ func (a *Agent) Kind() string { return "codex" }
 // session that quietly turns out to be empty.
 func (a *Agent) RecognizesSessionID(id string) bool { return agent.LooksLikeUUID(id) }
 
-// Setup captures os.Executable() so SpawnCommand can wire the `-c` hook
-// payload back to `jin hook`. Unlike the Claude adapter, Setup writes no
-// files: Codex hooks are injected per-invocation on the command line, so
-// ~/.codex/hooks.json and config.toml both stay untouched. See "Agent
-// Adapters" in docs/architecture.md for the design principle behind this.
+// Setup records the jin binary SpawnCommand wires the `-c` hook payload back
+// to. Unlike the Claude adapter, Setup writes no files: Codex hooks are
+// injected per-invocation on the command line, so ~/.codex/hooks.json and
+// config.toml both stay untouched. See "Agent Adapters" in
+// docs/architecture.md for the design principle behind this.
+//
+// It takes the value from every call rather than only the first. ExecPath is
+// the stable copy a Manager established under its own state directory
+// (session.EstablishHookBinary), so a second Manager in the same process names
+// a different file — and caching the first pins a path under a directory that
+// Manager owns. What was measured is the SetupContext every adapter is handed,
+// taken through the Claude Code adapter because the e2e suite runs no Codex
+// sessions: in that suite, which builds a daemon per test in one process, the
+// first test's directory was gone by the time the later ones ran, so what a
+// cache would pin is not a stale binary but a missing one. EstablishHookBinary
+// records what that costs, callbacks exiting 127. Production runs one Manager
+// per process, so it never saw this.
 func (a *Agent) Setup(ctx agent.SetupContext) error {
-	a.setupOnce.Do(func() {
-		a.execPath = ctx.ExecPath
-	})
+	a.setupMu.Lock()
+	a.execPath = ctx.ExecPath
+	a.setupMu.Unlock()
 	return nil
 }
 
-// SpawnCommand delegates to the package-level builder with the captured
-// execPath. When Setup has not run yet — an edge case the interface
-// contract does not forbid — execPath is the zero value, and HookArgs
-// gracefully falls back to a hook-less `codex` invocation.
+// SpawnCommand delegates to the package-level builder with the path the most
+// recent Setup recorded. When Setup has not run yet — an edge case the
+// interface contract does not forbid — execPath is the zero value, and
+// HookArgs gracefully falls back to a hook-less `codex` invocation.
 //
 // A resume (isResume(opts)) evicts AgentSessionID from locator's cache
 // first. Whether `codex resume` can retarget a UUID onto a different rollout
 // file is unverified (see rollout.go), but if it does, the next Find must
 // re-glob rather than keep answering with whatever the cache resolved before
 // the resume.
+//
+// The eviction stays outside setupMu. Locator has its own lock and nothing
+// links the two pieces of state, so holding one across the other would only
+// widen a critical section for no reader's benefit.
 func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 	if isResume(opts) {
 		a.locator.invalidate(opts.AgentSessionID)
 	}
-	return SpawnCommand(opts, a.execPath)
+	a.setupMu.Lock()
+	execPath := a.execPath
+	a.setupMu.Unlock()
+	return SpawnCommand(opts, execPath)
 }
 
 // StatusSource returns the cached hook-event interpreter.

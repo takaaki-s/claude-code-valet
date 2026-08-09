@@ -153,6 +153,14 @@ yourself.
     `Setup()` is called from `startSessionTmux` and cannot see the lock. It is
     safe only because it is a leaf — nothing beneath it re-enters
     session.Manager. Anything else added there must keep that property
+  - The same exception covers each adapter's `setupMu` (`claude.setupMu`,
+    `codex.setupMu`, `opencode.setupMu`), which guards the field `Setup`
+    derives from its `SetupContext` and `SpawnCommand` reads back. All three
+    are leaves by construction: the critical section holds nothing but the
+    assignment or the read, so there is nothing beneath them that could
+    re-enter anything. Where the adapter does I/O it stays outside that
+    section, on either side of it — the Claude Code adapter writes the hooks
+    file before taking the lock and the trust flag after releasing it
 - Perform I/O operations (Store.Save, transcript reads) outside the lock
   - Example: `List()` takes a snapshot under RLock, then reads transcripts after releasing the lock
 

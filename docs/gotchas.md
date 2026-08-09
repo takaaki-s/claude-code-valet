@@ -1475,6 +1475,12 @@ Common pitfalls and caveats that agents tend to fall into.
   random name. It also means the write needs permission on that *directory*,
   not just on the file, which a plain overwrite would not have.
 
+  `hooks-settings.json` goes the other way: it is published by rename with no
+  resolution, so a symlink at that path is replaced rather than followed. It
+  lives inside jind-ai's own state directory, where nothing else is expected
+  to keep a link, and it is rewritten at every session start rather than once
+  per daemon — so a link there would be lost quickly rather than eventually.
+
 ## Codex adapter
 
 > Codex has two trust prompts of its own, both described below. Neither has

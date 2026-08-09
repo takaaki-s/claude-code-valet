@@ -2587,7 +2587,13 @@ func snapshotForSpawn(session *Session, startDir, expandedWorkDir string) spawnS
 // buildAgentShellCmd wraps the adapter's SpawnPlan in the fixed shell
 // template Manager uses everywhere it spawns an agent (start and quick-fail
 // retry). Centralising the assembly keeps the two call sites in lock-step
-// on env vars, shell escaping, and the Setup() invariant.
+// on env vars, shell escaping, and the Setup() invariant — which is that
+// Setup runs here, with this spawn's SetupContext, immediately before
+// SpawnCommand, on both paths alike because neither reaches an adapter
+// except through this function. Adapters derive their spawn-time state from
+// the ctx of each call (see the contract on session.Agent.Setup), so a third
+// path that called SpawnCommand on its own would build its command out of
+// whatever the previous spawn left behind.
 //
 // Pure builder: reads only the immutable snapshot; performs NO Session
 // writes. Callers own the "started once" invariant

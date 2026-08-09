@@ -64,11 +64,13 @@ func TestAgent_Setup_CapturesExecPath(t *testing.T) {
 	}
 }
 
-func TestAgent_Setup_IsIdempotent(t *testing.T) {
-	// setupOnce means only the first Setup wins — a second Setup with a
-	// different ExecPath (unrealistic in practice, but possible if the
-	// daemon reconfigures) must not silently swap the value out under a
-	// live SpawnCommand caller.
+func TestAgent_Setup_LaterExecPathWins(t *testing.T) {
+	// One adapter instance is shared by the whole process while ExecPath is
+	// the stable copy one Manager established under its own state directory,
+	// so a second Manager must not be handed the first one's binary. Pinning
+	// the first is what a sync.Once here does, and the path it pins does not
+	// merely go stale — the directory it lives under belongs to the other
+	// Manager and can be gone, which costs callbacks exit 127.
 	a := New()
 	if err := a.Setup(agent.SetupContext{ExecPath: "/first/jin"}); err != nil {
 		t.Fatalf("Setup(first): %v", err)
@@ -77,18 +79,19 @@ func TestAgent_Setup_IsIdempotent(t *testing.T) {
 		t.Fatalf("Setup(second): %v", err)
 	}
 	plan := a.SpawnCommand(agent.SpawnOptions{})
-	if !strings.Contains(plan.Command, "/first/jin hook") {
-		t.Errorf("second Setup overwrote first — Command=%q", plan.Command)
+	if !strings.Contains(plan.Command, "/second/jin hook") {
+		t.Errorf("second Setup did not win — Command=%q", plan.Command)
 	}
-	if strings.Contains(plan.Command, "/second/jin") {
-		t.Errorf("second Setup leaked into Command=%q", plan.Command)
+	if strings.Contains(plan.Command, "/first/jin") {
+		t.Errorf("first Setup still named in Command=%q", plan.Command)
 	}
 }
 
 func TestAgent_Setup_ConcurrentSafe(t *testing.T) {
 	// The Agent contract allows Setup and SpawnCommand from parallel
-	// goroutines. setupOnce + immutable fields make this safe; the test
-	// hammers 32 concurrent starters to check the race detector agrees.
+	// goroutines. execPath is mutable, so setupMu is what makes that legal;
+	// the test hammers 32 concurrent starters to check the race detector
+	// agrees.
 	a := New()
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {

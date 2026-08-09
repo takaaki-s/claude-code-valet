@@ -76,11 +76,19 @@ func TestSpawnCommand_EmptyAgentSessionIDOmitsBothFlags(t *testing.T) {
 }
 
 func TestSpawnCommand_HooksPathAddsSettingsFlag(t *testing.T) {
+	// Goes through Setup rather than assigning the field: hooksPath is guarded
+	// by setupMu, so a test that poked it directly would be an unlocked write
+	// and -race would be right to complain.
+	isolateHome(t)
+	stateDir := t.TempDir()
 	a := New()
-	a.hooksPath = "/tmp/hooks-settings.json"
+	if err := a.Setup(agent.SetupContext{StateDir: stateDir, WorkDir: t.TempDir()}); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	want := "--settings " + hooksSettingsPath(stateDir)
 	plan := a.SpawnCommand(agent.SpawnOptions{})
-	if !strings.Contains(plan.Command, "--settings /tmp/hooks-settings.json") {
-		t.Errorf("Command = %q, want --settings /tmp/hooks-settings.json", plan.Command)
+	if !strings.Contains(plan.Command, want) {
+		t.Errorf("Command = %q, want %q", plan.Command, want)
 	}
 }
 

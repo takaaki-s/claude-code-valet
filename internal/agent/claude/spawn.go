@@ -36,9 +36,16 @@ const sessionArgEnv = "JIN_CLAUDE_SESSION"
 // via a hook, and we must strip it before spawning a *new* CC to avoid the
 // child thinking it's already inside a CC session.
 func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
+	// Read once, under the lock, into a local: the path is decided by the most
+	// recent Setup and a second read could see a different one. Snapshotting
+	// also keeps the lock off the string formatting below.
+	a.setupMu.Lock()
+	hooksPath := a.hooksPath
+	a.setupMu.Unlock()
+
 	cmd := "claude"
-	if a.hooksPath != "" {
-		cmd = fmt.Sprintf("claude --settings %s", a.hooksPath)
+	if hooksPath != "" {
+		cmd = fmt.Sprintf("claude --settings %s", hooksPath)
 	}
 
 	var extraEnv map[string]string
