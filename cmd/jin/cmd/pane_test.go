@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/takaaki-s/jind-ai/internal/debug"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -309,16 +310,38 @@ func TestRunCloseHere_NoTmuxClient(t *testing.T) {
 }
 
 // wantPaneEnv is the assignments callerPaneEnv must produce for a caller told
-// these three things. It is derived from paneDebugEnabled rather than fixed at
-// "off" because that flag is a package variable set at init: a suite run by
-// someone with JIN_DEBUG exported would otherwise fail on the environment
-// rather than on the code.
+// these three things. It reads debug.Enabled rather than being fixed at "off"
+// because that flag is a package variable set at init: a suite run by someone
+// with JIN_DEBUG exported would otherwise fail on the environment rather than
+// on the code.
+//
+// debug.Enabled and not paneDebugEnabled, deliberately. Asking the seam would
+// make both sides of every comparison move together, so unbinding the seam from
+// the real flag would satisfy them all — which is what an earlier version of
+// this helper did, and what let that mutation live.
 func wantPaneEnv(socket, bin, session string) []string {
 	debugAssign := "JIN_DEBUG="
-	if paneDebugEnabled() {
+	if debug.Enabled() {
 		debugAssign = "JIN_DEBUG=1"
 	}
 	return []string{"JIN_SOCKET=" + socket, "JIN_BIN=" + bin, debugAssign, "JIN_SESSION_ID=" + session}
+}
+
+// TestPaneDebugEnabled_IsWiredToTheRealFlag guards the link the test that
+// replaces paneDebugEnabled cannot: a version defined as a constant would
+// satisfy that one while leaving the pane told something the daemon never said.
+//
+// Its reach depends on the flag, and saying so is the point. With JIN_DEBUG
+// unset both sides read false and a constant false passes — nothing running in
+// this process can tell those apart, because internal/debug fixes its answer at
+// init. Under JIN_DEBUG=1 the comparison is real, and that is the run where a
+// disconnection matters: the pane would be told to stay quiet while the daemon
+// was recording.
+func TestPaneDebugEnabled_IsWiredToTheRealFlag(t *testing.T) {
+	if paneDebugEnabled() != debug.Enabled() {
+		t.Errorf("paneDebugEnabled() = %v, debug.Enabled() = %v; the seam has come loose from the flag it stands for",
+			paneDebugEnabled(), debug.Enabled())
+	}
 }
 
 // TestCallerPaneEnv_ForwardsWhatItWasTold is the --here counterpart of the
@@ -420,13 +443,14 @@ func TestCallerPaneEnv_ResolvesTheSocketItselfRatherThanForwardingIt(t *testing.
 type fakeCallerTmux struct {
 	popups []tmux.DisplayPopupOptions
 	splits []tmux.SplitOptions
+	named  map[string]string // slot name -> existing pane ID
 }
 
 func (f *fakeCallerTmux) DisplayPopup(o tmux.DisplayPopupOptions) error {
 	f.popups = append(f.popups, o)
 	return nil
 }
-func (f *fakeCallerTmux) FindPaneByName(string, string) (string, error) { return "", nil }
+func (f *fakeCallerTmux) FindPaneByName(_, name string) (string, error) { return f.named[name], nil }
 func (f *fakeCallerTmux) SplitPane(_ string, o tmux.SplitOptions) (string, error) {
 	f.splits = append(f.splits, o)
 	return "%9", nil
@@ -489,5 +513,44 @@ func TestRunSplitHere_TellsThePaneWhichJin(t *testing.T) {
 	}
 	if f.splits[0].Cmd != "htop" {
 		t.Errorf("runSplitHere mangled Cmd = %q", f.splits[0].Cmd)
+	}
+}
+
+// TestRunSplitHere_RequiresAnAnchorPane and the named-slot test below cover the
+// --here split's own behaviour, which the seam made reachable and nothing was
+// yet using it for. Both were measured to survive without them: the anchor
+// guard could be dropped (taking `jin pane close --here`'s refusal to kill the
+// caller's own pane with it) and the named-slot call could be replaced by a
+// plain split, with the suite staying green either way.
+func TestRunSplitHere_RequiresAnAnchorPane(t *testing.T) {
+	f := &fakeCallerTmux{}
+	prev := resolveCallerTmux
+	resolveCallerTmux = func() (callerPaneOps, string, error) { return f, "", nil }
+	t.Cleanup(func() { resolveCallerTmux = prev })
+
+	if _, err := runSplitHere(tmux.SplitOptions{Cmd: "htop"}, "", ""); err == nil {
+		t.Error("runSplitHere succeeded with no anchor pane; the split lands wherever tmux feels like")
+	}
+	if len(f.splits) != 0 {
+		t.Errorf("SplitPane called %d times despite no anchor pane", len(f.splits))
+	}
+}
+
+// TestRunSplitHere_ReusesANamedSlot pins that --here goes through the same
+// named-slot procedure the daemon path does. A plain split instead would stack
+// a new pane on every invocation, which is the whole thing --name prevents.
+func TestRunSplitHere_ReusesANamedSlot(t *testing.T) {
+	f := useFakeCallerTmux(t, "%3")
+	f.named = map[string]string{"monitor": "%50"}
+
+	got, err := runSplitHere(tmux.SplitOptions{Cmd: "htop"}, "monitor", tmux.IfExistsNoop)
+	if err != nil {
+		t.Fatalf("runSplitHere failed: %v", err)
+	}
+	if got != "%50" {
+		t.Errorf("runSplitHere returned %q, want the existing slot %q", got, "%50")
+	}
+	if len(f.splits) != 0 {
+		t.Errorf("SplitPane called %d times for a slot that already exists, want 0", len(f.splits))
 	}
 }
