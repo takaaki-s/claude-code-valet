@@ -1001,7 +1001,15 @@ func (s *Server) handleRemoveDirHistory(data json.RawMessage) Response {
 	return Response{Success: true}
 }
 
-// PanePopupRequest is the request payload for the "pane-popup" action.
+// PanePopupRequest is the request payload for the "pane-popup" action. It opens
+// a tmux popup anchored to the session's pane, running Cmd in the session's
+// working directory.
+//
+// The popup is told which jin to call back into and which session its work
+// belongs to: JIN_SOCKET, JIN_BIN, JIN_DEBUG and JIN_SESSION_ID reach it as one
+// tmux -e each, all four every time and empty when a value is unknown.
+// jinenv.Identity.TmuxEnviron renders them and says why omitting a key is not
+// the same as leaving it unset.
 type PanePopupRequest struct {
 	ID     string `json:"id"`
 	Cmd    string `json:"cmd"`
@@ -1031,6 +1039,10 @@ func (s *Server) handlePanePopup(data json.RawMessage) Response {
 // optional: an empty split just opens a shell in the new pane. Name enables
 // the idempotent named-slot path; IfExists picks the policy when the named
 // pane already exists (noop/respawn/error, empty = noop).
+//
+// The new pane is told the same four variables PanePopupRequest names, whether
+// it runs Cmd or a bare shell, and a slot restarted under IfExists=respawn is
+// told them again.
 type PaneSplitRequest struct {
 	ID        string `json:"id"`
 	Cmd       string `json:"cmd,omitempty"`

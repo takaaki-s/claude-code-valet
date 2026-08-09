@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -151,6 +152,51 @@ type mockTmuxRunner struct {
 	onRespawnPane func(target string)
 
 	calls []mockCall // recorded calls for assertion
+
+	// The options structs, kept whole. record() flattens a call to strings and
+	// keeps only the fields the assertions of the day needed, which is why the
+	// popup's Env — like its Width, Height and Title — is invisible through it.
+	// A pane's environment is exactly the kind of thing that is wrong by being
+	// absent, so it has to be observable as the slice it is, not as a string
+	// some earlier caller decided how to join.
+	//
+	// Read them through popupCalls/splitCalls/respawnedPanes, not directly:
+	// RespawnPane is reached from the monitor goroutine (that is what the
+	// onRespawnPane hook is for), so a future concurrent test reading a bare
+	// field would race where every other observation here does not.
+	popupOpts    []tmux.DisplayPopupOptions
+	splitOpts    []tmux.SplitOptions
+	respawnCalls []respawnCall
+}
+
+// respawnCall is a respawn kept whole, for the reason above: recording only the
+// env would be the same flattening in a smaller disguise.
+type respawnCall struct {
+	target string
+	cmd    string
+	env    []string
+}
+
+// popupCalls, splitCalls and respawnedPanes are the locked readers for the
+// three fields above, matching hasCalledWith and friends.
+func (m *mockTmuxRunner) popupCalls() []tmux.DisplayPopupOptions {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.popupOpts)
+}
+
+func (m *mockTmuxRunner) splitCalls() []tmux.SplitOptions {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.splitOpts)
+}
+
+// respawnedPanes clones only the outer slice, as the two above do: the Env
+// slices inside are fresh TmuxEnviron results that nothing mutates.
+func (m *mockTmuxRunner) respawnedPanes() []respawnCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.respawnCalls)
 }
 
 func newMockTmuxRunner() *mockTmuxRunner {
@@ -224,9 +270,10 @@ func (m *mockTmuxRunner) NewSessionWithCmdInDir(name string, width, height int, 
 	return nil
 }
 
-func (m *mockTmuxRunner) RespawnPane(target, cmd string) error {
+func (m *mockTmuxRunner) RespawnPane(target, cmd string, env []string) error {
 	m.mu.Lock()
 	m.record("RespawnPane", target, cmd)
+	m.respawnCalls = append(m.respawnCalls, respawnCall{target: target, cmd: cmd, env: env})
 	cb := takeHook(&m.onRespawnPane)
 	m.mu.Unlock()
 	if cb != nil {
@@ -379,6 +426,7 @@ func (m *mockTmuxRunner) DisplayPopup(opts tmux.DisplayPopupOptions) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("DisplayPopup", opts.Target, opts.Cmd, opts.Dir)
+	m.popupOpts = append(m.popupOpts, opts)
 	return nil
 }
 
@@ -386,6 +434,7 @@ func (m *mockTmuxRunner) SplitPane(target string, opts tmux.SplitOptions) (strin
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.record("SplitPane", target, opts.Cmd, opts.Direction, opts.Size, opts.Dir)
+	m.splitOpts = append(m.splitOpts, opts)
 	if id, ok := m.splitPaneIDs[target]; ok {
 		return id, nil
 	}

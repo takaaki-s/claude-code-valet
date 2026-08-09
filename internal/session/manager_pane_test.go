@@ -1,8 +1,10 @@
 package session
 
 import (
+	"reflect"
 	"testing"
 
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -285,5 +287,118 @@ func TestManager_Pane_TmuxUnavailable(t *testing.T) {
 	}
 	if err := mgr.PaneSendKeys(sess.ID, "x", true); err == nil {
 		t.Error("PaneSendKeys: expected error when tmux is nil")
+	}
+}
+
+// paneIdentity is deliberately not testIdentity(): all three fields are set,
+// and to values no other fixture uses, so a Manager that re-derived any of them
+// from its own process instead of using what it was handed would show up as a
+// mismatch rather than as a coincidence.
+func paneIdentity() jinenv.Identity {
+	return jinenv.Identity{
+		SocketPath: "/nonexistent/pane-daemon.sock",
+		BinPath:    "/nonexistent/pane-daemon-bin/jin",
+		Debug:      true,
+	}
+}
+
+// TestManager_PanePopup_TellsThePopupWhichJinAndWhichSession pins the hand-off
+// the popup path had no part in before: the identity this Manager was built
+// with, and the id of the session the popup was opened over.
+//
+// Two sessions exist because the id is the field most easily wrong in a way
+// that still looks right — a popup handed *a* session's id passes any check
+// that only looks for a UUID. Opening over the second one is what separates
+// "passes the session's id" from "passes a session's id".
+func TestManager_PanePopup_TellsThePopupWhichJinAndWhichSession(t *testing.T) {
+	identity := paneIdentity()
+	mgr, mock, _ := newTestManagerOn(t, identity)
+	_ = paneTestSession(t, mgr, "/tmp/pane-popup-env-a", "%6", "sess-pa")
+	target := paneTestSession(t, mgr, "/tmp/pane-popup-env-b", "%7", "sess-pb")
+
+	if err := mgr.PanePopup(target.ID, "echo hi", "", "", ""); err != nil {
+		t.Fatalf("PanePopup failed: %v", err)
+	}
+
+	popups := mock.popupCalls()
+	if len(popups) != 1 {
+		t.Fatalf("DisplayPopup called %d times, want 1", len(popups))
+	}
+	want := identity.TmuxEnviron(target.ID)
+	if got := popups[0].Env; !reflect.DeepEqual(got, want) {
+		t.Errorf("popup Env = %q, want %q", got, want)
+	}
+}
+
+// TestManager_PaneSplit_TellsTheNewPaneTheSame is the popup test's twin. The
+// two paths reach tmux through different verbs and could drift apart, which is
+// how the popup came to be the only one missing an identity in the first place.
+func TestManager_PaneSplit_TellsTheNewPaneTheSame(t *testing.T) {
+	identity := paneIdentity()
+	mgr, mock, _ := newTestManagerOn(t, identity)
+	_ = paneTestSession(t, mgr, "/tmp/pane-split-env-a", "%12", "sess-sa")
+	target := paneTestSession(t, mgr, "/tmp/pane-split-env-b", "%13", "sess-sb")
+
+	if _, err := mgr.PaneSplit(target.ID, "", "", tmux.SplitOptions{Cmd: "top"}); err != nil {
+		t.Fatalf("PaneSplit failed: %v", err)
+	}
+
+	splits := mock.splitCalls()
+	if len(splits) != 1 {
+		t.Fatalf("SplitPane called %d times, want 1", len(splits))
+	}
+	want := identity.TmuxEnviron(target.ID)
+	if got := splits[0].Env; !reflect.DeepEqual(got, want) {
+		t.Errorf("split Env = %q, want %q", got, want)
+	}
+}
+
+// TestManager_PaneSplit_CallerCannotSupplyTheEnv covers the one input this
+// path does not trust. Everything else in SplitOptions comes from the caller;
+// which jin the pane calls back into does not, or a plugin could point a slot
+// at a socket of its choosing.
+func TestManager_PaneSplit_CallerCannotSupplyTheEnv(t *testing.T) {
+	identity := paneIdentity()
+	mgr, mock, _ := newTestManagerOn(t, identity)
+	sess := paneTestSession(t, mgr, "/tmp/pane-split-env-c", "%14", "sess-sc")
+
+	opts := tmux.SplitOptions{Cmd: "top", Env: []string{"JIN_SOCKET=/tmp/attacker.sock", "SOMETHING=else"}}
+	if _, err := mgr.PaneSplit(sess.ID, "", "", opts); err != nil {
+		t.Fatalf("PaneSplit failed: %v", err)
+	}
+
+	want := identity.TmuxEnviron(sess.ID)
+	if got := mock.splitCalls()[0].Env; !reflect.DeepEqual(got, want) {
+		t.Errorf("split Env = %q, want %q", got, want)
+	}
+}
+
+// TestManager_PaneSplit_RespawnedSlotIsToldToo covers the branch that starts a
+// process without splitting. A named slot restarted through --if-exists respawn
+// never reaches SplitPane, so an env threaded only through the split arm would
+// leave every restarted slot inheriting the tmux server's values instead.
+func TestManager_PaneSplit_RespawnedSlotIsToldToo(t *testing.T) {
+	identity := paneIdentity()
+	mgr, mock, _ := newTestManagerOn(t, identity)
+	sess := paneTestSession(t, mgr, "/tmp/pane-split-env-d", "%15", "sess-sd")
+	mock.namedPanes["monitor"] = "%50"
+
+	if _, err := mgr.PaneSplit(sess.ID, "monitor", tmux.IfExistsRespawn, tmux.SplitOptions{Cmd: "htop"}); err != nil {
+		t.Fatalf("PaneSplit failed: %v", err)
+	}
+
+	respawns := mock.respawnedPanes()
+	if len(respawns) != 1 {
+		t.Fatalf("RespawnPane called %d times, want 1", len(respawns))
+	}
+	want := identity.TmuxEnviron(sess.ID)
+	if got := respawns[0].env; !reflect.DeepEqual(got, want) {
+		t.Errorf("respawn Env = %q, want %q", got, want)
+	}
+	if respawns[0].cmd != "htop" {
+		t.Errorf("respawn cmd = %q, want the slot's command", respawns[0].cmd)
+	}
+	if len(mock.splitCalls()) != 0 {
+		t.Errorf("SplitPane called %d times on a respawn, want 0", len(mock.splitCalls()))
 	}
 }

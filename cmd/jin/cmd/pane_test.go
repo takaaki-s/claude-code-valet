@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/takaaki-s/jind-ai/internal/debug"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -302,5 +305,217 @@ func TestRunCloseHere_NoTmuxClient(t *testing.T) {
 
 	if err := runCloseHere("demo"); err == nil {
 		t.Fatal("expected error when no tmux client is resolvable, got nil")
+	}
+}
+
+// wantPaneEnv is the assignments callerPaneEnv must produce for a caller told
+// these three things. It reads debug.Enabled rather than being fixed at "off"
+// because that flag is a package variable set at init: a suite run by someone
+// with JIN_DEBUG exported would otherwise fail on the environment rather than
+// on the code.
+//
+// debug.Enabled and not paneDebugEnabled, deliberately, and this is the only
+// thing guarding that binding. Asking the seam would make both sides of every
+// comparison move together, so unbinding the seam from the real flag would
+// satisfy them all — which is what an earlier version of this helper did, and
+// what let that mutation live. Reading the real flag here makes the runner
+// tests below fail on it instead, under JIN_DEBUG=1. Nothing can catch it with
+// the flag unset: internal/debug fixes its answer at init, so a constant false
+// and a flag that is off are indistinguishable from inside this process.
+func wantPaneEnv(socket, bin, session string) []string {
+	debugAssign := "JIN_DEBUG="
+	if debug.Enabled() {
+		debugAssign = "JIN_DEBUG=1"
+	}
+	return []string{"JIN_SOCKET=" + socket, "JIN_BIN=" + bin, debugAssign, "JIN_SESSION_ID=" + session}
+}
+
+// TestCallerPaneEnv_CarriesTheDebugFlag is separate because the flag cannot be
+// driven through the environment: internal/debug reads it into a package
+// variable at init. Without this, hardcoding the field to false passes.
+func TestCallerPaneEnv_CarriesTheDebugFlag(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
+	t.Setenv("JIN_BIN", "")
+	t.Setenv("JIN_SESSION_ID", "")
+
+	for _, on := range []bool{true, false} {
+		prev := paneDebugEnabled
+		paneDebugEnabled = func() bool { return on }
+		got := callerPaneEnv()
+		paneDebugEnabled = prev
+
+		want := "JIN_DEBUG="
+		if on {
+			want = "JIN_DEBUG=1"
+		}
+		if !slices.Contains(got, want) {
+			t.Errorf("with the flag %v, callerPaneEnv() = %q, want it to contain %q", on, got, want)
+		}
+	}
+}
+
+// TestCallerPaneEnv_NeverGuessesTheBinary is the one that has to fail if
+// someone reaches for os.Executable() here. A caller with no JIN_BIN is a
+// caller jind-ai did not start, and the honest answer is that we do not know
+// which binary it should re-enter — an empty assignment, which
+// "${JIN_BIN:-jin}" resolves to the PATH copy. The path of *this* process is
+// not an answer to that question, and it is what a derivation would produce.
+func TestCallerPaneEnv_NeverGuessesTheBinary(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
+	t.Setenv("JIN_BIN", "")
+	t.Setenv("JIN_SESSION_ID", "")
+
+	// TmuxEnviron emits exactly one JIN_BIN, so "it is empty" is also "it is not
+	// this process's path" — the answer a derivation would have produced.
+	if got := callerPaneEnv(); !slices.Contains(got, "JIN_BIN=") {
+		t.Errorf("callerPaneEnv() = %q, want an empty JIN_BIN assignment: leaving the key out lets the pane inherit the tmux server's", got)
+	}
+}
+
+// TestCallerPaneEnv_ResolvesTheSocketItselfRatherThanForwardingIt pins the one
+// field --here does not simply pass through. A caller with no JIN_SOCKET still
+// has to name one, because leaving the pane to work it out means leaving it to
+// a $XDG_RUNTIME_DIR that came from the tmux server — the value this whole
+// change stops trusting.
+//
+// The --socket flag is not exercised: it is registered on the daemon
+// subcommand only, so no `jin pane` invocation can set it. getSocketPath() is
+// still the right call because it is the one place that decides, and it is
+// where the flag would start applying if it were ever promoted.
+func TestCallerPaneEnv_ResolvesTheSocketItselfRatherThanForwardingIt(t *testing.T) {
+	t.Setenv("JIN_BIN", "")
+	t.Setenv("JIN_SESSION_ID", "")
+
+	t.Setenv("JIN_SOCKET", "/nonexistent/from-env.sock")
+	if got := callerPaneEnv(); !slices.Contains(got, "JIN_SOCKET=/nonexistent/from-env.sock") {
+		t.Errorf("callerPaneEnv() = %q, want the caller's own socket", got)
+	}
+
+	t.Setenv("JIN_SOCKET", "")
+	got := callerPaneEnv()
+	if slices.Contains(got, "JIN_SOCKET=") {
+		t.Errorf("callerPaneEnv() = %q, want a resolved socket rather than an empty one when the caller was told none", got)
+	}
+	if !slices.Contains(got, "JIN_SOCKET="+getSocketPath()) {
+		t.Errorf("callerPaneEnv() = %q, want the path getSocketPath() resolves", got)
+	}
+}
+
+// fakeCallerTmux stands in for the caller's tmux server so the --here runners
+// can be driven end to end. Reaching this far up matters: a double wired in
+// below the runner leaves the runner free to stop using it, and that is exactly
+// the regression measured to pass the whole suite.
+type fakeCallerTmux struct {
+	popups []tmux.DisplayPopupOptions
+	splits []tmux.SplitOptions
+	named  map[string]string // slot name -> existing pane ID
+}
+
+func (f *fakeCallerTmux) DisplayPopup(o tmux.DisplayPopupOptions) error {
+	f.popups = append(f.popups, o)
+	return nil
+}
+func (f *fakeCallerTmux) FindPaneByName(_, name string) (string, error) { return f.named[name], nil }
+func (f *fakeCallerTmux) SplitPane(_ string, o tmux.SplitOptions) (string, error) {
+	f.splits = append(f.splits, o)
+	return "%9", nil
+}
+func (f *fakeCallerTmux) SetPaneOption(string, string, string) error { return nil }
+func (f *fakeCallerTmux) RespawnPane(string, string, []string) error { return nil }
+func (f *fakeCallerTmux) KillPane(string) error                      { return nil }
+
+// useFakeCallerTmux swaps the resolution for the duration of a test.
+func useFakeCallerTmux(t *testing.T, anchorPane string) *fakeCallerTmux {
+	t.Helper()
+	f := &fakeCallerTmux{}
+	prev := resolveCallerTmux
+	resolveCallerTmux = func() (callerPaneOps, string, error) { return f, anchorPane, nil }
+	t.Cleanup(func() { resolveCallerTmux = prev })
+	return f
+}
+
+// TestRunPopupHere_TellsThePaneWhichJin and its split twin cover the call, not
+// the callee: what regressed before was a runner that assembled the options
+// itself, leaving every helper and its test intact and green.
+func TestRunPopupHere_TellsThePaneWhichJin(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
+	t.Setenv("JIN_BIN", "/nonexistent/told-bin/jin")
+	t.Setenv("JIN_SESSION_ID", "told-session")
+	f := useFakeCallerTmux(t, "%3")
+
+	if err := runPopupHere("less /tmp/x", "T", "80%", "50%"); err != nil {
+		t.Fatalf("runPopupHere failed: %v", err)
+	}
+	if len(f.popups) != 1 {
+		t.Fatalf("DisplayPopup called %d times, want 1", len(f.popups))
+	}
+	want := wantPaneEnv("/nonexistent/told.sock", "/nonexistent/told-bin/jin", "told-session")
+	if !reflect.DeepEqual(f.popups[0].Env, want) {
+		t.Errorf("popup Env = %q, want %q", f.popups[0].Env, want)
+	}
+	o := f.popups[0]
+	if o.Target != "%3" || o.Cmd != "less /tmp/x" || o.Title != "T" || o.Width != "80%" || o.Height != "50%" {
+		t.Errorf("runPopupHere mangled a field: %+v", o)
+	}
+}
+
+func TestRunSplitHere_TellsThePaneWhichJin(t *testing.T) {
+	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
+	t.Setenv("JIN_BIN", "/nonexistent/told-bin/jin")
+	t.Setenv("JIN_SESSION_ID", "told-session")
+	f := useFakeCallerTmux(t, "%3")
+
+	caller := tmux.SplitOptions{Cmd: "htop", Env: []string{"JIN_SOCKET=/tmp/attacker.sock"}}
+	if _, err := runSplitHere(caller, "", ""); err != nil {
+		t.Fatalf("runSplitHere failed: %v", err)
+	}
+	if len(f.splits) != 1 {
+		t.Fatalf("SplitPane called %d times, want 1", len(f.splits))
+	}
+	want := wantPaneEnv("/nonexistent/told.sock", "/nonexistent/told-bin/jin", "told-session")
+	if !reflect.DeepEqual(f.splits[0].Env, want) {
+		t.Errorf("split Env = %q, want %q (the caller's own Env must not stand)", f.splits[0].Env, want)
+	}
+	if f.splits[0].Cmd != "htop" {
+		t.Errorf("runSplitHere mangled Cmd = %q", f.splits[0].Cmd)
+	}
+}
+
+// TestRunSplitHere_RequiresAnAnchorPane and the named-slot test below cover the
+// --here split's own behaviour, which the seam made reachable and nothing was
+// yet using it for. Both were measured to survive without them: the anchor
+// guard could be dropped (taking `jin pane close --here`'s refusal to kill the
+// caller's own pane with it) and the named-slot call could be replaced by a
+// plain split, with the suite staying green either way.
+func TestRunSplitHere_RequiresAnAnchorPane(t *testing.T) {
+	f := &fakeCallerTmux{}
+	prev := resolveCallerTmux
+	resolveCallerTmux = func() (callerPaneOps, string, error) { return f, "", nil }
+	t.Cleanup(func() { resolveCallerTmux = prev })
+
+	if _, err := runSplitHere(tmux.SplitOptions{Cmd: "htop"}, "", ""); err == nil {
+		t.Error("runSplitHere succeeded with no anchor pane; the split lands wherever tmux feels like")
+	}
+	if len(f.splits) != 0 {
+		t.Errorf("SplitPane called %d times despite no anchor pane", len(f.splits))
+	}
+}
+
+// TestRunSplitHere_ReusesANamedSlot pins that --here goes through the same
+// named-slot procedure the daemon path does. A plain split instead would stack
+// a new pane on every invocation, which is the whole thing --name prevents.
+func TestRunSplitHere_ReusesANamedSlot(t *testing.T) {
+	f := useFakeCallerTmux(t, "%3")
+	f.named = map[string]string{"monitor": "%50"}
+
+	got, err := runSplitHere(tmux.SplitOptions{Cmd: "htop"}, "monitor", tmux.IfExistsNoop)
+	if err != nil {
+		t.Fatalf("runSplitHere failed: %v", err)
+	}
+	if got != "%50" {
+		t.Errorf("runSplitHere returned %q, want the existing slot %q", got, "%50")
+	}
+	if len(f.splits) != 0 {
+		t.Errorf("SplitPane called %d times for a slot that already exists, want 0", len(f.splits))
 	}
 }

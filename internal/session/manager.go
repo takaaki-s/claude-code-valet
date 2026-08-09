@@ -2138,6 +2138,12 @@ func (m *Manager) PanePopup(id, cmd, title, width, height string) error {
 		Width:  width,
 		Height: height,
 		Dir:    workDir,
+		// The popup is a process this daemon started, so it is told the same
+		// three things every other one is, plus the session it was opened over.
+		// Handed in from the identity this Manager was built with, never
+		// rebuilt here — see EstablishHookBinary for what a second derivation
+		// gets wrong. TmuxEnviron has why every key is emitted even when empty.
+		Env: m.identity.TmuxEnviron(id),
 	})
 }
 
@@ -2164,6 +2170,11 @@ func (m *Manager) PaneSplit(id, name, ifExists string, opts tmux.SplitOptions) (
 	if err != nil {
 		return "", err
 	}
+	// Overwritten, not merged: the working directory above is injected the same
+	// way, and what a caller asked to run in the pane does not get to decide
+	// which jin that pane calls back into. Reaches the respawn branch of a
+	// named slot too, so a restarted slot is told the same thing a fresh one is.
+	opts.Env = m.identity.TmuxEnviron(id)
 
 	// Named-slot idempotency is check-then-act inside EnsureNamedPane, and the
 	// daemon handles connections concurrently — serialize so two simultaneous
@@ -2615,7 +2626,7 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 
 	shellDir := workDirForShell(snap.StartDir)
 	customEnv := buildEnvString(m.configMgr.GetEnv())
-	envVars := fmt.Sprintf("JIN_SESSION_ID=%s TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1", snap.JinSessionID)
+	envVars := "TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1"
 	// The jin that started this agent, for the same reason JIN_SESSION_ID rides
 	// along: the process this launches will run `jin hook`, and that hook is
 	// jind-ai's own binary deciding which daemon to notify and whether to record
@@ -2640,7 +2651,20 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	// contain a space. It is all written before customEnv so that a user who
 	// names one of these in their own config still wins — `env` applies
 	// assignments left to right.
-	for _, kv := range m.identity.Environ() {
+	//
+	// TmuxEnviron rather than Environ — its doc has why a key this prefix omits
+	// is not absent from the agent but whatever the tmux server holds. Measured
+	// here: with the daemon's flag off and a server forked from an environment
+	// that had JIN_DEBUG=1, the agent pane ran with JIN_DEBUG=1, 3/3. It carries
+	// JIN_SESSION_ID too, so this function no longer assembles that one itself.
+	//
+	// The identity travels inside this string rather than as tmux -e because
+	// three verbs consume the string — NewSessionWithCmdInDir and both respawn
+	// sites — and only the string reaches all three. Moving it to -e would turn
+	// one coupling that cannot be forgotten into three that can. The prefix is
+	// needed regardless: -e has no unset form, so `env -u TMUX` has nowhere else
+	// to go.
+	for _, kv := range m.identity.TmuxEnviron(snap.JinSessionID) {
 		envVars += " " + shellEscape(kv)
 	}
 	if customEnv != "" {
@@ -2713,7 +2737,7 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	// Try to revive CC in existing inner tmux session (preserves user panes)
 	if session.TmuxWindowName != "" && m.tmuxClient.HasSession(session.TmuxWindowName) {
 		target := session.TmuxPaneID
-		if err := m.tmuxClient.RespawnPane(target, shellCmd); err == nil {
+		if err := m.tmuxClient.RespawnPane(target, shellCmd, nil); err == nil {
 			session.Status = StatusRunning
 			session.LastOutputTime = time.Now()
 			session.StartedAt = time.Now()
@@ -2926,7 +2950,7 @@ func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) 
 		respawned := false
 		if shellCmd, buildErr := m.buildAgentShellCmd(retrySnap); buildErr != nil {
 			debugLog("[TMUX] Session %s: cannot build retry cmd: %v", sessionName, buildErr)
-		} else if err := m.tmuxClient.RespawnPane(target, shellCmd); err != nil {
+		} else if err := m.tmuxClient.RespawnPane(target, shellCmd, nil); err != nil {
 			debugLog("[TMUX] Session %s respawn failed after quick death", sessionName)
 		} else {
 			respawned = true

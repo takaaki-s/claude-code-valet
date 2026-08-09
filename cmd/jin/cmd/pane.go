@@ -8,6 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
+	"github.com/takaaki-s/jind-ai/internal/debug"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -23,12 +25,14 @@ var panePopupCmd = &cobra.Command{
 	Use:   "popup <selector> -- <cmd...>",
 	Short: "Open a tmux popup running a command over a session's pane",
 	Long: `Open a tmux popup anchored to the session's pane, running the given command
-in the session's working directory. The command runs standalone inside the
-popup: it does not inherit JIN_* environment variables, so pass any data it
-needs directly in the command line.
+in the session's working directory. The popup is told which jin to call back
+into and which session its work belongs to: JIN_SOCKET, JIN_BIN, JIN_DEBUG
+and JIN_SESSION_ID are always set, empty when a value is unknown.
 
 With --here the popup opens over the caller's own tmux pane instead of a
-session's pane, and no selector is given:
+session's pane, and no selector is given. Such a popup carries the caller's
+own jin identity: the same four variables, taken from this process rather
+than from a daemon.
   jin pane popup --here -- less /tmp/diff.txt
 
 Example:
@@ -69,12 +73,29 @@ Example:
 	},
 }
 
-// callerTmux resolves the caller's own tmux server and anchor pane for --here
-// mode, bypassing the daemon. The server is discovered from $TMUX (human
+// callerPaneOps is everything the --here paths ask of the caller's tmux server.
+// *tmux.Client satisfies it; a test supplies a recording double.
+//
+// The interface, and the variable below, exist because the send is otherwise
+// unobservable — and that is measured, not assumed. With the resolution wired
+// straight into each runner, deleting the identity from both --here paths
+// passed the entire suite, including under -tags e2e. A helper that assembles
+// the options is not enough: what regresses is the call, and nothing obliged
+// anyone to make it.
+type callerPaneOps interface {
+	tmux.PaneSlotOps
+	DisplayPopup(tmux.DisplayPopupOptions) error
+}
+
+// resolveCallerTmux resolves the caller's own tmux server and anchor pane for
+// --here mode, bypassing the daemon. The server is discovered from $TMUX (human
 // invocation) or JIN_CALLER_TMUX_SOCKET (plugin action invocation); the anchor
 // pane likewise from $TMUX_PANE or JIN_CALLER_TMUX_PANE (may be empty; popup
 // treats empty as "active client", so this variant does not require it).
-func callerTmux() (*tmux.Client, string, error) {
+//
+// A variable so a test can stand in for the tmux server. Production never
+// reassigns it.
+var resolveCallerTmux = func() (callerPaneOps, string, error) {
 	socketPath := envFallback(tmux.SocketPathFromEnv(os.Getenv("TMUX")), "JIN_CALLER_TMUX_SOCKET")
 	if socketPath == "" {
 		return nil, "", errors.New("--here requires a tmux client: not inside tmux and no JIN_CALLER_TMUX_SOCKET")
@@ -87,11 +108,11 @@ func callerTmux() (*tmux.Client, string, error) {
 	return tc, anchorPane, nil
 }
 
-// callerTmuxWithPane is callerTmux plus a "must have a concrete anchor pane"
+// callerTmuxWithPane is resolveCallerTmux plus a "must have a concrete anchor pane"
 // guard, for --here operations (split, close) that address a specific pane
 // rather than the client's active one.
-func callerTmuxWithPane() (*tmux.Client, string, error) {
-	tc, anchorPane, err := callerTmux()
+func callerTmuxWithPane() (callerPaneOps, string, error) {
+	tc, anchorPane, err := resolveCallerTmux()
 	if err != nil {
 		return nil, "", err
 	}
@@ -101,9 +122,44 @@ func callerTmuxWithPane() (*tmux.Client, string, error) {
 	return tc, anchorPane, nil
 }
 
+// callerPaneEnv is the environment a --here pane is given.
+//
+// --here never reaches the daemon, so this process is the composition root for
+// the pane it opens — and it does not know the answers, it was told them. The
+// caller here is a plugin the dispatcher started or a shell inside an agent's
+// pane, and either way its own environment already names the jin that started
+// it. So this passes those on rather than working them out again:
+//
+//   - BinPath comes from JIN_BIN and nowhere else; jinenv.Identity.BinPath says
+//     why a spawn site must not work it out. A --here caller was handed the
+//     daemon's answer already.
+//   - SocketPath goes through getSocketPath() rather than os.Getenv, so a
+//     caller that was never given JIN_SOCKET still names a socket. Resolving it
+//     here rather than leaving the pane to do it is the point: the pane's
+//     XDG_RUNTIME_DIR comes from the tmux server, which is exactly the value
+//     this whole change stops trusting.
+//   - Debug is this process's own flag, which is the one the child is being
+//     told the meaning of.
+//
+// Asking the daemon for its identity instead would also work, and was rejected
+// because --here runs today with the daemon down and that is worth keeping.
+func callerPaneEnv() []string {
+	return jinenv.Identity{
+		SocketPath: getSocketPath(),
+		BinPath:    os.Getenv("JIN_BIN"),
+		Debug:      paneDebugEnabled(),
+	}.TmuxEnviron(os.Getenv("JIN_SESSION_ID"))
+}
+
+// paneDebugEnabled is a variable for the same reason internal/debug's
+// isTestBinary is: debug.Enabled() reads a package variable fixed at init, so
+// t.Setenv cannot move it and the branch a test cannot reach is the one where
+// the flag is on. Production never reassigns this.
+var paneDebugEnabled = debug.Enabled
+
 // runPopupHere opens a popup over the caller's own tmux pane.
 func runPopupHere(cmdStr, title, width, height string) error {
-	tc, anchorPane, err := callerTmux()
+	tc, anchorPane, err := resolveCallerTmux()
 	if err != nil {
 		return err
 	}
@@ -113,6 +169,7 @@ func runPopupHere(cmdStr, title, width, height string) error {
 		Height: height,
 		Title:  title,
 		Cmd:    cmdStr,
+		Env:    callerPaneEnv(),
 	})
 }
 
@@ -141,7 +198,10 @@ var paneSplitCmd = &cobra.Command{
 	Short: "Split a session's tmux pane and run a command in the new pane",
 	Long: `Split the session's pane in its working directory and, if given, run a
 command in the new pane. Without a command, the new pane just opens a shell.
-On success the new pane's ID is printed.
+On success the new pane's ID is printed. Either way the new pane is told which
+jin to call back into and which session its work belongs to: JIN_SOCKET,
+JIN_BIN, JIN_DEBUG and JIN_SESSION_ID are always set, empty when a value is
+unknown.
 
 With --name the split becomes idempotent (a "named slot"): when a pane with
 that name already exists in the session's window, no new pane is created and
@@ -150,7 +210,8 @@ respawn restarts it with the given command, error fails. Close a named slot
 with 'jin pane close'.
 
 With --here the caller's own tmux pane is split instead of a session's pane,
-and no selector is given:
+and no selector is given. Such a pane carries the caller's own jin identity:
+the same four variables, taken from this process rather than from a daemon.
   jin pane split --here --direction down --size 20% -- htop
 
 Example:
@@ -261,6 +322,9 @@ func runSplitHere(opts tmux.SplitOptions, name, ifExists string) (string, error)
 	if err != nil {
 		return "", err
 	}
+	// Overwritten rather than merged, as the daemon path does with the same
+	// field: which jin a pane calls back into is not the caller's to pick.
+	opts.Env = callerPaneEnv()
 	return tmux.EnsureNamedPane(tc, anchorPane, name, ifExists, opts)
 }
 

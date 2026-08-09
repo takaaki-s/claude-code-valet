@@ -397,13 +397,32 @@ func (c *Client) ListWindows(session string) ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
-// RespawnPane respawns a dead pane with a new command.
-func (c *Client) RespawnPane(target, shellCmd string) error {
-	args := []string{"respawn-pane", "-t", target, "-k"}
+// appendEnvArgs appends one -e per assignment, in slice order. Empty values are
+// kept: tmux has no unset form for -e, so "K=" is how a pane is told a value is
+// unknown rather than left to inherit the server's. split-window, display-popup
+// and respawn-pane all take this form, which is why it is here and not in each.
+func appendEnvArgs(args, env []string) []string {
+	for _, assignment := range env {
+		args = append(args, "-e", assignment)
+	}
+	return args
+}
+
+// buildRespawnArgs translates a respawn into respawn-pane arguments. Kept as a
+// pure function so the flag translation is unit-testable without tmux, as
+// buildSplitArgs and buildPopupArgs are.
+func buildRespawnArgs(target, shellCmd string, env []string) []string {
+	args := appendEnvArgs([]string{"respawn-pane", "-t", target, "-k"}, env)
 	if shellCmd != "" {
 		args = append(args, shellCmd)
 	}
-	return c.runSilent(args...)
+	return args
+}
+
+// RespawnPane respawns a dead pane with a new command. Runner.RespawnPane says
+// what env carries and what a nil one asserts.
+func (c *Client) RespawnPane(target, shellCmd string, env []string) error {
+	return c.runSilent(buildRespawnArgs(target, shellCmd, env)...)
 }
 
 // ClearHistory wipes both scrollback and the visible screen of the target pane
@@ -419,12 +438,13 @@ func (c *Client) ClearHistory(target string) error {
 // SplitOptions configures a SplitPane call, mirroring tmux split-window's
 // vocabulary rather than inventing a new one.
 type SplitOptions struct {
-	Direction string // where the new pane opens: "down" (empty = down), "up", "left", "right"
-	Size      string // new pane size: "30%" (percent) or "15" (lines/columns); empty = tmux default
-	Full      bool   // span the full window width/height (-f)
-	NoFocus   bool   // keep focus on the current pane (-d)
-	Dir       string // working directory for the new pane (-c); empty = tmux default
-	Cmd       string // command to run in the new pane; empty = shell
+	Direction string   // where the new pane opens: "down" (empty = down), "up", "left", "right"
+	Size      string   // new pane size: "30%" (percent) or "15" (lines/columns); empty = tmux default
+	Full      bool     // span the full window width/height (-f)
+	NoFocus   bool     // keep focus on the current pane (-d)
+	Dir       string   // working directory for the new pane (-c); empty = tmux default
+	Cmd       string   // command to run in the new pane; empty = shell
+	Env       []string // KEY=VALUE assignments, one -e each; empty is not neutral — see jinenv.Identity.TmuxEnviron
 }
 
 // Validate checks Direction and Size. Percent sizes are limited to 1-99;
@@ -474,6 +494,7 @@ func buildSplitArgs(target string, o SplitOptions) []string {
 	if o.Dir != "" {
 		args = append(args, "-c", o.Dir)
 	}
+	args = appendEnvArgs(args, o.Env)
 	if o.Cmd != "" {
 		args = append(args, o.Cmd)
 	}
@@ -519,7 +540,10 @@ type PaneSlotOps interface {
 	FindPaneByName(target, name string) (string, error)
 	SplitPane(target string, opts SplitOptions) (string, error)
 	SetPaneOption(target, option, value string) error
-	RespawnPane(target, cmd string) error
+	// RespawnPane replaces the process running in a pane. env is the assignments
+	// this call adds, one -e each; nil adds none, which is right only where
+	// something else has already answered — see the call site.
+	RespawnPane(target, cmd string, env []string) error
 	KillPane(target string) error
 }
 
@@ -543,7 +567,7 @@ func EnsureNamedPane(ops PaneSlotOps, target, name, ifExists string, opts SplitO
 		if existing != "" {
 			switch ifExists {
 			case IfExistsRespawn:
-				if err := ops.RespawnPane(existing, opts.Cmd); err != nil {
+				if err := ops.RespawnPane(existing, opts.Cmd, opts.Env); err != nil {
 					return "", err
 				}
 				return existing, nil
@@ -1017,34 +1041,43 @@ func clientSessionForTTY(out, tty string) string {
 
 // DisplayPopupOptions configures a tmux display-popup.
 type DisplayPopupOptions struct {
-	Target string // pane/session target for the popup (-t); empty uses the active client
-	Width  string // e.g., "80%"
-	Height string // e.g., "80%"
-	Dir    string // working directory for the command inside the popup (-d)
-	Cmd    string // command to run inside the popup
-	Title  string // popup title (tmux 3.3+)
+	Target string   // pane/session target for the popup (-t); empty uses the active client
+	Width  string   // e.g., "80%"
+	Height string   // e.g., "80%"
+	Dir    string   // working directory for the command inside the popup (-d)
+	Cmd    string   // command to run inside the popup
+	Title  string   // popup title (tmux 3.3+)
+	Env    []string // KEY=VALUE assignments, one -e each; empty is not neutral — see jinenv.Identity.TmuxEnviron
+}
+
+// buildPopupArgs translates DisplayPopupOptions into display-popup arguments.
+// Kept as a pure function so the flag translation is unit-testable without
+// tmux, as buildSplitArgs is.
+func buildPopupArgs(o DisplayPopupOptions) []string {
+	args := []string{"display-popup", "-E"}
+	if o.Target != "" {
+		args = append(args, "-t", o.Target)
+	}
+	if o.Width != "" {
+		args = append(args, "-w", o.Width)
+	}
+	if o.Height != "" {
+		args = append(args, "-h", o.Height)
+	}
+	if o.Dir != "" {
+		args = append(args, "-d", o.Dir)
+	}
+	if o.Title != "" {
+		args = append(args, "-T", o.Title)
+	}
+	args = appendEnvArgs(args, o.Env)
+	if o.Cmd != "" {
+		args = append(args, o.Cmd)
+	}
+	return args
 }
 
 // DisplayPopup opens a tmux popup that runs a command and closes when it exits.
 func (c *Client) DisplayPopup(opts DisplayPopupOptions) error {
-	args := []string{"display-popup", "-E"}
-	if opts.Target != "" {
-		args = append(args, "-t", opts.Target)
-	}
-	if opts.Width != "" {
-		args = append(args, "-w", opts.Width)
-	}
-	if opts.Height != "" {
-		args = append(args, "-h", opts.Height)
-	}
-	if opts.Dir != "" {
-		args = append(args, "-d", opts.Dir)
-	}
-	if opts.Title != "" {
-		args = append(args, "-T", opts.Title)
-	}
-	if opts.Cmd != "" {
-		args = append(args, opts.Cmd)
-	}
-	return c.runSilent(args...)
+	return c.runSilent(buildPopupArgs(opts)...)
 }

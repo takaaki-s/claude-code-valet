@@ -325,12 +325,148 @@ func TestBuildSplitArgs(t *testing.T) {
 			opts: SplitOptions{Size: "15"},
 			want: []string{"split-window", "-t", "%1", "-P", "-F", "#{pane_id}", "-v", "-l", "15"},
 		},
+		{
+			name: "nil env emits no -e",
+			opts: SplitOptions{Cmd: "htop"},
+			want: []string{"split-window", "-t", "%1", "-P", "-F", "#{pane_id}", "-v", "htop"},
+		},
+		{
+			name: "one env assignment",
+			opts: SplitOptions{Env: []string{"JIN_SESSION_ID=b1e2"}},
+			want: []string{"split-window", "-t", "%1", "-P", "-F", "#{pane_id}", "-v", "-e", "JIN_SESSION_ID=b1e2"},
+		},
+		{
+			// An empty value is the load-bearing case: tmux has no unset form,
+			// so "JIN_DEBUG=" is how a pane is told the flag is off rather than
+			// left to inherit the server's.
+			name: "env keeps slice order and empty values, and sits last before the command",
+			opts: SplitOptions{
+				Dir: "/work",
+				Cmd: "htop",
+				Env: []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin/jin", "JIN_DEBUG=", "JIN_SESSION_ID=b1e2"},
+			},
+			want: []string{
+				"split-window", "-t", "%1", "-P", "-F", "#{pane_id}", "-v", "-c", "/work",
+				"-e", "JIN_SOCKET=/run/jin.sock", "-e", "JIN_BIN=/opt/jin/jin", "-e", "JIN_DEBUG=", "-e", "JIN_SESSION_ID=b1e2",
+				"htop",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := buildSplitArgs("%1", tt.opts)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("buildSplitArgs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildPopupArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		opts DisplayPopupOptions
+		want []string
+	}{
+		{
+			name: "empty opts",
+			opts: DisplayPopupOptions{},
+			want: []string{"display-popup", "-E"},
+		},
+		{
+			name: "target only",
+			opts: DisplayPopupOptions{Target: "%1"},
+			want: []string{"display-popup", "-E", "-t", "%1"},
+		},
+		{
+			name: "size only",
+			opts: DisplayPopupOptions{Width: "80%", Height: "60%"},
+			want: []string{"display-popup", "-E", "-w", "80%", "-h", "60%"},
+		},
+		{
+			name: "dir and title",
+			opts: DisplayPopupOptions{Dir: "/work", Title: "jin"},
+			want: []string{"display-popup", "-E", "-d", "/work", "-T", "jin"},
+		},
+		{
+			name: "all options",
+			opts: DisplayPopupOptions{Target: "%1", Width: "80%", Height: "60%", Dir: "/work", Cmd: "htop", Title: "jin"},
+			want: []string{"display-popup", "-E", "-t", "%1", "-w", "80%", "-h", "60%", "-d", "/work", "-T", "jin", "htop"},
+		},
+		{
+			name: "nil env emits no -e",
+			opts: DisplayPopupOptions{Cmd: "htop"},
+			want: []string{"display-popup", "-E", "htop"},
+		},
+		{
+			name: "one env assignment",
+			opts: DisplayPopupOptions{Env: []string{"JIN_SESSION_ID=b1e2"}},
+			want: []string{"display-popup", "-E", "-e", "JIN_SESSION_ID=b1e2"},
+		},
+		{
+			// An empty value is the load-bearing case: tmux has no unset form,
+			// so "JIN_DEBUG=" is how a popup is told the flag is off rather
+			// than left to inherit the server's.
+			name: "env keeps slice order and empty values, and sits last before the command",
+			opts: DisplayPopupOptions{
+				Cmd: "htop",
+				Env: []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin/jin", "JIN_DEBUG=", "JIN_SESSION_ID=b1e2"},
+			},
+			want: []string{
+				"display-popup", "-E",
+				"-e", "JIN_SOCKET=/run/jin.sock", "-e", "JIN_BIN=/opt/jin/jin", "-e", "JIN_DEBUG=", "-e", "JIN_SESSION_ID=b1e2",
+				"htop",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildPopupArgs(tt.opts)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("buildPopupArgs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildRespawnArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		env  []string
+		want []string
+	}{
+		{
+			name: "nil env emits no -e",
+			cmd:  "htop",
+			want: []string{"respawn-pane", "-t", "%1", "-k", "htop"},
+		},
+		{
+			name: "empty command leaves the pane on a shell",
+			want: []string{"respawn-pane", "-t", "%1", "-k"},
+		},
+		{
+			name: "one env assignment",
+			cmd:  "htop",
+			env:  []string{"JIN_SESSION_ID=b1e2"},
+			want: []string{"respawn-pane", "-t", "%1", "-k", "-e", "JIN_SESSION_ID=b1e2", "htop"},
+		},
+		{
+			name: "env keeps slice order and empty values, and sits last before the command",
+			cmd:  "htop",
+			env:  []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin/jin", "JIN_DEBUG=", "JIN_SESSION_ID=b1e2"},
+			want: []string{
+				"respawn-pane", "-t", "%1", "-k",
+				"-e", "JIN_SOCKET=/run/jin.sock", "-e", "JIN_BIN=/opt/jin/jin", "-e", "JIN_DEBUG=", "-e", "JIN_SESSION_ID=b1e2",
+				"htop",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildRespawnArgs("%1", tt.cmd, tt.env)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("buildRespawnArgs() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -436,9 +572,18 @@ type fakeSlotOps struct {
 	setOptionErr error             // injected SetPaneOption failure
 
 	splitCalls   int
-	respawnCalls []string // "target cmd"
+	splitOpts    []SplitOptions
+	respawnCalls []respawnCall
 	killCalls    []string
 	setCalls     []string // "target option value"
+}
+
+// respawnCall is what fakeSlotOps was handed, kept whole: a respawn that drops
+// the slot's command or its environment is the failure these tests watch for.
+type respawnCall struct {
+	target string
+	cmd    string
+	env    []string
 }
 
 func (f *fakeSlotOps) FindPaneByName(target, name string) (string, error) {
@@ -447,6 +592,7 @@ func (f *fakeSlotOps) FindPaneByName(target, name string) (string, error) {
 
 func (f *fakeSlotOps) SplitPane(target string, opts SplitOptions) (string, error) {
 	f.splitCalls++
+	f.splitOpts = append(f.splitOpts, opts)
 	return f.splitID, nil
 }
 
@@ -455,8 +601,8 @@ func (f *fakeSlotOps) SetPaneOption(target, option, value string) error {
 	return f.setOptionErr
 }
 
-func (f *fakeSlotOps) RespawnPane(target, cmd string) error {
-	f.respawnCalls = append(f.respawnCalls, target+" "+cmd)
+func (f *fakeSlotOps) RespawnPane(target, cmd string, env []string) error {
+	f.respawnCalls = append(f.respawnCalls, respawnCall{target: target, cmd: cmd, env: env})
 	return nil
 }
 
@@ -517,10 +663,11 @@ func TestEnsureNamedPane(t *testing.T) {
 			wantErr:  true,
 		},
 	}
+	slotOpts := SplitOptions{Cmd: "top", Env: []string{"JIN_SOCKET=/run/jin.sock", "JIN_DEBUG=", "JIN_SESSION_ID=b1e2"}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ops := &fakeSlotOps{named: tt.existing, splitID: "%99"}
-			got, err := EnsureNamedPane(ops, "%1", tt.slotName, tt.ifExists, SplitOptions{Cmd: "top"})
+			got, err := EnsureNamedPane(ops, "%1", tt.slotName, tt.ifExists, slotOpts)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")
@@ -538,6 +685,16 @@ func TestEnsureNamedPane(t *testing.T) {
 			}
 			if len(ops.respawnCalls) != tt.wantRespawns {
 				t.Errorf("RespawnPane calls = %d, want %d", len(ops.respawnCalls), tt.wantRespawns)
+			}
+			for _, c := range ops.respawnCalls {
+				if c.cmd != slotOpts.Cmd || !reflect.DeepEqual(c.env, slotOpts.Env) {
+					t.Errorf("respawn of %s got cmd %q env %v, want the slot's own %q / %v", c.target, c.cmd, c.env, slotOpts.Cmd, slotOpts.Env)
+				}
+			}
+			for _, o := range ops.splitOpts {
+				if !reflect.DeepEqual(o, slotOpts) {
+					t.Errorf("SplitPane got %+v, want the slot options unchanged: %+v", o, slotOpts)
+				}
 			}
 		})
 	}

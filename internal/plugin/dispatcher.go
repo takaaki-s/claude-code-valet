@@ -20,6 +20,14 @@ var pluginLog = debug.NewLogger("plugin-debug.log")
 // the indirect loop (plugin → `jin session send` → agent → hook) because the
 // environment does not survive the agent process; the debounce window is the
 // primary guard for that path.
+//
+// It does not follow a pane either. A pane opened by `jin pane popup` / `jin
+// pane split` is given the four identity variables and not this one, so a
+// plugin that runs another plugin from inside a popup starts it back at depth
+// 1 — and nothing else stops it, because that run arrives through RunAction,
+// which bypasses debounce by design. The indirect loop's reasoning does not
+// carry over: that one comes back as a status event through publish, the only
+// caller of passDebounce.
 const maxDepth = 2
 
 // DefaultDebounce is the minimum interval between deliveries of the same
