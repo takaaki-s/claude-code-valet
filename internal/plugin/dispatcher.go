@@ -22,20 +22,12 @@ var pluginLog = debug.NewLogger("plugin-debug.log")
 // primary guard for that path.
 //
 // It does not follow a pane either. A pane opened by `jin pane popup` / `jin
-// pane split` is given the four identity variables and deliberately not this
-// one, so a plugin that runs another plugin from inside a popup starts it back
-// at depth 1. That is not a regression — the pane used to be given nothing at
-// all — but it is now a choice rather than an oversight: JIN_PLUGIN_DEPTH is
-// not part of "which jin am I calling back into", and forwarding it on the
-// `--here` path alone would guard one of the two ways in.
-//
-// Nothing else catches that path either, and the indirect loop's reasoning does
-// not carry over: that one comes back as a status event through publish, which
-// is the only caller of passDebounce, while a run started from a pane arrives
-// through RunAction — which bypasses debounce by design (see its doc). So a
-// plugin that runs another plugin from inside a popup is bounded by neither
-// depth nor debounce. Closing it means either forwarding the depth on both
-// paths or moving the guard somewhere a pane cannot step around.
+// pane split` is given the four identity variables and not this one, so a
+// plugin that runs another plugin from inside a popup starts it back at depth
+// 1 — and nothing else stops it, because that run arrives through RunAction,
+// which bypasses debounce by design. The indirect loop's reasoning does not
+// carry over: that one comes back as a status event through publish, the only
+// caller of passDebounce.
 const maxDepth = 2
 
 // DefaultDebounce is the minimum interval between deliveries of the same

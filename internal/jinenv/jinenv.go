@@ -58,12 +58,17 @@ type Identity struct {
 	// SocketPath is the daemon's listening socket — what a child's `jin`
 	// resolves instead of falling back to the default path.
 	SocketPath string
-	// BinPath is the jin binary a child should re-enter. The requirement is not
-	// "some jin": it must stay valid, and stay matched to the daemon serving the
-	// socket above, for as long as that child may call back — which is the whole
-	// life of a session, long after the caller has stopped watching. The
-	// daemon's own executable does not meet that; session.EstablishHookBinary
-	// says what goes wrong and how often.
+	// BinPath is the jin binary a child should re-enter to call back. The
+	// requirement is not "some jin": it must stay valid, and stay matched to the
+	// daemon serving the socket above, for as long as that child may call back —
+	// which is the whole life of a session, long after the caller has stopped
+	// watching. The daemon's own executable does not meet that;
+	// session.EstablishHookBinary says what goes wrong and how often, and why a
+	// spawn site must never work this out for itself.
+	//
+	// A binary a process re-launches itself as is a different question with a
+	// different answer: internal/tui's popups run this build's own executable on
+	// purpose, because what they open is more of this UI rather than a callback.
 	BinPath string
 	// Debug is whether the child should write its own debug log. Callers pass
 	// what debug.Enabled() reports rather than re-reading the variable, so a
@@ -86,23 +91,40 @@ type Identity struct {
 // the child starts from an environment jind-ai did not build — anything tmux
 // runs, including a shell `env` prefix tmux is given — use TmuxEnviron.
 func (i Identity) Environ() []string {
-	env := make([]string, 0, 3)
-	if i.SocketPath != "" {
-		env = append(env, "JIN_SOCKET="+i.SocketPath)
-	}
-	if i.BinPath != "" {
-		env = append(env, "JIN_BIN="+i.BinPath)
-	}
-	if i.Debug {
-		env = append(env, "JIN_DEBUG=1")
+	pairs := i.pairs()
+	env := make([]string, 0, len(pairs))
+	for _, kv := range pairs {
+		if kv[1] != "" {
+			env = append(env, kv[0]+"="+kv[1])
+		}
 	}
 	return env
 }
 
+// pairs is the identity as ordered key/value pairs, and is the only place the
+// key names and their order live. The two renderers below differ in one thing —
+// whether an empty value is emitted — and sharing the table is what keeps that
+// the only difference. Adding a field to one renderer and not the other would
+// otherwise be invisible: the reader that misses it is a pane, which quietly
+// takes the tmux server's value instead of failing.
+func (i Identity) pairs() [][2]string {
+	debugFlag := ""
+	if i.Debug {
+		debugFlag = "1"
+	}
+	return [][2]string{
+		{"JIN_SOCKET", i.SocketPath},
+		{"JIN_BIN", i.BinPath},
+		{"JIN_DEBUG", debugFlag},
+	}
+}
+
 // TmuxEnviron renders this identity, plus the session a pane's work belongs to,
-// as the assignments tmux takes one per -e. The session id is an argument
-// rather than a field because it answers a different question than the three
-// above: not which jin, but which of its sessions.
+// for a destination whose environment jind-ai did not build. tmux takes these
+// one per -e; the shell `env` prefix the agent's spawn line is built from takes
+// them as words. The session id is an argument rather than a field because it
+// answers a different question than the three above: not which jin, but which
+// of its sessions.
 //
 // It emits every key, empty when the value is unknown, and that is the whole
 // difference from Environ. The rule inverts because the destination does: a key
@@ -129,14 +151,10 @@ func (i Identity) Environ() []string {
 // Environ rather than set to "0": a plugin testing `[ -n "$JIN_DEBUG" ]` would
 // read "0" as on.
 func (i Identity) TmuxEnviron(sessionID string) []string {
-	debugFlag := ""
-	if i.Debug {
-		debugFlag = "1"
+	pairs := i.pairs()
+	env := make([]string, 0, len(pairs)+1)
+	for _, kv := range pairs {
+		env = append(env, kv[0]+"="+kv[1])
 	}
-	return []string{
-		"JIN_SOCKET=" + i.SocketPath,
-		"JIN_BIN=" + i.BinPath,
-		"JIN_DEBUG=" + debugFlag,
-		"JIN_SESSION_ID=" + sessionID,
-	}
+	return append(env, "JIN_SESSION_ID="+sessionID)
 }

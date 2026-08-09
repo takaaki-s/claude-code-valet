@@ -160,16 +160,24 @@ type mockTmuxRunner struct {
 	// absent, so it has to be observable as the slice it is, not as a string
 	// some earlier caller decided how to join.
 	//
-	// Read them through popupCalls/splitCalls/respawnEnvCalls, not directly:
+	// Read them through popupCalls/splitCalls/respawnedPanes, not directly:
 	// RespawnPane is reached from the monitor goroutine (that is what the
 	// onRespawnPane hook is for), so a future concurrent test reading a bare
 	// field would race where every other observation here does not.
-	popupOpts   []tmux.DisplayPopupOptions
-	splitOpts   []tmux.SplitOptions
-	respawnEnvs [][]string
+	popupOpts    []tmux.DisplayPopupOptions
+	splitOpts    []tmux.SplitOptions
+	respawnCalls []respawnCall
 }
 
-// popupCalls, splitCalls and respawnEnvCalls are the locked readers for the
+// respawnCall is a respawn kept whole, for the reason above: recording only the
+// env would be the same flattening in a smaller disguise.
+type respawnCall struct {
+	target string
+	cmd    string
+	env    []string
+}
+
+// popupCalls, splitCalls and respawnedPanes are the locked readers for the
 // three fields above, matching hasCalledWith and friends.
 func (m *mockTmuxRunner) popupCalls() []tmux.DisplayPopupOptions {
 	m.mu.Lock()
@@ -183,12 +191,12 @@ func (m *mockTmuxRunner) splitCalls() []tmux.SplitOptions {
 	return slices.Clone(m.splitOpts)
 }
 
-// respawnEnvCalls clones only the outer slice: each inner one is a fresh
-// TmuxEnviron result that nothing mutates.
-func (m *mockTmuxRunner) respawnEnvCalls() [][]string {
+// respawnedPanes clones only the outer slice, as the two above do: the Env
+// slices inside are fresh TmuxEnviron results that nothing mutates.
+func (m *mockTmuxRunner) respawnedPanes() []respawnCall {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return slices.Clone(m.respawnEnvs)
+	return slices.Clone(m.respawnCalls)
 }
 
 func newMockTmuxRunner() *mockTmuxRunner {
@@ -265,7 +273,7 @@ func (m *mockTmuxRunner) NewSessionWithCmdInDir(name string, width, height int, 
 func (m *mockTmuxRunner) RespawnPane(target, cmd string, env []string) error {
 	m.mu.Lock()
 	m.record("RespawnPane", target, cmd)
-	m.respawnEnvs = append(m.respawnEnvs, env)
+	m.respawnCalls = append(m.respawnCalls, respawnCall{target: target, cmd: cmd, env: env})
 	cb := takeHook(&m.onRespawnPane)
 	m.mu.Unlock()
 	if cb != nil {

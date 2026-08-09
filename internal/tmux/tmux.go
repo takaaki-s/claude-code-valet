@@ -397,14 +397,22 @@ func (c *Client) ListWindows(session string) ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
+// appendEnvArgs appends one -e per assignment, in slice order. Empty values are
+// kept: tmux has no unset form for -e, so "K=" is how a pane is told a value is
+// unknown rather than left to inherit the server's. split-window, display-popup
+// and respawn-pane all take this form, which is why it is here and not in each.
+func appendEnvArgs(args, env []string) []string {
+	for _, assignment := range env {
+		args = append(args, "-e", assignment)
+	}
+	return args
+}
+
 // buildRespawnArgs translates a respawn into respawn-pane arguments. Kept as a
 // pure function so the flag translation is unit-testable without tmux, as
 // buildSplitArgs and buildPopupArgs are.
 func buildRespawnArgs(target, shellCmd string, env []string) []string {
-	args := []string{"respawn-pane", "-t", target, "-k"}
-	for _, assignment := range env {
-		args = append(args, "-e", assignment)
-	}
+	args := appendEnvArgs([]string{"respawn-pane", "-t", target, "-k"}, env)
 	if shellCmd != "" {
 		args = append(args, shellCmd)
 	}
@@ -430,17 +438,13 @@ func (c *Client) ClearHistory(target string) error {
 // SplitOptions configures a SplitPane call, mirroring tmux split-window's
 // vocabulary rather than inventing a new one.
 type SplitOptions struct {
-	Direction string // where the new pane opens: "down" (empty = down), "up", "left", "right"
-	Size      string // new pane size: "30%" (percent) or "15" (lines/columns); empty = tmux default
-	Full      bool   // span the full window width/height (-f)
-	NoFocus   bool   // keep focus on the current pane (-d)
-	Dir       string // working directory for the new pane (-c); empty = tmux default
-	Cmd       string // command to run in the new pane; empty = shell
-	// Env is KEY=VALUE assignments for the new pane, one -e each. Leaving it
-	// empty is not neutral: the pane then takes its environment from the tmux
-	// server, which holds whatever process forked that server.
-	// jinenv.Identity.TmuxEnviron says what jind-ai puts here and why.
-	Env []string
+	Direction string   // where the new pane opens: "down" (empty = down), "up", "left", "right"
+	Size      string   // new pane size: "30%" (percent) or "15" (lines/columns); empty = tmux default
+	Full      bool     // span the full window width/height (-f)
+	NoFocus   bool     // keep focus on the current pane (-d)
+	Dir       string   // working directory for the new pane (-c); empty = tmux default
+	Cmd       string   // command to run in the new pane; empty = shell
+	Env       []string // KEY=VALUE assignments, one -e each; empty is not neutral — see jinenv.Identity.TmuxEnviron
 }
 
 // Validate checks Direction and Size. Percent sizes are limited to 1-99;
@@ -487,12 +491,10 @@ func buildSplitArgs(target string, o SplitOptions) []string {
 	if o.Size != "" {
 		args = append(args, "-l", o.Size)
 	}
-	for _, assignment := range o.Env {
-		args = append(args, "-e", assignment)
-	}
 	if o.Dir != "" {
 		args = append(args, "-c", o.Dir)
 	}
+	args = appendEnvArgs(args, o.Env)
 	if o.Cmd != "" {
 		args = append(args, o.Cmd)
 	}
@@ -538,8 +540,9 @@ type PaneSlotOps interface {
 	FindPaneByName(target, name string) (string, error)
 	SplitPane(target string, opts SplitOptions) (string, error)
 	SetPaneOption(target, option, value string) error
-	// RespawnPane: see Runner.RespawnPane for what env carries and what a nil
-	// one asserts. This is the interface the --here path reaches.
+	// RespawnPane replaces the process running in a pane. env is the assignments
+	// this call adds, one -e each; nil adds none, which is right only where
+	// something else has already answered — see the call site.
 	RespawnPane(target, cmd string, env []string) error
 	KillPane(target string) error
 }
@@ -1038,17 +1041,13 @@ func clientSessionForTTY(out, tty string) string {
 
 // DisplayPopupOptions configures a tmux display-popup.
 type DisplayPopupOptions struct {
-	Target string // pane/session target for the popup (-t); empty uses the active client
-	Width  string // e.g., "80%"
-	Height string // e.g., "80%"
-	Dir    string // working directory for the command inside the popup (-d)
-	Cmd    string // command to run inside the popup
-	Title  string // popup title (tmux 3.3+)
-	// Env is KEY=VALUE assignments for the popup's command, one -e each.
-	// Leaving it empty is not neutral: the command then takes its environment
-	// from the tmux server, which holds whatever process forked that server.
-	// jinenv.Identity.TmuxEnviron says what jind-ai puts here and why.
-	Env []string
+	Target string   // pane/session target for the popup (-t); empty uses the active client
+	Width  string   // e.g., "80%"
+	Height string   // e.g., "80%"
+	Dir    string   // working directory for the command inside the popup (-d)
+	Cmd    string   // command to run inside the popup
+	Title  string   // popup title (tmux 3.3+)
+	Env    []string // KEY=VALUE assignments, one -e each; empty is not neutral — see jinenv.Identity.TmuxEnviron
 }
 
 // buildPopupArgs translates DisplayPopupOptions into display-popup arguments.
@@ -1071,9 +1070,7 @@ func buildPopupArgs(o DisplayPopupOptions) []string {
 	if o.Title != "" {
 		args = append(args, "-T", o.Title)
 	}
-	for _, assignment := range o.Env {
-		args = append(args, "-e", assignment)
-	}
+	args = appendEnvArgs(args, o.Env)
 	if o.Cmd != "" {
 		args = append(args, o.Cmd)
 	}

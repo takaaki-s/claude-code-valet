@@ -339,16 +339,16 @@ func TestBuildSplitArgs(t *testing.T) {
 			// An empty value is the load-bearing case: tmux has no unset form,
 			// so "JIN_DEBUG=" is how a pane is told the flag is off rather than
 			// left to inherit the server's.
-			name: "env keeps slice order, empty values, and its place before -c and the command",
+			name: "env keeps slice order and empty values, and sits last before the command",
 			opts: SplitOptions{
 				Dir: "/work",
 				Cmd: "htop",
 				Env: []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin/jin", "JIN_DEBUG=", "JIN_SESSION_ID=b1e2"},
 			},
 			want: []string{
-				"split-window", "-t", "%1", "-P", "-F", "#{pane_id}", "-v",
+				"split-window", "-t", "%1", "-P", "-F", "#{pane_id}", "-v", "-c", "/work",
 				"-e", "JIN_SOCKET=/run/jin.sock", "-e", "JIN_BIN=/opt/jin/jin", "-e", "JIN_DEBUG=", "-e", "JIN_SESSION_ID=b1e2",
-				"-c", "/work", "htop",
+				"htop",
 			},
 		},
 	}
@@ -407,7 +407,7 @@ func TestBuildPopupArgs(t *testing.T) {
 			// An empty value is the load-bearing case: tmux has no unset form,
 			// so "JIN_DEBUG=" is how a popup is told the flag is off rather
 			// than left to inherit the server's.
-			name: "env keeps slice order, empty values, and its place before the command",
+			name: "env keeps slice order and empty values, and sits last before the command",
 			opts: DisplayPopupOptions{
 				Cmd: "htop",
 				Env: []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin/jin", "JIN_DEBUG=", "JIN_SESSION_ID=b1e2"},
@@ -452,7 +452,7 @@ func TestBuildRespawnArgs(t *testing.T) {
 			want: []string{"respawn-pane", "-t", "%1", "-k", "-e", "JIN_SESSION_ID=b1e2", "htop"},
 		},
 		{
-			name: "env keeps slice order, empty values, and its place before the command",
+			name: "env keeps slice order and empty values, and sits last before the command",
 			cmd:  "htop",
 			env:  []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin/jin", "JIN_DEBUG=", "JIN_SESSION_ID=b1e2"},
 			want: []string{

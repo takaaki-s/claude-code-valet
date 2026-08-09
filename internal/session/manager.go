@@ -2652,14 +2652,18 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	// names one of these in their own config still wins — `env` applies
 	// assignments left to right.
 	//
-	// TmuxEnviron rather than Environ, and it carries JIN_SESSION_ID rather than
-	// this function assembling that one itself. `env` without -i adds to the
-	// environment it was handed, and what tmux hands a pane is the tmux server's
-	// — so a key this prefix omits is not absent from the agent, it is whatever
-	// that server holds. Measured: with the daemon's flag off and a tmux server
-	// forked from an environment that had JIN_DEBUG=1, the agent pane ran with
-	// JIN_DEBUG=1, 3/3. Emitting every key, empty when unknown, is what closes
-	// it, and it is the same rule the panes jind-ai opens through tmux follow.
+	// TmuxEnviron rather than Environ — its doc has why a key this prefix omits
+	// is not absent from the agent but whatever the tmux server holds. Measured
+	// here: with the daemon's flag off and a server forked from an environment
+	// that had JIN_DEBUG=1, the agent pane ran with JIN_DEBUG=1, 3/3. It carries
+	// JIN_SESSION_ID too, so this function no longer assembles that one itself.
+	//
+	// The identity travels inside this string rather than as tmux -e because
+	// three verbs consume the string — NewSessionWithCmdInDir and both respawn
+	// sites — and only the string reaches all three. Moving it to -e would turn
+	// one coupling that cannot be forgotten into three that can. The prefix is
+	// needed regardless: -e has no unset form, so `env -u TMUX` has nowhere else
+	// to go.
 	for _, kv := range m.identity.TmuxEnviron(snap.JinSessionID) {
 		envVars += " " + shellEscape(kv)
 	}

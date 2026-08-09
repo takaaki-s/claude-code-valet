@@ -87,16 +87,15 @@ type callerPaneOps interface {
 	DisplayPopup(tmux.DisplayPopupOptions) error
 }
 
-// resolveCallerTmux is callerTmux, as a variable so a test can stand in for the
-// caller's tmux server. Production never reassigns it.
-var resolveCallerTmux = callerTmux
-
-// callerTmux resolves the caller's own tmux server and anchor pane for --here
-// mode, bypassing the daemon. The server is discovered from $TMUX (human
+// resolveCallerTmux resolves the caller's own tmux server and anchor pane for
+// --here mode, bypassing the daemon. The server is discovered from $TMUX (human
 // invocation) or JIN_CALLER_TMUX_SOCKET (plugin action invocation); the anchor
 // pane likewise from $TMUX_PANE or JIN_CALLER_TMUX_PANE (may be empty; popup
 // treats empty as "active client", so this variant does not require it).
-func callerTmux() (callerPaneOps, string, error) {
+//
+// A variable so a test can stand in for the tmux server. Production never
+// reassigns it.
+var resolveCallerTmux = func() (callerPaneOps, string, error) {
 	socketPath := envFallback(tmux.SocketPathFromEnv(os.Getenv("TMUX")), "JIN_CALLER_TMUX_SOCKET")
 	if socketPath == "" {
 		return nil, "", errors.New("--here requires a tmux client: not inside tmux and no JIN_CALLER_TMUX_SOCKET")
@@ -109,7 +108,7 @@ func callerTmux() (callerPaneOps, string, error) {
 	return tc, anchorPane, nil
 }
 
-// callerTmuxWithPane is callerTmux plus a "must have a concrete anchor pane"
+// callerTmuxWithPane is resolveCallerTmux plus a "must have a concrete anchor pane"
 // guard, for --here operations (split, close) that address a specific pane
 // rather than the client's active one.
 func callerTmuxWithPane() (callerPaneOps, string, error) {
@@ -131,12 +130,9 @@ func callerTmuxWithPane() (callerPaneOps, string, error) {
 // pane, and either way its own environment already names the jin that started
 // it. So this passes those on rather than working them out again:
 //
-//   - BinPath comes from JIN_BIN and nowhere else. This process's own path is
-//     not an answer to the question: os.Executable() reports whichever jin was
-//     invoked, which need not be the same build as the daemon serving the
-//     socket and cannot say whether it is. The daemon answers this once, into a
-//     copy that outlives a rebuild — session.EstablishHookBinary has what goes
-//     wrong otherwise — and a --here caller was handed that answer already.
+//   - BinPath comes from JIN_BIN and nowhere else; jinenv.Identity.BinPath says
+//     why a spawn site must not work it out. A --here caller was handed the
+//     daemon's answer already.
 //   - SocketPath goes through getSocketPath() rather than os.Getenv, so a
 //     caller that was never given JIN_SOCKET still names a socket. Resolving it
 //     here rather than leaving the pane to do it is the point: the pane's

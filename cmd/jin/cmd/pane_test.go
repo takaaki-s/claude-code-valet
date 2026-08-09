@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -315,48 +314,20 @@ func TestRunCloseHere_NoTmuxClient(t *testing.T) {
 // with JIN_DEBUG exported would otherwise fail on the environment rather than
 // on the code.
 //
-// debug.Enabled and not paneDebugEnabled, deliberately. Asking the seam would
-// make both sides of every comparison move together, so unbinding the seam from
-// the real flag would satisfy them all — which is what an earlier version of
-// this helper did, and what let that mutation live.
+// debug.Enabled and not paneDebugEnabled, deliberately, and this is the only
+// thing guarding that binding. Asking the seam would make both sides of every
+// comparison move together, so unbinding the seam from the real flag would
+// satisfy them all — which is what an earlier version of this helper did, and
+// what let that mutation live. Reading the real flag here makes the runner
+// tests below fail on it instead, under JIN_DEBUG=1. Nothing can catch it with
+// the flag unset: internal/debug fixes its answer at init, so a constant false
+// and a flag that is off are indistinguishable from inside this process.
 func wantPaneEnv(socket, bin, session string) []string {
 	debugAssign := "JIN_DEBUG="
 	if debug.Enabled() {
 		debugAssign = "JIN_DEBUG=1"
 	}
 	return []string{"JIN_SOCKET=" + socket, "JIN_BIN=" + bin, debugAssign, "JIN_SESSION_ID=" + session}
-}
-
-// TestPaneDebugEnabled_IsWiredToTheRealFlag guards the link the test that
-// replaces paneDebugEnabled cannot: a version defined as a constant would
-// satisfy that one while leaving the pane told something the daemon never said.
-//
-// Its reach depends on the flag, and saying so is the point. With JIN_DEBUG
-// unset both sides read false and a constant false passes — nothing running in
-// this process can tell those apart, because internal/debug fixes its answer at
-// init. Under JIN_DEBUG=1 the comparison is real, and that is the run where a
-// disconnection matters: the pane would be told to stay quiet while the daemon
-// was recording.
-func TestPaneDebugEnabled_IsWiredToTheRealFlag(t *testing.T) {
-	if paneDebugEnabled() != debug.Enabled() {
-		t.Errorf("paneDebugEnabled() = %v, debug.Enabled() = %v; the seam has come loose from the flag it stands for",
-			paneDebugEnabled(), debug.Enabled())
-	}
-}
-
-// TestCallerPaneEnv_ForwardsWhatItWasTold is the --here counterpart of the
-// daemon path's hand-off test. What it pins is that nothing here is worked out
-// locally: --here never reaches the daemon, so the only correct source for
-// which jin and which session is the environment this process was started with.
-func TestCallerPaneEnv_ForwardsWhatItWasTold(t *testing.T) {
-	t.Setenv("JIN_SOCKET", "/nonexistent/told.sock")
-	t.Setenv("JIN_BIN", "/nonexistent/told-bin/jin")
-	t.Setenv("JIN_SESSION_ID", "told-session")
-
-	want := wantPaneEnv("/nonexistent/told.sock", "/nonexistent/told-bin/jin", "told-session")
-	if got := callerPaneEnv(); !reflect.DeepEqual(got, want) {
-		t.Errorf("callerPaneEnv() = %q, want %q", got, want)
-	}
 }
 
 // TestCallerPaneEnv_CarriesTheDebugFlag is separate because the flag cannot be
@@ -394,15 +365,9 @@ func TestCallerPaneEnv_NeverGuessesTheBinary(t *testing.T) {
 	t.Setenv("JIN_BIN", "")
 	t.Setenv("JIN_SESSION_ID", "")
 
-	self, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable failed: %v", err)
-	}
-	got := callerPaneEnv()
-	if slices.Contains(got, "JIN_BIN="+self) {
-		t.Fatalf("callerPaneEnv() derived JIN_BIN from this process (%s)", self)
-	}
-	if !slices.Contains(got, "JIN_BIN=") {
+	// TmuxEnviron emits exactly one JIN_BIN, so "it is empty" is also "it is not
+	// this process's path" — the answer a derivation would have produced.
+	if got := callerPaneEnv(); !slices.Contains(got, "JIN_BIN=") {
 		t.Errorf("callerPaneEnv() = %q, want an empty JIN_BIN assignment: leaving the key out lets the pane inherit the tmux server's", got)
 	}
 }

@@ -1221,6 +1221,14 @@ func (m Model) openPopup(name, title string) {
 // resolution is unit-testable without a live tmux client. Both the size
 // and the subcommand are looked up from config's popup catalog, so config
 // keys and cobra subcommand names cannot silently drift.
+//
+// Env is left unset, which is not the same statement it is for `jin pane
+// popup`. What these popups open is more of this UI — os.Executable() is the
+// right binary for that, and jinenv.Identity.BinPath says why it is the wrong
+// one for a callback. Which daemon they should reach is a question the TUI has
+// not been given an answer to: it holds no identity, so today each popup
+// resolves one for itself from the environment the outer tmux server was
+// forked with. Unmeasured, and open.
 func (m Model) popupDisplayOptions(name, title string) tmux.DisplayPopupOptions {
 	width, height := m.configMgr.GetPopupSize(name)
 	selfBin, _ := os.Executable()
