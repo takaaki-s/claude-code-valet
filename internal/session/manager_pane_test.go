@@ -68,29 +68,42 @@ func TestManager_PaneTarget_UnknownID(t *testing.T) {
 	}
 }
 
-func TestManager_PanePopup_TargetAndDir(t *testing.T) {
-	mgr, mock, _ := newTestManager(t)
+// TestManager_PanePopup_ForwardsEveryOption pins the whole hand-off rather than
+// the two fields an earlier assertion happened to need. PanePopup takes five
+// strings positionally and every one of them is the same type, so a dropped
+// argument or a transposed pair is a change the compiler has no opinion about.
+//
+// The options are compared whole. That is what mockTmuxRunner keeps them for
+// (see popupOpts), and reading them through the flattened call log instead is
+// how Cmd, Title, Width and Height came to be recorded here but asserted by
+// nobody: an argument can be passed and still be unobserved.
+//
+// Width and Height are deliberately unequal, and unlike every other value in
+// the struct. Equal ones cannot tell a correct forward from a swapped one.
+func TestManager_PanePopup_ForwardsEveryOption(t *testing.T) {
+	identity := paneIdentity()
+	mgr, mock, _ := newTestManagerOn(t, identity)
 	sess := paneTestSession(t, mgr, "/tmp/pane-popup", "%7", "sess-z")
 
-	if err := mgr.PanePopup(sess.ID, "echo hi", "Title", "80%", "50%"); err != nil {
+	if err := mgr.PanePopup(sess.ID, "echo hi", " Diff ", "81%", "43%"); err != nil {
 		t.Fatalf("PanePopup failed: %v", err)
 	}
 
-	var found bool
-	for _, c := range mock.calls {
-		if c.method != "DisplayPopup" {
-			continue
-		}
-		found = true
-		if c.args[0] != "%7" {
-			t.Errorf("DisplayPopup target = %q, want %q", c.args[0], "%7")
-		}
-		if c.args[2] != "/tmp/pane-popup" {
-			t.Errorf("DisplayPopup dir = %q, want %q", c.args[2], "/tmp/pane-popup")
-		}
+	popups := mock.popupCalls()
+	if len(popups) != 1 {
+		t.Fatalf("DisplayPopup called %d times, want 1", len(popups))
 	}
-	if !found {
-		t.Error("expected DisplayPopup to be called")
+	want := tmux.DisplayPopupOptions{
+		Target: "%7",
+		Width:  "81%",
+		Height: "43%",
+		Dir:    "/tmp/pane-popup",
+		Cmd:    "echo hi",
+		Title:  " Diff ",
+		Env:    identity.TmuxEnviron(sess.ID),
+	}
+	if got := popups[0]; !reflect.DeepEqual(got, want) {
+		t.Errorf("DisplayPopup options =\n\t%+v\nwant\n\t%+v", got, want)
 	}
 }
 
