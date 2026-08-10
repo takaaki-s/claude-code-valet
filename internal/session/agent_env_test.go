@@ -117,6 +117,101 @@ func TestBuildAgentShellCmd_TellsTheAdapterTheSameBinary(t *testing.T) {
 	}
 }
 
+// TestBuildAgentShellCmd_TellsTheAdapterOneStory pins the obligation that lets
+// adapters carry nothing between calls: this builder, and nothing else, resolves
+// the paths a spawn is built from, and it must put them on BOTH structs it hands
+// the adapter.
+//
+// It belongs here rather than beside an adapter because this is where the values
+// are decided. An adapter test can only ask "given these options, what comes
+// back?" — it cannot oblige anyone to fill them, and each adapter answers an
+// absent path by quietly dropping what depended on it: claude its --settings and
+// opencode its OPENCODE_CONFIG_DIR when StateDir is empty, codex its whole hook
+// injection when ExecPath is. (Measured, and not symmetric: an empty StateDir
+// alone leaves codex injecting hooks as usual, because its payload is built from
+// ExecPath.) All three still return a runnable command, so a builder that
+// quietly stopped passing either value would leave three adapters silently
+// unconfigured — measured with every test in ./internal/agent/... still green.
+//
+// The agreement half is what earns the type duplication. SetupContext is
+// deliberately narrower than SpawnOptions (see its doc), so its three fields are
+// written twice from one call site; that is only safe while the two copies
+// cannot disagree. Setup prepares a directory and SpawnCommand points at it, so
+// a skew means pointing at something nobody prepared.
+func TestBuildAgentShellCmd_TellsTheAdapterOneStory(t *testing.T) {
+	stable := filepath.Join(t.TempDir(), "bin", "jin")
+	workDir := t.TempDir()
+	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{BinPath: stable})
+
+	var setup SetupContext
+	var spawn SpawnOptions
+	mgr.SetAgentResolver(&fakeAgentResolver{agents: map[string]Agent{
+		"probe": &fakeAgent{
+			setupFn: func(ctx SetupContext) error { setup = ctx; return nil },
+			spawnFn: func(opts SpawnOptions) SpawnPlan {
+				spawn = opts
+				return SpawnPlan{Command: "true"}
+			},
+		},
+	}})
+	if _, err := mgr.buildAgentShellCmd(spawnSnapshot{
+		JinSessionID:    "probe-session",
+		AgentKind:       "probe",
+		StartDir:        t.TempDir(),
+		ExpandedWorkDir: workDir,
+	}); err != nil {
+		t.Fatalf("buildAgentShellCmd: %v", err)
+	}
+
+	// Compared against the Manager's own field, not against a literal: the
+	// point is that the adapter is told where THIS Manager keeps its state.
+	//
+	// Every field is compared against the value it should carry, never merely
+	// against its counterpart. Two fields agreeing says nothing about either
+	// being right, and this test has been wrong that way twice: the WorkDir pair
+	// was "" == "" until the snapshot above started carrying one, and once it
+	// did, a mutant handing BOTH structs snap.StartDir instead still passed.
+	if mgr.stateDir == "" {
+		t.Fatal("test manager has no state dir, so the assertions below would hold vacuously")
+	}
+	if spawn.StateDir != mgr.stateDir {
+		t.Errorf("SpawnOptions.StateDir = %q, want this Manager's own %q", spawn.StateDir, mgr.stateDir)
+	}
+	if spawn.ExecPath != stable {
+		t.Errorf("SpawnOptions.ExecPath = %q, want the identity's binary %q", spawn.ExecPath, stable)
+	}
+	if setup.StateDir != spawn.StateDir {
+		t.Errorf("Setup was pointed at %q while the spawn was built for %q; whatever Setup wrote, "+
+			"SpawnCommand is looking somewhere else", setup.StateDir, spawn.StateDir)
+	}
+	if setup.ExecPath != spawn.ExecPath {
+		t.Errorf("Setup wired callbacks through %q while the spawn names %q", setup.ExecPath, spawn.ExecPath)
+	}
+	// Both WorkDirs must be the TILDE-EXPANDED directory, which is a stronger
+	// requirement than agreeing with each other. snapshotForSpawn carries two
+	// work dirs — StartDir as the session recorded it, which may still begin
+	// with "~" (workDirForShell exists to expand it for the shell), and
+	// ExpandedWorkDir, which is what the pane is actually created in
+	// (tmuxClient.NewSessionWithCmdInDir). The Claude Code adapter records trust
+	// for the one Setup is handed, and EnsureTrustState only calls filepath.Abs,
+	// so handing it the unexpanded form registers a literal "~" directory under
+	// the daemon's own cwd — a trust dialog nobody is watching, for a path that
+	// does not exist. Measured: a mutant putting StartDir on both structs
+	// satisfies an equality-only check.
+	//
+	// SpawnOptions.WorkDir has no adapter reading it today — zero non-test hits
+	// for opts.WorkDir under internal/agent/, which is the only place a
+	// SpawnOptions is consumed. It is pinned anyway because it is part of the
+	// interface an adapter may start using at any time, and it should not be
+	// the wrong directory when one does.
+	if setup.WorkDir != workDir {
+		t.Errorf("SetupContext.WorkDir = %q, want the expanded work dir %q", setup.WorkDir, workDir)
+	}
+	if spawn.WorkDir != workDir {
+		t.Errorf("SpawnOptions.WorkDir = %q, want the expanded work dir %q", spawn.WorkDir, workDir)
+	}
+}
+
 // TestBuildAgentShellCmd_AssignsEvenWhatItDoesNotKnow pins the opposite of what
 // this test used to. Leaving an unknown value out looked harmless — every
 // consumer reads an empty JIN_SOCKET as no socket, so the assignment seemed to

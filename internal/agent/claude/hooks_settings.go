@@ -45,14 +45,26 @@ func usableHooksSettings(data []byte) bool {
 // the last successful Setup produce?" — the second can name a directory
 // belonging to a different Manager, and the first cannot.
 //
-// It reads rather than stats because the caller is on a failure path, so what
-// is on disk was left by some earlier write and a rename-published file is
-// only one of the things it can be: a version that wrote in place could have
-// been killed mid-truncate. Handing Claude Code a settings file it reads as
-// empty is worse than handing it none, because none is a documented fallback
-// and the other is silent. What parses is served as it stands, so a file an
-// older jind-ai published is accepted.
+// It reads rather than stats because the caller cannot know whether this
+// spawn's own write succeeded — SpawnCommand asks on every spawn, not only
+// after a failure — so what is on disk may have been left by some earlier
+// write, and a rename-published file is only one of the things it can be: a
+// version that wrote in place could have been killed mid-truncate. Handing
+// Claude Code a settings file it reads as empty is worse than handing it none,
+// because none is a documented fallback and the other is silent. What parses is
+// served as it stands, so a file an older jind-ai published is accepted.
 func existingHooksSettings(stateDir string) string {
+	if stateDir == "" {
+		// Without this, hooksSettingsPath returns the RELATIVE name
+		// "hooks-settings.json", which resolves against the caller's working
+		// directory — and the spawn this answers for runs in the session's own
+		// work dir, so a repository that happened to contain a file by that
+		// name would be handed to Claude Code as its hook configuration.
+		// paths.State() panics rather than returning empty, so no production
+		// caller reaches this; it costs one comparison to make that a fact
+		// about this function rather than about its callers.
+		return ""
+	}
 	path := hooksSettingsPath(stateDir)
 	data, err := os.ReadFile(path)
 	if err != nil || !usableHooksSettings(data) {

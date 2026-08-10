@@ -19,7 +19,8 @@ func TestSpawnCommand_Fresh_IgnoresPreMintUUID(t *testing.T) {
 	plan := SpawnCommand(agent.SpawnOptions{
 		AgentSessionID:      "pre-mint-01900000-0000-0000-0000-000000000000",
 		AgentSessionStarted: false,
-	}, testExecPath)
+		ExecPath:            testExecPath,
+	})
 
 	if !strings.HasPrefix(plan.Command, "codex ") {
 		t.Errorf("fresh spawn Command = %q, want prefix %q", plan.Command, "codex ")
@@ -42,7 +43,8 @@ func TestSpawnCommand_Resume(t *testing.T) {
 	plan := SpawnCommand(agent.SpawnOptions{
 		AgentSessionID:      uuid,
 		AgentSessionStarted: true,
-	}, testExecPath)
+		ExecPath:            testExecPath,
+	})
 
 	if !strings.HasPrefix(plan.Command, resumeBase+" ") {
 		t.Errorf("resume Command = %q, want prefix %q", plan.Command, resumeBase+" ")
@@ -74,7 +76,8 @@ func TestSpawnCommand_NoResumeWithoutStarted(t *testing.T) {
 	plan := SpawnCommand(agent.SpawnOptions{
 		AgentSessionID:      "01900000-0000-7000-8000-000000000abc",
 		AgentSessionStarted: false,
-	}, testExecPath)
+		ExecPath:            testExecPath,
+	})
 
 	if strings.HasPrefix(plan.Command, "codex resume") {
 		t.Errorf("Command = %q, want plain `codex` when not started", plan.Command)
@@ -84,7 +87,8 @@ func TestSpawnCommand_NoResumeWithoutStarted(t *testing.T) {
 func TestSpawnCommand_HooksAppended(t *testing.T) {
 	plan := SpawnCommand(agent.SpawnOptions{
 		AgentSessionStarted: false,
-	}, testExecPath)
+		ExecPath:            testExecPath,
+	})
 
 	if !strings.Contains(plan.Command, "--enable hooks") {
 		t.Errorf("Command missing --enable hooks: %q", plan.Command)
@@ -99,7 +103,8 @@ func TestSpawnCommand_HooksAppended(t *testing.T) {
 func TestSpawnCommand_NoHookArgsWhenExecPathEmpty(t *testing.T) {
 	plan := SpawnCommand(agent.SpawnOptions{
 		AgentSessionStarted: false,
-	}, "")
+		ExecPath:            "",
+	})
 
 	if strings.Contains(plan.Command, "--enable hooks") {
 		t.Errorf("Command = %q, want no hooks when execPath is empty", plan.Command)
@@ -127,15 +132,16 @@ func TestSpawnCommand_ConfigArgs(t *testing.T) {
 		name string
 		opts agent.SpawnOptions
 	}{
-		{"fresh", agent.SpawnOptions{AgentSessionStarted: false}},
+		{"fresh", agent.SpawnOptions{AgentSessionStarted: false, ExecPath: testExecPath}},
 		{"resume", agent.SpawnOptions{
 			AgentSessionID:      "01900000-0000-7000-8000-000000000abc",
 			AgentSessionStarted: true,
+			ExecPath:            testExecPath,
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := SpawnCommand(tc.opts, testExecPath)
+			plan := SpawnCommand(tc.opts)
 			for _, w := range want {
 				if !strings.Contains(plan.Command, w) {
 					t.Errorf("Command missing %q: %q", w, plan.Command)
@@ -153,7 +159,8 @@ func TestSpawnCommand_ConfigArgsFollowBase(t *testing.T) {
 	plan := SpawnCommand(agent.SpawnOptions{
 		AgentSessionID:      uuid,
 		AgentSessionStarted: true,
-	}, testExecPath)
+		ExecPath:            testExecPath,
+	})
 
 	resumeIdx := strings.Index(plan.Command, resumeBase)
 	cfgIdx := strings.Index(plan.Command, "-c 'disable_paste_burst=true'")
@@ -169,7 +176,7 @@ func TestSpawnCommand_ConfigArgsFollowBase(t *testing.T) {
 }
 
 func TestSpawnCommand_UnsetEnv(t *testing.T) {
-	plan := SpawnCommand(agent.SpawnOptions{}, testExecPath)
+	plan := SpawnCommand(agent.SpawnOptions{ExecPath: testExecPath})
 
 	want := []string{
 		"CODEX_SANDBOX",
@@ -184,7 +191,7 @@ func TestSpawnCommand_UnsetEnv(t *testing.T) {
 func TestSpawnCommand_UnsetEnvOmitsAuthKeys(t *testing.T) {
 	// Defensive: authentication env vars MUST NOT appear in UnsetEnv, or
 	// the spawned Codex will fail to authenticate.
-	plan := SpawnCommand(agent.SpawnOptions{}, testExecPath)
+	plan := SpawnCommand(agent.SpawnOptions{ExecPath: testExecPath})
 	forbidden := []string{
 		"CODEX_API_KEY",
 		"CODEX_ACCESS_TOKEN",
@@ -205,7 +212,7 @@ func TestSpawnCommand_NoExtraEnvOnAFreshSpawn(t *testing.T) {
 	// must not double up. A resume adds exactly one variable of its own (the
 	// session id, which must not be spliced into the command text); a fresh
 	// spawn has no id to carry, so anything here would be an error signal.
-	plan := SpawnCommand(agent.SpawnOptions{}, testExecPath)
+	plan := SpawnCommand(agent.SpawnOptions{ExecPath: testExecPath})
 	if len(plan.ExtraEnv) != 0 {
 		t.Errorf("ExtraEnv = %v, want empty (JIN_SESSION_ID is Manager's job)", plan.ExtraEnv)
 	}
@@ -219,7 +226,8 @@ func TestSpawnCommand_ResumePlusHooks(t *testing.T) {
 	plan := SpawnCommand(agent.SpawnOptions{
 		AgentSessionID:      uuid,
 		AgentSessionStarted: true,
-	}, testExecPath)
+		ExecPath:            testExecPath,
+	})
 
 	resumeIdx := strings.Index(plan.Command, resumeBase)
 	enableIdx := strings.Index(plan.Command, "--enable hooks")

@@ -236,38 +236,47 @@ func TestRecognizesSessionID_NoAdapterAcceptsEverything(t *testing.T) {
 	}
 }
 
-// TestSetup_NoAdapterPinsTheFirstContext is the conformance check for the rule
-// that an adapter derives what a spawn needs from the SetupContext of THIS call
-// rather than from the first one it ever saw (see the contract on
-// session.Agent.Setup).
+// TestSpawnCommand_EveryAdapterFollowsItsOptionsNotItsLastSetup is the
+// conformance check for the rule that an adapter builds a spawn out of the
+// SpawnOptions it is handed, and carries nothing between calls (see the
+// contract on session.SpawnOptions.StateDir).
 //
-// Written over agent.Kinds() for the same reason as the checks above. The
-// registry holds one adapter instance per kind for the whole process while a
-// SetupContext describes one Manager's session, so a sync.Once around Setup
-// pins whichever Manager got there first — including a state directory whose
-// owner has since deleted it. Two of the three adapters did exactly that, and a
+// It is the inverse of the check it replaces. That one demanded the LAST Setup
+// decide the spawn, which is the best a shared field can do; the registry holds
+// one adapter instance per kind for the whole process while these paths belong
+// to the Manager starting one session, so whoever wrote last answered for
+// everyone. Now the paths arrive with the spawn, and the older directory is the
+// correct answer when that is what the caller asks for — which a field cannot
+// give however carefully it is locked. Measured by putting the field back in
+// all three adapters, with SpawnOptions left as it is: every kind's subtest
+// fails, and each adapter's own field fails only its own kind. (Reverting the
+// struct as well is not the same experiment and cannot be run — a SpawnOptions
+// without these fields does not compile against this test.)
+//
+// Written over agent.Kinds() for the same reason as the checks above, and it is
+// the reason this test is not merely a duplicate of the per-adapter ones. A
 // per-package test cannot fail for a package that does not exist yet, so a
-// fourth adapter would reintroduce it with nothing to catch it. Registering a
-// kind is what enrols it here.
+// fourth adapter that quietly cached its first Setup would reintroduce the
+// defect with nothing to catch it. Registering a kind is what enrols it here.
+// Measured rather than assumed: a fourth adapter doing exactly that survives
+// the whole unit suite with this test removed, and is killed by it.
 //
 // Both directions are asserted, and the second is what makes the first mean
-// anything: an adapter that carries nothing at all out of its SetupContext
-// would satisfy "the first directory is absent" vacuously. It therefore fails
-// here, which is the intended cost — an adapter that needs nothing from the
-// context is a claim worth making in this file rather than by silence.
+// anything: an adapter that carries nothing at all out of its options would
+// satisfy "the other directory is absent" vacuously. It therefore fails here,
+// which is the intended cost — an adapter that needs neither path is a claim
+// worth making in this file rather than by silence.
 //
-// ExtraEnv is searched beside Command because an adapter may carry the context
+// ExtraEnv is searched beside Command because an adapter may carry either path
 // through either: the opencode adapter exposes its directory only as
 // OPENCODE_CONFIG_DIR, and a check reading Command alone would pass it blind.
 //
-// It leaves every adapter pointing at a directory this test owns and t.TempDir
-// then deletes: agent.Lookup returns the registry's one instance per kind, so
-// there is no copy to throw away at the end. Nothing else here reads those
-// fields — the only other test that calls SpawnCommand asks whether a session
-// id or a payload fragment came back in it, and a temp directory path is
-// neither — which is why the residue is inert under -shuffle=on as well as in
-// source order.
-func TestSetup_NoAdapterPinsTheFirstContext(t *testing.T) {
+// Setup still runs for both directories, in the order a process would see them,
+// because the adapters answer out of what Setup left on disk — the Claude Code
+// adapter reads back its hooks file and the opencode adapter looks for its
+// plugin. Preparing only one would leave the assertion unable to tell "follows
+// its options" from "found nothing anywhere".
+func TestSpawnCommand_EveryAdapterFollowsItsOptionsNotItsLastSetup(t *testing.T) {
 	// The Claude Code adapter's Setup records trust for WorkDir in
 	// ~/.claude.json, so hand the whole test a home of its own.
 	t.Setenv("HOME", t.TempDir())
@@ -294,18 +303,34 @@ func TestSetup_NoAdapterPinsTheFirstContext(t *testing.T) {
 				}
 			}
 
-			plan := a.SpawnCommand(session.SpawnOptions{WorkDir: t.TempDir()})
-			spawn := plan.Command
-			for k, v := range plan.ExtraEnv {
-				spawn += " " + k + "=" + v
-			}
-			if strings.Contains(spawn, first) {
-				t.Errorf("%s.SpawnCommand still names the first Setup's state dir %s: %s",
-					kind, first, spawn)
-			}
-			if !strings.Contains(spawn, second) {
-				t.Errorf("%s.SpawnCommand does not name the last Setup's state dir %s, so nothing in the spawn came from that context: %s",
-					kind, second, spawn)
+			// Asked for BOTH directories, from the same adapter, after both
+			// Setups have run. One direction is not enough and the gap is not
+			// hypothetical: a version of this test that only asked for `first`
+			// was measured to let a fourth adapter caching its FIRST context
+			// through, because the cached answer and the wanted answer were
+			// the same directory. A cache can satisfy at most one of these two
+			// requests, whichever end it holds.
+			for _, ask := range []struct{ want, other string }{
+				{want: first, other: second},
+				{want: second, other: first},
+			} {
+				plan := a.SpawnCommand(session.SpawnOptions{
+					StateDir: ask.want,
+					ExecPath: filepath.Join(ask.want, "bin", "jin"),
+					WorkDir:  t.TempDir(),
+				})
+				spawn := plan.Command
+				for k, v := range plan.ExtraEnv {
+					spawn += " " + k + "=" + v
+				}
+				if !strings.Contains(spawn, ask.want) {
+					t.Errorf("%s.SpawnCommand does not name the state dir it was given, %s, so nothing in the spawn came from its options: %s",
+						kind, ask.want, spawn)
+				}
+				if strings.Contains(spawn, ask.other) {
+					t.Errorf("%s.SpawnCommand was built for %s but names %s, so it is answering from something it kept rather than from its options: %s",
+						kind, ask.want, ask.other, spawn)
+				}
 			}
 		})
 	}

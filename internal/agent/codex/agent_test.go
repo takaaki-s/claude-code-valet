@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,75 +54,52 @@ func TestAgent_Setup_NoFileWrites(t *testing.T) {
 	}
 }
 
-func TestAgent_Setup_CapturesExecPath(t *testing.T) {
-	a := New()
-	if err := a.Setup(agent.SetupContext{ExecPath: "/opt/jin"}); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	plan := a.SpawnCommand(agent.SpawnOptions{})
-	if !strings.Contains(plan.Command, "/opt/jin hook") {
-		t.Errorf("SpawnCommand does not use captured ExecPath: %q", plan.Command)
-	}
-}
-
-func TestAgent_Setup_LaterExecPathWins(t *testing.T) {
-	// One adapter instance is shared by the whole process while ExecPath is
-	// the stable copy one Manager established under its own state directory,
-	// so a second Manager must not be handed the first one's binary. Pinning
-	// the first is what a sync.Once here does, and the path it pins does not
-	// merely go stale — the directory it lives under belongs to the other
-	// Manager and can be gone, which costs callbacks exit 127.
-	a := New()
-	if err := a.Setup(agent.SetupContext{ExecPath: "/first/jin"}); err != nil {
-		t.Fatalf("Setup(first): %v", err)
-	}
-	if err := a.Setup(agent.SetupContext{ExecPath: "/second/jin"}); err != nil {
-		t.Fatalf("Setup(second): %v", err)
-	}
-	plan := a.SpawnCommand(agent.SpawnOptions{})
-	if !strings.Contains(plan.Command, "/second/jin hook") {
-		t.Errorf("second Setup did not win — Command=%q", plan.Command)
-	}
-	if strings.Contains(plan.Command, "/first/jin") {
-		t.Errorf("first Setup still named in Command=%q", plan.Command)
-	}
-}
-
-func TestAgent_Setup_ConcurrentSafe(t *testing.T) {
-	// The Agent contract allows Setup and SpawnCommand from parallel
-	// goroutines. execPath is mutable, so setupMu is what makes that legal;
-	// the test hammers 32 concurrent starters to check the race detector
-	// agrees.
+// TestAgent_SpawnCommand_ConcurrentSpawnsDoNotCross is the regression test for
+// the hazard that outlived the mutex.
+//
+// A mutex made the shared execPath field safe to write and read, but Setup and
+// SpawnCommand are two separate calls with no lock spanning them
+// (session.Manager.buildAgentShellCmd), so two sessions could interleave as
+// Setup(A) → Setup(B) → SpawnCommand(A), and A was handed B's binary. One
+// Manager per process kept that out of production — both sessions then name the
+// same path — but nothing made it impossible.
+//
+// Each spawn now carries its own ExecPath, so the interleave has nothing to
+// corrupt. The assertion is per-goroutine on purpose: 32 starters each check
+// they were given THEIR OWN path, which the field-and-mutex design cannot
+// satisfy however correct its locking, because there is only one field.
+func TestAgent_SpawnCommand_ConcurrentSpawnsDoNotCross(t *testing.T) {
 	a := New()
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_ = a.Setup(agent.SetupContext{ExecPath: "/race/jin"})
-			plan := a.SpawnCommand(agent.SpawnOptions{})
-			if !strings.Contains(plan.Command, "codex") {
-				t.Errorf("goroutine %d got empty Command: %q", i, plan.Command)
+			exec := fmt.Sprintf("/manager-%d/bin/jin", i)
+			// The order a real spawn uses: Setup, then SpawnCommand.
+			_ = a.Setup(agent.SetupContext{ExecPath: exec})
+			plan := a.SpawnCommand(agent.SpawnOptions{ExecPath: exec})
+			if !strings.Contains(plan.Command, exec+" hook") {
+				t.Errorf("goroutine %d was handed %q, want its own %q", i, plan.Command, exec)
 			}
 		}(i)
 	}
 	wg.Wait()
 }
 
-func TestAgent_SpawnCommand_BeforeSetup(t *testing.T) {
-	// If SpawnCommand fires before Setup (defensive), execPath is empty
-	// and HookArgs returns nil, so only the config overrides remain. This
-	// ensures the session still starts even if Setup was skipped or failed
-	// silently — and that the overrides, which do not depend on execPath,
-	// are not lost along with the hooks.
-	a := New()
-	plan := a.SpawnCommand(agent.SpawnOptions{})
+func TestAgent_SpawnCommand_NoExecPath(t *testing.T) {
+	// An empty ExecPath is reachable in production, not merely defensive: the
+	// Manager passes what EstablishHookBinary resolved, and that is "" when
+	// even os.Executable() failed. HookArgs then returns nil, so only the
+	// config overrides remain — the session still starts, without hooks, and
+	// the overrides (which depend on no binary path) are not lost with them.
+	plan := New().SpawnCommand(agent.SpawnOptions{ExecPath: ""})
 	want := "codex " + strings.Join(configArgs(), " ")
 	if plan.Command != want {
-		t.Errorf("pre-Setup Command = %q, want %q", plan.Command, want)
+		t.Errorf("Command = %q, want %q", plan.Command, want)
 	}
 	if strings.Contains(plan.Command, "hooks") {
-		t.Errorf("pre-Setup Command = %q, want no hook args", plan.Command)
+		t.Errorf("Command = %q, want no hook args", plan.Command)
 	}
 }
 

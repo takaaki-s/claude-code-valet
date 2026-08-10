@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -75,10 +76,41 @@ func TestSpawnCommand_EmptyAgentSessionIDOmitsBothFlags(t *testing.T) {
 	}
 }
 
+// TestSpawnCommand_EmptyStateDirOmitsSettingsFlag pins the guard in
+// existingHooksSettings, and the staging is what gives it force.
+//
+// hooksSettingsPath("") is the RELATIVE name "hooks-settings.json". The spawn
+// this answers for runs in the session's own working directory, so without the
+// guard a repository that happened to contain a file by that name would be
+// handed to Claude Code as its hook configuration — a file of shell commands,
+// from the checkout rather than from jind-ai's state.
+//
+// Run from a directory with no such file, the read fails whether or not the
+// guard exists and the assertion holds for the wrong reason: measured, removing
+// the guard left the whole suite green. Standing where the relative name WOULD
+// resolve is what separates "guarded" from "got lucky".
+func TestSpawnCommand_EmptyStateDirOmitsSettingsFlag(t *testing.T) {
+	isolateHome(t)
+	t.Chdir(t.TempDir())
+	// Staged under the package's own spelling of the name: with a literal here,
+	// renaming the file would leave the bait where nothing looks for it and
+	// this assertion would pass for the wrong reason. Usable by
+	// usableHooksSettings, so nothing but the guard can reject it.
+	bait := []byte(`{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo bait","timeout":5}]}]}}`)
+	if err := os.WriteFile(hooksSettingsFileName, bait, 0o644); err != nil {
+		t.Fatalf("staging the relative file: %v", err)
+	}
+
+	plan := New().SpawnCommand(agent.SpawnOptions{})
+	if strings.Contains(plan.Command, "--settings") {
+		t.Errorf("Command = %q, want no --settings: an empty state dir names nothing", plan.Command)
+	}
+}
+
 func TestSpawnCommand_HooksPathAddsSettingsFlag(t *testing.T) {
-	// Goes through Setup rather than assigning the field: hooksPath is guarded
-	// by setupMu, so a test that poked it directly would be an unlocked write
-	// and -race would be right to complain.
+	// Goes through Setup rather than planting a file, so what is exercised is
+	// the pair a real spawn runs: Setup writes into the state dir, and
+	// SpawnCommand — handed the same directory — finds what it left.
 	isolateHome(t)
 	stateDir := t.TempDir()
 	a := New()
@@ -86,7 +118,7 @@ func TestSpawnCommand_HooksPathAddsSettingsFlag(t *testing.T) {
 		t.Fatalf("Setup: %v", err)
 	}
 	want := "--settings " + hooksSettingsPath(stateDir)
-	plan := a.SpawnCommand(agent.SpawnOptions{})
+	plan := a.SpawnCommand(agent.SpawnOptions{StateDir: stateDir})
 	if !strings.Contains(plan.Command, want) {
 		t.Errorf("Command = %q, want %q", plan.Command, want)
 	}

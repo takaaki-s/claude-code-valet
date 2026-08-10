@@ -22,9 +22,11 @@ const sessionArgEnv = "JIN_CLAUDE_SESSION"
 // its fixed shell wrapper. The wrapper handles cwd + JIN_SESSION_ID + env -u
 // TMUX; we only own the agent-specific pieces:
 //
-//   - `--settings <path>` when Setup successfully wrote the hooks file.
-//     Omitted otherwise so the CLI still starts (with default settings) and
-//     the user gets a working session, just without status hooks.
+//   - `--settings <path>` when opts.StateDir still holds a usable hooks file —
+//     normally the one Setup wrote moments ago, sometimes one an earlier spawn
+//     left there when this session's own write failed. Omitted otherwise so the
+//     CLI still starts (with default settings) and the user gets a working
+//     session, just without status hooks.
 //   - `--session-id "$JIN_CLAUDE_SESSION"` on the very first spawn, or
 //     `--resume "$JIN_CLAUDE_SESSION"` when the session has already been
 //     started at least once. Falling through both branches (empty
@@ -36,12 +38,13 @@ const sessionArgEnv = "JIN_CLAUDE_SESSION"
 // via a hook, and we must strip it before spawning a *new* CC to avoid the
 // child thinking it's already inside a CC session.
 func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
-	// Read once, under the lock, into a local: the path is decided by the most
-	// recent Setup and a second read could see a different one. Snapshotting
-	// also keeps the lock off the string formatting below.
-	a.setupMu.Lock()
-	hooksPath := a.hooksPath
-	a.setupMu.Unlock()
+	// Asked of the state directory itself rather than remembered from Setup.
+	// Setup ran for this spawn moments ago and normally leaves a usable file
+	// right here; when its write failed, this answers with whatever the
+	// directory can still serve, and with "" when that is nothing — which is
+	// what drops --settings below. See existingHooksSettings for what it will
+	// and will not serve.
+	hooksPath := existingHooksSettings(opts.StateDir)
 
 	cmd := "claude"
 	if hooksPath != "" {

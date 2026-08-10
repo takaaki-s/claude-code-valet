@@ -13,6 +13,37 @@ import "github.com/takaaki-s/jind-ai/internal/transcript"
 // build the shell command that starts (or resumes) the agent inside a tmux
 // pane.
 type SpawnOptions struct {
+	// StateDir is jind-ai's persistent state directory
+	// (~/.local/state/jind-ai) — the same value Setup was handed for this
+	// spawn, and the root of whatever Setup wrote there.
+	//
+	// It is here so that no adapter has to carry this value from Setup to the
+	// spawn. The registry hands out ONE adapter instance per kind for the whole
+	// process (internal/agent/registry.go), while this value belongs to the
+	// Manager starting this one session — so an adapter that remembered it
+	// would be answering for whichever Manager wrote last. Derive what the
+	// spawn needs from the options of THIS call and keep no field: with nothing
+	// to remember between Setup and the spawn, there is nothing for a second
+	// session's Setup to overwrite. (Adapters may still lock for their own
+	// reasons — Codex guards a rollout-path cache — but not for this.)
+	//
+	// Derive rather than assume. Setup is best-effort and its failures are
+	// swallowed, so the artefacts it writes here may be absent — the Claude
+	// Code adapter reads back what this directory can still serve, and the
+	// opencode adapter checks its plugin is present, each omitting its flag
+	// when there is nothing to point at.
+	StateDir string
+	// ExecPath is the jin binary this session's children re-enter to call
+	// back — the same value Setup received, repeated here because
+	// SpawnCommand names it directly (the Codex adapter's `-c hooks.…`
+	// payloads) rather than only through a file Setup wrote.
+	//
+	// It is not os.Executable(): the Manager passes the stable copy
+	// EstablishHookBinary took under its own state directory, falling back to
+	// the live path when that copy could not be made, and to empty when even
+	// that cannot be resolved. Empty is reachable in production, so treat it
+	// as "no callback path" rather than as impossible.
+	ExecPath string
 	// JinSessionID is jind-ai's own session UUID. Adapters typically expose
 	// it to the agent via the JIN_SESSION_ID env var so hook callbacks can
 	// correlate back to a jind-ai session.
@@ -280,6 +311,16 @@ type StatusSource interface {
 // path and the quick-fail resume retry both go through it — before the shell
 // command is built. Adapters use it to write agent-side config files (Claude
 // Code's hooks-settings.json, trust dialog state, ...).
+//
+// Its three fields all appear on SpawnOptions too, carrying the same values
+// from the same call site, and the duplication is deliberate: this type is
+// narrower, and the difference is the contract. A Setup handed SpawnOptions
+// could read AgentSessionID and AgentSessionStarted, and nothing about
+// preparing a directory should depend on whether the session is being resumed.
+// Keeping the smaller type says that in the signature rather than in a comment
+// somebody has to obey. TestBuildAgentShellCmd_TellsTheAdapterOneStory pins
+// that all three of these fields arrive with the same values on both structs,
+// so the copy cannot drift.
 type SetupContext struct {
 	// StateDir is jind-ai's persistent state directory
 	// (~/.local/state/jind-ai).
@@ -410,22 +451,18 @@ type Agent interface {
 	// but do not abort the launch — see the Claude Code adapter for the
 	// intended failure semantics.
 	//
-	// Derive what the spawn needs from the ctx of THIS call rather than
-	// caching the first one. The registry hands out one adapter instance
-	// for the whole process (internal/agent/registry.go), while a
-	// SetupContext describes the Manager starting this one session, so a
-	// sync.Once here pins whichever Manager got there first — including a
-	// StateDir whose owner has since deleted it. A field derived from ctx
-	// is therefore rewritten on every call and read back by SpawnCommand,
-	// which puts it under the concurrency rule above and means it needs a
-	// mutex; the opencode and Claude Code adapters are the worked examples.
+	// Write into the ctx of THIS call and carry nothing out of it. The
+	// registry hands out one adapter instance for the whole process
+	// (internal/agent/registry.go) while a SetupContext describes the Manager
+	// starting this one session, so a value kept here would answer for
+	// whichever Manager wrote last — and SpawnCommand does not need one,
+	// because it is handed the same paths itself (see SpawnOptions.StateDir).
 	//
-	// The rule binds the failure path as well: a value derived from an
-	// earlier SetupContext may survive a failure only where it is still
-	// derivable from this one — see the Claude Code adapter, which falls
-	// back to what ctx.StateDir itself holds rather than to whatever the
-	// field last named. The opencode adapter is the one that does not, and
-	// its own Setup doc says so and says what is unmeasured about it.
+	// That is what makes the concurrency rule above cheap to satisfy for the
+	// hand-off: with nothing kept between the two calls, a second session's
+	// Setup has nothing of this one's to overwrite. Whatever an implementation
+	// touches on its own account is still its own to make safe — the Claude
+	// Code adapter's Setup takes claude.trustMu to edit ~/.claude.json.
 	Setup(SetupContext) error
 	// SpawnCommand returns the shell command + env additions that launch
 	// (or resume) the agent for the given session.

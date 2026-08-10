@@ -106,18 +106,56 @@ func WritePlugin(stateDir, execPath string) (string, error) {
 		return "", fmt.Errorf("opencode: empty exec path")
 	}
 
-	configDir := filepath.Join(stateDir, "opencode")
-	pluginDir := filepath.Join(configDir, "plugin")
-	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+	dst := pluginPath(stateDir)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("opencode: create plugin dir: %w", err)
 	}
 
 	src := strings.ReplaceAll(pluginSource, execPathPlaceholder, quoteForJS(execPath))
-	pluginPath := filepath.Join(pluginDir, "jin.ts")
-	if err := atomicfile.Write(pluginPath, []byte(src), pluginFileMode, pluginTmpPattern); err != nil {
+	if err := atomicfile.Write(dst, []byte(src), pluginFileMode, pluginTmpPattern); err != nil {
 		return "", fmt.Errorf("opencode: write plugin: %w", err)
 	}
-	return configDir, nil
+	return configDirFor(stateDir), nil
+}
+
+// configDirFor is the directory handed to opencode as OPENCODE_CONFIG_DIR for
+// a session whose Manager keeps its state in stateDir.
+func configDirFor(stateDir string) string {
+	return filepath.Join(stateDir, "opencode")
+}
+
+// pluginPath is the single spelling of where the plugin lives. Both the write
+// and the check below go through it, so the layout opencode's
+// {plugin,plugins}/*.{ts,js} glob expects is stated once.
+func pluginPath(stateDir string) string {
+	return filepath.Join(configDirFor(stateDir), "plugin", "jin.ts")
+}
+
+// installedConfigDir answers what SpawnCommand should hand opencode for a
+// spawn rooted at stateDir: the config directory when a plugin is actually
+// there to load, and "" when there is none — which is what makes the spawn
+// omit OPENCODE_CONFIG_DIR and start opencode without jind-ai's status
+// reporting rather than pointing it at nothing.
+//
+// The empty-stateDir guard is not defensive noise. filepath.Join("", "opencode")
+// is the RELATIVE path "opencode", which opencode would resolve against a
+// working directory this package does not choose.
+//
+// It stats where the Claude Code adapter's equivalent reads, and the asymmetry
+// has a reason rather than being an oversight. existingHooksSettings reads
+// because a settings file could have been left zero-length by a jind-ai old
+// enough to have written it in place, and Claude Code treats an unparsable one
+// as a whole-config failure. This plugin has only ever been published by rename
+// (see WritePlugin), so a half-written jin.ts has never been observable, and
+// there is no torn state for a read to detect that a stat would miss.
+func installedConfigDir(stateDir string) string {
+	if stateDir == "" {
+		return ""
+	}
+	if _, err := os.Stat(pluginPath(stateDir)); err != nil {
+		return ""
+	}
+	return configDirFor(stateDir)
 }
 
 // WriteAgentContext materialises the agent-facing jin context into configDir

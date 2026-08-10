@@ -87,7 +87,7 @@ func isResume(opts agent.SpawnOptions) bool {
 // authentication vars (CODEX_API_KEY / CODEX_ACCESS_TOKEN /
 // OPENAI_API_KEY) are intentionally left set so the spawned Codex can
 // authenticate.
-func SpawnCommand(opts agent.SpawnOptions, execPath string) agent.SpawnPlan {
+func SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 	base := "codex"
 	var extraEnv map[string]string
 	if isResume(opts) {
@@ -97,7 +97,12 @@ func SpawnCommand(opts agent.SpawnOptions, execPath string) agent.SpawnPlan {
 		extraEnv = map[string]string{sessionArgEnv: opts.AgentSessionID}
 	}
 	args := configArgs()
-	args = append(args, HookArgs(execPath)...)
+	// Straight from the options rather than from anything Setup kept — this
+	// adapter carries nothing between the two calls (see the type's doc, which
+	// also names the rollout cache it does keep, for its own unrelated reason).
+	// An empty ExecPath is reachable in production, and HookArgs answers it
+	// with a hook-less invocation.
+	args = append(args, HookArgs(opts.ExecPath)...)
 	cmd := base
 	if len(args) > 0 {
 		cmd = base + " " + strings.Join(args, " ")

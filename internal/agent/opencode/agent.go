@@ -20,7 +20,6 @@ package opencode
 import (
 	"fmt"
 	"strings"
-	"sync"
 	"unicode"
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
@@ -29,24 +28,15 @@ import (
 
 var opencodeLog = debug.NewLogger("daemon-debug.log")
 
-// Agent is the process-wide opencode adapter state.
+// Agent is the process-wide opencode adapter state. Nothing here comes from a
+// Setup: statusSrc is cached only so hot-path StatusSource() calls on every
+// hook don't reallocate, and it is built in New and never reassigned, so it
+// needs no lock.
 //
-//   - configDir is the OPENCODE_CONFIG_DIR value Setup materialised the
-//     plugin into. Empty means Setup has not run or the write failed; the
-//     spawn path then omits the env var entirely and opencode starts
-//     without the jind-ai plugin (see SpawnCommand for the fail-open
-//     rationale).
-//   - statusSrc is cached so hot-path StatusSource() calls on every hook
-//     don't reallocate.
-//
-// setupMu guards configDir on both sides because the directory belongs to the
-// Manager whose SetupContext named it, while this adapter belongs to the
-// process. Setup runs per spawn, from a per-session goroutine, and a process
-// hosting two Managers — the e2e suite builds a daemon per test — writes two
-// different directories into this one field while SpawnCommand reads it.
+// The OPENCODE_CONFIG_DIR a spawn is given is worked out from
+// SpawnOptions.StateDir on each call — see installedConfigDir — rather than
+// remembered from the Setup that wrote it.
 type Agent struct {
-	setupMu   sync.Mutex
-	configDir string
 	statusSrc *EventStatusSource
 }
 
@@ -79,27 +69,16 @@ func (a *Agent) Kind() string { return "opencode" }
 func (a *Agent) RecognizesSessionID(id string) bool { return hasSessionIDPrefix(id) }
 
 // Setup materialises the bundled plugin under
-// <StateDir>/opencode/plugin/jin.ts and records the directory SpawnCommand
-// hands to opencode via OPENCODE_CONFIG_DIR.
+// <StateDir>/opencode/plugin/jin.ts, which is where SpawnCommand looks for it
+// when deciding whether to hand opencode an OPENCODE_CONFIG_DIR.
 //
 // Failures are logged and swallowed: the session must still start. Losing
 // the plugin costs live status reporting (the session falls back to
 // pane-death detection), which is strictly better than refusing to launch
-// the agent at all.
-// A failure deliberately leaves the previously recorded directory in place.
-// Setup is called once per spawn, from a per-session goroutine, against one
-// shared adapter — so clearing the field here would let a failure on one
-// session silently disable status reporting for every other session already
-// running.
-//
-// That directory belongs to the Manager that last succeeded, and the adapter
-// outlives any one of them (see the contract on session.Agent.Setup), so on a
-// failure it can name a state directory this ctx does not own. This adapter
-// keeps it even so, which TestAgent_SetupFailure_KeepsPreviousConfigDir pins;
-// the Claude Code adapter answers the other way, re-deriving inside the ctx's
-// own state directory. What either answer costs opencode has not been measured
-// here, so the difference is a gap left alone rather than a considered
-// asymmetry.
+// the agent at all. A write that fails leaves whatever an earlier spawn
+// published in this same directory untouched, so one session's transient
+// failure cannot disable status reporting for the sessions already running
+// out of it — SpawnCommand asks the directory what is actually there.
 func (a *Agent) Setup(ctx agent.SetupContext) error {
 	dir, err := WritePlugin(ctx.StateDir, ctx.ExecPath)
 	if err != nil {
@@ -113,19 +92,14 @@ func (a *Agent) Setup(ctx agent.SetupContext) error {
 	if err := WriteAgentContext(dir); err != nil {
 		opencodeLog("[OPENCODE] Warning: failed to write agent context: %v", err)
 	}
-	a.setupMu.Lock()
-	defer a.setupMu.Unlock()
-	a.configDir = dir
 	return nil
 }
 
 // SpawnCommand delegates to the package-level builder with the config dir
-// captured by the most recent successful Setup.
+// this spawn's own state directory can actually offer — "" when no plugin is
+// installed there, which is what makes the builder omit OPENCODE_CONFIG_DIR.
 func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
-	a.setupMu.Lock()
-	dir := a.configDir
-	a.setupMu.Unlock()
-	return SpawnCommand(opts, dir)
+	return SpawnCommand(opts, installedConfigDir(opts.StateDir))
 }
 
 // StatusSource returns the cached interpreter for the canonical event names
