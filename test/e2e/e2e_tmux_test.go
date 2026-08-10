@@ -24,26 +24,30 @@ import (
 
 // --- helpers ---
 
-// setupE2EWithDataDir creates a daemon server using the provided sessions/config dirs.
-// The same configDir is reused as stateDir (acceptable for ephemeral test scratch).
-// Returns the client and server (server is needed for Stop in recovery tests).
-func setupE2EWithDataDir(t *testing.T, sessionsDir, configDir string) (*daemon.Client, *daemon.Server) {
+// startE2EDaemon builds a daemon for socketPath, starts it, and returns a client
+// once it is accepting connections — with the server, which a caller keeps only
+// if it has to stop it before its test ends.
+//
+// Every daemon in this suite is built here, and that is the point. The
+// goroutine, the channel Start's return value goes into, and the Cleanup that
+// stops the server are one unit; a setup that assembles them itself can get any
+// part of it wrong, and all three call sites had already drifted into three
+// different spellings, two of which threw Start's error away. Only the bare
+// `server.Start()` is a spelling errcheck can see, so listing `e2e` in
+// .golangci.yml does not on its own keep `_ = server.Start()` from coming back.
+// Owning the sequence does: there is no other way here to get a client.
+func startE2EDaemon(t *testing.T, socketPath, sessionsDir, configDir, stateDir string) (*daemon.Client, *daemon.Server) {
 	t.Helper()
 
-	isolateTmuxSocket(t)
-
-	socketPath := testutil.SocketPath(t, "e2e-tmux.sock")
-
-	server, err := daemon.NewServer(socketPath, sessionsDir, configDir, configDir)
+	server, err := daemon.NewServer(socketPath, sessionsDir, configDir, stateDir)
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
+		t.Fatalf("NewServer(sessions=%s, config=%s, state=%s): %v", sessionsDir, configDir, stateDir, err)
 	}
 
-	go func() {
-		_ = server.Start()
-	}()
+	startErr := make(chan error, 1)
+	go func() { startErr <- server.Start() }()
 
-	waitForDaemonSocket(t, socketPath)
+	waitForDaemonSocket(t, socketPath, startErr)
 
 	t.Cleanup(func() {
 		server.Stop()
@@ -52,15 +56,49 @@ func setupE2EWithDataDir(t *testing.T, sessionsDir, configDir string) (*daemon.C
 	return daemon.NewClient(socketPath), server
 }
 
+// setupE2EWithDataDir creates a daemon server using the provided sessions/config dirs.
+// The same configDir is reused as stateDir (acceptable for ephemeral test scratch).
+// Returns the client and server (server is needed for Stop in recovery tests).
+func setupE2EWithDataDir(t *testing.T, sessionsDir, configDir string) (*daemon.Client, *daemon.Server) {
+	t.Helper()
+
+	isolateTmuxSocket(t)
+
+	return startE2EDaemon(t, testutil.SocketPath(t, "e2e-tmux.sock"), sessionsDir, configDir, configDir)
+}
+
 // waitForDaemonSocket blocks until a daemon accepts a connection on socketPath,
 // and fails the test if none does. Failing here rather than proceeding matters
 // most where a test builds two daemons: a silent timeout surfaces later as the
 // wrong daemon answering, which reads as a defect in what the test asserts
 // rather than in its setup.
-func waitForDaemonSocket(t *testing.T, socketPath string) {
+//
+// startErr carries what Start returned, and watching it is what turns "no
+// daemon bound within the deadline" into the reason there is none. Start fails
+// fast when it cannot bind — the socket directory or the listen itself — so a
+// caller that only polls the socket waits out the whole deadline and then
+// reports the one fact it already had.
+//
+// Start otherwise blocks while serving, so anything arriving here means there
+// is no daemon left to reach. A nil says Stop ran: it either beat Start to the
+// stopping sentinel or closed the listener out from under the accept loop, the
+// second being what the channel receives after a test stops its own server —
+// by then this function has returned, and the buffer of one is why the sending
+// goroutine does not block on a value nobody reads. Neither is a defect in
+// Start, and neither leaves anything left to wait for.
+func waitForDaemonSocket(t *testing.T, socketPath string, startErr <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-startErr:
+			if err != nil {
+				t.Fatalf("daemon Start(%s): %v", socketPath, err)
+			} else {
+				t.Fatalf("daemon Start(%s) returned before binding: the server was stopped", socketPath)
+			}
+		default:
+		}
 		conn, err := net.Dial("unix", socketPath)
 		if err == nil {
 			conn.Close()
@@ -530,33 +568,35 @@ func setupGitWorktree(t *testing.T) (string, string) {
 
 	repoDir := t.TempDir()
 
-	// git init
-	cmd := exec.Command("git", "-C", repoDir, "init")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git init: %s: %v", out, err)
+	// Every git call below is fixture setup, so none of them has a failure
+	// worth continuing past. CombinedOutput rather than Run because git puts
+	// the reason on stderr, which an exit status on its own does not carry.
+	// The %q is so an argument with a space in it does not read as two.
+	runGit := func(args ...string) {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", repoDir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %q: %s: %v", args, out, err)
+		}
 	}
 
+	runGit("init")
+
 	// Configure git user for commit
-	exec.Command("git", "-C", repoDir, "config", "user.email", "test@test.com").Run()
-	exec.Command("git", "-C", repoDir, "config", "user.name", "test").Run()
+	runGit("config", "user.email", "test@test.com")
+	runGit("config", "user.name", "test")
 
 	// Create initial commit (required for worktree)
 	dummyFile := filepath.Join(repoDir, "README.md")
 	if err := os.WriteFile(dummyFile, []byte("init"), 0644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	exec.Command("git", "-C", repoDir, "add", ".").Run()
-	cmd = exec.Command("git", "-C", repoDir, "commit", "-m", "init")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git commit: %s: %v", out, err)
-	}
+	runGit("add", ".")
+	runGit("commit", "-m", "init")
 
 	// Create worktree
 	worktreeDir := filepath.Join(repoDir, "wt")
-	cmd = exec.Command("git", "-C", repoDir, "worktree", "add", worktreeDir, "-b", "test-branch")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git worktree add: %s: %v", out, err)
-	}
+	runGit("worktree", "add", worktreeDir, "-b", "test-branch")
 
 	return repoDir, worktreeDir
 }
@@ -713,27 +753,11 @@ func TestE2E_DeleteWorktreeAlreadyRemoved(t *testing.T) {
 func setupE2EWithStateDir(t *testing.T, stateDir string) *daemon.Client {
 	t.Helper()
 
-	socketPath := testutil.SocketPath(t, "e2e-hooks.sock")
-
-	server, err := daemon.NewServer(socketPath,
+	client, _ := startE2EDaemon(t, testutil.SocketPath(t, "e2e-hooks.sock"),
 		filepath.Join(stateDir, "sessions"),
 		filepath.Join(stateDir, "config"),
 		stateDir)
-	if err != nil {
-		t.Fatalf("NewServer(%s): %v", stateDir, err)
-	}
-
-	go func() {
-		_ = server.Start()
-	}()
-
-	waitForDaemonSocket(t, socketPath)
-
-	t.Cleanup(func() {
-		server.Stop()
-	})
-
-	return daemon.NewClient(socketPath)
+	return client
 }
 
 // startRunningSession creates one Start:true session and waits for it to reach

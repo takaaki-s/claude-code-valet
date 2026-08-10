@@ -9,6 +9,15 @@
 version: "2"
 
 run:
+  # A tagged file is invisible to every linter unless its tag is listed here,
+  # and everything listed is enabled at once — so files under different tags in
+  # the same package have to co-compile, which no test target ever asks of them.
+  # A collision surfaces as a `typecheck` issue from the lint job and as nothing
+  # at all from any test, so `go vet -tags "render e2e" ./...` is how to look for
+  # one before adding a third tag.
+  #
+  # The two below both belong here, for reasons that are not the same one.
+  #
   # `render` is internal/tui/model_render_test.go, the in-process View() harness
   # that exists so a layout change never has to be eyeballed by starting `jin
   # ui` against the user's real tmux server. It skips itself unless pointed at
@@ -17,13 +26,29 @@ run:
   # ui`. Listing it here type-checks it on every lint, which is the only bound
   # it needs.
   #
-  # This lives here rather than as a `go vet -tags render` line in the Makefile
-  # because CI does not go through `make lint` (it runs golangci-lint-action) or
-  # `make test` (it runs `go test -race`), so a Makefile-only guard would hold
-  # locally and nowhere else. `e2e` is absent on purpose: it has its own
-  # Makefile target and its own CI job, which compile and run it for real.
+  # `e2e` is the opposite case. `make test-e2e` and the e2e CI job both compile
+  # and run that suite, so it needs no help staying valid, and this entry used
+  # to be absent for exactly that reason. But "it gets compiled and run" answers
+  # the question `render` asks, not this one: beyond the vet subset `go test`
+  # runs on its own, nothing was holding e2e code to the rules the rest of the
+  # tree is held to, and the errcheck it had drifted into went unreported for as
+  # long as that lasted.
+  #
+  # That errcheck is not the whole of it. The exclusions rule that scopes
+  # forbidigo to internal/procgroup already says why a test that starts a
+  # process is no special case; that reasoning covers this suite, and it cannot
+  # reach a file no linter reads.
+  #
+  # Both could be tag-carrying check lines in a Makefile target instead, and
+  # `test-e2e` is one CI actually runs — though not the same line for each:
+  # `render` needs only type-checking, which `go vet -tags render` gives, while
+  # `e2e` needs the linters, which `go vet` does not run. Either way it buys a
+  # second place deciding what gets checked, free to disagree with this one,
+  # while the lint CI job — golangci-lint-action, which never runs `make lint`
+  # — would go on reading only this file.
   build-tags:
     - render
+    - e2e
 
 linters:
   enable:
