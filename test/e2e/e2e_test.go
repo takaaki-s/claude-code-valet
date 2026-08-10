@@ -47,27 +47,12 @@ func setupE2E(t *testing.T) *daemon.Client {
 	isolateTmuxSocket(t)
 
 	tmpDir := t.TempDir()
-	socketPath := testutil.SocketPath(t, "e2e.sock")
-	sessionsDir := filepath.Join(tmpDir, "sessions")
-	configDir := filepath.Join(tmpDir, "config")
-	stateDir := filepath.Join(tmpDir, "state")
 
-	server, err := daemon.NewServer(socketPath, sessionsDir, configDir, stateDir)
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	go func() {
-		server.Start()
-	}()
-
-	waitForDaemonSocket(t, socketPath)
-
-	t.Cleanup(func() {
-		server.Stop()
-	})
-
-	return daemon.NewClient(socketPath)
+	client, _ := startE2EDaemon(t, testutil.SocketPath(t, "e2e.sock"),
+		filepath.Join(tmpDir, "sessions"),
+		filepath.Join(tmpDir, "config"),
+		filepath.Join(tmpDir, "state"))
+	return client
 }
 
 func TestE2E_DaemonStartStop(t *testing.T) {
