@@ -1795,12 +1795,17 @@ Common pitfalls and caveats that agents tend to fall into.
   jin, or that builds a daemon client from `getSocketPath()`, isolate it the
   same way.
 
-- **`make test-e2e` covers two packages**, `./test/e2e/` and `./internal/tui/`.
-  The TUI's tmux-backed tests (`model_tmux_e2e_test.go`, build tag `e2e`) drive
-  unexported `Model` methods against a real outer tmux, so they cannot live in
-  the external `e2e` package. `go test ./...` does not build them, and the plain
-  unit CI job has no tmux — the `e2e` job runs `make test-e2e`, so the package
-  list only ever has to be edited in the Makefile.
+- **The e2e package list lives in the Makefile's `test-e2e` target and nowhere
+  else.** `./test/e2e/` is the external suite; the others are in-tree because
+  their tmux-backed tests (build tag `e2e`) drive unexported functions and
+  cannot live there. `go test ./...` does not build them, and the plain unit CI
+  job has no tmux — the `e2e` job runs `make test-e2e`, so the list only ever
+  has to be edited in one place. This paragraph used to repeat the packages and
+  their count, and went stale; `test/e2elist` now fails the unit job when the
+  list does not name a package with e2e-tagged tests, which is how a test added
+  during this change was found running nowhere. It shells out to `make -n`, so
+  it skips where make is absent — CI has it. Note what it cannot tell you:
+  `go test -tags e2e ./...` passes locally and proves nothing about the job.
 
 ## Concurrency
 

@@ -7,12 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/agent/agenttest"
 	"github.com/takaaki-s/jind-ai/internal/config"
+	"github.com/takaaki-s/jind-ai/internal/paths"
+	"github.com/takaaki-s/jind-ai/internal/plugin"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -519,5 +522,274 @@ func TestApplySessionFilterBinding_EmptyKeySkip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(fb.calls, want) {
 		t.Errorf("BindKey calls mismatch\n got: %v\nwant: %v", fb.calls, want)
+	}
+}
+
+// --- identity: which jin the TUI and its popups reach ---
+
+// fakeTUIRespawner records what respawnTUIPane handed tmux. The environment is
+// the whole point of the call, and respawn-pane reports nothing about it, so a
+// recorder is the only way to see it.
+type fakeTUIRespawner struct {
+	calls []respawnCall
+}
+
+type respawnCall struct {
+	target, cmd string
+	env         []string
+}
+
+func (f *fakeTUIRespawner) RespawnPane(target, shellCmd string, env []string) error {
+	f.calls = append(f.calls, respawnCall{target: target, cmd: shellCmd, env: env})
+	return nil
+}
+
+// withUIEnv points this process's identity inputs at fixed values for one test.
+func withUIEnv(t *testing.T, socket, bin string, debug bool) {
+	t.Helper()
+	t.Setenv("JIN_SOCKET", socket)
+	t.Setenv("JIN_BIN", bin)
+	prev := debugEnabled
+	debugEnabled = func() bool { return debug }
+	t.Cleanup(func() { debugEnabled = prev })
+}
+
+func TestUIIdentity_TakesTheSocketThisProcessResolved(t *testing.T) {
+	withUIEnv(t, "/tmp/ui.sock", "/tmp/jin-bin", true)
+
+	id := uiIdentity()
+	if id.SocketPath != "/tmp/ui.sock" {
+		t.Errorf("SocketPath = %q, want the resolved socket %q", id.SocketPath, "/tmp/ui.sock")
+	}
+	if id.BinPath != "/tmp/jin-bin" {
+		t.Errorf("BinPath = %q, want %q", id.BinPath, "/tmp/jin-bin")
+	}
+	if !id.Debug {
+		t.Error("Debug = false, want true")
+	}
+}
+
+// TestUIIdentity_FallsBackToTheDefaultSocket covers the main production path:
+// a `jin ui` from a plain shell has no JIN_SOCKET, and resolving the default
+// here rather than leaving the child to do it is what stops the child resolving
+// it from the tmux server's XDG instead.
+func TestUIIdentity_FallsBackToTheDefaultSocket(t *testing.T) {
+	withUIEnv(t, "", "/tmp/jin-bin", false)
+
+	got := uiIdentity().SocketPath
+	if got == "" {
+		t.Fatal("SocketPath is empty; the child would resolve one from its own environment")
+	}
+	if want := paths.Socket(); got != want {
+		t.Errorf("SocketPath = %q, want %q", got, want)
+	}
+}
+
+// TestUIIdentity_MissingBinIsEmptyNotInherited pins the deliberate half: a
+// `jin ui` from a plain shell has no JIN_BIN, and the pane must be told that
+// rather than left to take whatever the tmux server holds. TmuxEnviron emits
+// the key regardless, so an empty value is what overrides a stale one.
+func TestUIIdentity_MissingBinIsEmptyNotInherited(t *testing.T) {
+	withUIEnv(t, "/tmp/ui.sock", "", false)
+
+	if got := uiIdentity().BinPath; got != "" {
+		t.Errorf("BinPath = %q, want empty", got)
+	}
+	if !slices.Contains(uiChildEnv(), "JIN_BIN=") {
+		t.Errorf("uiChildEnv() = %q, want it to contain %q", uiChildEnv(), "JIN_BIN=")
+	}
+}
+
+// TestUIChildEnv_NamesNoSession keeps the TUI out of any session's identity: a
+// stale JIN_SESSION_ID in the outer tmux server is a plausible UUID, and a pane
+// that inherited one would report another session's work as its own.
+func TestUIChildEnv_NamesNoSession(t *testing.T) {
+	withUIEnv(t, "/tmp/ui.sock", "/tmp/jin-bin", false)
+	// The precondition is the whole test: with JIN_SESSION_ID unset this
+	// assertion cannot fail, and `jin ui` launched from an agent's pane is
+	// exactly where it is set.
+	t.Setenv("JIN_SESSION_ID", "11111111-1111-1111-1111-111111111111")
+
+	if !slices.Contains(uiChildEnv(), "JIN_SESSION_ID=") {
+		t.Errorf("uiChildEnv() = %q, want it to contain %q", uiChildEnv(), "JIN_SESSION_ID=")
+	}
+}
+
+// TestUIChildEnv_NamesNoPluginChain is the other inherited value that must not
+// travel: a depth in the environment makes the daemon refuse every plugin run
+// started from a pane of this server.
+func TestUIChildEnv_NamesNoPluginChain(t *testing.T) {
+	withUIEnv(t, "/tmp/ui.sock", "/tmp/jin-bin", false)
+	t.Setenv(plugin.EnvDepth, "1")
+
+	if !slices.Contains(uiChildEnv(), plugin.EnvDepth+"=") {
+		t.Errorf("uiChildEnv() = %q, want it to contain %q", uiChildEnv(), plugin.EnvDepth+"=")
+	}
+}
+
+// TestRespawnTUIPane_AlwaysCarriesTheIdentity is the assertion the three call
+// sites rely on. They pass no environment of their own, so this is the only
+// place the answer can be got wrong — which is why the environment is not a
+// parameter.
+func TestRespawnTUIPane_AlwaysCarriesTheIdentity(t *testing.T) {
+	withUIEnv(t, "/tmp/ui.sock", "/tmp/jin-bin", true)
+
+	fr := &fakeTUIRespawner{}
+	if err := respawnTUIPane(fr, "%3", "JIN_TMUX=1 'jin' ui"); err != nil {
+		t.Fatalf("respawnTUIPane: %v", err)
+	}
+	if len(fr.calls) != 1 {
+		t.Fatalf("RespawnPane called %d times, want 1", len(fr.calls))
+	}
+	got := fr.calls[0]
+	if got.target != "%3" || got.cmd != "JIN_TMUX=1 'jin' ui" {
+		t.Errorf("respawn = (%q, %q), want (%q, %q)", got.target, got.cmd, "%3", "JIN_TMUX=1 'jin' ui")
+	}
+	// The depth clear is in this list too. uiChildEnv is one list precisely so
+	// the pane and the session cannot carry different keys, and reattach
+	// respawns before it writes the session — a pane missing the clear there
+	// inherits the tmux server's depth, and anything it launches (the editor
+	// `v` opens, for one) inherits it in turn.
+	for _, kv := range []string{
+		"JIN_SOCKET=/tmp/ui.sock", "JIN_BIN=/tmp/jin-bin", "JIN_DEBUG=1",
+		"JIN_SESSION_ID=", plugin.EnvDepth + "=",
+	} {
+		if !slices.Contains(got.env, kv) {
+			t.Errorf("respawn env = %q, want it to contain %q", got.env, kv)
+		}
+	}
+}
+
+// TestApplyOuterSessionIdentity_WritesEveryKey covers the floor under the
+// popups and plugin runs tmux starts from a key binding, which carry no
+// environment of their own. Empty values are written rather than skipped: a
+// session entry set to the empty string masks the server's global one, while
+// leaving the key out lets the global value through.
+func TestApplyOuterSessionIdentity_WritesEveryKey(t *testing.T) {
+	withUIEnv(t, "/tmp/ui.sock", "", true)
+	fe := &fakeAgentEnvSetter{}
+	applyOuterSessionIdentity(fe)
+
+	want := [][3]string{
+		{tmux.SessionName, "JIN_SOCKET", "/tmp/ui.sock"},
+		{tmux.SessionName, "JIN_BIN", ""},
+		{tmux.SessionName, "JIN_DEBUG", "1"},
+		{tmux.SessionName, "JIN_SESSION_ID", ""},
+		{tmux.SessionName, plugin.EnvDepth, ""},
+	}
+	if !reflect.DeepEqual(fe.sets, want) {
+		t.Errorf("sets = %v, want %v", fe.sets, want)
+	}
+	if len(fe.unsets) != 0 {
+		t.Errorf("unsets = %v, want none (unsetting only stops overriding the server's value)", fe.unsets)
+	}
+}
+
+// TestApplyOuterSessionIdentity_SplitsAtTheFirstEquals pins the parse against a
+// value that contains one. Splitting at the last would write a variable named
+// "JIN_SOCKET=/tmp/a" — a name nothing reads, so the socket would simply be
+// missing, which is the silent shape this whole change is about.
+func TestApplyOuterSessionIdentity_SplitsAtTheFirstEquals(t *testing.T) {
+	withUIEnv(t, "/tmp/a=b.sock", "", false)
+	fe := &fakeAgentEnvSetter{}
+	applyOuterSessionIdentity(fe)
+
+	if !slices.Contains(fe.sets, [3]string{tmux.SessionName, "JIN_SOCKET", "/tmp/a=b.sock"}) {
+		t.Errorf("sets = %v, want JIN_SOCKET set to the whole value", fe.sets)
+	}
+}
+
+// TestApplyOuterSessionIdentity_ClearsAnInheritedPluginDepth is the measured
+// failure this closes: a depth left in the tmux server's environment made the
+// daemon refuse every `jin plugin run` started from a pane of that server, and
+// the plugin key bindings discard their output, so nothing said so.
+func TestApplyOuterSessionIdentity_ClearsAnInheritedPluginDepth(t *testing.T) {
+	withUIEnv(t, "/tmp/ui.sock", "/tmp/jin-bin", false)
+	t.Setenv(plugin.EnvDepth, "1")
+	fe := &fakeAgentEnvSetter{}
+	applyOuterSessionIdentity(fe)
+
+	if !slices.Contains(fe.sets, [3]string{tmux.SessionName, plugin.EnvDepth, ""}) {
+		t.Errorf("sets = %v, want it to clear %s", fe.sets, plugin.EnvDepth)
+	}
+}
+
+// fakeUISessionOps records both halves of the outer-session setup: the
+// environment writes and the key bindings.
+type fakeUISessionOps struct {
+	fakeAgentEnvSetter
+	binds [][]string
+}
+
+func (f *fakeUISessionOps) BindKey(key string, cmdArgs ...string) error {
+	f.binds = append(f.binds, append([]string{key}, cmdArgs...))
+	return nil
+}
+
+// TestApplyOuterSessionSetup_DoesEverythingBothOrchestratorsNeed pins the whole
+// contents of the collapsed list, not just the identity write that prompted the
+// collapse. The two orchestrators call this instead of repeating its parts, so
+// this is the only place any of them can go missing from both at once — and a
+// missing one is silent: a key binding that was never issued is a key that does
+// nothing, and an identity that was never published is a popup on another
+// daemon.
+func TestApplyOuterSessionSetup_DoesEverythingBothOrchestratorsNeed(t *testing.T) {
+	withUIEnv(t, "/tmp/ui.sock", "/tmp/jin-bin", false)
+	f := &fakeUISessionOps{}
+
+	// A config that binds every core key and one plugin action, so each of the
+	// four binders has something to issue and its absence is visible.
+	yaml := "keybindings:\n" +
+		"  toggle_pane: [\"M-\\\\\"]\n" +
+		"  action_panel: [\"M-p\"]\n" +
+		"  search: [\"M-f\"]\n" +
+		"  plugins:\n    notifier:\n      actions:\n        default: { keys: [\"M-n\"] }\n"
+	const selfBin, displayPane = "/usr/local/bin/jin", "%7"
+	applyOuterSessionSetup(f, outerSessionSetup{
+		ConfigMgr:        mgrWithYAML(t, yaml),
+		AgentFlag:        "codex",
+		SelfBin:          selfBin,
+		DisplayPaneID:    displayPane,
+		InstalledPlugins: pluginSet("notifier"),
+	})
+
+	for _, want := range [][3]string{
+		{tmux.SessionName, "JIN_SOCKET", "/tmp/ui.sock"},
+		{tmux.SessionName, plugin.EnvDepth, ""},
+		// setTransientAgentEnv: the create form reads this to preselect --agent.
+		{tmux.SessionName, "JIN_UI_AGENT", "codex"},
+	} {
+		if !slices.Contains(f.sets, want) {
+			t.Errorf("sets = %v, want it to contain %v", f.sets, want)
+		}
+	}
+
+	// One key per binder, so dropping any single applier fails here rather than
+	// leaving the others to carry the assertion — and each is checked against
+	// what its command must contain, not merely that something was bound.
+	// agentFlag, selfBin and displayPaneID are three strings in a row, so a
+	// caller can transpose two of them and still compile; the result is a
+	// binding that resizes a pane named `/usr/local/bin/jin` or opens a popup
+	// by running `'%7' action-popup`, which is the silent shape this whole
+	// change is about.
+	bound := map[string]string{}
+	for _, call := range f.binds {
+		bound[call[0]] = strings.Join(call[1:], " ")
+	}
+	for _, want := range []struct{ key, what, contains string }{
+		{"M-\\", "toggle pane", displayPane},
+		{"M-p", "action palette", selfBin},
+		{"M-f", "session filter", selfBin},
+		{"M-n", "the notifier plugin action", selfBin},
+	} {
+		got, ok := bound[want.key]
+		if !ok {
+			t.Errorf("no binding for %s (%s); bound keys were %v", want.key, want.what, bound)
+			continue
+		}
+		if !strings.Contains(got, want.contains) {
+			t.Errorf("binding for %s (%s) runs %q, want it to name %q",
+				want.key, want.what, got, want.contains)
+		}
 	}
 }

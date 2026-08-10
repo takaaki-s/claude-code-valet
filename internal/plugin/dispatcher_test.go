@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -603,4 +605,378 @@ func TestRunActionRejectsUnknownAction(t *testing.T) {
 	if !strings.Contains(err.Error(), "primary, secondary") {
 		t.Errorf("error %q should list available actions", err.Error())
 	}
+}
+
+// --- refusal logging ---
+
+// capturePluginLog swaps the package logger for a recorder and returns a reader
+// for what it collected. pluginLog is a no-op in a test binary (internal/debug
+// refuses to write from one), so replacing it is the only way to see what a
+// refusal would have recorded — and the refusals that matter most reach no one
+// else: a plugin key binding fires `jin plugin run` through tmux's
+// `run-shell -b` with its output discarded.
+//
+// It is set on one dispatcher rather than on the package, so a test cannot see
+// another test's runs, and it goes in through setLog rather than by assigning
+// the field: this dispatcher's own goroutines read that field, and an
+// unsynchronised write was measured racing with them. The recorder locks for
+// the same reason on the way out.
+func capturePluginLog(t *testing.T, d *EventDispatcher) func() []string {
+	t.Helper()
+	var mu sync.Mutex
+	var lines []string
+	// Restored on the way out: subtests here share a dispatcher, and a run still
+	// in flight from an earlier one would otherwise write into a later one's
+	// recorder. No case does that today; the ordering is what makes it safe, so
+	// it should not be left to hold by luck.
+	prev := d.setLog(func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+	})
+	t.Cleanup(func() { d.setLog(prev) })
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(lines)
+	}
+}
+
+// refusalsFor returns the recorded lines reporting that a run for the given
+// plugin did not start.
+func refusalsFor(lines []string, plugin string) []string {
+	var out []string
+	for _, l := range lines {
+		if strings.Contains(l, "not started") && strings.Contains(l, plugin) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func TestRunAction_RecordsEveryRefusal(t *testing.T) {
+	d, pluginsDir, stateDir := newTestDispatcher(t, config.PluginsConfig{})
+	installTestPlugin(t, pluginsDir, stateDir, "dumper", dumpEntrypointRuntime)
+
+	tests := []struct {
+		name       string
+		plugin     string
+		action     string
+		depth      int
+		wantInLine string
+	}{
+		{"depth limit", "dumper", "default", 1, "depth limit reached"},
+		{"not installed", "absent", "", 0, "not installed"},
+		{"unknown action", "dumper", "nope", 0, "no action"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorded := capturePluginLog(t, d)
+			if err := d.RunAction(tt.plugin, tt.action, idleEvent(), tt.depth, ActionContext{}); err == nil {
+				t.Fatal("RunAction succeeded, want a refusal")
+			}
+			got := refusalsFor(recorded(), tt.plugin)
+			if len(got) != 1 {
+				t.Fatalf("recorded %d refusals for %s, want 1: %q", len(got), tt.plugin, got)
+			}
+			if !strings.Contains(got[0], tt.wantInLine) {
+				t.Errorf("logged %q, want it to mention %q", got[0], tt.wantInLine)
+			}
+			// The action id is the part only the caller knows: a depth refusal
+			// happens before any action is resolved, so the error beside it
+			// cannot name one.
+			if tt.action != "" && !strings.Contains(got[0], tt.action) {
+				t.Errorf("logged %q, want it to name the requested action %q", got[0], tt.action)
+			}
+		})
+	}
+}
+
+// TestRunAction_AcceptedRunLogsNothing is the other half: a line per accepted
+// run would make the log useless for finding the refused ones.
+func TestRunAction_AcceptedRunLogsNothing(t *testing.T) {
+	d, pluginsDir, stateDir := newTestDispatcher(t, config.PluginsConfig{})
+	installTestPlugin(t, pluginsDir, stateDir, "dumper", dumpEntrypointRuntime)
+
+	recorded := capturePluginLog(t, d)
+	if err := d.RunAction("dumper", "", idleEvent(), 0, ActionContext{}); err != nil {
+		t.Fatalf("RunAction: %v", err)
+	}
+	// The run is async, and it writes inside the plugin dir this test's TempDir
+	// owns. Waiting for it is not only about seeing the result: returning first
+	// leaves a process writing into a directory t.Cleanup is removing.
+	if !waitForFile(t, filepath.Join(pluginsDir, "dumper", "out.txt")) {
+		t.Fatal("plugin did not run")
+	}
+	if got := refusalsFor(recorded(), "dumper"); len(got) != 0 {
+		t.Errorf("recorded %q, want no refusal for an accepted run", got)
+	}
+}
+
+// TestRunAction_RefusalIsBoundAndQuoted covers the sanitising the convention
+// requires of any value the local process did not choose: `jin plugin run` puts
+// its arguments here unchecked, and a newline in one would otherwise forge
+// whole entries in a log read as jind-ai's own.
+func TestRunAction_RefusalIsBoundAndQuoted(t *testing.T) {
+	d, _, _ := newTestDispatcher(t, config.PluginsConfig{})
+
+	// Both logged values are formatted with %s, so neither is escaped by fmt and
+	// both depend on untrusted. The plugin name reaches the line through an
+	// error built the same way ("plugin %s is not installed"); the action id
+	// goes in directly. A payload in either has to come out inert, so each gets
+	// a turn.
+	forged := "x\n[2026-01-01 00:00:00.000] plugin run not started (requested action \"forged\")"
+	payload := forged + strings.Repeat("A", 4096)
+	for _, tt := range []struct{ name, plugin, action string }{
+		{"in the plugin name", payload, "act"},
+		{"in the action id", "absent", payload},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			recorded := capturePluginLog(t, d)
+			if err := d.RunAction(tt.plugin, tt.action, idleEvent(), 0, ActionContext{}); err == nil {
+				t.Fatal("RunAction succeeded, want a refusal")
+			}
+			assertInertLogLine(t, recorded())
+		})
+	}
+}
+
+// assertInert checks one recorded line cannot forge entries or fill the file —
+// the two properties debug.Untrusted is there for.
+//
+// maxLen is the caller's own ceiling rather than a multiple of logFieldMax:
+// deriving it from the constant would make the assertion move with the value it
+// is meant to guard, so a bound that grew sixteenfold would still pass. This log
+// is appended to and never rotated, so a per-line size is the property worth
+// pinning.
+func assertInert(t *testing.T, line string, maxLen int) {
+	t.Helper()
+	if strings.Contains(line, "\n") {
+		t.Errorf("logged line contains a raw newline, so one payload can forge entries: %q", line)
+	}
+	if len(line) > maxLen {
+		t.Errorf("logged line is %d bytes, want at most %d (logFieldMax is %d); one payload can fill the file",
+			len(line), maxLen, logFieldMax)
+	}
+}
+
+// assertInertLogLine checks the one recorded refusal line. Matching is on the
+// message's own prefix rather than on the caller's values: those are exactly the
+// ones being truncated.
+func assertInertLogLine(t *testing.T, lines []string) {
+	t.Helper()
+	var got string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "plugin run not started") {
+			if got != "" {
+				t.Fatalf("recorded more than one line: %q", lines)
+			}
+			got = l
+		}
+	}
+	if got == "" {
+		t.Fatalf("recorded no refusal line: %q", lines)
+	}
+	// The headroom is for what quoting does to the bound: strconv.Quote renders
+	// one control byte as four characters, so two fields cut at 256 bytes reach
+	// about 2KB in the worst case against roughly 560 for the ASCII payload in
+	// the caller. The claim is boundedness, not a tight fit.
+	assertInert(t, got, 4096)
+}
+
+// TestNewDispatcher_WiresTheProductionLogger pins the one line the tests above
+// cannot: they all install a recorder, so a dispatcher built with a logger of
+// its own would satisfy every one of them while the daemon recorded nothing.
+//
+// The check is by value, not by pointer identity. Comparing
+// reflect.Value.Pointer would compare code addresses, and every logger
+// debug.NewLogger returns shares one — so a dispatcher wired to a logger
+// writing to the wrong file would have passed, while the CHANGELOG and
+// docs/gotchas.md tell readers to look in plugin-debug.log.
+//
+// Swapping the package variable is safe here because NewDispatcher is its only
+// reader and this package's tests do not run in parallel; the swap is undone
+// before the test returns.
+func TestNewDispatcher_WiresTheProductionLogger(t *testing.T) {
+	reached := false
+	prev := pluginLog
+	pluginLog = func(string, ...any) { reached = true }
+	t.Cleanup(func() { pluginLog = prev })
+
+	d, _, _ := newTestDispatcher(t, config.PluginsConfig{})
+	d.logf("probe")
+
+	if !reached {
+		t.Error("a dispatcher's diagnostics do not reach pluginLog; refusals would go somewhere other than plugin-debug.log")
+	}
+}
+
+// TestWarnOnce_GoesThroughTheInjectedLogger and the debounce case below cover
+// the other two conversions to the seam. Without them "the dispatcher's
+// diagnostics are injectable" would be true of one call site out of three.
+func TestWarnOnce_GoesThroughTheInjectedLogger(t *testing.T) {
+	d, _, _ := newTestDispatcher(t, config.PluginsConfig{})
+	recorded := capturePluginLog(t, d)
+
+	d.warnOnce("k", "something broke: %s", "detail")
+	d.warnOnce("k", "something broke: %s", "detail")
+
+	got := recorded()
+	if len(got) != 1 {
+		t.Fatalf("recorded %d lines, want 1 (warnOnce logs once per key): %q", len(got), got)
+	}
+	if !strings.Contains(got[0], "something broke: detail") {
+		t.Errorf("recorded %q, want the formatted message", got[0])
+	}
+}
+
+func TestPublishDebounced_GoesThroughTheInjectedLogger(t *testing.T) {
+	d, pluginsDir, stateDir := newTestDispatcher(t, config.PluginsConfig{Debounce: 60})
+	installTestPlugin(t, pluginsDir, stateDir, "dumper", dumpEntrypointRuntime)
+	recorded := capturePluginLog(t, d)
+
+	d.Publish(idleEvent())
+	if !waitForFile(t, filepath.Join(pluginsDir, "dumper", "out.txt")) {
+		t.Fatal("plugin did not run for the first event")
+	}
+	d.Publish(idleEvent())
+
+	if _, ok := waitForRecordedLine(recorded, "debounced"); !ok {
+		t.Errorf("no debounce line recorded; got %q", recorded())
+	}
+}
+
+// TestSetLog_IsSafeWhileRunsAreInFlight builds the interleave the lock exists
+// for: a recorder installed while this dispatcher's own goroutines are logging.
+// Without it the field's protection is a claim rather than a guarantee — both
+// earlier attempts at this seam (a package variable, then an unguarded field)
+// raced, and each time the suite stayed green because every other test installs
+// its recorder before starting anything.
+//
+// Only meaningful under -race, which the unit CI job runs.
+func TestSetLog_IsSafeWhileRunsAreInFlight(t *testing.T) {
+	d, pluginsDir, stateDir := newTestDispatcher(t, config.PluginsConfig{})
+	installTestPlugin(t, pluginsDir, stateDir, "dumper", dumpEntrypointRuntime)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 50 {
+			// Refused runs log without spawning anything, so the goroutines
+			// reading d.log are this dispatcher's own and the test stays fast.
+			_ = d.RunAction("absent", "", idleEvent(), 0, ActionContext{})
+		}
+	}()
+	for range 50 {
+		d.setLog(func(string, ...any) {})
+	}
+	<-done
+}
+
+// TestPublish_BrokenManifestIsReportedInert covers the other value this package
+// logs that a caller chose. A plugin's manifest arrives from a registry or a
+// git checkout, and a parse failure quotes what it could not read — so the
+// error carries manifest text into a log read as jind-ai's own. Measured with a
+// raw newline in it before it was bounded.
+func TestPublish_BrokenManifestIsReportedInert(t *testing.T) {
+	d, pluginsDir, stateDir := newTestDispatcher(t, config.PluginsConfig{})
+	// No double quote in the payload: it sits inside a double-quoted YAML
+	// scalar, and one would end the scalar early — the parser would then fail
+	// somewhere else, with an error that happens not to carry a newline, and
+	// the test would pass against an unbounded log line. Measured.
+	forged := "x\n[2026-01-01 00:00:00.000] plugin run not started"
+	broken := "schema_version: \"" + forged + strings.Repeat("A", 4096) + "\"\n" +
+		"name: evil\nversion: 0.1.0\ndescription: d\njin: \">=0.0.0\"\n" +
+		"install:\n  source: {}\nactions:\n  - id: default\n    entrypoint: true\n    on: []\n"
+	installTestPlugin(t, pluginsDir, stateDir, "evil", broken)
+
+	recorded := capturePluginLog(t, d)
+	d.Publish(idleEvent())
+
+	line := assertInertDiagnostic(t, recorded, "evil")
+	// Inert is half of it. The line exists to say why the plugin was skipped,
+	// and an empty diagnostic would be inert too.
+	if !strings.Contains(line, "manifest") {
+		t.Errorf("logged line does not say what went wrong: %q", line)
+	}
+}
+
+// TestPublish_UnreadableLockIsReportedInert and the failing-run case below hold
+// the two remaining lines this package writes to the same rule as the others.
+//
+// Neither discriminates today, and that is worth saying rather than leaving for
+// the next reader to measure: removing the sanitising from either line still
+// passes. No caller-chosen text reaches them in the current code — ExecPlugin
+// reduces a failed run to `exit status N`, and a lock file that fails to parse
+// produced no newline in the errors tried here. They are regression anchors for
+// the rule, not evidence that it is load-bearing on these two lines; the lines
+// where it is are covered by TestRunAction_RefusalIsBoundAndQuoted and
+// TestPublish_BrokenManifestIsReportedInert, whose mutants do die.
+func TestPublish_UnreadableLockIsReportedInert(t *testing.T) {
+	d, pluginsDir, stateDir := newTestDispatcher(t, config.PluginsConfig{})
+	installTestPlugin(t, pluginsDir, stateDir, "dumper", dumpEntrypointRuntime)
+
+	forged := "x\n[2026-01-01 00:00:00.000] plugin run not started"
+	corrupt := "plugins:\n  dumper: " + forged + strings.Repeat("A", 4096) + "\n"
+	if err := os.WriteFile(filepath.Join(stateDir, "plugins.lock.yaml"), []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	recorded := capturePluginLog(t, d)
+	d.Publish(idleEvent())
+	assertInertDiagnostic(t, recorded, "registry")
+}
+
+func TestRun_FailingPluginIsReportedInert(t *testing.T) {
+	d, pluginsDir, stateDir := newTestDispatcher(t, config.PluginsConfig{})
+	// The entrypoint writes a forged line to stderr and exits non-zero, so the
+	// error the dispatcher reports carries text the plugin chose.
+	forged := `x\n[2026-01-01 00:00:00.000] plugin run not started`
+	failing := `schema_version: 1
+name: failer
+version: 0.1.0
+description: fails
+jin: ">=0.0.0"
+install:
+  source:
+    build: ["true"]
+    entrypoint: bash -c 'printf "` + forged + `" >&2; exit 3'
+on:
+  - status_changed:idle
+`
+	installTestPlugin(t, pluginsDir, stateDir, "failer", failing)
+
+	recorded := capturePluginLog(t, d)
+	d.Publish(idleEvent())
+	assertInertDiagnostic(t, recorded, "failer")
+}
+
+// assertInertDiagnostic waits for a recorded line naming want, checks it cannot
+// forge entries or fill the file, and returns it so a caller can go on to assert
+// what the line says.
+func assertInertDiagnostic(t *testing.T, recorded func() []string, want string) string {
+	t.Helper()
+	line, ok := waitForRecordedLine(recorded, want)
+	if !ok {
+		t.Fatalf("no line recorded naming %q", want)
+	}
+	assertInert(t, line, 1024)
+	return line
+}
+
+// waitForRecordedLine returns the first recorded line containing want. It waits
+// because the dispatch that produces one runs on its own goroutine, so the line
+// lands after the Publish that caused it returns. Three seconds, the budget this
+// package's other waits allow a plugin process.
+func waitForRecordedLine(recorded func() []string, want string) (string, bool) {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, l := range recorded() {
+			if strings.Contains(l, want) {
+				return l, true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return "", false
 }

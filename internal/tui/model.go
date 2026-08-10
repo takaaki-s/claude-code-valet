@@ -17,6 +17,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/action"
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/paths"
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
@@ -163,6 +164,7 @@ type Model struct {
 
 	// tmux integration
 	tmuxClient         *tmux.Client // outer tmux client (-L jin-mgr, nil in legacy mode)
+	popups             popupOpener  // outer tmux popup spawner; same client, narrowed — see popupOpener
 	innerTmuxClient    *tmux.Client // inner tmux client (-L jin, for switch-client)
 	tuiPaneID          string       // TUI pane unique ID (e.g. "%42") in outer tmux
 	displayPaneID      string       // Right pane unique ID (for session display) in outer tmux
@@ -191,6 +193,14 @@ type Model struct {
 	// variable. Used to detect Layer C description upgrades between polls so
 	// the tmux status bar template picks them up without a manual switch.
 	lastDisplayedDesc string
+
+	// identity is the jin every popup this Model opens must reach: the daemon
+	// `jin ui` validated, rather than whichever one the environment a popup
+	// happens to start from names. Handed in at construction so that a popup
+	// and the list behind it cannot answer "which jin" differently — the
+	// process that made the answer is `jin ui`, and it is one process further
+	// out than this one.
+	identity jinenv.Identity
 }
 
 // NewModel creates a new TUI model
@@ -219,9 +229,22 @@ func NewModel(client *daemon.Client) Model {
 // NewModelWithTmux creates a new TUI model with tmux integration.
 // The outer tmux (-L jin-mgr) has a fixed 2-pane layout:
 // left pane (TUI) + right pane (session display via RespawnPane).
-func NewModelWithTmux(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID, displayPaneID string) Model {
+//
+// identity travels as a parameter, and is not defaulted, because a Model that
+// resolved one for itself is exactly the bug this closes: every popup it opens
+// would answer "which jin" from the outer tmux server's environment, and that
+// environment named a different daemon than `jin ui` had just validated in 3 of
+// 3 trials. There is one construction site, so there is one place to answer it.
+func NewModelWithTmux(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID, displayPaneID string, identity jinenv.Identity) Model {
 	m := NewModel(client)
 	m.tmuxClient = tc
+	m.identity = identity
+	// The same client, narrowed to the one call openPopup makes. No nil guard
+	// here on purpose: tc is dereferenced a few lines down, so this constructor
+	// already requires a live client, and a guard would be an untested branch
+	// claiming to protect a case that panics before reaching it. The Models
+	// that legitimately have no tmux come from NewModel, which leaves this nil.
+	m.popups = tc
 	m.innerTmuxClient = innerTC
 	m.tuiPaneID = tuiPaneID
 	m.displayPaneID = displayPaneID
@@ -1187,17 +1210,32 @@ func (m Model) writeCursorEnv() {
 	_ = m.tmuxClient.SetEnvironment(tmux.SessionName, "JIN_CURSOR_SESSION", m.currentCursorSessionID())
 }
 
+// popupOpener is the whole outer-tmux surface openPopup needs: the one call
+// that actually spawns the popup. *tmux.Client satisfies it directly; tests
+// inject a recorder.
+//
+// The interface, and the field below, exist because that spawn is otherwise
+// unobservable — and that is measured, not assumed. With the call wired
+// straight to the concrete client, replacing openPopup's whole body with a
+// no-op passed the entire suite, including under -tags e2e; so did deleting
+// only the percent-fallback retry below. A test on popupDisplayOptions does
+// not cover it: what regresses is the spawn, and nothing obliged anyone to
+// make it.
+type popupOpener interface {
+	DisplayPopup(tmux.DisplayPopupOptions) error
+}
+
 // openPopup runs one of the hidden `jin <name>-popup` UIs inside a tmux
-// popup, sized via configMgr.GetPopupSize(name). No-op when tmuxClient or
-// configMgr is unwired (tests, legacy mode); popup errors are swallowed
+// popup, sized via configMgr.GetPopupSize(name). No-op when the popup opener
+// or configMgr is unwired (tests, legacy mode); popup errors are swallowed
 // since there is no useful recovery from a failed popup spawn mid-Bubble
 // Tea update loop.
 func (m Model) openPopup(name, title string) {
-	if m.tmuxClient == nil || m.configMgr == nil {
+	if m.popups == nil || m.configMgr == nil {
 		return
 	}
 	opts := m.popupDisplayOptions(name, title)
-	if err := m.tmuxClient.DisplayPopup(opts); err == nil {
+	if err := m.popups.DisplayPopup(opts); err == nil {
 		return
 	}
 	// A popup sized in absolute cells is refused outright by tmux when the
@@ -1213,7 +1251,7 @@ func (m Model) openPopup(name, title string) {
 		return
 	}
 	opts.Width, opts.Height = w, h
-	_ = m.tmuxClient.DisplayPopup(opts)
+	_ = m.popups.DisplayPopup(opts)
 }
 
 // popupDisplayOptions resolves the tmux display-popup arguments for a
@@ -1222,13 +1260,29 @@ func (m Model) openPopup(name, title string) {
 // and the subcommand are looked up from config's popup catalog, so config
 // keys and cobra subcommand names cannot silently drift.
 //
-// Env is left unset, which is not the same statement it is for `jin pane
-// popup`. What these popups open is more of this UI — os.Executable() is the
-// right binary for that, and jinenv.Identity.BinPath says why it is the wrong
-// one for a callback. Which daemon they should reach is a question the TUI has
-// not been given an answer to: it holds no identity, so today each popup
-// resolves one for itself from the environment the outer tmux server was
-// forked with. Unmeasured, and open.
+// Cmd and Env answer two different questions, and only one of them is about
+// this build. What these popups open is more of this UI, so os.Executable() is
+// the right binary to run — jinenv.Identity.BinPath says why it is the wrong
+// one to advertise as JIN_BIN, which is a callback address rather than a
+// program to launch.
+//
+// Env carries the identity this Model was handed, because leaving it unset does
+// not mean "inherit sensibly". A popup tmux opens is given the tmux server's
+// environment with the session's entries layered over it — neither of which
+// this process writes, and both of which outlive it: with a stale JIN_SOCKET on
+// the outer server, this TUI and its popups alike reached a daemon `jin ui` had
+// not validated, 3 of 3 trials. -e beats both layers (3 of 3), and
+// jinenv.Identity.TmuxEnviron has why every key is emitted even when its value
+// is empty.
+//
+// JIN_PLUGIN_DEPTH is not among them, unlike the environment `jin ui` gives the
+// panes it starts. It does not need to be: `jin ui` writes it empty on the
+// session these popups inherit from, and that entry masks the server's.
+//
+// The session id is empty on purpose: a popup is this UI, not work belonging to
+// one of the sessions it lists. Emitting it empty is also what clears a stale
+// id the outer server may be holding — TmuxEnviron records that one as the
+// value to fear, since a leftover UUID is plausible where an absent one is not.
 func (m Model) popupDisplayOptions(name, title string) tmux.DisplayPopupOptions {
 	width, height := m.configMgr.GetPopupSize(name)
 	selfBin, _ := os.Executable()
@@ -1237,6 +1291,7 @@ func (m Model) popupDisplayOptions(name, title string) tmux.DisplayPopupOptions 
 		Height: height,
 		Cmd:    fmt.Sprintf("'%s' %s", selfBin, config.PopupSubcmd(name)),
 		Title:  title,
+		Env:    m.identity.TmuxEnviron(""),
 	}
 }
 
@@ -3163,3 +3218,9 @@ func wrapText(text string, width int) []string {
 	}
 	return lines
 }
+
+// Identity reports which jin this Model was built to reach. Exported for
+// cmd/jin/cmd's wiring test: that package builds the Model and has no other way
+// to see whether the identity it passed arrived, and the answer decides which
+// daemon every popup this UI opens will talk to.
+func (m Model) Identity() jinenv.Identity { return m.identity }

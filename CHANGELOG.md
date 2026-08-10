@@ -120,6 +120,38 @@ log.
 
 ### Bug Fixes
 
+- **`jin ui` now decides which daemon its own UI talks to.** The TUI runs in a
+  pane of the outer tmux server, so it used to resolve a daemon from that
+  server's environment — which holds whatever forked the server, not what the
+  `jin ui` invocation meant. The two were measured disagreeing in both
+  directions, 3 trials of 3 each: with a stale socket on the server, `jin ui`
+  confirmed a daemon was running and the TUI then died against a different,
+  dead one (`daemon is not running`, on a UI that had just started); with the
+  daemons swapped, `jin ui` refused to start while the daemon the TUI would
+  actually have used was up. The popups the TUI opens took the same
+  environment. The identity now comes from `jin ui` itself and travels to the
+  pane, to every popup, and to the outer tmux session the key bindings read.
+  What was measured is a stale `JIN_SOCKET` on the tmux server; the same split
+  is reachable wherever the server's `XDG_RUNTIME_DIR` or `TMPDIR` differs from
+  the shell's, since the default socket path is derived from those. `JIN_DEBUG`
+  travels the same way, which is a behaviour change worth knowing: a `jin ui`
+  run without it now turns debug logging off for the popups that outer tmux
+  server opens, where before they kept whatever the server was holding.
+
+- **A plugin key binding no longer stops working because of a leftover
+  environment.** A tmux server forked by a process that carried
+  `JIN_PLUGIN_DEPTH` handed it to every pane, and the daemon then refused each
+  `jin plugin run` from those panes as a plugin chaining another — measured
+  3 of 3, and invisible, since the binding runs through `run-shell -b` with its
+  output discarded. `jin ui` now states the depth as empty on its own tmux
+  session, and the daemon records every `jin plugin run` its dispatcher declines
+  to start in `plugin-debug.log` when it was started with `JIN_DEBUG=1` (a
+  `jin plugin run` that cannot reach a daemon still leaves nothing behind). A
+  depth stranded in the inner tmux server, the one the agents' panes live in, is
+  the same fault and is not covered yet. A chain started from inside a
+  `jin pane popup` is still unbounded by design — see the plugin Constraints in
+  the README.
+
 - **A session's agent is now told which daemon to call back to.** Its hooks
   used to find one by inheritance: a tmux pane is handed the tmux *server's*
   environment, and that server outlives any one daemon, so an agent reached

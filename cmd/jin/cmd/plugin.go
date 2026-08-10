@@ -128,10 +128,10 @@ func runPluginRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// JIN_PLUGIN_DEPTH is set when this CLI is invoked from inside a plugin run;
+	// plugin.EnvDepth is set when this CLI is invoked from inside a plugin run;
 	// forwarding it lets the daemon reject a plugin chaining another plugin run.
 	// An unset or malformed value is treated as depth 0 (a top-level invocation).
-	depth, _ := strconv.Atoi(os.Getenv("JIN_PLUGIN_DEPTH"))
+	depth, _ := strconv.Atoi(os.Getenv(plugin.EnvDepth))
 
 	err = client.PluginRun(daemon.PluginRunRequest{
 		Plugin:           name,

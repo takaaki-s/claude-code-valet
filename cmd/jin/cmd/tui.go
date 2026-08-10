@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -13,6 +14,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/paths"
 	"github.com/takaaki-s/jind-ai/internal/plugin"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
@@ -53,6 +55,185 @@ func applyPaneBorderStyle(tc *tmux.Client) {
 	_ = tc.SetOption("pane-border-style", inactivePaneBorderStyle, true)
 	_ = tc.SetOption("pane-border-status", "top", true)
 	_ = tc.SetOption("pane-border-format", paneBorderFormat, true)
+}
+
+// uiIdentity is the jin that this UI, and everything it opens, must reach.
+//
+// This process is where that answer is made: it resolves a socket from the
+// user's environment and checks a daemon is listening there before building
+// anything. Every other process in the tree gets the answer from here, because
+// none of them is in a position to make it — they run in panes and popups of
+// the outer tmux server, so left alone they read that server's environment,
+// which holds whatever forked it rather than whatever this invocation meant.
+// The two were measured disagreeing: with a stale JIN_SOCKET on the server,
+// `jin ui` validated a live daemon and the TUI then died against a dead one, 3
+// of 3 trials; with the daemons swapped, `jin ui` refused to start while the
+// daemon the TUI would have used was up, also 3 of 3.
+//
+// runTUIInner calls this too, and gets the same answer rather than a second
+// opinion: by then JIN_SOCKET in its environment is the value respawnTUIPane
+// put there.
+//
+// BinPath comes from JIN_BIN and nowhere else, exactly as callerPaneEnv takes
+// it — jinenv.Identity.BinPath says why a spawn site must not work it out for
+// itself. A `jin ui` launched from a plain shell has none, and emitting it
+// empty is the point rather than a shortfall: an inherited stale path exits
+// 127, while `"${JIN_BIN:-jin}"` substitutes on empty.
+func uiIdentity() jinenv.Identity {
+	return jinenv.Identity{
+		SocketPath: getSocketPath(),
+		BinPath:    os.Getenv("JIN_BIN"),
+		Debug:      debugEnabled(),
+	}
+}
+
+// uiChildEnv is the environment every process this UI starts is given, and the
+// single list both destinations below draw from — the TUI pane's -e and the
+// outer tmux session. Two lists would be two chances to disagree about a key,
+// and a key only one of them carries is a process that reads the tmux server's
+// value instead.
+//
+// No session, because nothing here belongs to one: emitting JIN_SESSION_ID
+// empty is also what clears a stale id the outer server may hold, which
+// jinenv.Identity.TmuxEnviron records as the value to fear — a leftover UUID is
+// plausible where an absent one is not.
+//
+// No plugin chain either. A depth left in a tmux server's environment is
+// inherited by every `jin plugin run` started from its panes, and the daemon
+// then refuses the run as a plugin chaining another — measured 3 of 3, and
+// invisible, because a plugin key binding fires through `run-shell -b` with its
+// output discarded. Nothing started from this UI continues a plugin's process,
+// so "not in a chain" is the honest value, and stating it beats inheriting an
+// accident.
+//
+// This reaches the outer tmux server only. A depth stranded in the inner server
+// — the one the agents' panes live in — is the same defect and is not addressed
+// here; closing it means clearing the key where every jind-ai pane is built
+// rather than where this UI is.
+func uiChildEnv() []string {
+	return append(uiIdentity().TmuxEnviron(""), plugin.EnvDepth+"=")
+}
+
+// tuiPaneRespawner is the minimal tmux surface respawnTUIPane needs.
+// *tmux.Client satisfies it directly; tests inject a fake.
+type tuiPaneRespawner interface {
+	RespawnPane(target, shellCmd string, env []string) error
+}
+
+// respawnTUIPane starts the inner TUI in a pane of the outer tmux server.
+//
+// The environment is not a parameter, so the three call sites that start this
+// pane — a fresh layout, a dead pane on reattach, and the untracked-pane
+// fallback — cannot differ in what they pass. That is a property of this
+// signature and not of the file: `tc.RespawnPane(target, cmd, nil)` remains
+// callable, and is called legitimately a few lines below for the display pane,
+// which runs a placeholder rather than a jin. Reaching for it here instead
+// would not fail — the pane would come up on whatever daemon the tmux server
+// names, silently — so the e2e tests enter both orchestrators and read the
+// respawned pane's own environment.
+func respawnTUIPane(tc tuiPaneRespawner, target, shellCmd string) error {
+	return tc.RespawnPane(target, shellCmd, uiChildEnv())
+}
+
+// applyOuterSessionIdentity publishes the same identity onto the outer tmux
+// session, which is the floor under everything tmux starts without jind-ai in
+// the loop: the popups bound to M-p / M-f, and the `jin plugin run` a plugin
+// key binding fires through run-shell. Those are issued once at startup as tmux
+// commands, so they carry no environment of their own and would otherwise read
+// the server's.
+//
+// Written as values rather than removed, empty included, for the reason
+// jinenv.Identity.TmuxEnviron gives: a session entry set to the empty string
+// masks the server's global one, while unsetting it merely stops overriding.
+//
+// The environment is not a parameter, for the same reason respawnTUIPane's is
+// not: both callers want uiChildEnv and nothing else, and a caller that passed
+// something else would not fail — it would put this UI's popups on another
+// daemon, silently.
+//
+// It takes agentEnvSetter rather than a set-only interface although it never
+// unsets: having UnsetEnvironment in reach is what lets a test assert that
+// nothing here unsets, which is the mistake this function has to keep not
+// making.
+func applyOuterSessionIdentity(tc agentEnvSetter) {
+	for _, assignment := range uiChildEnv() {
+		// Unreachable today: uiChildEnv is two lines above and every entry it
+		// builds is KEY=VALUE. Kept anyway, where internal/tui dropped a
+		// comparable nil guard, because the failure differs — that one panicked
+		// on the way to the guard, while a bare word here would quietly set a
+		// variable named after the whole token.
+		name, value, ok := strings.Cut(assignment, "=")
+		if !ok {
+			continue
+		}
+		_ = tc.SetEnvironment(tmux.SessionName, name, value)
+	}
+}
+
+// uiSessionOps is the outer-tmux surface applyOuterSessionSetup needs: the
+// environment writes and the key bindings. *tmux.Client satisfies it; tests
+// inject a fake.
+type uiSessionOps interface {
+	agentEnvSetter
+	BindKey(key string, cmdArgs ...string) error
+}
+
+// applyOuterSessionSetup applies everything the outer tmux session needs that
+// does not depend on how this invocation reached it: the identity every process
+// tmux starts from this session is given, and the bindings that start them.
+//
+// One function rather than the same calls written out in createAndAttachTmux
+// and reattachTmux, which had five of them each. Adding a sixth — this identity
+// write — to one and not the other would not fail: the UI would come up on
+// whichever daemon the tmux server names, which is exactly the defect being
+// closed and is silent when it happens. So the two lists are one list. The
+// orchestrators still decide *when* to call it.
+func applyOuterSessionSetup(tc uiSessionOps, s outerSessionSetup) {
+	setTransientAgentEnv(tc, s.AgentFlag)
+	applyOuterSessionIdentity(tc)
+	applyTogglePaneBinding(tc, s.ConfigMgr, s.DisplayPaneID)
+	applyActionPanelBinding(tc, s.ConfigMgr, s.SelfBin)
+	applySessionFilterBinding(tc, s.ConfigMgr, s.SelfBin)
+	applyPluginActionBindings(tc, s.ConfigMgr, s.SelfBin, s.InstalledPlugins)
+}
+
+// outerSessionSetup is what applyOuterSessionSetup needs, as named fields
+// rather than three strings in a row.
+//
+// The three are interchangeable to the compiler and not to tmux: transposing
+// two of them binds a key that resizes a pane named `/usr/local/bin/jin`, or
+// opens a popup by running `'%7' action-popup`, and neither reports anything.
+// Naming them makes such a swap visible where it is written; it does not
+// prevent one, since every field is a string — measured, after a comment here
+// claimed otherwise. What catches it is the e2e pass over both orchestrators,
+// which reads the agent env and the bindings back off a live tmux server;
+// covering only one of the two left the transpositions alive on the other,
+// also measured.
+type outerSessionSetup struct {
+	ConfigMgr        *config.Manager
+	AgentFlag        string
+	SelfBin          string
+	DisplayPaneID    string
+	InstalledPlugins installedPluginSetFn
+}
+
+// localPluginSet is the InstalledPlugins both orchestrators pass: the on-disk
+// registry, read when the bindings are issued rather than now. Spelled once for
+// the reason applyOuterSessionSetup exists — two copies are two chances to name
+// a different directory, and a set read from the wrong one issues no bindings
+// and says nothing.
+func localPluginSet(configMgr *config.Manager) installedPluginSetFn {
+	return func() map[string]struct{} {
+		return installedEnabledPluginNames(paths.Plugins(), configMgr)
+	}
+}
+
+// tuiModelForPane builds the Model the inner TUI runs, with this process's
+// identity supplied rather than asked for. Split out from runTUIInner because
+// runTUIInner cannot be entered from a test — it takes over the terminal — and
+// which jin the Model was given is the answer everything the TUI opens inherits.
+func tuiModelForPane(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID, displayPaneID string) tui.Model {
+	return tui.NewModelWithTmux(client, tc, innerTC, tuiPaneID, displayPaneID, uiIdentity())
 }
 
 // togglePaneBinder is the minimal tmux surface applyTogglePaneBinding needs.
@@ -176,6 +357,18 @@ func applyPluginActionBindings(tc actionPanelBinder, configMgr *config.Manager, 
 			// tmux builds still surface `run-shell -b` stdout via view-mode
 			// when a captured pane is available. The daemon dispatches
 			// asynchronously so nothing depends on the CLI's stdout.
+			//
+			// It discards the errors too, which is why this is the one caller
+			// of `jin plugin run` that can fail in total silence. A run the
+			// dispatcher declines is recorded on the daemon side for that
+			// reason — see EventDispatcher.RunAction — so a binding refused
+			// there is diagnosable from plugin-debug.log, on a daemon started
+			// with JIN_DEBUG=1.
+			//
+			// Only that far. A request the daemon rejects before the dispatcher
+			// sees it leaves nothing, and neither does a CLI that cannot reach a
+			// daemon at all — the second being the failure this file's identity
+			// plumbing exists to stop happening by accident.
 			runShellCmd := fmt.Sprintf("'%s' plugin run %s %s >/dev/null 2>&1", selfBin, name, actionID)
 			for _, key := range actions[actionID] {
 				if key == "" {
@@ -399,13 +592,13 @@ func createAndAttachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	if displayPaneID != "" {
 		_ = tc.SetEnvironment(tmux.SessionName, "JIN_DISPLAY_PANE", displayPaneID)
 	}
-	setTransientAgentEnv(tc, agentFlag)
-	applyTogglePaneBinding(tc, configMgr, displayPaneID)
 	selfBin, _ := os.Executable()
-	applyActionPanelBinding(tc, configMgr, selfBin)
-	applySessionFilterBinding(tc, configMgr, selfBin)
-	applyPluginActionBindings(tc, configMgr, selfBin, func() map[string]struct{} {
-		return installedEnabledPluginNames(paths.Plugins(), configMgr)
+	applyOuterSessionSetup(tc, outerSessionSetup{
+		ConfigMgr:        configMgr,
+		AgentFlag:        agentFlag,
+		SelfBin:          selfBin,
+		DisplayPaneID:    displayPaneID,
+		InstalledPlugins: localPluginSet(configMgr),
 	})
 	// Propagate SSH_AUTH_SOCK to tmux session so popups can access it
 	if sshAuthSock := os.Getenv("SSH_AUTH_SOCK"); sshAuthSock != "" {
@@ -416,15 +609,23 @@ func createAndAttachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	// command into the left pane and focus it. Doing this last (instead of at
 	// NewSessionWithCmd) guarantees the TUI process sees a fully-built layout on its
 	// first look, so its display-pane discovery never times out on a cold start.
+	//
+	// It also means the session environment is already written, so this pane
+	// would inherit the identity even without the -e respawnTUIPane adds — the
+	// two agree by construction, both being uiChildEnv. Nothing can observe the
+	// difference here, and a test that tried would be asserting an equivalence
+	// rather than a behaviour. The -e stays because reattach runs the opposite
+	// order, where it is the only source, and a helper that carries the identity
+	// on one path and not the other is the divergence this closed.
 	if tuiPaneID != "" {
-		_ = tc.RespawnPane(tuiPaneID, tuiInnerCmd, nil)
+		_ = respawnTUIPane(tc, tuiPaneID, tuiInnerCmd)
 		_ = tc.SelectPane(tuiPaneID)
 	}
 
 	// Bind detach key to switch to TUI pane (prefix-free binding, works with prefix=None)
 	_ = tc.BindKey(detachTmuxKey, "select-pane", "-L")
 
-	return attachToSession(tc)
+	return attachToSessionFn(tc)
 }
 
 // reattachTmux reattaches to an existing outer tmux session, respawning dead panes.
@@ -449,7 +650,7 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	if tuiPaneID != "" {
 		if tc.IsPaneDead(tuiPaneID) {
 			// TUI pane exists but dead → respawn it
-			_ = tc.RespawnPane(tuiPaneID, tuiInnerCmd, nil)
+			_ = respawnTUIPane(tc, tuiPaneID, tuiInnerCmd)
 		}
 		// Re-apply the border label in case the outer tmux server was
 		// restarted between sessions and cleared the per-pane option. Also the
@@ -460,7 +661,7 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 		_ = tc.SelectPane(tuiPaneID)
 	} else {
 		// No tracked TUI pane → respawn in UI window pane 0
-		_ = tc.RespawnPane(tmux.UITarget(0), tuiInnerCmd, nil)
+		_ = respawnTUIPane(tc, tmux.UITarget(0), tuiInnerCmd)
 		_ = tc.SelectWindow(tmux.SessionName + ":" + tmux.UIWindowName)
 	}
 
@@ -472,17 +673,44 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 		_ = tc.RespawnPane(displayPaneID, tmux.PlaceholderCmd, nil)
 		_ = tc.SetPaneOption(displayPaneID, tmux.PaneLabelOption, "")
 	}
-	setTransientAgentEnv(tc, agentFlag)
-	applyTogglePaneBinding(tc, configMgr, displayPaneID)
+	// Republishing the identity matters most here: reattach is the path where
+	// the server predates this invocation, so it is the one most likely to be
+	// holding another jin's values. It runs after the respawns above rather
+	// than before, unlike the fresh-layout path, and the order is not
+	// load-bearing for the pane: a respawned one is handed the same values as
+	// -e, which beat the session environment whenever they disagree. It is
+	// load-bearing for the test that reads that pane's environment: -e and the
+	// session entry carry identical values, so the only thing that makes the
+	// pane's copy attributable to -e is that nothing else has written it yet.
+	// Move this call above the respawns and that test stops discriminating —
+	// it will still pass, and it will stop meaning anything. So it stays here.
+	//
+	// Panes already running keep the identity they started with, deliberately —
+	// moving a live TUI onto a different daemon mid-session would be a worse
+	// answer than leaving it where it is. That does leave one asymmetry: after
+	// a `jin ui` naming a different daemon than the running TUI's, the popups
+	// tmux opens from a key binding follow the new session environment while
+	// the TUI and the popups it opens itself stay on the old one. Detaching and
+	// rerunning is what puts them back together.
 	selfBin, _ := os.Executable()
-	applyActionPanelBinding(tc, configMgr, selfBin)
-	applySessionFilterBinding(tc, configMgr, selfBin)
-	applyPluginActionBindings(tc, configMgr, selfBin, func() map[string]struct{} {
-		return installedEnabledPluginNames(paths.Plugins(), configMgr)
+	applyOuterSessionSetup(tc, outerSessionSetup{
+		ConfigMgr:        configMgr,
+		AgentFlag:        agentFlag,
+		SelfBin:          selfBin,
+		DisplayPaneID:    displayPaneID,
+		InstalledPlugins: localPluginSet(configMgr),
 	})
 
-	return attachToSession(tc)
+	return attachToSessionFn(tc)
 }
+
+// attachToSessionFn is the last thing createAndAttachTmux and reattachTmux do,
+// and the reason neither could be entered from a test: it takes over the
+// terminal and blocks until the user detaches. A function value so a test can
+// stop there and inspect what the orchestrator set up on the way — chiefly
+// whether it published this process's identity, which nothing else observes.
+// Production never reassigns it.
+var attachToSessionFn = attachToSession
 
 // attachToSession attaches to the tmux session and blocks until detach.
 func attachToSession(tc *tmux.Client) error {
@@ -573,7 +801,7 @@ func runTUIInner() error {
 	// Create inner tmux client (-L jin) for switch-client operations
 	innerTC, _ := tmux.NewClient()
 
-	model := tui.NewModelWithTmux(client, tc, innerTC, tuiPaneID, displayPaneID)
+	model := tuiModelForPane(client, tc, innerTC, tuiPaneID, displayPaneID)
 
 	// Cell-motion is the cheapest mouse mode Bubble Tea offers that still
 	// reports button presses and wheel notches. Trade-off: while the TUI pane

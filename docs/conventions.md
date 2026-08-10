@@ -89,7 +89,7 @@ var debugLog = debug.NewLogger("daemon-debug.log")   // one per log file
   resulting `jinenv.Identity` to every spawner — do not read it again at a spawn
   site. Each site once answered separately, and no site answered completely.
 
-  One exception, and it is the shape of the exception that matters: `--here`
+  Two exceptions, and it is their shape that matters. The first: `--here`
   (`callerPaneEnv` in `cmd/jin/cmd/pane.go`) never reaches the daemon, so there
   is no one to hand it an identity. It forwards its own process's — a plugin's,
   or an agent pane's shell's — rather than deriving anything, which is the same
@@ -97,6 +97,19 @@ var debugLog = debug.NewLogger("daemon-debug.log")   // one per log file
   the daemon would cost `--here` the property that it works while the daemon is
   down. A spawn site may read the environment only when nothing upstream of it
   could have been asked.
+
+  The second: `jin ui` (`uiIdentity` in `cmd/jin/cmd/tui.go`) passes the same
+  test from the other direction — it is not downstream of anyone. It is
+  the process that picks which daemon this UI manages, so there is no one above
+  it to ask — asking the daemon which socket it is on would be asking the answer
+  to supply itself. Everything it starts (the TUI's pane, every popup, the outer
+  tmux session the key bindings read) is handed that identity rather than
+  deriving one, because those all read the tmux *server's* environment when left
+  alone, and that was measured naming a different daemon than this invocation
+  validated, 3 trials of 3. Only the socket is resolved there: `BinPath` and
+  `Debug` are forwarded from this process's environment, following the first
+  exception's rule. `BinPath` is the one that could have been derived —
+  `os.Executable()` is right there — and must not be.
 - `debug.Untrusted` / `debug.UntrustedBytes` bound and quote any value the
   local process did not choose, so one payload cannot forge entries or fill the
   file.

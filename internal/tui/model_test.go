@@ -19,6 +19,7 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/action"
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/testutil"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
@@ -5367,12 +5368,156 @@ func TestOpenPopup_LooksUpSizeByName(t *testing.T) {
 }
 
 // TestOpenPopup_NoConfigMgr_NoOp verifies the configMgr=nil safeguard: an
-// unwired Model (tmuxClient and configMgr both nil — the legacy/test path)
+// unwired Model (popup opener and configMgr both nil — the legacy/test path)
 // must not panic when opening a popup, since popupDisplayOptions dereferences
 // configMgr.GetPopupSize.
 func TestOpenPopup_NoConfigMgr_NoOp(t *testing.T) {
 	m := Model{deletingIDs: map[string]bool{}}
 	m.openPopup("create", " New Session ")
+}
+
+// fakePopupOpener records what openPopup actually asked tmux for. errs[i] is
+// returned from the i-th call, so a test can make tmux refuse the first spawn
+// the way it refuses a cell-sized popup on a client too small to hold it.
+type fakePopupOpener struct {
+	calls []tmux.DisplayPopupOptions
+	errs  []error
+}
+
+func (f *fakePopupOpener) DisplayPopup(o tmux.DisplayPopupOptions) error {
+	f.calls = append(f.calls, o)
+	if len(f.calls) <= len(f.errs) {
+		return f.errs[len(f.calls)-1]
+	}
+	return nil
+}
+
+// popupTestModel is a Model wired for the popup path only: a recorder in place
+// of the outer tmux client, real config defaults, and a distinguishable
+// identity.
+func popupTestModel(t *testing.T, errs ...error) (Model, *fakePopupOpener) {
+	t.Helper()
+	configMgr, err := config.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("config.NewManager: %v", err)
+	}
+	fp := &fakePopupOpener{errs: errs}
+	return Model{
+		configMgr: configMgr,
+		popups:    fp,
+		// Non-empty on purpose: a popup must name no session, and with this
+		// zero the assertion that it does could not fail. The TUI has a
+		// displayed session for most of its life.
+		currentSessionID: "22222222-2222-2222-2222-222222222222",
+		deletingIDs:      map[string]bool{},
+		identity: jinenv.Identity{
+			SocketPath: "/tmp/from-jin-ui.sock",
+			BinPath:    "/tmp/jin-bin",
+			Debug:      true,
+		},
+	}, fp
+}
+
+// TestOpenPopup_SpawnsWithTheGivenIdentity is the assertion that the popup
+// reaches the daemon `jin ui` picked rather than the one the outer tmux server
+// names. It asserts on the spawn, not on popupDisplayOptions: the options
+// builder had a test while openPopup could be emptied out entirely without one
+// failing.
+func TestOpenPopup_SpawnsWithTheGivenIdentity(t *testing.T) {
+	m, fp := popupTestModel(t)
+	m.openPopup(config.PopupCreate, " New Session ")
+
+	if len(fp.calls) != 1 {
+		t.Fatalf("DisplayPopup called %d times, want 1", len(fp.calls))
+	}
+	want := []string{
+		"JIN_SOCKET=/tmp/from-jin-ui.sock",
+		"JIN_BIN=/tmp/jin-bin",
+		"JIN_DEBUG=1",
+		// Empty rather than absent: a popup belongs to no session, and saying
+		// so is what clears a stale id the outer tmux server may hold.
+		"JIN_SESSION_ID=",
+	}
+	for _, kv := range want {
+		if !slices.Contains(fp.calls[0].Env, kv) {
+			t.Errorf("popup Env = %q, want it to contain %q", fp.calls[0].Env, kv)
+		}
+	}
+}
+
+// TestOpenPopup_EveryCorePopupCarriesTheIdentity keeps the guarantee at the
+// catalog level: a popup added later must not be the one that quietly opens
+// without an identity. PopupPluginDefault is a resolver tier rather than a
+// popup, and is excluded the same way PopupSubcmd excludes it.
+func TestOpenPopup_EveryCorePopupCarriesTheIdentity(t *testing.T) {
+	for _, name := range config.PopupNames() {
+		if config.PopupSubcmd(name) == "" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			m, fp := popupTestModel(t)
+			m.openPopup(name, " Title ")
+			if len(fp.calls) != 1 {
+				t.Fatalf("DisplayPopup called %d times, want 1", len(fp.calls))
+			}
+			if !slices.Contains(fp.calls[0].Env, "JIN_SOCKET=/tmp/from-jin-ui.sock") {
+				t.Errorf("popup %q Env = %q, want the identity's socket", name, fp.calls[0].Env)
+			}
+		})
+	}
+}
+
+// TestOpenPopup_RetriesAtPercentWhenTheCellSizedSpawnIsRefused covers the
+// branch that keeps a destructive keypress from becoming a no-op on a client
+// too small for the confirm dialog. tmux refuses an absolute size larger than
+// the client outright, and the refusal is invisible from the TUI, so the retry
+// is the only thing that puts the dialog on screen.
+func TestOpenPopup_RetriesAtPercentWhenTheCellSizedSpawnIsRefused(t *testing.T) {
+	m, fp := popupTestModel(t, errors.New("width too large"))
+	m.openPopup(config.PopupConfirm, " Confirm ")
+
+	if len(fp.calls) != 2 {
+		t.Fatalf("DisplayPopup called %d times, want 2 (spawn + percent retry)", len(fp.calls))
+	}
+	cells := config.DefaultPopupSizes()[config.PopupConfirm]
+	if got, want := fp.calls[0].Width, fmt.Sprintf("%d", cells.Width); got != want {
+		t.Errorf("first spawn Width = %q, want the cell size %q", got, want)
+	}
+	wantW, wantH, ok := m.configMgr.PopupFallbackPercent(config.PopupConfirm)
+	if !ok {
+		t.Fatal("PopupFallbackPercent(confirm) ok = false, want true")
+	}
+	if fp.calls[1].Width != wantW || fp.calls[1].Height != wantH {
+		t.Errorf("retry size = (%q, %q), want (%q, %q)",
+			fp.calls[1].Width, fp.calls[1].Height, wantW, wantH)
+	}
+	// The retry is the same popup, so it must still name its daemon.
+	if !slices.Contains(fp.calls[1].Env, "JIN_SOCKET=/tmp/from-jin-ui.sock") {
+		t.Errorf("retry Env = %q, want the identity's socket", fp.calls[1].Env)
+	}
+}
+
+// TestOpenPopup_DoesNotRetryAPercentSizedPopup is the other half: a popup that
+// was already sized as a share of the client cannot be refused for being too
+// big, so a second identical spawn could only fail the same way.
+func TestOpenPopup_DoesNotRetryAPercentSizedPopup(t *testing.T) {
+	m, fp := popupTestModel(t, errors.New("popup failed"))
+	m.openPopup(config.PopupCreate, " New Session ")
+
+	if len(fp.calls) != 1 {
+		t.Fatalf("DisplayPopup called %d times, want 1 (no retry)", len(fp.calls))
+	}
+}
+
+// TestOpenPopup_NoOpenerIsNoOp pins the guard that keeps a Model built by
+// NewModel (no tmux) from calling into a nil opener.
+func TestOpenPopup_NoOpenerIsNoOp(t *testing.T) {
+	configMgr, err := config.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("config.NewManager: %v", err)
+	}
+	m := Model{configMgr: configMgr, deletingIDs: map[string]bool{}}
+	m.openPopup(config.PopupCreate, " New Session ")
 }
 
 // --- adoptAttachedSession / pollAttachedSessionCmd ---

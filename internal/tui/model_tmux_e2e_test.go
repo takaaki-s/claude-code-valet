@@ -3,10 +3,13 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/takaaki-s/jind-ai/internal/config"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/session"
 	"github.com/takaaki-s/jind-ai/internal/testutil"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
@@ -303,5 +306,29 @@ func TestE2E_AttachTargetsResolvedInnerSocket(t *testing.T) {
 	if strings.Contains(got, "-L "+tmux.SocketName+" ") {
 		t.Errorf("display pane runs %q — it targets the built-in default socket despite JIN_TMUX_SOCKET=%s",
 			got, innerSocket)
+	}
+}
+
+// TestNewModelWithTmux_WiresThePopupOpener covers the one link the plain tests
+// cannot reach: NewModelWithTmux needs a live client, so nothing outside this
+// file can see whether it actually hands that client to the popup path. Without
+// this, dropping the assignment would stop every popup from opening in
+// production while the whole unit suite stayed green.
+func TestNewModelWithTmux_WiresThePopupOpener(t *testing.T) {
+	tc, displayPaneID := outerTmuxFixture(t)
+
+	id := jinenv.Identity{SocketPath: "/tmp/e2e-ui.sock", BinPath: "/tmp/e2e-bin", Debug: true}
+	m := NewModelWithTmux(nil, tc, nil, "", displayPaneID, id)
+
+	if m.popups == nil {
+		t.Fatal("popups is nil — openPopup would silently no-op for the whole session")
+	}
+	if m.identity != id {
+		t.Errorf("identity = %+v, want %+v", m.identity, id)
+	}
+	// And the identity reaches the options the popup is actually spawned with.
+	opts := m.popupDisplayOptions(config.PopupCreate, " New Session ")
+	if !slices.Contains(opts.Env, "JIN_SOCKET=/tmp/e2e-ui.sock") {
+		t.Errorf("popup Env = %q, want the identity handed to the constructor", opts.Env)
 	}
 }
