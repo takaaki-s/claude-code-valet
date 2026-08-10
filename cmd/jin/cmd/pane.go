@@ -147,15 +147,19 @@ func callerPaneEnv() []string {
 	return jinenv.Identity{
 		SocketPath: getSocketPath(),
 		BinPath:    os.Getenv("JIN_BIN"),
-		Debug:      paneDebugEnabled(),
+		Debug:      debugEnabled(),
 	}.TmuxEnviron(os.Getenv("JIN_SESSION_ID"))
 }
 
-// paneDebugEnabled is a variable for the same reason internal/debug's
-// isTestBinary is: debug.Enabled() reads a package variable fixed at init, so
-// t.Setenv cannot move it and the branch a test cannot reach is the one where
-// the flag is on. Production never reassigns this.
-var paneDebugEnabled = debug.Enabled
+// debugEnabled is a variable for the same reason internal/debug's isTestBinary
+// is: debug.Enabled() reads a package variable fixed at init, so t.Setenv
+// cannot move it and the branch a test cannot reach is the one where the flag
+// is on. Production never reassigns this.
+//
+// Shared by both of this package's composition roots — callerPaneEnv here and
+// uiIdentity in tui.go — so the two cannot disagree about what "on" means for
+// a child they hand the same flag to.
+var debugEnabled = debug.Enabled
 
 // runPopupHere opens a popup over the caller's own tmux pane.
 func runPopupHere(cmdStr, title, width, height string) error {

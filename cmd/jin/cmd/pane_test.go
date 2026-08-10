@@ -314,7 +314,7 @@ func TestRunCloseHere_NoTmuxClient(t *testing.T) {
 // with JIN_DEBUG exported would otherwise fail on the environment rather than
 // on the code.
 //
-// debug.Enabled and not paneDebugEnabled, deliberately, and this is the only
+// debug.Enabled and not debugEnabled, deliberately, and this is the only
 // thing guarding that binding. Asking the seam would make both sides of every
 // comparison move together, so unbinding the seam from the real flag would
 // satisfy them all — which is what an earlier version of this helper did, and
@@ -338,11 +338,11 @@ func TestCallerPaneEnv_CarriesTheDebugFlag(t *testing.T) {
 	t.Setenv("JIN_BIN", "")
 	t.Setenv("JIN_SESSION_ID", "")
 
+	prev := debugEnabled
+	t.Cleanup(func() { debugEnabled = prev })
 	for _, on := range []bool{true, false} {
-		prev := paneDebugEnabled
-		paneDebugEnabled = func() bool { return on }
+		debugEnabled = func() bool { return on }
 		got := callerPaneEnv()
-		paneDebugEnabled = prev
 
 		want := "JIN_DEBUG="
 		if on {

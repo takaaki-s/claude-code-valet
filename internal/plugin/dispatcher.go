@@ -15,6 +15,28 @@ import (
 
 var pluginLog = debug.NewLogger("plugin-debug.log")
 
+// logFieldMax bounds one logged field. The values this package logs come from
+// `jin plugin run` arguments, which the daemon accepts without inspecting.
+const logFieldMax = 256
+
+// untrusted is debug.Untrusted at this package's bound, named once so that a
+// field added later gets the bound and the quoting together — remembering only
+// one of the two is the mistake the pair exists to prevent.
+//
+// The rule here is uniform rather than per value: everything this package
+// interpolates into a log line goes through it, except the constants and
+// integers it produced itself. Deciding per value meant deciding what each one
+// had already been checked against, and that reasoning was wrong twice — a
+// manifest error quoting the file it could not parse, and a plugin name whose
+// only validation lives in a caller two packages away. A rule with no
+// exceptions costs a few characters per line and needs no census to stay true.
+func untrusted(s string) string { return debug.Untrusted(s, logFieldMax) }
+
+// untrustedErr is the same rule for an error, which is most of what this
+// package logs. fmt.Sprint rather than Error() so that a nil one renders
+// instead of panicking: an entry's Err is a field, not a return value.
+func untrustedErr(err error) string { return untrusted(fmt.Sprint(err)) }
+
 // maxDepth bounds direct plugin→plugin chains: a plugin runs at depth 1, so a
 // run it requests would land at depth 2 and is rejected. Depth cannot follow
 // the indirect loop (plugin → `jin session send` → agent → hook) because the
@@ -28,6 +50,25 @@ var pluginLog = debug.NewLogger("plugin-debug.log")
 // which bypasses debounce by design. The indirect loop's reasoning does not
 // carry over: that one comes back as a status event through publish, the only
 // caller of passDebounce.
+//
+// That paragraph is measured, 3 trials of 3: a plugin at depth 1 opened a popup
+// with `jin pane popup --here`, EnvDepth was *unset* inside it rather than 0,
+// the `jin plugin run` issued from there was accepted, and the second plugin
+// ran at depth 1 again. Unset and 0 differ only in spelling here — the CLI's
+// strconv.Atoi("") is 0 either way — but the distinction is why the guard has
+// nothing to bite on rather than something too small.
+//
+// Left this way on purpose. Propagating the depth into panes would bound the
+// chain, and would also refuse the run a user makes by pressing a button in a
+// popup a plugin opened as its own UI, which is a documented use for popups.
+// The README says a chain started from a popup is unbounded and the author must
+// stop it; that is the contract, not an oversight.
+//
+// The inverse — a depth arriving where no plugin put one — is guarded, since
+// there the accident refuses runs rather than allowing them. A tmux server
+// forked by a process that carried EnvDepth hands it to every pane, and each
+// `jin plugin run` from those panes is then refused as a chain; `jin ui` writes
+// it empty onto its session for that reason.
 const maxDepth = 2
 
 // DefaultDebounce is the minimum interval between deliveries of the same
@@ -64,6 +105,41 @@ type EventDispatcher struct {
 	mu        sync.Mutex
 	lastFired map[string]time.Time
 	warned    map[string]bool
+	// log is where this dispatcher's diagnostics go, and it is under mu with
+	// the rest of the mutable state rather than beside the immutable
+	// configuration above. A field at all so a test can read what a run
+	// recorded — the package logger writes nothing from a test binary — and
+	// under the lock because the readers are this dispatcher's own goroutines:
+	// Publish dispatches on one, and a run it started can still be logging when
+	// a test installs its recorder. An unsynchronised field was measured racing
+	// there, which is the same fault the package variable it replaced had, one
+	// scope smaller.
+	log func(string, ...any)
+}
+
+// logf writes one diagnostic line, reading the logger under the lock and
+// calling it outside. Holding the lock across the call would also be correct —
+// nothing this package does re-enters — but it would put a file write inside
+// the mutex the debounce map uses, and the lock is not there to serialise
+// logging.
+func (d *EventDispatcher) logf(format string, args ...any) {
+	d.mu.Lock()
+	log := d.log
+	d.mu.Unlock()
+	log(format, args...)
+}
+
+// setLog installs a logger and returns the one it replaced. Only tests call it;
+// production sets the field once in NewDispatcher, before the dispatcher is
+// reachable from any goroutine. It returns the previous value so a caller
+// restoring it afterwards never has to read the field itself — a read outside
+// the lock is the thing this pair exists to prevent.
+func (d *EventDispatcher) setLog(fn func(string, ...any)) func(string, ...any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	prev := d.log
+	d.log = fn
+	return prev
 }
 
 // NewDispatcher returns a dispatcher that resolves plugins through registry
@@ -87,6 +163,7 @@ func NewDispatcher(registry *Registry, pluginsDir, stateDir string, identity jin
 		identity:      identity,
 		debounce:      debounce,
 		popupResolver: popupResolver,
+		log:           pluginLog,
 		lastFired:     make(map[string]time.Time),
 		warned:        make(map[string]bool),
 	}
@@ -100,7 +177,7 @@ func (d *EventDispatcher) Publish(ev Event) {
 func (d *EventDispatcher) publish(ev Event) {
 	entries, err := d.registry.Load()
 	if err != nil {
-		d.warnOnce("registry", "plugin registry load failed: %v", err)
+		d.warnOnce("registry", "plugin registry load failed: %s", untrustedErr(err))
 		return
 	}
 	for _, e := range entries {
@@ -108,7 +185,12 @@ func (d *EventDispatcher) publish(ev Event) {
 		case StateEnabled:
 			// handled below
 		case StateIncompatible, StateBroken:
-			d.warnOnce(e.Name+"|"+e.State.String(), "plugin %s skipped (%s): %v", e.Name, e.State, e.Err)
+			// The name comes from a key in the lock file and the error quotes
+			// the manifest it could not parse; neither was chosen here. A
+			// manifest that fails to unmarshal was measured putting a raw
+			// newline into a line read as jind-ai's own.
+			d.warnOnce(e.Name+"|"+e.State.String(), "plugin %s skipped (%s): %s",
+				untrusted(e.Name), e.State, untrustedErr(e.Err))
 			continue
 		default:
 			continue
@@ -119,7 +201,8 @@ func (d *EventDispatcher) publish(ev Event) {
 				continue
 			}
 			if !d.passDebounce(e.Name, a.ID, ev) {
-				pluginLog("plugin %s:%s debounced for %s %s:%s", e.Name, a.ID, ev.SessionID, ev.Name, ev.Status)
+				d.logf("plugin %s:%s debounced for %s %s:%s",
+					untrusted(e.Name), untrusted(a.ID), untrusted(ev.SessionID), ev.Name, ev.Status)
 				continue
 			}
 			go d.run(e, a, ev, 1, ActionContext{})
@@ -133,9 +216,37 @@ func (d *EventDispatcher) publish(ev Event) {
 // action (actions[0]) and an unknown id is a synchronous error. The run
 // itself is async. actx carries the invoking CLI's tmux context (empty when
 // not applicable).
-func (d *EventDispatcher) RunAction(name, actionID string, ev Event, callerDepth int, actx ActionContext) error {
+//
+// Every run that does not start is logged as well as returned, because the
+// caller that most needs to know is the one that cannot report: a plugin key
+// binding fires `jin plugin run` through tmux's `run-shell -b` with stdout and
+// stderr discarded, so the returned error reaches no one. A run refused that way
+// left no trace at all — measured with a depth inherited from a tmux server,
+// where every binding was refused and the screen showed nothing.
+//
+// "not started" rather than "refused" because a registry read failure comes out
+// of here too, and that is this daemon's fault rather than the caller's. One
+// word covering both would be ambiguous exactly when someone is grepping for
+// why a binding does nothing.
+//
+// Under JIN_DEBUG=1, that is: pluginLog is a no-op otherwise, so on a default
+// install the binding is still silent. Making it diagnosable without the flag
+// would mean a channel this package does not have.
+func (d *EventDispatcher) RunAction(name, actionID string, ev Event, callerDepth int, actx ActionContext) (err error) {
+	defer func() {
+		if err != nil {
+			// The error already names the plugin; the requested action is the
+			// part only the caller knows, and a depth refusal happens before
+			// any action is resolved. Both go through debug.Untrusted: they
+			// come from a `jin plugin run` argument, and a name carrying a
+			// newline would otherwise forge entries in a log read as jind-ai's
+			// own.
+			d.logf("plugin run not started (requested action %s): %s",
+				untrusted(actionID), untrustedErr(err))
+		}
+	}()
 	if callerDepth+1 >= maxDepth {
-		return fmt.Errorf("plugin %s not run: depth limit reached (JIN_PLUGIN_DEPTH=%d) — plugins cannot chain plugin runs", name, callerDepth)
+		return fmt.Errorf("plugin %s not run: depth limit reached (%s=%d) — plugins cannot chain plugin runs", name, EnvDepth, callerDepth)
 	}
 	entries, err := d.registry.Load()
 	if err != nil {
@@ -194,7 +305,8 @@ func (d *EventDispatcher) run(e Entry, a *manifest.Action, ev Event, depth int, 
 		PopupHeight: popupHeight,
 	})
 	if err != nil {
-		d.warnOnce(e.Name+"|"+a.ID+"|"+err.Error(), "plugin %s:%s failed: %v", e.Name, a.ID, err)
+		d.warnOnce(e.Name+"|"+a.ID+"|"+err.Error(), "plugin %s:%s failed: %s",
+			untrusted(e.Name), untrusted(a.ID), untrustedErr(err))
 	}
 }
 
@@ -237,6 +349,6 @@ func (d *EventDispatcher) warnOnce(key, format string, args ...any) {
 	d.warned[key] = true
 	d.mu.Unlock()
 	if !seen {
-		pluginLog(format, args...)
+		d.logf(format, args...)
 	}
 }
