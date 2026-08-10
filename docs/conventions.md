@@ -153,14 +153,18 @@ yourself.
     `Setup()` is called from `startSessionTmux` and cannot see the lock. It is
     safe only because it is a leaf — nothing beneath it re-enters
     session.Manager. Anything else added there must keep that property
-  - The same exception covers each adapter's `setupMu` (`claude.setupMu`,
-    `codex.setupMu`, `opencode.setupMu`), which guards the field `Setup`
-    derives from its `SetupContext` and `SpawnCommand` reads back. All three
-    are leaves by construction: the critical section holds nothing but the
-    assignment or the read, so there is nothing beneath them that could
-    re-enter anything. Where the adapter does I/O it stays outside that
-    section, on either side of it — the Claude Code adapter writes the hooks
-    file before taking the lock and the trust flag after releasing it
+  - No adapter carries state from its `Setup` to its `SpawnCommand`
+    (`session.SpawnOptions.StateDir` says why), so none of them needs a lock
+    for that hand-off — the three `setupMu`s that used to guard it are gone.
+    Adapters do still hold locks for their own reasons, and two of them are
+    reached under `mu`, because `startSessionTmux` runs under
+    `StartBackground`'s `mu.Lock()` and calls both `Setup` and `SpawnCommand`:
+    `claude.trustMu` (via `Setup`) and the `Locator.mu` guarding Codex's
+    rollout-path cache (via `SpawnCommand` on a resume). Both are therefore
+    covered by the exception above, and both keep the property it requires:
+    nothing beneath them re-enters session.Manager. A lock appearing between
+    `Setup` and `SpawnCommand` specifically is the thing to question: it means
+    something is being remembered that the spawn was already handed
 - Perform I/O operations (Store.Save, transcript reads) outside the lock
   - Example: `List()` takes a snapshot under RLock, then reads transcripts after releasing the lock
 

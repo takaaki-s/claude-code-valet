@@ -2590,10 +2590,16 @@ func snapshotForSpawn(session *Session, startDir, expandedWorkDir string) spawnS
 // on env vars, shell escaping, and the Setup() invariant — which is that
 // Setup runs here, with this spawn's SetupContext, immediately before
 // SpawnCommand, on both paths alike because neither reaches an adapter
-// except through this function. Adapters derive their spawn-time state from
-// the ctx of each call (see the contract on session.Agent.Setup), so a third
-// path that called SpawnCommand on its own would build its command out of
-// whatever the previous spawn left behind.
+// except through this function.
+//
+// This is also the only place that resolves the two paths every adapter builds
+// its command from (StateDir, ExecPath), and it puts them on both structs. A
+// third path that reached an adapter without coming through here would not get
+// a stale command — it would get an empty one: all three adapters fail open on
+// absent paths, so the session would start with no --settings, no
+// OPENCODE_CONFIG_DIR and no hook injection, and every adapter's own tests
+// would still pass. TestBuildAgentShellCmd_TellsTheAdapterOneStory is what
+// stands in the way.
 //
 // Pure builder: reads only the immutable snapshot; performs NO Session
 // writes. Callers own the "started once" invariant
@@ -2622,7 +2628,13 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 		debugLog("[AGENT] Setup returned error: %v", err)
 	}
 
+	// The same two paths Setup just received. SpawnCommand derives what it
+	// emits from them rather than from anything the adapter kept, which is
+	// what lets no adapter carry state from one call to the other — see
+	// SpawnOptions.StateDir.
 	plan := ag.SpawnCommand(SpawnOptions{
+		StateDir:            m.stateDir,
+		ExecPath:            m.identity.BinPath,
 		JinSessionID:        snap.JinSessionID,
 		AgentSessionID:      snap.AgentSessionID,
 		AgentSessionStarted: snap.AgentSessionStarted,

@@ -30,28 +30,26 @@ func setupIn(t *testing.T, a *Agent, stateDir, execPath string) {
 	}
 }
 
-func TestAgent_Setup_LaterStateDirWins(t *testing.T) {
-	// One adapter instance is shared by the whole process while StateDir
-	// belongs to the Manager starting a session, so a second Manager must not
-	// be handed the first one's path. This is the assertion a sync.Once here
-	// fails; TestE2E_SecondDaemonGetsItsOwnHooksSettings carries what it was
-	// measured to cost.
+func TestAgent_SpawnCommand_FollowsItsOptionsNotTheLastSetup(t *testing.T) {
+	// The inverse of what this test used to assert, and the inversion is the
+	// change. It used to demand that the LAST Setup decide the spawn, which is
+	// the best a shared field can offer. Now the spawn is decided by the
+	// options it is handed, so the older Setup's directory is the right answer
+	// when that is what the caller asks for — and a field would give the newer
+	// one however carefully it was locked.
 	isolateHome(t)
 	first, second := t.TempDir(), t.TempDir()
 	a := New()
 
 	setupIn(t, a, first, "/first/jin")
-	if got, want := a.SpawnCommand(agent.SpawnOptions{}).Command, "--settings "+hooksSettingsPath(first); !strings.Contains(got, want) {
-		t.Fatalf("after first Setup: Command = %q, want %q", got, want)
-	}
-
 	setupIn(t, a, second, "/second/jin")
-	got := a.SpawnCommand(agent.SpawnOptions{}).Command
-	if want := "--settings " + hooksSettingsPath(second); !strings.Contains(got, want) {
-		t.Errorf("after second Setup: Command = %q, want %q", got, want)
+
+	got := a.SpawnCommand(agent.SpawnOptions{StateDir: first}).Command
+	if want := "--settings " + hooksSettingsPath(first); !strings.Contains(got, want) {
+		t.Errorf("spawn built for the first state dir: Command = %q, want %q", got, want)
 	}
-	if strings.Contains(got, first) {
-		t.Errorf("second Setup still names the first state dir: Command = %q", got)
+	if strings.Contains(got, second) {
+		t.Errorf("spawn built for the first state dir names the second: Command = %q", got)
 	}
 }
 
@@ -112,12 +110,16 @@ func TestAgent_Setup_RestoresAHandEditedFile(t *testing.T) {
 	}
 }
 
-func TestAgent_Setup_FailureDoesNotLeaveAnotherStateDirsPath(t *testing.T) {
-	// The failure path is where falling back to the field would reintroduce
-	// the defect: this session would spawn with --settings pointing into a
-	// state directory it does not own. With nothing to fall back to inside
-	// its own, empty is the documented answer — the session starts, without
-	// status hooks.
+func TestAgent_SpawnCommand_FailedSetupOmitsSettingsRatherThanBorrowing(t *testing.T) {
+	// A session whose own Setup could not write has nothing to point at, and
+	// the answer is to omit --settings — the session starts, without status
+	// hooks. What it must never do is borrow: another Manager's directory was
+	// prepared for another daemon's binary, and naming it here would be the
+	// defect arriving through the error path.
+	//
+	// The good directory is set up first and deliberately still holds a usable
+	// file, so an implementation that reached for "the last one that worked"
+	// would find something and be caught.
 	isolateHome(t)
 	good := t.TempDir()
 	missing := filepath.Join(t.TempDir(), "no-such-dir")
@@ -128,12 +130,12 @@ func TestAgent_Setup_FailureDoesNotLeaveAnotherStateDirsPath(t *testing.T) {
 	// command it leaves behind, not the return value.
 	setupIn(t, a, missing, "/missing/jin")
 
-	got := a.SpawnCommand(agent.SpawnOptions{}).Command
+	got := a.SpawnCommand(agent.SpawnOptions{StateDir: missing}).Command
 	if strings.Contains(got, "--settings") {
 		t.Errorf("failed Setup still passes --settings: Command = %q", got)
 	}
 	if strings.Contains(got, good) {
-		t.Errorf("failed Setup fell back to another state dir: Command = %q", got)
+		t.Errorf("failed Setup borrowed another state dir: Command = %q", got)
 	}
 }
 
@@ -173,7 +175,7 @@ func TestAgent_Setup_FailedRewriteKeepsThisStateDirsOwnFile(t *testing.T) {
 		t.Fatalf("the rewrite succeeded, so nothing here exercised the failure path")
 	}
 
-	got := a.SpawnCommand(agent.SpawnOptions{}).Command
+	got := a.SpawnCommand(agent.SpawnOptions{StateDir: dir}).Command
 	if want := "--settings " + hooksSettingsPath(dir); !strings.Contains(got, want) {
 		t.Errorf("a failed rewrite dropped this state dir's own file: Command = %q, want %q", got, want)
 	}
@@ -224,20 +226,23 @@ func TestAgent_Setup_FailedRewriteIgnoresAnUnusableLeftoverFile(t *testing.T) {
 				t.Fatalf("the rewrite succeeded, so nothing here exercised the failure path")
 			}
 
-			if got := a.SpawnCommand(agent.SpawnOptions{}).Command; strings.Contains(got, "--settings") {
+			if got := a.SpawnCommand(agent.SpawnOptions{StateDir: dir}).Command; strings.Contains(got, "--settings") {
 				t.Errorf("an unusable leftover was passed to the agent: Command = %q", got)
 			}
 		})
 	}
 }
 
-func TestAgent_ConcurrentSetupAndSpawn(t *testing.T) {
-	// The Agent contract allows Setup and SpawnCommand from parallel
-	// goroutines (session.Agent's doc). hooksPath is now mutable, so the
-	// mutex is what makes that legal — run under -race. Each goroutine brings
-	// its own state dir so the writes genuinely differ; no assertion is made
-	// about which one wins, because with one shared field there is no answer
-	// to assert. The interleavings themselves are the test.
+func TestAgent_ConcurrentSpawnsDoNotCross(t *testing.T) {
+	// The regression test for the hazard the mutex could not reach.
+	//
+	// Setup and SpawnCommand are separate calls with no lock spanning them
+	// (session.Manager.buildAgentShellCmd), so a shared field could be
+	// overwritten between one session's Setup and its own SpawnCommand however
+	// correctly it was guarded. This test asserts per goroutine that each spawn
+	// names ITS OWN state directory, which no single-field design can satisfy;
+	// the old version of this test deliberately asserted nothing about which
+	// directory won, because there was no answer to assert.
 	isolateHome(t)
 	const goroutines = 32
 	dirs := make([]string, goroutines)
@@ -256,8 +261,9 @@ func TestAgent_ConcurrentSetupAndSpawn(t *testing.T) {
 			defer wg.Done()
 			<-start
 			_ = a.Setup(agent.SetupContext{StateDir: dirs[i], ExecPath: "/race/jin", WorkDir: dirs[i]})
-			if plan := a.SpawnCommand(agent.SpawnOptions{}); !strings.HasPrefix(plan.Command, "claude") {
-				t.Errorf("goroutine %d got Command = %q", i, plan.Command)
+			plan := a.SpawnCommand(agent.SpawnOptions{StateDir: dirs[i]})
+			if want := "--settings " + hooksSettingsPath(dirs[i]); !strings.Contains(plan.Command, want) {
+				t.Errorf("goroutine %d was handed %q, want its own %q", i, plan.Command, want)
 			}
 		}(i)
 	}

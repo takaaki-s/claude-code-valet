@@ -130,7 +130,7 @@ func TestAgent_Setup_WiresConfigDir(t *testing.T) {
 		t.Fatalf("Setup: %v", err)
 	}
 
-	plan := a.SpawnCommand(agent.SpawnOptions{})
+	plan := a.SpawnCommand(agent.SpawnOptions{StateDir: stateDir})
 	want := filepath.Join(stateDir, "opencode")
 	if got := plan.ExtraEnv["OPENCODE_CONFIG_DIR"]; got != want {
 		t.Errorf("OPENCODE_CONFIG_DIR = %q, want %q", got, want)
@@ -202,46 +202,122 @@ func TestPluginRouting_BunTest(t *testing.T) {
 	}
 }
 
-// The Agent interface documents that Setup and SpawnCommand may run from
-// several per-session goroutines at once. Run under -race.
-func TestAgent_ConcurrentSetupAndSpawn(t *testing.T) {
-	stateDir := t.TempDir()
+// TestAgent_ConcurrentSpawnsDoNotCross is the regression test for the hazard
+// the mutex could not reach: Setup and SpawnCommand are separate calls with no
+// lock spanning them (session.Manager.buildAgentShellCmd), so a shared
+// configDir could be overwritten between one session's Setup and its own
+// SpawnCommand. Each goroutine here asserts on ITS OWN directory, which no
+// single-field design can satisfy however correctly it locks. Run under -race.
+func TestAgent_ConcurrentSpawnsDoNotCross(t *testing.T) {
+	const goroutines = 16
+	dirs := make([]string, goroutines)
+	for i := range dirs {
+		dirs[i] = t.TempDir()
+	}
 	a := New()
 
 	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
+	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			_ = a.Setup(agent.SetupContext{StateDir: stateDir, ExecPath: "/usr/local/bin/jin"})
-			_ = a.SpawnCommand(agent.SpawnOptions{})
-		}()
+			_ = a.Setup(agent.SetupContext{StateDir: dirs[i], ExecPath: "/usr/local/bin/jin"})
+			plan := a.SpawnCommand(agent.SpawnOptions{StateDir: dirs[i]})
+			want := filepath.Join(dirs[i], "opencode")
+			if got := plan.ExtraEnv["OPENCODE_CONFIG_DIR"]; got != want {
+				t.Errorf("goroutine %d was handed %q, want its own %q", i, got, want)
+			}
+		}(i)
 	}
 	wg.Wait()
+}
 
-	want := filepath.Join(stateDir, "opencode")
-	if got := a.SpawnCommand(agent.SpawnOptions{}).ExtraEnv["OPENCODE_CONFIG_DIR"]; got != want {
-		t.Errorf("OPENCODE_CONFIG_DIR = %q, want %q", got, want)
+// TestAgent_SpawnCommand_NoPluginOmitsConfigDir replaces a test that pinned the
+// opposite: the adapter used to keep the last directory a Setup had succeeded
+// for, which could belong to a different Manager entirely.
+//
+// The property that actually matters survives, and is what this checks — a
+// session whose plugin could not be written starts without status reporting
+// rather than being pointed somewhere. It is now a fact about the directory
+// rather than about a field: nothing was installed here, so nothing is named.
+func TestAgent_SpawnCommand_NoPluginOmitsConfigDir(t *testing.T) {
+	good := t.TempDir()
+	a := New()
+
+	// A directory that was set up successfully, so an implementation that
+	// borrowed "the last one that worked" would have something to borrow.
+	if err := a.Setup(agent.SetupContext{StateDir: good, ExecPath: "/usr/local/bin/jin"}); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	// A state dir the plugin cannot be written into. A merely absent directory
+	// would NOT do it — WritePlugin's MkdirAll creates the whole tree — so the
+	// blocker is an <stateDir>/opencode that is already a regular file, which
+	// makes MkdirAll fail with ENOTDIR for any user, root included.
+	blocked := t.TempDir()
+	if err := os.WriteFile(filepath.Join(blocked, "opencode"), []byte("not a dir"), 0o644); err != nil {
+		t.Fatalf("planting the blocker: %v", err)
+	}
+	if err := a.Setup(agent.SetupContext{StateDir: blocked, ExecPath: "/usr/local/bin/jin"}); err != nil {
+		t.Fatalf("Setup(blocked) returned %v, want nil (fail-open)", err)
+	}
+
+	plan := a.SpawnCommand(agent.SpawnOptions{StateDir: blocked})
+	if got, ok := plan.ExtraEnv["OPENCODE_CONFIG_DIR"]; ok {
+		t.Errorf("OPENCODE_CONFIG_DIR = %q, want it omitted when no plugin is installed", got)
+	}
+	if plan.Command == "" {
+		t.Error("Command is empty; the session must still start without the plugin")
 	}
 }
 
-// A failing Setup on one session must not disable status reporting for the
-// sessions that already succeeded — the adapter is shared process-wide.
-func TestAgent_SetupFailure_KeepsPreviousConfigDir(t *testing.T) {
+// An empty StateDir must not become the RELATIVE path "opencode", which
+// opencode would resolve against a working directory this package does not
+// choose. Cheap to get wrong, and silent when it is.
+//
+// The chdir is what gives this test any force. Run from a directory with no
+// ./opencode/plugin/jin.ts, the stat fails whether or not the guard exists, so
+// the assertion holds for the wrong reason: measured, deleting the guard left
+// the whole suite green. Standing somewhere the relative path WOULD resolve is
+// what separates "guarded" from "got lucky".
+func TestAgent_SpawnCommand_EmptyStateDirOmitsConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.MkdirAll(filepath.Join(dir, "opencode", "plugin"), 0o755); err != nil {
+		t.Fatalf("staging the relative tree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "opencode", "plugin", "jin.ts"), []byte("// bait\n"), 0o644); err != nil {
+		t.Fatalf("staging the relative plugin: %v", err)
+	}
+
+	plan := New().SpawnCommand(agent.SpawnOptions{})
+	if got, ok := plan.ExtraEnv["OPENCODE_CONFIG_DIR"]; ok {
+		t.Errorf("OPENCODE_CONFIG_DIR = %q, want it omitted for an empty state dir", got)
+	}
+}
+
+// TestAgent_SpawnCommand_TreeWithoutPluginOmitsConfigDir covers the shape the
+// realistic failures actually leave behind.
+//
+// WritePlugin creates <stateDir>/opencode/plugin with MkdirAll and only then
+// writes jin.ts, so any failure of the write itself leaves the directories
+// standing and no plugin in them. A read-only filesystem that already had the
+// tree, a full one, and a plugin directory the daemon cannot write into all
+// land here; measured, each stops at the write rather than at MkdirAll.
+//
+// The sibling above blocks Setup at MkdirAll instead (an <stateDir>/opencode
+// that is a regular file), which is a different shape: measured, a version that
+// stats the plugin DIRECTORY rather than the plugin FILE passes every other
+// test in this package and is caught only by this one.
+func TestAgent_SpawnCommand_TreeWithoutPluginOmitsConfigDir(t *testing.T) {
 	stateDir := t.TempDir()
-	a := New()
-
-	if err := a.Setup(agent.SetupContext{StateDir: stateDir, ExecPath: "/usr/local/bin/jin"}); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-	// Second session start fails (empty state dir).
-	if err := a.Setup(agent.SetupContext{}); err != nil {
-		t.Fatalf("Setup(empty) returned %v, want nil", err)
+	if err := os.MkdirAll(filepath.Join(stateDir, "opencode", "plugin"), 0o755); err != nil {
+		t.Fatalf("staging the tree: %v", err)
 	}
 
-	want := filepath.Join(stateDir, "opencode")
-	if got := a.SpawnCommand(agent.SpawnOptions{}).ExtraEnv["OPENCODE_CONFIG_DIR"]; got != want {
-		t.Errorf("OPENCODE_CONFIG_DIR = %q, want the last good %q", got, want)
+	plan := New().SpawnCommand(agent.SpawnOptions{StateDir: stateDir})
+	if got, ok := plan.ExtraEnv["OPENCODE_CONFIG_DIR"]; ok {
+		t.Errorf("OPENCODE_CONFIG_DIR = %q, want it omitted: the directories are there but no plugin is", got)
 	}
 }
 
