@@ -153,6 +153,14 @@ jin daemon stop    # デーモン停止
 jin daemon status  # 状態確認
 ```
 
+**どのデーモンに届くか。** `JIN_SOCKET` があればそれを、無ければ既定のパス
+（`$XDG_RUNTIME_DIR/jind-ai/daemon.sock`、`XDG_RUNTIME_DIR` が無い環境では
+`$TMPDIR/jind-ai-<uid>/daemon.sock` —— macOS はこちらが通常）を使います。jind-ai の管理外で起動した
+tmux サーバーは fork 時の環境を保持し続けるため、そのペインから `jin` を叩くと
+古いデーモンに届くことがあります（警告は出ません）。`JIN_SOCKET` を明示するか、
+そのサーバーを立て直してください。jind-ai が開くペインは影響を受けません。
+詳細は [docs/ipc-protocol.md](docs/ipc-protocol.md#which-daemon-a-command-reaches)。
+
 ### セッション管理
 
 ```bash

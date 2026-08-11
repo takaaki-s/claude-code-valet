@@ -174,6 +174,15 @@ jin daemon stop    # Stop daemon
 jin daemon status  # Check status
 ```
 
+**Which daemon a command reaches.** `JIN_SOCKET` when set, otherwise the default
+socket path — `$XDG_RUNTIME_DIR/jind-ai/daemon.sock`, or
+`$TMPDIR/jind-ai-<uid>/daemon.sock` where `XDG_RUNTIME_DIR` is unset, which is
+the usual case on macOS. A tmux server started outside jind-ai keeps the
+environment it was forked with, so a `jin` run from one of its panes can reach
+an older daemon without saying so — set `JIN_SOCKET` or restart that server.
+Panes jind-ai opens are unaffected. Details in
+[docs/ipc-protocol.md](docs/ipc-protocol.md#which-daemon-a-command-reaches).
+
 ### Session management
 
 ```bash
