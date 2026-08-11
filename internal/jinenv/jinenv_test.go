@@ -55,6 +55,23 @@ func TestIdentity_EnvironEmpty(t *testing.T) {
 	}
 }
 
+// TestIdentity_EnvironOmitsDepth pins that Environ never emits EnvDepth, because
+// a caller that relied on it not to would break silently rather than loudly:
+// internal/plugin's buildEnv writes a plugin's own depth first and appends
+// Identity.Environ() afterwards (exec.go's buildEnv), so if Environ ever
+// started emitting EnvDepth, an empty assignment from here would land after
+// buildEnv's and win, erasing the depth buildEnv had just set and disabling
+// the chain guard for every plugin run — with no error, since the run simply
+// looks like it started at depth 0.
+func TestIdentity_EnvironOmitsDepth(t *testing.T) {
+	got := Identity{SocketPath: "/run/jin.sock", BinPath: "/opt/jin", Debug: true}.Environ()
+	for _, kv := range got {
+		if key, _, _ := strings.Cut(kv, "="); key == EnvDepth {
+			t.Fatalf("Environ() emitted %q; buildEnv appends Environ() after writing its own depth, so this would silently overwrite it", kv)
+		}
+	}
+}
+
 // TestIdentity_TmuxEnviron is Environ's table with the opposite expectation on
 // every row that is missing something: an assignment, empty, rather than no
 // assignment. The rows exist to pin that inversion, because it is the only
@@ -72,31 +89,31 @@ func TestIdentity_TmuxEnviron(t *testing.T) {
 			name:      "everything known",
 			id:        Identity{SocketPath: "/run/jin.sock", BinPath: "/opt/jin", Debug: true},
 			sessionID: "sess-1",
-			want:      []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin", "JIN_DEBUG=1", "JIN_SESSION_ID=sess-1"},
+			want:      []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin", "JIN_DEBUG=1", "JIN_SESSION_ID=sess-1", "JIN_PLUGIN_DEPTH="},
 		},
 		{
 			name:      "debug off is an empty assignment, not a 0 and not an absence",
 			id:        Identity{SocketPath: "/run/jin.sock", BinPath: "/opt/jin"},
 			sessionID: "sess-1",
-			want:      []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin", "JIN_DEBUG=", "JIN_SESSION_ID=sess-1"},
+			want:      []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin", "JIN_DEBUG=", "JIN_SESSION_ID=sess-1", "JIN_PLUGIN_DEPTH="},
 		},
 		{
 			name:      "no binary, e.g. the stable copy could not be made",
 			id:        Identity{SocketPath: "/run/jin.sock"},
 			sessionID: "sess-1",
-			want:      []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=", "JIN_DEBUG=", "JIN_SESSION_ID=sess-1"},
+			want:      []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=", "JIN_DEBUG=", "JIN_SESSION_ID=sess-1", "JIN_PLUGIN_DEPTH="},
 		},
 		{
 			name:      "no session, e.g. a --here caller outside any session",
 			id:        Identity{SocketPath: "/run/jin.sock", BinPath: "/opt/jin"},
 			sessionID: "",
-			want:      []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin", "JIN_DEBUG=", "JIN_SESSION_ID="},
+			want:      []string{"JIN_SOCKET=/run/jin.sock", "JIN_BIN=/opt/jin", "JIN_DEBUG=", "JIN_SESSION_ID=", "JIN_PLUGIN_DEPTH="},
 		},
 		{
 			name:      "nothing known still blocks every inherited value",
 			id:        Identity{},
 			sessionID: "",
-			want:      []string{"JIN_SOCKET=", "JIN_BIN=", "JIN_DEBUG=", "JIN_SESSION_ID="},
+			want:      []string{"JIN_SOCKET=", "JIN_BIN=", "JIN_DEBUG=", "JIN_SESSION_ID=", "JIN_PLUGIN_DEPTH="},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

@@ -1275,9 +1275,10 @@ func (m Model) openPopup(name, title string) {
 // jinenv.Identity.TmuxEnviron has why every key is emitted even when its value
 // is empty.
 //
-// JIN_PLUGIN_DEPTH is not among them, unlike the environment `jin ui` gives the
-// panes it starts. It does not need to be: `jin ui` writes it empty on the
-// session these popups inherit from, and that entry masks the server's.
+// JIN_PLUGIN_DEPTH is among them, always empty. A popup is not continuing a
+// plugin's process, and a depth the outer server happens to hold would
+// otherwise make every `jin plugin run` issued from inside this popup refuse
+// itself as a chain, with nothing on screen to say so.
 //
 // The session id is empty on purpose: a popup is this UI, not work belonging to
 // one of the sessions it lists. Emitting it empty is also what clears a stale

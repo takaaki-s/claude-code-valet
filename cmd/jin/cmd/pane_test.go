@@ -327,7 +327,7 @@ func wantPaneEnv(socket, bin, session string) []string {
 	if debug.Enabled() {
 		debugAssign = "JIN_DEBUG=1"
 	}
-	return []string{"JIN_SOCKET=" + socket, "JIN_BIN=" + bin, debugAssign, "JIN_SESSION_ID=" + session}
+	return []string{"JIN_SOCKET=" + socket, "JIN_BIN=" + bin, debugAssign, "JIN_SESSION_ID=" + session, "JIN_PLUGIN_DEPTH="}
 }
 
 // TestCallerPaneEnv_CarriesTheDebugFlag is separate because the flag cannot be

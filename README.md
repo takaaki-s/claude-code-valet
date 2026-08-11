@@ -855,6 +855,12 @@ omitted, because a key left out of a pane's environment is one tmux fills in
 from its server. That is also why `JIN_DEBUG` is empty here when debug logging
 is off rather than absent as it is above; it is never `0` in either place.
 
+A pane also gets `JIN_PLUGIN_DEPTH` empty. That is not part of the identity —
+it says the pane continues no plugin's chain, so a depth some process left in
+the tmux server cannot be read as this pane's caller and silently refuse every
+`jin plugin run` you make from here. See [Constraints](#constraints) for what
+the depth does bound.
+
 **Compatibility contract**: treat any environment variable, JSON field, or CLI
 flag you don't recognize as something to ignore, not an error. jind-ai only
 adds to this surface within a `schema_version`; breaking removals happen
@@ -957,10 +963,11 @@ are decided once at install time and honoured by every later update.
   (e.g. a plugin that sends a prompt whose eventual response re-triggers the
   same plugin a few seconds later) — avoiding that is on the plugin author.
   Neither reaches a run started from inside a `jin pane popup` / `jin pane
-  split` child either: the depth travels in the plugin's own environment and a
-  pane is not given it, so such a run begins at depth 1 again, and the debounce
-  window covers status dispatch rather than `jin plugin run`. Treat a chain you
-  start from a popup as unbounded and stop it yourself.
+  split` child either: the depth travels in the plugin's own environment, and a
+  pane is given `JIN_PLUGIN_DEPTH` empty rather than the depth of whoever
+  opened it, so such a run begins at depth 1 again, and the debounce window
+  covers status dispatch rather than `jin plugin run`. Treat a chain you start
+  from a popup as unbounded and stop it yourself.
 
 ### Config (`~/.config/jind-ai/config.yaml`)
 

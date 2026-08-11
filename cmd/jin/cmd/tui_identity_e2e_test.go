@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/paths"
 	"github.com/takaaki-s/jind-ai/internal/plugin"
 	"github.com/takaaki-s/jind-ai/internal/testutil"
@@ -131,7 +132,7 @@ func TestReattachTmux_PublishesTheIdentity(t *testing.T) {
 
 	// The values a server forked by something else would be holding.
 	_ = tc.SetEnvironment(tmux.SessionName, "JIN_SOCKET", "/tmp/stale.sock")
-	_ = tc.SetEnvironment(tmux.SessionName, plugin.EnvDepth, "1")
+	_ = tc.SetEnvironment(tmux.SessionName, jinenv.EnvDepth, "1")
 
 	attached := stubAttach(t)
 
@@ -157,8 +158,8 @@ func TestReattachTmux_PublishesTheIdentity(t *testing.T) {
 	if got := tc.GetEnvironment(tmux.SessionName, "JIN_SOCKET"); got != socket {
 		t.Errorf("session JIN_SOCKET = %q, want this process's socket", got)
 	}
-	if got := tc.GetEnvironment(tmux.SessionName, plugin.EnvDepth); got != "" {
-		t.Errorf("session %s = %q, want it cleared", plugin.EnvDepth, got)
+	if got := tc.GetEnvironment(tmux.SessionName, jinenv.EnvDepth); got != "" {
+		t.Errorf("session %s = %q, want it cleared", jinenv.EnvDepth, got)
 	}
 
 	assertPaneCarriesSocket(t, envDump, socket)
@@ -247,7 +248,7 @@ func TestCreateAndAttachTmux_PublishesTheIdentity(t *testing.T) {
 	// No session yet: createAndAttachTmux builds its own.
 	tc := uiTestClient(t)
 	withUIEnv(t, socket, "/tmp/e2e-bin", false)
-	t.Setenv(plugin.EnvDepth, "1")
+	t.Setenv(jinenv.EnvDepth, "1")
 	installProbePlugin(t)
 
 	attached := stubAttach(t)
@@ -265,8 +266,8 @@ func TestCreateAndAttachTmux_PublishesTheIdentity(t *testing.T) {
 	if got := tc.GetEnvironment(tmux.SessionName, "JIN_SOCKET"); got != socket {
 		t.Errorf("session JIN_SOCKET = %q, want this process's socket", got)
 	}
-	if got := tc.GetEnvironment(tmux.SessionName, plugin.EnvDepth); got != "" {
-		t.Errorf("session %s = %q, want it cleared", plugin.EnvDepth, got)
+	if got := tc.GetEnvironment(tmux.SessionName, jinenv.EnvDepth); got != "" {
+		t.Errorf("session %s = %q, want it cleared", jinenv.EnvDepth, got)
 	}
 
 	assertPaneCarriesSocket(t, envDump, socket)

@@ -98,20 +98,13 @@ func uiIdentity() jinenv.Identity {
 // jinenv.Identity.TmuxEnviron records as the value to fear — a leftover UUID is
 // plausible where an absent one is not.
 //
-// No plugin chain either. A depth left in a tmux server's environment is
-// inherited by every `jin plugin run` started from its panes, and the daemon
-// then refuses the run as a plugin chaining another — measured 3 of 3, and
-// invisible, because a plugin key binding fires through `run-shell -b` with its
-// output discarded. Nothing started from this UI continues a plugin's process,
-// so "not in a chain" is the honest value, and stating it beats inheriting an
-// accident.
-//
-// This reaches the outer tmux server only. A depth stranded in the inner server
-// — the one the agents' panes live in — is the same defect and is not addressed
-// here; closing it means clearing the key where every jind-ai pane is built
-// rather than where this UI is.
+// No plugin chain either, though that one is cleared by TmuxEnviron rather than
+// here: nothing started from this UI continues a plugin's process, and the same
+// is true of every pane jind-ai opens through tmux, so the key is written empty
+// in the one place all of them pass through. TmuxEnviron's doc has what a depth
+// stranded in a tmux server costs and why empty is the honest value.
 func uiChildEnv() []string {
-	return append(uiIdentity().TmuxEnviron(""), plugin.EnvDepth+"=")
+	return uiIdentity().TmuxEnviron("")
 }
 
 // tuiPaneRespawner is the minimal tmux surface respawnTUIPane needs.
