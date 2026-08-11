@@ -1009,7 +1009,9 @@ func (s *Server) handleRemoveDirHistory(data json.RawMessage) Response {
 // belongs to: JIN_SOCKET, JIN_BIN, JIN_DEBUG and JIN_SESSION_ID reach it as one
 // tmux -e each, all four every time and empty when a value is unknown.
 // jinenv.Identity.TmuxEnviron renders them and says why omitting a key is not
-// the same as leaving it unset.
+// the same as leaving it unset. It writes JIN_PLUGIN_DEPTH empty alongside
+// them, which is not part of the identity — its doc has why a popup is told it
+// continues no plugin's chain.
 type PanePopupRequest struct {
 	ID     string `json:"id"`
 	Cmd    string `json:"cmd"`
@@ -1040,7 +1042,7 @@ func (s *Server) handlePanePopup(data json.RawMessage) Response {
 // the idempotent named-slot path; IfExists picks the policy when the named
 // pane already exists (noop/respawn/error, empty = noop).
 //
-// The new pane is told the same four variables PanePopupRequest names, whether
+// The new pane is told the same variables PanePopupRequest names, whether
 // it runs Cmd or a bare shell, and a slot restarted under IfExists=respawn is
 // told them again.
 type PaneSplitRequest struct {

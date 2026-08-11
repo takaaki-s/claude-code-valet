@@ -34,6 +34,21 @@
 // gap to close.
 package jinenv
 
+// EnvDepth names the chain depth a plugin run carries. Spelled once and
+// exported because the parties have to agree on it exactly and none of them
+// fails when they do not: internal/plugin's buildEnv writes the depth a plugin
+// runs at, `jin plugin run` reads it back to tell the daemon how deep its
+// caller was, and TmuxEnviron below writes it empty so a value stranded in a
+// tmux server cannot be mistaken for a caller's. A typo in any one of those is
+// silent — a run refused with its output discarded, or a chain guard that never
+// sees a depth.
+//
+// It lives here rather than beside the guard that reads it, in internal/plugin,
+// because that package imports this one and the reverse would not compile. The
+// layering says the same thing the name does: a key has to be spelled where the
+// environment is assembled, and this is that place.
+const EnvDepth = "JIN_PLUGIN_DEPTH"
+
 // Identity names the jin a spawned process should call back into: which daemon
 // to talk to, which binary to re-enter, and whether to record what it does.
 //
@@ -90,6 +105,13 @@ type Identity struct {
 // child, which is a property of the destination and not of this function. Where
 // the child starts from an environment jind-ai did not build — anything tmux
 // runs, including a shell `env` prefix tmux is given — use TmuxEnviron.
+//
+// This renders pairs() and nothing else, which is what keeps EnvDepth out of a
+// plugin's environment. internal/plugin writes that key itself, from a depth
+// only it knows, and appends this identity afterwards; a second assignment from
+// here would land after that one and win. Keeping the key out of pairs() means
+// the collision cannot be reintroduced by changing what an empty value renders
+// as, which is the only rule this function has.
 func (i Identity) Environ() []string {
 	pairs := i.pairs()
 	env := make([]string, 0, len(pairs))
@@ -101,12 +123,17 @@ func (i Identity) Environ() []string {
 	return env
 }
 
-// pairs is the identity as ordered key/value pairs, and is the only place the
-// key names and their order live. The two renderers below differ in one thing —
-// whether an empty value is emitted — and sharing the table is what keeps that
-// the only difference. Adding a field to one renderer and not the other would
-// otherwise be invisible: the reader that misses it is a pane, which quietly
-// takes the tmux server's value instead of failing.
+// pairs is the identity as ordered key/value pairs, and is the only place these
+// three key names and their order live. The two renderers below differ in one
+// thing — whether an empty value is emitted — and sharing the table is what
+// keeps that the only difference. Adding a field to one renderer and not the
+// other would otherwise be invisible: the reader that misses it is a pane, which
+// quietly takes the tmux server's value instead of failing.
+//
+// What TmuxEnviron appends past this table — the session a pane's work belongs
+// to, and the plugin chain depth — are not fields of an identity and are not
+// rendered by Environ at all. They are named there rather than here for that
+// reason, and in EnvDepth's case the separation is load-bearing: see Environ.
 func (i Identity) pairs() [][2]string {
 	debugFlag := ""
 	if i.Debug {
@@ -150,11 +177,27 @@ func (i Identity) pairs() [][2]string {
 // JIN_DEBUG is emitted empty rather than "0" for the reason it is omitted from
 // Environ rather than set to "0": a plugin testing `[ -n "$JIN_DEBUG" ]` would
 // read "0" as on.
+//
+// EnvDepth is emitted too, and unlike the others it is never anything but
+// empty. A depth belongs to a plugin's own process, so nothing tmux starts here
+// is continuing one; what a pane can inherit is only an accident. A tmux server
+// forked by a process that carried a depth hands it to every pane, and each
+// `jin plugin run` from those panes is then refused as a chain — measured 3 of
+// 3, and invisible, because a plugin key binding fires through `run-shell -b`
+// with its output discarded. Stating "not in a chain" beats inheriting that.
+//
+// It does not bound a chain and is not meant to. A run started from a pane
+// still begins at depth 1: an empty assignment reads back through strconv.Atoi
+// as 0, exactly as the absent one it replaces did. README's "Loop residual
+// risk" says a chain started from a popup is unbounded and the plugin author
+// must stop it, and that contract is unchanged — what this closes is the
+// inverse, a depth arriving where no plugin put one, which internal/plugin's
+// maxDepth doc separates from the other for the same reason.
 func (i Identity) TmuxEnviron(sessionID string) []string {
 	pairs := i.pairs()
-	env := make([]string, 0, len(pairs)+1)
+	env := make([]string, 0, len(pairs)+2)
 	for _, kv := range pairs {
 		env = append(env, kv[0]+"="+kv[1])
 	}
-	return append(env, "JIN_SESSION_ID="+sessionID)
+	return append(env, "JIN_SESSION_ID="+sessionID, EnvDepth+"=")
 }

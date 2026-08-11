@@ -52,11 +52,12 @@ func untrustedErr(err error) string { return untrusted(fmt.Sprint(err)) }
 // caller of passDebounce.
 //
 // That paragraph is measured, 3 trials of 3: a plugin at depth 1 opened a popup
-// with `jin pane popup --here`, EnvDepth was *unset* inside it rather than 0,
-// the `jin plugin run` issued from there was accepted, and the second plugin
-// ran at depth 1 again. Unset and 0 differ only in spelling here — the CLI's
-// strconv.Atoi("") is 0 either way — but the distinction is why the guard has
-// nothing to bite on rather than something too small.
+// with `jin pane popup --here`, the `jin plugin run` issued from there was
+// accepted, and the second plugin ran at depth 1 again. The depth read back as
+// 0 — at the time of that measurement because the key was unset inside the
+// pane, and now because jinenv.TmuxEnviron assigns it empty, which the CLI's
+// strconv.Atoi reads the same way. Either spelling is why the guard has nothing
+// to bite on rather than something too small.
 //
 // Left this way on purpose. Propagating the depth into panes would bound the
 // chain, and would also refuse the run a user makes by pressing a button in a
@@ -66,9 +67,10 @@ func untrustedErr(err error) string { return untrusted(fmt.Sprint(err)) }
 //
 // The inverse — a depth arriving where no plugin put one — is guarded, since
 // there the accident refuses runs rather than allowing them. A tmux server
-// forked by a process that carried EnvDepth hands it to every pane, and each
-// `jin plugin run` from those panes is then refused as a chain; `jin ui` writes
-// it empty onto its session for that reason.
+// forked by a process that carried a depth hands it to every pane, and each
+// `jin plugin run` from those panes is then refused as a chain;
+// jinenv.TmuxEnviron writes the key empty for that reason, on every pane
+// jind-ai opens through tmux rather than only on the one server `jin ui` owns.
 const maxDepth = 2
 
 // DefaultDebounce is the minimum interval between deliveries of the same
@@ -246,7 +248,7 @@ func (d *EventDispatcher) RunAction(name, actionID string, ev Event, callerDepth
 		}
 	}()
 	if callerDepth+1 >= maxDepth {
-		return fmt.Errorf("plugin %s not run: depth limit reached (%s=%d) — plugins cannot chain plugin runs", name, EnvDepth, callerDepth)
+		return fmt.Errorf("plugin %s not run: depth limit reached (%s=%d) — plugins cannot chain plugin runs", name, jinenv.EnvDepth, callerDepth)
 	}
 	entries, err := d.registry.Load()
 	if err != nil {

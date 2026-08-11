@@ -246,6 +246,33 @@ func TestBuildAgentShellCmd_NamesTheSessionItStarts(t *testing.T) {
 	}
 }
 
+// TestBuildAgentShellCmd_TellsTheAgentItIsNotInAPluginChain pins the other key
+// TmuxEnviron appends past the identity, and the one no value here could be
+// right for: a depth belongs to the plugin process that is running, and the
+// agent this line starts is not continuing one.
+//
+// What it prevents is inheritance rather than a wrong value written here.
+// startSessionTmux forks the inner tmux server from the daemon's own process
+// (NewSessionWithCmdInDir, with no environment of its own), so a daemon started
+// from something that carried a depth hands one to that server, and the server
+// hands it to every pane it opens. `jin plugin run` from such a pane reads it
+// back as its caller's depth and the dispatcher refuses the run as a chain —
+// see maxDepth, which separates that from the chains it means to bound.
+//
+// The closing quote is part of the assertion. shellEscape quotes the whole
+// assignment, so 'JIN_PLUGIN_DEPTH=' matches only the empty one; a number would
+// bound a chain nobody started, and README's "Loop residual risk" says a run
+// begun from a pane starts over at depth 1.
+func TestBuildAgentShellCmd_TellsTheAgentItIsNotInAPluginChain(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+
+	cmd := probeShellCmd(t, mgr)
+
+	if want := "'" + jinenv.EnvDepth + "='"; !strings.Contains(cmd, want) {
+		t.Errorf("command does not carry %s, so the agent inherits whatever depth the tmux server holds\ncommand: %s", want, cmd)
+	}
+}
+
 // TestBuildAgentShellCmd_PassesTheDebugFlagToTheAgent pins that the flag
 // reaches the process that runs `jin hook`, and reaches it as what the daemon
 // decided rather than as silence. Off is an assignment too: buildAgentShellCmd's

@@ -31,7 +31,7 @@ and JIN_SESSION_ID are always set, empty when a value is unknown.
 
 With --here the popup opens over the caller's own tmux pane instead of a
 session's pane, and no selector is given. Such a popup carries the caller's
-own jin identity: the same four variables, taken from this process rather
+own jin identity: the same variables, taken from this process rather
 than from a daemon.
   jin pane popup --here -- less /tmp/diff.txt
 
@@ -215,7 +215,7 @@ with 'jin pane close'.
 
 With --here the caller's own tmux pane is split instead of a session's pane,
 and no selector is given. Such a pane carries the caller's own jin identity:
-the same four variables, taken from this process rather than from a daemon.
+the same variables, taken from this process rather than from a daemon.
   jin pane split --here --direction down --size 20% -- htop
 
 Example:

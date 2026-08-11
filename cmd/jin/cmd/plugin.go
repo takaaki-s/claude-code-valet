@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/takaaki-s/jind-ai/internal/config"
 	"github.com/takaaki-s/jind-ai/internal/daemon"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/paths"
 	"github.com/takaaki-s/jind-ai/internal/plugin"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
@@ -128,10 +129,13 @@ func runPluginRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// plugin.EnvDepth is set when this CLI is invoked from inside a plugin run;
+	// jinenv.EnvDepth is set when this CLI is invoked from inside a plugin run;
 	// forwarding it lets the daemon reject a plugin chaining another plugin run.
-	// An unset or malformed value is treated as depth 0 (a top-level invocation).
-	depth, _ := strconv.Atoi(os.Getenv(plugin.EnvDepth))
+	// An unset or malformed value is treated as depth 0 (a top-level invocation),
+	// and so is the empty one every pane jind-ai opens carries — jinenv writes it
+	// there precisely so a depth stranded in a tmux server cannot be read as this
+	// caller's.
+	depth, _ := strconv.Atoi(os.Getenv(jinenv.EnvDepth))
 
 	err = client.PluginRun(daemon.PluginRunRequest{
 		Plugin:           name,

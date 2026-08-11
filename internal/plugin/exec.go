@@ -19,15 +19,6 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
 
-// EnvDepth names the chain depth a plugin run carries. Spelled once and
-// exported because the three parties have to agree on it exactly and none of
-// them fails when they do not: buildEnv writes it, `jin plugin run` reads it
-// back to tell the daemon how deep its caller was, and `jin ui` writes it empty
-// onto the outer tmux session so a value left in that server cannot be mistaken
-// for a caller's. A typo in any one of those is silent — a run that is refused
-// with its output discarded, or a chain guard that never sees a depth.
-const EnvDepth = "JIN_PLUGIN_DEPTH"
-
 // inheritedEnvKeys is the minimal set of parent-process env vars forwarded to a
 // plugin run. It covers what interpreters / toolchains need to bootstrap without
 // leaking arbitrary daemon state. LC_* is handled separately by prefix match.
@@ -208,7 +199,7 @@ func buildEnv(opts ExecOptions) []string {
 		"JIN_TMUX_PANE_ID="+opts.Env.TmuxPaneID,
 		"JIN_NOTIFY_KIND="+opts.Env.NotifyKind,
 		"JIN_ACTION_ID="+opts.ActionID,
-		EnvDepth+"="+strconv.Itoa(opts.Depth),
+		jinenv.EnvDepth+"="+strconv.Itoa(opts.Depth),
 	)
 	// Caller tmux context exists only for action runs launched from inside a
 	// tmux client; unlike the JIN_* event vars above these are omitted (not set

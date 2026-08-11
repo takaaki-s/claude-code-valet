@@ -14,8 +14,8 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/agent"
 	"github.com/takaaki-s/jind-ai/internal/agent/agenttest"
 	"github.com/takaaki-s/jind-ai/internal/config"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/paths"
-	"github.com/takaaki-s/jind-ai/internal/plugin"
 	"github.com/takaaki-s/jind-ai/internal/tmux"
 )
 
@@ -620,10 +620,10 @@ func TestUIChildEnv_NamesNoSession(t *testing.T) {
 // started from a pane of this server.
 func TestUIChildEnv_NamesNoPluginChain(t *testing.T) {
 	withUIEnv(t, "/tmp/ui.sock", "/tmp/jin-bin", false)
-	t.Setenv(plugin.EnvDepth, "1")
+	t.Setenv(jinenv.EnvDepth, "1")
 
-	if !slices.Contains(uiChildEnv(), plugin.EnvDepth+"=") {
-		t.Errorf("uiChildEnv() = %q, want it to contain %q", uiChildEnv(), plugin.EnvDepth+"=")
+	if !slices.Contains(uiChildEnv(), jinenv.EnvDepth+"=") {
+		t.Errorf("uiChildEnv() = %q, want it to contain %q", uiChildEnv(), jinenv.EnvDepth+"=")
 	}
 }
 
@@ -652,7 +652,7 @@ func TestRespawnTUIPane_AlwaysCarriesTheIdentity(t *testing.T) {
 	// `v` opens, for one) inherits it in turn.
 	for _, kv := range []string{
 		"JIN_SOCKET=/tmp/ui.sock", "JIN_BIN=/tmp/jin-bin", "JIN_DEBUG=1",
-		"JIN_SESSION_ID=", plugin.EnvDepth + "=",
+		"JIN_SESSION_ID=", jinenv.EnvDepth + "=",
 	} {
 		if !slices.Contains(got.env, kv) {
 			t.Errorf("respawn env = %q, want it to contain %q", got.env, kv)
@@ -675,7 +675,7 @@ func TestApplyOuterSessionIdentity_WritesEveryKey(t *testing.T) {
 		{tmux.SessionName, "JIN_BIN", ""},
 		{tmux.SessionName, "JIN_DEBUG", "1"},
 		{tmux.SessionName, "JIN_SESSION_ID", ""},
-		{tmux.SessionName, plugin.EnvDepth, ""},
+		{tmux.SessionName, jinenv.EnvDepth, ""},
 	}
 	if !reflect.DeepEqual(fe.sets, want) {
 		t.Errorf("sets = %v, want %v", fe.sets, want)
@@ -705,12 +705,12 @@ func TestApplyOuterSessionIdentity_SplitsAtTheFirstEquals(t *testing.T) {
 // the plugin key bindings discard their output, so nothing said so.
 func TestApplyOuterSessionIdentity_ClearsAnInheritedPluginDepth(t *testing.T) {
 	withUIEnv(t, "/tmp/ui.sock", "/tmp/jin-bin", false)
-	t.Setenv(plugin.EnvDepth, "1")
+	t.Setenv(jinenv.EnvDepth, "1")
 	fe := &fakeAgentEnvSetter{}
 	applyOuterSessionIdentity(fe)
 
-	if !slices.Contains(fe.sets, [3]string{tmux.SessionName, plugin.EnvDepth, ""}) {
-		t.Errorf("sets = %v, want it to clear %s", fe.sets, plugin.EnvDepth)
+	if !slices.Contains(fe.sets, [3]string{tmux.SessionName, jinenv.EnvDepth, ""}) {
+		t.Errorf("sets = %v, want it to clear %s", fe.sets, jinenv.EnvDepth)
 	}
 }
 
@@ -755,7 +755,7 @@ func TestApplyOuterSessionSetup_DoesEverythingBothOrchestratorsNeed(t *testing.T
 
 	for _, want := range [][3]string{
 		{tmux.SessionName, "JIN_SOCKET", "/tmp/ui.sock"},
-		{tmux.SessionName, plugin.EnvDepth, ""},
+		{tmux.SessionName, jinenv.EnvDepth, ""},
 		// setTransientAgentEnv: the create form reads this to preselect --agent.
 		{tmux.SessionName, "JIN_UI_AGENT", "codex"},
 	} {
