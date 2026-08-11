@@ -8,6 +8,34 @@
 - Comments should be in English
 - Technical terms, struct/function names remain in English
 
+## Comments
+
+One rule: **write what the code cannot say and a test cannot enforce.**
+Everything else is deleted, not shortened.
+
+Drop:
+
+- Restatements of the code (`// EnsureTrustState sets hasTrustDialogAccepted=true`)
+- Contracts a test already enforces — the test is the statement
+- Rejected alternatives, and why a case that does not exist is absent. These
+  answer a reviewer, not the next implementer
+- History ("this used to…", "before the refactor…") — that belongs in the commit
+  message, where it cannot go stale without anyone noticing
+- Another file's reasoning, retold. Link to where it is decided
+- The story around a measurement. Keep the number, drop the narrative
+
+Keep:
+
+- An exported symbol's contract, in a line or three: what a caller gets wrong
+  without it
+- External facts the code cannot show — tmux's behaviour, an agent's on-disk
+  format, an OS quirk, a measured threshold
+- A "why" that will be reintroduced if removed. One line
+- Directives (`//go:*`, `//nolint`)
+
+The same paragraph written twice is the most common finding. State it once, at
+the widest scope that covers every case, and link to it from the others.
+
 ## Error Handling
 
 - Propagate errors to the caller via return
