@@ -300,14 +300,15 @@ func hasE2ETag(fields []string) bool {
 // under -n. This target has no such line, and a guard that ran the e2e suite to
 // check the e2e list would be its own kind of mistake, so it is worth knowing.
 //
-// Both defences below are load-bearing, and neither replaces the other: the
-// environment covers flags this process was started with, which no counter-flag
-// can cancel in general, and --no-print-directory covers a makefile that turns
-// -w on itself, which no environment can reach.
+// The child gets a stripped environment rather than a counter-flag because -w
+// is the only such state a flag can cancel, and even that is not portable:
+// --no-print-directory loses to a makefile's own `MAKEFLAGS += -w` on the CI
+// runner's make and wins on 4.4.1. A makefile that raises -w itself is out of
+// scope; nothing this reads does that.
 func makeDryRun(t *testing.T, dir, target string) []string {
 	t.Helper()
 	requireMake(t)
-	cmd := exec.Command("make", "-n", "--no-print-directory", target)
+	cmd := exec.Command("make", "-n", target)
 	cmd.Dir = dir
 	cmd.Env = withoutMakeState(os.Environ())
 	out, err := cmd.Output()
@@ -646,7 +647,6 @@ func TestMakeDryRunJoinsContinuations(t *testing.T) {
 	}{
 		{name: "--trace, which no flag cancels", env: map[string]string{"MAKEFLAGS": "--trace"}},
 		{name: "-d through GNUMAKEFLAGS", env: map[string]string{"GNUMAKEFLAGS": "-d"}},
-		{name: "the makefile asks for -w itself", preamble: "MAKEFLAGS += -w\n"},
 		{
 			name:     "the makefile branches on $(MAKELEVEL)",
 			env:      map[string]string{"MAKELEVEL": "1"},
