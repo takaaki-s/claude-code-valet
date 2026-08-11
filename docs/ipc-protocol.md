@@ -6,6 +6,35 @@
 - One request / one response per connection (no connection pooling)
 - JSON encoding/decoding
 
+### Which daemon a command reaches
+
+`jin daemon` subcommands accept `--socket`; it is not a global flag. Every other
+command takes `JIN_SOCKET` when set, and otherwise the path above. Both are
+resolved per call (`getSocketPath`, `internal/paths.Socket`), not fixed at
+startup.
+
+A tmux server keeps the environment it was forked with, so a `jin` run from one
+of its panes resolves against whatever that server holds. When the value has
+gone stale — a rotated `$TMPDIR` where `XDG_RUNTIME_DIR` is unset, or an
+`XDG_RUNTIME_DIR` from an earlier login — the run reaches whatever daemon lives
+under the older path, measured 3 of 3, and does so without complaint, because a
+daemon really is listening there. This reaches only tmux servers started outside
+jind-ai. The agent panes and the TUI pane are handed `JIN_SOCKET` explicitly
+(measured 3 of 3 in the same setup), and popups inherit it from the client that
+opened them.
+
+`jin ui` publishes the identity onto the outer tmux session on **every** start,
+along with the key bindings that read it at fire time; neither write is
+conditional. What is conditional is the TUI pane: one already running on a
+different daemon is respawned rather than left behind, so a live UI and the keys
+around it do not end up on two daemons. `identityMoved` in `cmd/jin/cmd/tui.go`
+carries the reasoning and the measurements.
+
+Other entries an earlier `jin ui` left on that session — `JIN_CURRENT_SESSION`,
+`JIN_CURSOR_SESSION` — still name the previous daemon's sessions until something
+overwrites them. They are UI state rather than routing, so nothing resolves a
+daemon through them.
+
 ## Timeouts
 
 `Client` bounds every exchange so a daemon that accepts a connection and then

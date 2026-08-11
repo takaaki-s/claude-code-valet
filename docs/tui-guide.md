@@ -258,9 +258,15 @@ notation; outer-tmux keys (`toggle_pane`, `action_panel`, `search`,
 `plugins.*.actions.*.keys`) travel through the normalizer above, so pick
 whichever form you find easier to read.
 
-The tmux command issued is `run-shell '<jin>' plugin run <name> <action>`,
-which returns immediately (the daemon dispatches the plugin
-asynchronously). Even a plugin with only a default action gets the
+The tmux command issued is
+`run-shell -b '<jin>' plugin run <name> <action> >/dev/null 2>&1`, which returns
+immediately (the daemon dispatches the plugin asynchronously). It resolves which
+jin to reach from the outer tmux session environment, which `jin ui` rewrites —
+along with these bindings — on every start. Note the consequence of `-b` plus
+the redirect: this is the one caller of `jin plugin run` whose failures reach no
+one (`internal/plugin/dispatcher.go` has what survives).
+
+Even a plugin with only a default action gets the
 action ID rendered explicitly — the CLI accepts it and the daemon
 resolves it back to `actions[0]`. If the action wants to render a popup
 it does so itself via `jin pane popup --here` — the shortcut path is

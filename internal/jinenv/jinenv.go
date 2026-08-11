@@ -26,13 +26,19 @@
 // one jind-ai writes is handed to tmux, which starts a pane from its server's
 // environment. That is why the agent's spawn line uses TmuxEnviron too.
 //
-// The worktree post-create hook is a deliberate non-consumer. It runs inside
-// provisioning, before the session's recorded working directory moves to the
-// new worktree, so a hook that could call back would be asking about a session
-// mid-creation; its documented contract is the six JIN_WORKTREE_*/JIN_SESSION_*
-// variables and no callback at all. Wiring one is a product decision, not a
-// gap to close.
+// The worktree post-create hook is a deliberate non-consumer *of the identity*.
+// It runs inside provisioning, before the session's recorded working directory
+// moves to the new worktree, so a hook that could call back would be asking
+// about a session mid-creation; its documented contract is the six
+// JIN_WORKTREE_*/JIN_SESSION_* variables and no callback at all. Wiring one is
+// a product decision, not a gap to close. It does consume InheritedEnv, which
+// names no jind-ai at all.
 package jinenv
+
+import (
+	"os"
+	"strings"
+)
 
 // EnvDepth names the chain depth a plugin run carries. Spelled once and
 // exported because the parties have to agree on it exactly and none of them
@@ -48,6 +54,45 @@ package jinenv
 // layering says the same thing the name does: a key has to be spelled where the
 // environment is assembled, and this is that place.
 const EnvDepth = "JIN_PLUGIN_DEPTH"
+
+// inheritedEnvKeys is the minimal set of parent-process variables forwarded to
+// a child jind-ai starts — a worktree post-create hook, or a plugin's dispatch
+// and build runs. It covers what interpreters and toolchains (pnpm / mise /
+// node …) need to bootstrap, without leaking arbitrary caller or daemon state.
+// LC_* is matched by prefix instead, in InheritedEnv.
+//
+// One table rather than one per caller. Nothing would report a drift between
+// two: a child missing a variable fails somewhere inside a toolchain, far from
+// the list that omitted it, and a child given one too many fails not at all.
+var inheritedEnvKeys = map[string]bool{
+	"PATH":  true,
+	"HOME":  true,
+	"USER":  true,
+	"SHELL": true,
+	"LANG":  true,
+	"TERM":  true,
+}
+
+// InheritedEnv returns the allowlisted subset of this process's environment,
+// as KEY=VALUE entries. Callers append their own JIN_* variables afterwards.
+//
+// Order follows os.Environ, not the table: a child reads assignments, not a
+// list, and pinning an order here would be a promise no caller needs.
+func InheritedEnv() []string {
+	// Sized for what callers end up holding — this set plus the six to ten JIN_*
+	// they append — rather than for what this function returns.
+	env := make([]string, 0, 16)
+	for _, kv := range os.Environ() {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if inheritedEnvKeys[key] || strings.HasPrefix(key, "LC_") {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
 
 // Identity names the jin a spawned process should call back into: which daemon
 // to talk to, which binary to re-enter, and whether to record what it does.

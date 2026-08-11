@@ -199,19 +199,9 @@ func TestReattachTmux_RespawnsATrackedDeadPaneWithTheIdentity(t *testing.T) {
 	tc := uiTestTmux(t)
 	withUIEnv(t, socket, "/tmp/e2e-bin", false)
 
-	paneID, err := tc.GetPaneID(tmux.SessionName + ":" + tmux.UIWindowName)
-	if err != nil || paneID == "" {
-		t.Fatalf("GetPaneID: %q %v", paneID, err)
-	}
-	if err := tc.TagManagedPane(paneID); err != nil {
-		t.Fatalf("TagManagedPane: %v", err)
-	}
-	_ = tc.SetEnvironment(tmux.SessionName, "JIN_TUI_PANE", paneID)
 	// remain-on-exit keeps the pane in place once its command ends, which is
 	// what makes it dead rather than gone — the state reattach looks for.
-	if err := tc.RespawnPane(paneID, "true", nil); err != nil {
-		t.Fatalf("RespawnPane: %v", err)
-	}
+	paneID := trackTUIPane(t, tc, "true")
 	waitUntil(t, "the tracked TUI pane is dead", func() bool { return tc.IsPaneDead(paneID) })
 
 	stubAttach(t)
@@ -222,6 +212,29 @@ func TestReattachTmux_RespawnsATrackedDeadPaneWithTheIdentity(t *testing.T) {
 	}
 
 	assertPaneCarriesSocket(t, envDump, socket)
+}
+
+// trackTUIPane puts the fixture reattach looks for in place: a tagged pane
+// recorded as JIN_TUI_PANE, running cmd. Returns its id.
+//
+// The three reattach tests below differ only in that command and in the state
+// they then wait for — dead for the ordinary case, alive for the two that ask
+// whether a running TUI is left alone — so the setup lives here rather than
+// three times.
+func trackTUIPane(t *testing.T, tc *tmux.Client, cmd string) string {
+	t.Helper()
+	paneID, err := tc.GetPaneID(tmux.SessionName + ":" + tmux.UIWindowName)
+	if err != nil || paneID == "" {
+		t.Fatalf("GetPaneID: %q %v", paneID, err)
+	}
+	if err := tc.TagManagedPane(paneID); err != nil {
+		t.Fatalf("TagManagedPane: %v", err)
+	}
+	_ = tc.SetEnvironment(tmux.SessionName, "JIN_TUI_PANE", paneID)
+	if err := tc.RespawnPane(paneID, cmd, nil); err != nil {
+		t.Fatalf("RespawnPane: %v", err)
+	}
+	return paneID
 }
 
 // waitUntil polls cond, which describes a tmux-side state change that the
@@ -380,4 +393,77 @@ on: []
 	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestReattachTmux_RespawnsALivePaneOnlyWhenTheIdentityMoved covers both halves
+// of the branch that decides whether a running TUI is restarted. Restarting one
+// is disruptive, so the negative rows matter as much as the positive: an
+// ordinary reattach is the common case, run every time a user comes back.
+//
+// The observation is the pane's pid. respawn-pane replaces the process, so the
+// pid changes exactly when a respawn happened — which reads the outcome
+// directly, and lets the negative rows conclude without waiting for a file that
+// is never going to appear.
+//
+// Measured before this existed: making identityMoved constant in either
+// direction left the whole suite green.
+func TestReattachTmux_RespawnsALivePaneOnlyWhenTheIdentityMoved(t *testing.T) {
+	const socket = "/tmp/e2e-live.sock"
+	for _, tt := range []struct {
+		name string
+		// what the session already names; "" leaves the entry unwritten
+		sessionSocket string
+		wantRespawn   bool
+	}{
+		// Another jin — the halves would otherwise come apart with nothing said.
+		{"the identity moved", "/tmp/e2e-someone-else.sock", true},
+		{"the identity matches", socket, false},
+		// A server from before the identity write, or one something cleared.
+		// Empty is not a disagreement: the session is about to be given this
+		// identity, so there is nothing to move a pane off of.
+		{"the session names no jin", "", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := uiTestTmux(t)
+			withUIEnv(t, socket, "/tmp/e2e-bin", false)
+
+			paneID := trackTUIPane(t, tc, "sleep 30")
+			waitUntil(t, "the tracked TUI pane is alive", func() bool { return !tc.IsPaneDead(paneID) })
+			before := panePID(t, tc, paneID)
+
+			if tt.sessionSocket == "" {
+				_ = tc.UnsetEnvironment(tmux.SessionName, "JIN_SOCKET")
+			} else {
+				_ = tc.SetEnvironment(tmux.SessionName, "JIN_SOCKET", tt.sessionSocket)
+			}
+
+			stubAttach(t)
+
+			envDump := filepath.Join(t.TempDir(), "pane-env")
+			if err := reattachTmux(tc, "env > "+envDump+"; sleep 30", ""); err != nil {
+				t.Fatalf("reattachTmux: %v", err)
+			}
+
+			if got := panePID(t, tc, paneID) != before; got != tt.wantRespawn {
+				t.Errorf("pane respawned = %v, want %v", got, tt.wantRespawn)
+			}
+			if tt.wantRespawn {
+				// And that the replacement carries this run's identity rather
+				// than the one the session was holding.
+				assertPaneCarriesSocket(t, envDump, socket)
+			}
+		})
+	}
+}
+
+// panePID reads the pid of the process tmux started in a pane. Comparing it
+// across a call answers "was this pane restarted?" without depending on
+// anything the new command does afterwards.
+func panePID(t *testing.T, tc *tmux.Client, paneID string) string {
+	t.Helper()
+	pid, err := tc.GetPaneOption(paneID, "pane_pid")
+	if err != nil {
+		t.Fatalf("read pane_pid of %s: %v", paneID, err)
+	}
+	return pid
 }

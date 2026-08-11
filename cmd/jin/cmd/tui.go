@@ -128,6 +128,24 @@ func respawnTUIPane(tc tuiPaneRespawner, target, shellCmd string) error {
 	return tc.RespawnPane(target, shellCmd, uiChildEnv())
 }
 
+// identityMoved reports whether the outer tmux session already names a
+// different jin than this invocation resolved. prev is that session's recorded
+// JIN_SOCKET, which the caller reads with the other entries it needs rather
+// than in its own tmux call.
+//
+// An empty entry is not a move. It means either a first run or a server written
+// by a build older than the identity write, and in both cases the session is
+// about to be given this identity rather than disagreeing with it.
+//
+// Only JIN_SOCKET is compared — it is what decides which daemon answers, and
+// JIN_BIN and JIN_DEBUG cannot select a different jind-ai on their own.
+//
+// What a move is worth doing about is the caller's question; see the branch in
+// reattachTmux.
+func identityMoved(prev string) bool {
+	return prev != "" && prev != uiIdentity().SocketPath
+}
+
 // applyOuterSessionIdentity publishes the same identity onto the outer tmux
 // session, which is the floor under everything tmux starts without jind-ai in
 // the loop: the popups bound to M-p / M-f, and the `jin plugin run` a plugin
@@ -638,11 +656,21 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	// or the options were tampered with between sessions.
 	applyPaneBorderStyle(tc)
 
-	tuiPaneID := tc.GetEnvironment(tmux.SessionName, "JIN_TUI_PANE")
+	// One tmux call for the three entries this function reads. Reattach is a
+	// path a human waits on, and each GetEnvironment is its own fork/exec.
+	sessionEnv := tc.ListEnvironment(tmux.SessionName)
+	tuiPaneID := sessionEnv["JIN_TUI_PANE"]
 
 	if tuiPaneID != "" {
-		if tc.IsPaneDead(tuiPaneID) {
-			// TUI pane exists but dead → respawn it
+		// Dead, or alive on a jin that has moved. The second restarts something
+		// the user is watching, which earlier builds refused to do — but what
+		// that refusal left behind was measured: a plugin key binding followed
+		// the new session environment 3 of 3 while the running TUI stayed on the
+		// old daemon, and such a binding reports nothing when it lands on the
+		// wrong one (applyPluginActionBindings has why). A restart the user can
+		// see is the cheaper failure. The popups tmux opens were never part of
+		// it — they inherit the firing client's environment, 5 of 5.
+		if tc.IsPaneDead(tuiPaneID) || identityMoved(sessionEnv["JIN_SOCKET"]) {
 			_ = respawnTUIPane(tc, tuiPaneID, tuiInnerCmd)
 		}
 		// Re-apply the border label in case the outer tmux server was
@@ -661,7 +689,7 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	// Restore right pane if dead. Pane options survive respawn-pane, so the
 	// label has to be cleared alongside it — otherwise the placeholder comes
 	// back wearing the name of whatever session the pane died on.
-	displayPaneID := tc.GetEnvironment(tmux.SessionName, "JIN_DISPLAY_PANE")
+	displayPaneID := sessionEnv["JIN_DISPLAY_PANE"]
 	if displayPaneID != "" && tc.IsPaneDead(displayPaneID) {
 		_ = tc.RespawnPane(displayPaneID, tmux.PlaceholderCmd, nil)
 		_ = tc.SetPaneOption(displayPaneID, tmux.PaneLabelOption, "")
@@ -677,14 +705,6 @@ func reattachTmux(tc *tmux.Client, tuiInnerCmd, agentFlag string) error {
 	// pane's copy attributable to -e is that nothing else has written it yet.
 	// Move this call above the respawns and that test stops discriminating —
 	// it will still pass, and it will stop meaning anything. So it stays here.
-	//
-	// Panes already running keep the identity they started with, deliberately —
-	// moving a live TUI onto a different daemon mid-session would be a worse
-	// answer than leaving it where it is. That does leave one asymmetry: after
-	// a `jin ui` naming a different daemon than the running TUI's, the popups
-	// tmux opens from a key binding follow the new session environment while
-	// the TUI and the popups it opens itself stay on the old one. Detaching and
-	// rerunning is what puts them back together.
 	selfBin, _ := os.Executable()
 	applyOuterSessionSetup(tc, outerSessionSetup{
 		ConfigMgr:        configMgr,

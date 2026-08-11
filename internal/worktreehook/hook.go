@@ -8,25 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/takaaki-s/jind-ai/internal/debug"
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
 
 const scriptRelPath = ".jin/worktree-post-create.sh"
-
-// inheritedEnvKeys is the minimal set of parent-process env vars forwarded to
-// the hook. It covers what pnpm / mise / node etc. need to bootstrap without
-// leaking arbitrary caller state. LC_* is handled separately by prefix match.
-var inheritedEnvKeys = map[string]bool{
-	"PATH":  true,
-	"HOME":  true,
-	"USER":  true,
-	"SHELL": true,
-	"LANG":  true,
-	"TERM":  true,
-}
 
 type runner struct {
 	allowlist *Allowlist
@@ -152,17 +140,7 @@ func (r *runner) Run(ctx context.Context, opts RunOptions) error {
 }
 
 func buildEnv(opts RunOptions) []string {
-	env := make([]string, 0, 16)
-	for _, kv := range os.Environ() {
-		i := strings.IndexByte(kv, '=')
-		if i < 0 {
-			continue
-		}
-		key := kv[:i]
-		if inheritedEnvKeys[key] || strings.HasPrefix(key, "LC_") {
-			env = append(env, kv)
-		}
-	}
+	env := jinenv.InheritedEnv()
 	env = append(env,
 		"JIN_WORKTREE_PATH="+opts.WorktreePath,
 		"JIN_WORKTREE_BRANCH="+opts.Branch,
