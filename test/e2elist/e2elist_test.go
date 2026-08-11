@@ -299,13 +299,18 @@ func hasE2ETag(fields []string) bool {
 // Not a complete dry run: a recipe line prefixed with `+` is executed even
 // under -n. This target has no such line, and a guard that ran the e2e suite to
 // check the e2e list would be its own kind of mistake, so it is worth knowing.
+//
+// The child gets a stripped environment rather than a counter-flag because -w
+// is the only such state a flag can cancel, and even that is not portable:
+// --no-print-directory loses to a makefile's own `MAKEFLAGS += -w` on the CI
+// runner's make and wins on 4.4.1. A makefile that raises -w itself is out of
+// scope; nothing this reads does that.
 func makeDryRun(t *testing.T, dir, target string) []string {
 	t.Helper()
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skipf("make not available: %v", err)
-	}
+	requireMake(t)
 	cmd := exec.Command("make", "-n", target)
 	cmd.Dir = dir
+	cmd.Env = withoutMakeState(os.Environ())
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError
@@ -316,6 +321,37 @@ func makeDryRun(t *testing.T, dir, target string) []string {
 	}
 	joined := strings.ReplaceAll(string(out), "\\\n", " ")
 	return strings.Split(strings.TrimSpace(joined), "\n")
+}
+
+// requireMake skips when make is not installed. Nothing here tests that path,
+// so it is checked by hand: docs/gotchas.md promises this package skips there.
+func requireMake(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("make"); err != nil {
+		t.Skipf("make not available: %v", err)
+	}
+}
+
+// makeStateEnv is the state one make passes to the next. Each name has a case
+// in TestMakeDryRunJoinsContinuations that fails if it is dropped; the list is
+// the doors somebody has walked through, not a proof that no other exists.
+var makeStateEnv = map[string]bool{
+	"MAKEFLAGS":    true,
+	"GNUMAKEFLAGS": true,
+	"MAKELEVEL":    true,
+}
+
+// withoutMakeState returns env without the variables above, so that a child
+// make starts as if no make had started this process.
+func withoutMakeState(env []string) []string {
+	kept := make([]string, 0, len(env))
+	for _, kv := range env {
+		if key, _, ok := strings.Cut(kv, "="); ok && makeStateEnv[key] {
+			continue
+		}
+		kept = append(kept, kv)
+	}
+	return kept
 }
 
 // repoRoot walks up from this package to the directory holding the Makefile.
@@ -590,23 +626,54 @@ func TestE2EPackagesInSurvivesAnUnreadableDirectory(t *testing.T) {
 	}
 }
 
-// TestMakeDryRunJoinsContinuations pins the one thing makeDryRun adds on top of
-// make: `make -n` prints a recipe's backslash continuation as two lines, and a
-// command split that way would otherwise be read as two, neither of which is a
-// `go test` invocation naming packages.
+// TestMakeDryRunJoinsContinuations pins the two things makeDryRun adds on top
+// of make. One is joining: `make -n` prints a recipe's backslash continuation
+// as two lines, and a command split that way would otherwise be read as two,
+// neither of which is a `go test` invocation naming packages. The other is that
+// none of the state below reaches the child.
+//
+// The cases set that state themselves rather than leaving it to the invocation,
+// so the plain `go test ./...` that CI runs catches an insulation going missing.
+// The run through make that exposed this happens on a developer's machine and
+// nowhere in CI.
 func TestMakeDryRunJoinsContinuations(t *testing.T) {
-	dir := t.TempDir()
-	makefile := "test-e2e:\n\tgo test -tags e2e ./a/ \\\n\t\t./b/\n"
-	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(makefile), 0o644); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name string
+		// env is what the process running the suite carries in.
+		env map[string]string
+		// preamble is state arriving through the makefile instead, which is
+		// the door an environment cannot close.
+		preamble string
+	}{
+		{name: "--trace, which no flag cancels", env: map[string]string{"MAKEFLAGS": "--trace"}},
+		{name: "-d through GNUMAKEFLAGS", env: map[string]string{"GNUMAKEFLAGS": "-d"}},
+		{
+			name:     "the makefile branches on $(MAKELEVEL)",
+			env:      map[string]string{"MAKELEVEL": "1"},
+			preamble: "ifneq ($(MAKELEVEL),0)\n$(info nested build)\nendif\n",
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireMake(t)
 
-	got := makeDryRun(t, dir, "test-e2e")
-	if len(got) != 1 {
-		t.Fatalf("makeDryRun returned %d commands, want 1: %q", len(got), got)
-	}
-	want := map[string]bool{"./a": true, "./b": true}
-	if pkgs := goTestPackages(got); !reflect.DeepEqual(pkgs, want) {
-		t.Errorf("packages = %v, want %v", pkgs, want)
+			dir := t.TempDir()
+			makefile := tt.preamble + "test-e2e:\n\tgo test -tags e2e ./a/ \\\n\t\t./b/\n"
+			if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(makefile), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for key, value := range tt.env {
+				t.Setenv(key, value)
+			}
+
+			got := makeDryRun(t, dir, "test-e2e")
+			if len(got) != 1 {
+				t.Fatalf("makeDryRun returned %d commands, want 1: %q", len(got), got)
+			}
+			want := map[string]bool{"./a": true, "./b": true}
+			if pkgs := goTestPackages(got); !reflect.DeepEqual(pkgs, want) {
+				t.Errorf("packages = %v, want %v", pkgs, want)
+			}
+		})
 	}
 }
