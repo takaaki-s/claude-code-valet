@@ -11,25 +11,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/takaaki-s/jind-ai/internal/debug"
 	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
-
-// inheritedEnvKeys is the minimal set of parent-process env vars forwarded to a
-// plugin run. It covers what interpreters / toolchains need to bootstrap without
-// leaking arbitrary daemon state. LC_* is handled separately by prefix match.
-var inheritedEnvKeys = map[string]bool{
-	"PATH":  true,
-	"HOME":  true,
-	"USER":  true,
-	"SHELL": true,
-	"LANG":  true,
-	"TERM":  true,
-}
 
 // Event is the payload delivered to a plugin for one dispatch. It is defined
 // here (not in session) so that session depends on plugin and not the reverse.
@@ -166,29 +153,10 @@ func ExecPlugin(ctx context.Context, opts ExecOptions) error {
 	return nil
 }
 
-// curatedEnv returns the allowlisted subset of the parent process environment
-// (inheritedEnvKeys plus any LC_* locale vars). It is the shared base for both a
-// plugin's dispatch run and its build step, so neither inherits arbitrary daemon
-// state.
-func curatedEnv() []string {
-	env := make([]string, 0, 8)
-	for _, kv := range os.Environ() {
-		i := strings.IndexByte(kv, '=')
-		if i < 0 {
-			continue
-		}
-		key := kv[:i]
-		if inheritedEnvKeys[key] || strings.HasPrefix(key, "LC_") {
-			env = append(env, kv)
-		}
-	}
-	return env
-}
-
 // buildEnv assembles the plugin's environment: the curated inherited keys plus
 // the injected JIN_* vars derived from opts.
 func buildEnv(opts ExecOptions) []string {
-	env := curatedEnv()
+	env := jinenv.InheritedEnv()
 	env = append(env,
 		"JIN_EVENT="+opts.Env.Name,
 		"JIN_SESSION_ID="+opts.Env.SessionID,

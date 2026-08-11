@@ -370,3 +370,18 @@ func TestRunner_HookLogPath(t *testing.T) {
 		t.Errorf("HookLogPath = %q, want %q", got, want)
 	}
 }
+
+// TestBuildEnv_ForwardsTheInheritedAllowlist covers the wiring, not the table:
+// the allowlist lives in jinenv and is tested there. Dropping the call here
+// left this package green, since nothing else asserts a hook gets a PATH at all
+// — and one that runs without it fails inside somebody's toolchain, far away.
+// The JIN_* half is already held end-to-end by TestRunner_Run_EnvVars.
+func TestBuildEnv_ForwardsTheInheritedAllowlist(t *testing.T) {
+	t.Setenv("PATH", "/pinned/by/the/test")
+
+	env := strings.Join(buildEnv(RunOptions{WorktreePath: "/w", SessionID: "s"}), "\n")
+
+	if !strings.Contains(env, "PATH=/pinned/by/the/test") {
+		t.Errorf("the hook is not given the inherited PATH; env:\n%s", env)
+	}
+}

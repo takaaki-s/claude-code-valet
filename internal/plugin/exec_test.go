@@ -363,3 +363,17 @@ func TestBuildEnv_OmitsWidthOnlyWhenHeightUnset(t *testing.T) {
 		t.Errorf("unexpected JIN_PLUGIN_POPUP_HEIGHT when unset; env:\n%s", joined)
 	}
 }
+
+// TestBuildEnv_ForwardsTheInheritedAllowlist covers the wiring, not the table:
+// the allowlist lives in jinenv and is tested there. Dropping the call here
+// left this package green, because the only coverage of a curated environment
+// was on the build path (TestRunBuilds_EnvIsCuratedNotInherited), not dispatch.
+func TestBuildEnv_ForwardsTheInheritedAllowlist(t *testing.T) {
+	t.Setenv("PATH", "/pinned/by/the/test")
+
+	env := strings.Join(buildEnv(ExecOptions{Env: sampleEvent(), Identity: testIdentity()}), "\n")
+
+	if !strings.Contains(env, "PATH=/pinned/by/the/test") {
+		t.Errorf("the plugin is not given the inherited PATH; env:\n%s", env)
+	}
+}

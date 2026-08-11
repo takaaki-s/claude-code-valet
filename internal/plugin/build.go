@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/takaaki-s/jind-ai/internal/jinenv"
 	"github.com/takaaki-s/jind-ai/internal/procgroup"
 )
 
@@ -63,9 +64,9 @@ func RunBuilds(cmds []string, opts BuildOptions) error {
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
 	defer cancel()
 
-	// curatedEnv() scans os.Environ() on every call, so the environment is
-	// assembled once here rather than per step.
-	env := append(curatedEnv(), "npm_config_ignore_scripts=true")
+	// jinenv.InheritedEnv() scans os.Environ() on every call, so the environment
+	// is assembled once here rather than per step.
+	env := append(jinenv.InheritedEnv(), "npm_config_ignore_scripts=true")
 
 	for i, cmdStr := range cmds {
 		fmt.Fprintf(out, "\n--- build step %d/%d: %s ---\n", i+1, len(cmds), cmdStr)

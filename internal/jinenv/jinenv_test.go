@@ -145,3 +145,57 @@ func TestIdentity_TmuxEnvironCoversEveryKeyEnvironCan(t *testing.T) {
 		}
 	}
 }
+
+// TestInheritedEnv_ForwardsEveryAllowlistedKey pins the table by value.
+//
+// The keys are spelled out rather than ranged over inheritedEnvKeys: a test
+// that reads the table cannot notice a key removed from it — the loop simply
+// gets shorter and still passes. Measured, and not hypothetically: with this
+// package's only coverage of the allowlist living in internal/plugin's tests,
+// dropping PATH from the table left internal/worktreehook green.
+func TestInheritedEnv_ForwardsEveryAllowlistedKey(t *testing.T) {
+	want := []string{"PATH", "HOME", "USER", "SHELL", "LANG", "TERM"}
+	for _, key := range want {
+		t.Setenv(key, "value-of-"+key)
+	}
+
+	got := inheritedEnvMap(t)
+	for _, key := range want {
+		if got[key] != "value-of-"+key {
+			t.Errorf("%s not forwarded to the child (got %q)", key, got[key])
+		}
+	}
+}
+
+// TestInheritedEnv_ForwardsLocaleByPrefixAndNothingElse covers the two rules
+// that are not the table: LC_* travels on a prefix match, and anything else the
+// parent happens to hold does not. The negative half is the point — this env is
+// assembled by a daemon whose own environment is not a child's business.
+func TestInheritedEnv_ForwardsLocaleByPrefixAndNothingElse(t *testing.T) {
+	t.Setenv("LC_TIME", "C")
+	t.Setenv("JIN_SOCKET", "/somewhere/daemon.sock")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "must-not-travel")
+
+	got := inheritedEnvMap(t)
+	if got["LC_TIME"] != "C" {
+		t.Errorf("LC_TIME not forwarded (got %q)", got["LC_TIME"])
+	}
+	for _, key := range []string{"JIN_SOCKET", "AWS_SECRET_ACCESS_KEY"} {
+		if v, ok := got[key]; ok {
+			t.Errorf("%s reached the child as %q; the identity is added by the caller, not inherited here", key, v)
+		}
+	}
+}
+
+func inheritedEnvMap(t *testing.T) map[string]string {
+	t.Helper()
+	got := map[string]string{}
+	for _, kv := range InheritedEnv() {
+		key, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("InheritedEnv returned a bare word, not KEY=VALUE: %q", kv)
+		}
+		got[key] = value
+	}
+	return got
+}
