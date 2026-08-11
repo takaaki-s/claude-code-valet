@@ -17,10 +17,9 @@ type FuzzyMatch struct {
 }
 
 // FuzzyFilter runs sahilm/fuzzy.Find over targets and returns index +
-// matched-rune positions per hit. An empty query short-circuits to all
-// targets in their original order (MatchedIndexes nil) — this preserves
-// the "no filter typed" ordering that palette and switch-session picker
-// both expect, which sahilm/fuzzy would otherwise report as zero results.
+// matched-rune positions per hit. An empty query short-circuits to all targets
+// in their original order (MatchedIndexes nil) — sahilm/fuzzy would otherwise
+// report zero results, losing the "no filter typed" ordering callers expect.
 func FuzzyFilter(query string, targets []string) []FuzzyMatch {
 	q := strings.TrimSpace(query)
 	if q == "" {
@@ -38,12 +37,10 @@ func FuzzyFilter(query string, targets []string) []FuzzyMatch {
 	return out
 }
 
-// BuildActionHaystack joins a palette action's Label and Description into
-// the single haystack that FuzzyFilter matches against. A space separates
-// the two so both segments remain searchable — sahilm/fuzzy stops matching
-// across NUL bytes, which would otherwise drop description hits entirely
-// under the fuzzy engine (a substring engine wouldn't care). Empty
-// Description keeps just the label.
+// BuildActionHaystack joins a palette action's Label and Description into the
+// single haystack FuzzyFilter matches against. A space separates the two
+// because sahilm/fuzzy stops matching across NUL bytes, which would otherwise
+// drop description hits entirely. An empty Description keeps just the label.
 func BuildActionHaystack(label, description string) string {
 	if description == "" {
 		return label
@@ -52,23 +49,19 @@ func BuildActionHaystack(label, description string) string {
 }
 
 // RenderMatchedLine renders target runes with matchedIndexes highlighted,
-// truncating with an ellipsis if the target exceeds maxWidth. Highlights
-// past the truncation boundary are dropped silently; we do not attempt to
-// scroll the target horizontally.
+// truncating with an ellipsis if the target exceeds maxWidth. Highlights past
+// the truncation boundary are dropped silently.
 //
-// matched is expected to be sorted ascending (sahilm/fuzzy guarantees this)
-// so we walk it with a two-pointer cursor instead of building a lookup map,
-// and coalesce runs of adjacent hits into a single style.Render call so a
-// contiguous match of N runes emits one SGR pair instead of N.
+// matched is expected to be sorted ascending (sahilm/fuzzy guarantees this), so
+// it is walked with a two-pointer cursor instead of a lookup map, and runs of
+// adjacent hits coalesce into a single style.Render call.
 func RenderMatchedLine(target []rune, matched []int, maxWidth int, style lipgloss.Style, selected bool) string {
 	if maxWidth <= 0 {
 		return ""
 	}
-	// Truncate rune-wise. maxWidth here is a display width but callers
-	// (palette label column, switch-session row) pass mostly-ASCII targets;
-	// for the popup a rune-count fallback is close enough and keeps the
-	// highlight index math simple. If East-Asian descriptions become
-	// common we can revisit.
+	// Truncate rune-wise. maxWidth here is a display width, but callers pass
+	// mostly-ASCII targets, so a rune-count fallback is close enough for the
+	// popup and keeps the highlight index math simple.
 	visible := target
 	truncated := false
 	if len(visible) > maxWidth {
@@ -126,16 +119,15 @@ func RenderMatchedLine(target []rune, matched []int, maxWidth int, style lipglos
 }
 
 // RenderMatchedSegment is a companion to RenderMatchedLine for callers that
-// paint per-piece with a base style (e.g. the switch-session card, whose
+// paint per-piece with a base style (the switch-session card, whose
 // dir/branch/kind columns each get a different color). matched carries the
 // caller's haystack-wide match indexes; matchOffset is where this segment
-// starts in that haystack. Only indexes in [matchOffset, matchOffset+len(target))
-// participate, rebased to segment-local rune positions on the fly — no
-// allocation per segment (compare the removed localMatched helper).
+// starts in that haystack. Only indexes inside the segment participate, rebased
+// to segment-local rune positions on the fly.
 //
-// Plain runs render under base; hit runs render under base.Underline(true) so
-// the fuzzy hint composes with the segment color instead of clashing with a
-// fixed highlight foreground. Truncation math mirrors RenderMatchedLine.
+// Plain runs render under base; hit runs under base.Underline(true), so the
+// fuzzy hint composes with the segment color instead of clashing with a fixed
+// highlight foreground. Truncation math mirrors RenderMatchedLine.
 func RenderMatchedSegment(target []rune, matched []int, matchOffset, maxWidth int, base lipgloss.Style) string {
 	if maxWidth <= 0 {
 		return ""

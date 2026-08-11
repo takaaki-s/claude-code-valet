@@ -16,15 +16,12 @@ import (
 const lockFilename = "plugins.lock.yaml"
 
 // LockEntry records how one installed plugin was obtained: its source, the
-// requested ref, the commit that was approved at install time, whether it is a
-// symlink (linked) rather than a clone, whether the user pinned it to a
-// specific version at install time, and when it was installed. Linked plugins
-// leave Commit empty because their contents can change out from under the
-// lock. Pinned=true means `plugin update` must not silently move the plugin
-// off the ref the user chose (pass `-v` / `@ref` at install to opt in); a
-// Pinned=false entry is what a bare `plugin install <name>` or
-// `plugin install <url>` writes and follows "the plugin's latest release"
-// under `plugin update`.
+// requested ref, the commit approved at install time, whether it is a symlink
+// (linked) rather than a clone, whether the user pinned it, and when it was
+// installed. Linked plugins leave Commit empty because their contents can
+// change out from under the lock. Pinned=true means `plugin update` must not
+// silently move the plugin off the ref the user chose (pass `-v` / `@ref` at
+// install to opt in); Pinned=false follows "the plugin's latest release".
 type LockEntry struct {
 	Source      string    `yaml:"source"`
 	Ref         string    `yaml:"ref,omitempty"`
@@ -80,10 +77,10 @@ func LoadLock(stateDir string) (*Lock, error) {
 // Get returns the entry for name and whether it exists.
 //
 // The on-disk file is re-read under a shared flock on every call so that
-// entries written by another process (e.g. `jin plugin install` from the CLI
-// while the daemon is running) are visible without restarting the daemon.
-// Re-read failures fall back to the in-memory map so a transient I/O error
-// cannot make previously-visible entries disappear.
+// entries written by another process — `jin plugin install` from the CLI while
+// the daemon runs — are visible without a restart. Re-read failures fall back
+// to the in-memory map, so a transient I/O error cannot make previously-visible
+// entries disappear.
 func (l *Lock) Get(name string) (LockEntry, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

@@ -53,15 +53,10 @@ type Server struct {
 	//
 	// stopping is an explicit sentinel rather than a `listener == nil` check:
 	// conflating "the field was cleared" with "shutdown was intended" is what
-	// forced the accept loop to read a field Stop was concurrently writing.
-	// It also lets Stop publish the intent *before* closing the listener, so
-	// the loop can never observe a close-induced Accept error while the
-	// sentinel still says "unexpected" and spin on the dead listener.
-	//
-	// A mutex is used over an atomic flag because listener needs guarding
-	// anyway (Start writes it, Stop reads it), and one lock covering both
-	// keeps them from drifting apart. It is never held across Accept, which
-	// blocks until a connection arrives or the listener closes.
+	// forced the accept loop to read a field Stop was concurrently writing. It
+	// also lets Stop publish the intent before closing the listener, so the loop
+	// can never observe a close-induced Accept error while the sentinel still
+	// says "unexpected" and spin on the dead listener.
 	lifecycleMu sync.Mutex
 	listener    net.Listener
 	stopping    bool
@@ -70,9 +65,8 @@ type Server struct {
 
 // Message types
 //
-// ProtocolVersion travels on every request and response so a version-mismatch
-// between the CLI and a running daemon (typically: jin binary updated but the
-// daemon was never restarted) fails loudly with an actionable message,
+// ProtocolVersion travels on every request and response so a version mismatch
+// between the CLI and a running daemon fails loudly with an actionable message,
 // instead of surfacing as endpoint-specific JSON parse errors.
 type Request struct {
 	ProtocolVersion int             `json:"protocol_version,omitempty"`
@@ -103,15 +97,11 @@ func NewServer(socketPath, sessionsDir, configDir, stateDir string) (*Server, er
 		return nil, err
 	}
 
-	// Which jin every child this daemon spawns — an agent in a tmux pane, a
-	// plugin from the dispatcher — is told to call back into. Assembled once,
-	// here, because this is the only place that knows all three answers, and
-	// answering separately per spawn site is what once let them disagree.
-	//
-	// The binary is a copy taken now, so the path baked into a session's hooks
-	// survives the launch binary being rebuilt or deleted; EstablishHookBinary
-	// has what goes wrong otherwise, and falls back to the live path when the
-	// copy cannot be made.
+	// Which jin every child this daemon spawns is told to call back into.
+	// Assembled once, here, because this is the only place that knows all three
+	// answers, and answering separately per spawn site is what once let them
+	// disagree. The binary is a copy taken now, so the path baked into a session's
+	// hooks survives the launch binary being rebuilt or deleted.
 	identity := jinenv.Identity{
 		SocketPath: socketPath,
 		BinPath:    session.EstablishHookBinary(stateDir),
@@ -188,13 +178,11 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
-	// Publishing the listener and re-checking the sentinel happen under one
-	// lock, which closes the window between net.Listen returning and the
-	// field being visible to Stop. A Stop landing in that window would
-	// otherwise find a nil listener, close nothing, and leave the accept loop
-	// below blocked forever on a listener nobody owns. Exactly one side wins:
-	// either Stop sees the listener and closes it, or we see stopping and
-	// close it here.
+	// Publishing the listener and re-checking the sentinel happen under one lock,
+	// which closes the window between net.Listen returning and the field being
+	// visible to Stop. A Stop landing in that window would find a nil listener,
+	// close nothing, and leave the accept loop below blocked forever on a
+	// listener nobody owns. Exactly one side wins.
 	s.lifecycleMu.Lock()
 	if s.stopping {
 		s.lifecycleMu.Unlock()
@@ -243,12 +231,11 @@ func (s *Server) stopRequested() bool {
 
 // Stop stops the daemon server.
 //
-// Safe to call concurrently and more than once: the signal handler goroutine
-// installed by Start, handleStop's goroutine, and an explicit call can all
-// fire at the same time. sync.Once (rather than an early return on a flag)
-// means later callers block until the first has finished closing the listener
-// and removing the socket, so a caller that follows Stop with os.Exit cannot
-// exit before the cleanup lands.
+// Safe to call concurrently and more than once: the signal handler goroutine,
+// handleStop's goroutine, and an explicit call can all fire at the same time.
+// sync.Once rather than an early return on a flag, so later callers block until
+// the first has finished closing the listener and removing the socket — a
+// caller that follows Stop with os.Exit cannot exit before the cleanup lands.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
 		// Publish the intent before closing, so the accept loop is guaranteed
@@ -347,12 +334,11 @@ func (s *Server) handleRequest(req *Request) Response {
 
 // readOnlyActions names the actions above whose handlers only read state. The
 // client uses it to decide whether a timeout needs the "your request may have
-// gone through anyway" warning (see wrapDeadline); it lives here so that the
-// two stay in sync as the switch grows.
+// gone through anyway" warning (see wrapDeadline); it lives here so the two
+// stay in sync as the switch grows.
 //
-// Membership is opt-in on purpose: an action added above and forgotten here
-// gets the cautious wording, which is wrong but harmless — the reverse
-// mistake would quietly drop the warning from a mutating action.
+// Membership is opt-in on purpose: an action forgotten here gets the cautious
+// wording, which is wrong but harmless. The reverse mistake would be silent.
 var readOnlyActions = map[string]bool{
 	"list":         true,
 	"get":          true,
@@ -557,12 +543,10 @@ func (s *Server) handleSend(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 
-	// Reject prompts SendPrompt could not verify. Its verify path searches
-	// the captured pane for the prompt's tail, and a prompt that normalizes
-	// to nothing leaves no needle — sendVerifyOK then accepts it trivially,
-	// so allowing one through here would send an unverified Enter to the
-	// TUI. This covers whitespace-only prompts and, because verify also
-	// discards box-drawing runes, ones built only from those; deferring to
+	// Reject prompts SendPrompt could not verify. Its verify path searches the
+	// captured pane for the prompt's tail, and a prompt that normalizes to
+	// nothing leaves no needle — sendVerifyOK then accepts it trivially, so one
+	// let through here would send an unverified Enter to the TUI. Deferring to
 	// session.PromptVerifiable keeps the two rules from drifting apart.
 	if req.Prompt == "" {
 		return Response{Success: false, Error: "prompt is required"}
@@ -572,13 +556,10 @@ func (s *Server) handleSend(data json.RawMessage) Response {
 			"(only whitespace or box-drawing characters)"}
 	}
 	// Success here means the keystrokes reached the input area and Enter was
-	// pressed — not that a turn began on them. SendPrompt closes any
-	// completion overlay first and re-checks the prompt survived, so the
-	// specific case where Enter is swallowed as a completion is covered, but
-	// nothing downstream confirms the agent picked the prompt up. Callers
-	// that need that fact poll for it (`send --wait-running`); a caller that
-	// treats this true as "the child is working" can be reading the previous
-	// turn's output.
+	// pressed — not that a turn began on them. SendPrompt closes any completion
+	// overlay first and re-checks the prompt survived, but nothing downstream
+	// confirms the agent picked the prompt up. Callers that need that fact poll
+	// for it (`send --wait-running`).
 	if err := s.manager.SendPrompt(req.ID, req.Prompt); err != nil {
 		return Response{Success: false, Error: err.Error()}
 	}
@@ -607,18 +588,16 @@ type RespondResponse struct {
 // RespondNotClearedPrefix tags the one "respond" failure the CLI maps to the
 // timeout exit code: the prompt was still on screen after the answer went out.
 //
-// A prefix rather than a shared phrase because the wire format has no room for
-// an error code, and rather than a substring match on the message because that
-// couples an exit code the docs promise to wording nobody would think to keep
-// stable. Callers strip it before display.
+// A prefix rather than a substring match on the message, which would couple an
+// exit code the docs promise to wording nobody would think to keep stable.
+// Callers strip it before display.
 const RespondNotClearedPrefix = "not-cleared: "
 
 // tagRespondError flattens a RespondToBlock failure into the wire's one error
 // string, marking the single case the CLI turns into a distinct exit code.
-//
-// Split out from the handler because it is the whole of that contract and the
-// handler is not reachable in a test without a live tmux pane. A classifier
-// nothing can exercise is a classifier that silently stops classifying.
+// Split out from the handler because the handler is not reachable in a test
+// without a live tmux pane, and a classifier nothing exercises silently stops
+// classifying.
 func tagRespondError(err error) string {
 	if errors.Is(err, session.ErrBlockNotCleared) {
 		return RespondNotClearedPrefix + err.Error()
@@ -705,14 +684,12 @@ type ResultResponse struct {
 // MarshalJSON renders Entries as an array even when it is nil.
 //
 // The invariant belongs on the type rather than at a call site because this
-// value is marshalled twice on the way to a user: once by the daemon, and
-// again by the CLI, which re-encodes the struct it decoded rather than passing
-// the daemon's bytes through (cmd/jin/cmd/result.go). A nil slice encodes as
-// `null`, and the way the agent-facing docs tell an orchestrator to separate
-// "the child said nothing" from "the conversation was lost" is
-// `jq '.entries[] | select(.type=="system")'` — which dies with "Cannot
-// iterate over null" at precisely the moment someone is asking which of the
-// two happened.
+// value is marshalled twice on the way to a user: once by the daemon, and again
+// by the CLI, which re-encodes the struct it decoded. A nil slice encodes as
+// `null`, and the agent-facing docs tell an orchestrator to separate "the child
+// said nothing" from "the conversation was lost" with
+// `jq '.entries[] | select(.type=="system")'` — which dies with "Cannot iterate
+// over null" at precisely that moment.
 func (r ResultResponse) MarshalJSON() ([]byte, error) {
 	// The alias drops the method set, so this does not recurse.
 	type wire ResultResponse
@@ -789,22 +766,20 @@ func (s *Server) handleResult(data json.RawMessage) Response {
 	return Response{Success: true, Data: respData}
 }
 
-// filterResultEntries keeps entries that contain at least one block matching the
-// given tool name and/or error filter. An empty tool and errorsOnly=false returns
-// the input as-is. Tool name matching uses the tool_use's name; for a tool_result
-// entry, name matching requires having seen a corresponding tool_use earlier in
-// the input (matched by tool_use_id).
+// filterResultEntries keeps entries that contain at least one block matching
+// the given tool name and/or error filter. An empty tool with errorsOnly=false
+// returns the input as-is. For a tool_result entry, name matching requires
+// having seen the corresponding tool_use earlier in the input (by tool_use_id).
 //
-// This reads the shared block vocabulary and nothing agent-specific, which is
-// why it stays here rather than moving into the adapters — a per-adapter filter
-// would let --tool and --errors-only mean different things per agent kind.
+// It reads the shared block vocabulary and nothing agent-specific, which is why
+// it stays here rather than moving into the adapters: a per-adapter filter would
+// let --tool and --errors-only mean different things per agent kind.
 //
-// The vocabulary is what is short, not this function: IsError=false means "the
-// agent said it succeeded" on Claude Code and "jind-ai could not tell" on Codex,
-// where the format records no failure flag at all. Do not resolve that by
-// branching on kind here. It is fixed by giving the block an error state that
-// can say "undetermined", which changes the wire format and so is its own
-// change.
+// The vocabulary is what is short. IsError=false means "the agent said it
+// succeeded" on Claude Code and "jind-ai could not tell" on Codex, which records
+// no failure flag at all. Do not resolve that by branching on kind here; it is
+// fixed by giving the block an error state that can say "undetermined", which
+// changes the wire format and so is its own change.
 func filterResultEntries(entries []transcript.Entry, tool string, errorsOnly bool) []transcript.Entry {
 	if tool == "" && !errorsOnly {
 		return entries
@@ -939,13 +914,11 @@ func (s *Server) handleDelete(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 
-	// Flip Status to StatusDeleting so a `get` between here and the
-	// goroutine's completion surfaces the in-flight state to the UI.
-	// MarkDeleting is a CAS: if a prior accept is still finalizing, it
-	// returns ErrDeleteInFlight and we reject the duplicate here so two
-	// finalize goroutines cannot race on the same worktree. It also
-	// atomically captures dreq.previousStatus for MarkDeletionFailed's
-	// rollback path (see manager.MarkDeleting for the split-lock reason).
+	// Flip Status to StatusDeleting so a `get` between here and the goroutine's
+	// completion surfaces the in-flight state to the UI. MarkDeleting is a CAS: a
+	// prior accept still finalizing returns ErrDeleteInFlight, so two finalize
+	// goroutines cannot race on the same worktree. It also atomically captures
+	// dreq.previousStatus for MarkDeletionFailed's rollback path.
 	if err := s.manager.MarkDeleting(&dreq); err != nil {
 		return Response{Success: false, Error: err.Error()}
 	}
@@ -1008,10 +981,8 @@ func (s *Server) handleRemoveDirHistory(data json.RawMessage) Response {
 // The popup is told which jin to call back into and which session its work
 // belongs to: JIN_SOCKET, JIN_BIN, JIN_DEBUG and JIN_SESSION_ID reach it as one
 // tmux -e each, all four every time and empty when a value is unknown.
-// jinenv.Identity.TmuxEnviron renders them and says why omitting a key is not
-// the same as leaving it unset. It writes JIN_PLUGIN_DEPTH empty alongside
-// them, which is not part of the identity — its doc has why a popup is told it
-// continues no plugin's chain.
+// jinenv.Identity.TmuxEnviron renders them, plus an empty JIN_PLUGIN_DEPTH, and
+// says why omitting a key is not the same as leaving it unset.
 type PanePopupRequest struct {
 	ID     string `json:"id"`
 	Cmd    string `json:"cmd"`
@@ -1038,13 +1009,11 @@ func (s *Server) handlePanePopup(data json.RawMessage) Response {
 }
 
 // PaneSplitRequest is the request payload for the "pane-split" action. Cmd is
-// optional: an empty split just opens a shell in the new pane. Name enables
-// the idempotent named-slot path; IfExists picks the policy when the named
-// pane already exists (noop/respawn/error, empty = noop).
-//
-// The new pane is told the same variables PanePopupRequest names, whether
-// it runs Cmd or a bare shell, and a slot restarted under IfExists=respawn is
-// told them again.
+// optional: an empty split just opens a shell in the new pane. Name enables the
+// idempotent named-slot path; IfExists picks the policy when the named pane
+// already exists (noop/respawn/error, empty = noop). The new pane is told the
+// same variables PanePopupRequest names, and a slot restarted under
+// IfExists=respawn is told them again.
 type PaneSplitRequest struct {
 	ID        string `json:"id"`
 	Cmd       string `json:"cmd,omitempty"`
@@ -1167,15 +1136,13 @@ func (s *Server) handlePaneSendKeys(data json.RawMessage) Response {
 
 // PluginRunRequest is the request payload for the "plugin-run" action. It runs
 // one plugin action on demand, bypassing matcher and debounce: against a
-// session's current snapshot when SessionID is set, or as a global action
-// (all session fields empty) when it is not. Action selects which manifest
-// action runs; empty means the plugin's default action (actions[0]), so old
-// clients that never send the field keep their pre-multi-action behaviour.
-// Depth carries the caller CLI's JIN_PLUGIN_DEPTH so the dispatcher can
-// reject a plugin that tries to chain another plugin run.
-// CallerTmuxSocket/CallerTmuxPane carry the invoking CLI's tmux context
-// (from $TMUX/$TMUX_PANE) so the plugin can address the pane it was
-// launched from.
+// session's current snapshot when SessionID is set, or as a global action when
+// it is not. Action selects which manifest action runs; empty means the
+// plugin's default action (actions[0]), so old clients that never send the
+// field keep their pre-multi-action behaviour. Depth carries the caller CLI's
+// JIN_PLUGIN_DEPTH so the dispatcher can reject a chained plugin run.
+// CallerTmuxSocket/CallerTmuxPane carry the invoking CLI's tmux context so the
+// plugin can address the pane it was launched from.
 type PluginRunRequest struct {
 	Plugin           string `json:"plugin"`
 	Action           string `json:"action,omitempty"`

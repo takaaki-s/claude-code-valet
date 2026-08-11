@@ -10,13 +10,11 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/atomicfile"
 )
 
-// hooksSettingsTmpPattern names the in-flight temp file. Nothing scans
-// stateDir by glob — every other name under it is built literally — so the
-// only requirement is that it not collide with the published name. A crash
-// between creating it and the rename leaves one behind, and nothing sweeps
-// stateDir; the .jin- prefix is what makes such a file attributable, the same
-// reasoning the other temp patterns in this package and in the opencode
-// adapter give.
+// hooksSettingsTmpPattern names the in-flight temp file. Nothing scans stateDir
+// by glob, so the only requirement is that it not collide with the published
+// name. A crash between creating it and the rename leaves one behind and
+// nothing sweeps stateDir; the .jin- prefix is what makes such a file
+// attributable.
 const hooksSettingsTmpPattern = ".jin-hooks-*.tmp"
 
 // hooksSettingsFileName is the only spelling of the name in this package.
@@ -43,26 +41,23 @@ func usableHooksSettings(data []byte) bool {
 // "" if there is none or it cannot serve as one. It answers "what can THIS
 // state directory still offer?", which is a different question from "what did
 // the last successful Setup produce?" — the second can name a directory
-// belonging to a different Manager, and the first cannot.
+// belonging to a different Manager.
 //
 // It reads rather than stats because the caller cannot know whether this
-// spawn's own write succeeded — SpawnCommand asks on every spawn, not only
-// after a failure — so what is on disk may have been left by some earlier
-// write, and a rename-published file is only one of the things it can be: a
-// version that wrote in place could have been killed mid-truncate. Handing
-// Claude Code a settings file it reads as empty is worse than handing it none,
-// because none is a documented fallback and the other is silent. What parses is
-// served as it stands, so a file an older jind-ai published is accepted.
+// spawn's own write succeeded, so what is on disk may have been left by an
+// earlier write, and a rename-published file is only one of the things it can
+// be. Handing Claude Code a settings file it reads as empty is worse than
+// handing it none, because none is a documented fallback and the other is
+// silent. What parses is served as it stands, so a file an older jind-ai
+// published is accepted.
 func existingHooksSettings(stateDir string) string {
 	if stateDir == "" {
 		// Without this, hooksSettingsPath returns the RELATIVE name
 		// "hooks-settings.json", which resolves against the caller's working
 		// directory — and the spawn this answers for runs in the session's own
-		// work dir, so a repository that happened to contain a file by that
-		// name would be handed to Claude Code as its hook configuration.
-		// paths.State() panics rather than returning empty, so no production
-		// caller reaches this; it costs one comparison to make that a fact
-		// about this function rather than about its callers.
+		// work dir, so a repository containing a file by that name would be handed
+		// to Claude Code as its hook configuration. paths.State() panics rather
+		// than returning empty, so no production caller reaches this.
 		return ""
 	}
 	path := hooksSettingsPath(stateDir)
@@ -95,12 +90,11 @@ type hooksSettings struct {
 }
 
 // EnsureHooksSettingsFile generates hooks-settings.json inside stateDir so
-// Claude Code (started via `claude --settings <path>`) invokes `jin hook`
-// on every event the daemon cares about.
+// Claude Code (started via `claude --settings <path>`) invokes `jin hook` on
+// every event the daemon cares about. Returns the absolute path.
 //
-// The file is written on every call — it's cheap, and always-write means the
-// command path stays correct if the jin binary was upgraded / moved. Returns
-// the absolute path to the generated file.
+// Written on every call — it is cheap, and always-write keeps the command path
+// correct if the jin binary was upgraded or moved.
 func EnsureHooksSettingsFile(stateDir, execPath string) (string, error) {
 	entry := hooksEntry{
 		Type:    "command",
@@ -143,20 +137,16 @@ func EnsureHooksSettingsFile(stateDir, execPath string) (string, error) {
 	path := hooksSettingsPath(stateDir)
 	// 0600: match trust state and session store; the file is single-user.
 	//
-	// Published atomically rather than written in place, and the reason is
-	// what Setup now does: this runs at every session start, so a rewrite can
-	// land while another session's Claude Code is starting up and reading the
-	// same file through --settings. os.WriteFile opens with O_TRUNC, which
-	// leaves the file at length zero for the middle of each write — measured
-	// at 28-30 microseconds per rewrite, roughly half of the call. While the
-	// write happened once per process no session was starting up alongside it.
-	// (Whether a Claude Code already running re-reads the file is unmeasured,
-	// so this says nothing about one; a tmux session outlives a daemon
-	// restart, so such a reader does exist.) ~/.claude.json is temp-and-renamed
-	// for exactly this reason (docs/gotchas.md), and hooks-settings.json has
-	// now joined it. The rename replaces a symlink at this path rather than
-	// following it — acceptable inside jind-ai's own state directory, unlike
-	// ~/.claude.json, where EnsureTrustState resolves one first.
+	// Published atomically rather than written in place, because Setup runs at
+	// every session start: a rewrite can land while another session's Claude Code
+	// is starting up and reading the same file through --settings. os.WriteFile
+	// opens with O_TRUNC, which leaves the file at length zero for the middle of
+	// each write — measured at 28-30 microseconds per rewrite, roughly half of
+	// the call. (Whether a Claude Code ALREADY running re-reads the file is
+	// unmeasured, so this says nothing about one.) The rename replaces a symlink
+	// at this path rather than following it — acceptable inside jind-ai's own
+	// state directory, unlike ~/.claude.json, where EnsureTrustState resolves one
+	// first.
 	if err := atomicfile.Write(path, data, 0600, hooksSettingsTmpPattern); err != nil {
 		return "", fmt.Errorf("failed to write hooks settings file: %w", err)
 	}

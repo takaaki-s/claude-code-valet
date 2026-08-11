@@ -40,11 +40,10 @@ const (
 	// hint line demands more room.
 	confirmDialogMaxInner = 44
 
-	// Placement fallbacks used before the first tea.WindowSizeMsg lands.
-	// They only decide the centering box for that one frame, and they are
-	// roomier than the settled popup rather than equal to it: at the default
-	// confirm size an 80-column client gives an inner pty of 38 columns and
-	// 10 rows.
+	// Placement fallbacks used before the first tea.WindowSizeMsg lands. They
+	// only decide the centering box for that one frame, and they are roomier
+	// than the settled popup: at the default confirm size an 80-column client
+	// gives an inner pty of 38 columns and 10 rows.
 	confirmFallbackWidth  = 60
 	confirmFallbackHeight = 20
 )
@@ -118,28 +117,25 @@ func confirmSpecFor(mode, desc string) (confirmSpec, bool) {
 	case ConfirmModeDeleteWorktreeForce:
 		return confirmSpec{
 			// Names the session like the other three modes: this prompt is
-			// raised asynchronously (after the daemon refuses a dirty
-			// worktree) in a popup of its own, so the title is the only
-			// context the user has — and both answers here destroy something.
+			// raised asynchronously in a popup of its own, so the title is
+			// the only context the user has — and both answers destroy
+			// something.
 			//
-			// The reason sits in the subtitle rather than the title because
-			// the two compete for one truncated line otherwise: at the default
-			// popup size the content width is 34, so "⚠ '<desc>' has
-			// uncommitted changes" loses its reason for any name longer than
-			// six characters. Split, the title holds names up to 22 and the
-			// reason is never the part that disappears.
+			// The reason sits in the subtitle because the two compete for
+			// one truncated line otherwise: at the default popup size the
+			// content width is 34, so the reason is lost for any name longer
+			// than six characters. Split, the title holds names up to 22.
 			title:    fmt.Sprintf("⚠ Delete '%s'?", desc),
 			subtitle: "Worktree has uncommitted changes",
 			hints: []keyHint{
 				{"y", "force delete worktree"},
 				{"n", "delete session only"},
-				// The only non-destructive way out, and the one mode where it
-				// has to be advertised: both answers above destroy something.
-				// Accurate as written — the daemon refused the dirty worktree
-				// before this prompt was raised, so nothing has been deleted
-				// yet and dismissing leaves session and worktree as they are.
-				// Ctrl+C is not in results: Update handles it for every mode,
-				// writing no answer at all.
+				// The only non-destructive way out, and the one mode
+				// where it has to be advertised: both answers above
+				// destroy something. Accurate as written — the daemon
+				// refused the dirty worktree before this prompt was
+				// raised, so nothing has been deleted yet. Ctrl+C is not
+				// in results: Update handles it for every mode.
 				{"ctrl+c", "cancel, delete nothing"},
 			},
 			// No "enter" here: force-removing a dirty worktree discards work,
@@ -157,10 +153,9 @@ func confirmSpecFor(mode, desc string) (confirmSpec, bool) {
 
 // ConfirmPopupModel is the standalone Bubble Tea model behind
 // `jin confirm-popup`: a single yes/no(/worktree) prompt for a destructive
-// action. It runs in its own tmux popup so it owns keyboard focus while
-// open — the reason the confirmation is not drawn inside the parent TUI's
-// pane, which does not hold focus when the action palette launched the
-// action.
+// action. It runs in its own tmux popup so it owns keyboard focus while open —
+// the parent TUI's pane does not hold focus when the action palette launched
+// the action.
 type ConfirmPopupModel struct {
 	spec   confirmSpec
 	result string
@@ -169,10 +164,9 @@ type ConfirmPopupModel struct {
 }
 
 // NewConfirmPopupModel builds the dialog for mode, naming targetDesc in the
-// title. The bool reports whether mode is one this popup can render: it is
-// false for a stale or garbled JIN_CONFIRM_MODE, and the caller must then run
-// nothing rather than show a prompt it cannot attribute to a real request —
-// answering one would destroy a session.
+// title. The bool reports whether mode is one this popup can render: false for
+// a stale or garbled JIN_CONFIRM_MODE, and the caller must then run nothing
+// rather than show a prompt it cannot attribute to a real request.
 func NewConfirmPopupModel(mode, targetDesc string) (ConfirmPopupModel, bool) {
 	spec, ok := confirmSpecFor(mode, targetDesc)
 	if !ok {
@@ -223,11 +217,10 @@ func (m ConfirmPopupModel) View() string {
 }
 
 // renderConfirmDialog lays out the confirm dialog: warning-tinted title,
-// optional dim subtitle, then a run of "<key>  <desc>" lines. Text is
-// truncated to the resolved width so wide session names never sprawl past the
-// clamp. availWidth / availHeight are the popup's inner pty — the space tmux
-// leaves inside the border it draws itself, which is why nothing here adds a
-// frame of its own.
+// optional dim subtitle, then a run of "<key>  <desc>" lines. Text is truncated
+// to the resolved width so wide session names never sprawl. availWidth /
+// availHeight are the popup's inner pty — the space tmux leaves inside the
+// border it draws itself, which is why nothing here adds a frame of its own.
 func renderConfirmDialog(title, subtitle string, hints []keyHint, availWidth, availHeight int) string {
 	longest := lipgloss.Width(title)
 	if w := lipgloss.Width(subtitle); w > longest {
@@ -271,19 +264,16 @@ func renderConfirmDialog(title, subtitle string, hints []keyHint, availWidth, av
 
 // clampConfirmLines assembles the dialog body from its already-styled parts,
 // shedding from least to most load-bearing until it fits maxLines rows: the
-// blank spacer first, then the subtitle, then hints. The title always
-// survives; the LAST hint survives whenever any hint is shown at all.
+// blank spacer first, then the subtitle, then hints. The title always survives;
+// the LAST hint survives whenever any hint is shown at all.
 //
 // It exists because bubbletea's renderer truncates an over-tall frame from the
-// TOP: on a popup shorter than the dialog the top rows — the ones naming what
-// is about to be destroyed — are what would disappear, leaving a bare y/n
-// prompt. Trimming here keeps the target on screen, and the keys the dropped
-// hints advertised still work.
+// TOP: on a popup shorter than the dialog, the rows naming what is about to be
+// destroyed are what would disappear, leaving a bare y/n prompt.
 //
 // Hints go from the middle rather than off the end because every mode puts its
-// way out last — "n cancel", and for the force dialog the Ctrl+C row that
-// leaves session and worktree alone. Trimming the tail would leave a prompt
-// advertising only the answers that destroy something.
+// way out last. Trimming the tail would leave a prompt advertising only the
+// answers that destroy something.
 func clampConfirmLines(title, subtitle string, hints []string, maxLines int) []string {
 	maxLines = max(maxLines, 1)
 	head := 1 // title

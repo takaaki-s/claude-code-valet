@@ -10,39 +10,32 @@ import (
 // reaches a shell as text. The rule and the reasoning behind it are the
 // shell-safety contract on session.SpawnPlan; this is one adapter obeying it.
 //
-// Codex has the weakest claim of the three adapters to trust this value: with no
-// --session-id equivalent, every id it resumes arrived from a hook payload
-// rather than from jind-ai. Manager validates one before recording it, but a
-// record written by an older jind-ai — or edited by hand — reaches SpawnCommand
-// having passed no gate.
-// TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand (internal/agent/register)
-// enforces the rule for every registered adapter.
+// Codex has the weakest claim of the three adapters to trust this value: with
+// no --session-id equivalent, every id it resumes arrived from a hook payload
+// rather than from jind-ai, and a record written by an older jind-ai — or
+// edited by hand — reaches SpawnCommand having passed no gate.
 const sessionArgEnv = "JIN_CODEX_SESSION"
 
-// configArgs returns the `-c` overrides jind-ai forces on every spawned
-// Codex. They are passed per spawn — the user's own Codex config is never
-// rewritten, so a Codex started outside jind-ai keeps its normal
-// behaviour.
+// configArgs returns the `-c` overrides jind-ai forces on every spawned Codex.
+// They are passed per spawn — the user's own Codex config is never rewritten,
+// so a Codex started outside jind-ai keeps its normal behaviour.
 //
 //   - disable_paste_burst=true turns off the input folding that replaces a
 //     large paste with a "[Pasted Content N chars]" placeholder. Manager's
 //     verify reads the prompt tail back out of capture-pane, and a folded
 //     input hides it — the send then looks dropped even though it landed.
-//     Trade-off: a human pasting into this pane also gets raw text instead
-//     of the placeholder.
-//   - check_for_update_on_startup=false suppresses the startup update
-//     prompt. It steals the first keystrokes of a session, and answering it
-//     by accident upgrades Codex out from under the user.
+//     Trade-off: a human pasting into this pane also gets raw text.
+//   - check_for_update_on_startup=false suppresses the startup update prompt,
+//     which steals the first keystrokes of a session and, answered by
+//     accident, upgrades Codex out from under the user.
 //
-// Values are wrapped in single quotes to match HookArgs: SpawnPlan.Command
-// is spliced into a shell wrapper, and quoting everything uniformly means
-// no one has to work out which `-c` values happen to be shell-safe.
+// Values are wrapped in single quotes to match HookArgs, so no one has to work
+// out which `-c` values happen to be shell-safe.
 //
 // Caveat: Codex ignores unknown `-c` keys silently rather than failing. If
-// either key is renamed upstream this stops working with no error, so do
-// not treat the paste-burst override as a reason to drop the chunking and
-// inter-chunk delay in Manager.SendPrompt — those defend the same failure
-// independently.
+// either key is renamed upstream this stops working with no error, so do not
+// treat the paste-burst override as a reason to drop the chunking and
+// inter-chunk delay in Manager.SendPrompt.
 func configArgs() []string {
 	return []string{
 		"-c", "'disable_paste_burst=true'",
@@ -59,34 +52,26 @@ func isResume(opts agent.SpawnOptions) bool {
 	return opts.AgentSessionID != "" && opts.AgentSessionStarted
 }
 
-// SpawnCommand builds the `codex ...` command line the daemon splices into
-// its fixed shell wrapper. Manager handles cwd + JIN_SESSION_ID + env -u
-// TMUX; we only own the agent-specific pieces:
+// SpawnCommand builds the `codex ...` command line the daemon splices into its
+// fixed shell wrapper. Manager handles cwd + JIN_SESSION_ID + env -u TMUX;
+// this owns the agent-specific pieces:
 //
-//   - `codex` on the first spawn — Codex has no `--session-id`
-//     equivalent, so we spawn fresh and let SessionStart's hook stdin
-//     write the actual UUID back into Session.AgentSessionID. The
-//     pre-mint UUID Manager set on Session.AgentSessionID is
-//     intentionally ignored here — see "Codex adapter" in
-//     docs/gotchas.md for why.
-//   - `codex resume "$JIN_CODEX_SESSION"` once AgentSessionStarted is true
-//     and AgentSessionID has been re-keyed to the real Codex UUID. `codex
-//     resume` fails fast on an unknown UUID (~3s in Codex 0.144.1, well
-//     within the existing 10s quick-fail auto-recovery window), so a
-//     stale UUID does not require a defensive glob check up front. The
-//     UUID itself travels in ExtraEnv — see sessionArgEnv.
-//   - Hook injection via `--enable hooks` + one `-c 'hooks.X=[...]'`
-//     per managedEvent. See hook_args.go.
-//   - The behaviour overrides in configArgs, injected per spawn rather
-//     than written into the user's Codex config.
+//   - `codex` on the first spawn — Codex has no `--session-id` equivalent, so
+//     we spawn fresh and let SessionStart's hook stdin write the actual UUID
+//     back into Session.AgentSessionID. The pre-minted UUID is intentionally
+//     ignored here; see "Codex adapter" in docs/gotchas.md for why.
+//   - `codex resume "$JIN_CODEX_SESSION"` once AgentSessionStarted is true and
+//     AgentSessionID has been re-keyed to the real Codex UUID. `codex resume`
+//     fails fast on an unknown UUID (~3s in Codex 0.144.1, well within the 10s
+//     quick-fail auto-recovery window), so a stale UUID does not require a
+//     defensive glob check up front. The UUID travels in ExtraEnv.
+//   - Hook injection via `--enable hooks` + one `-c 'hooks.X=[...]'` per
+//     managedEvent (see hook_args.go), plus the overrides in configArgs.
 //
-// UnsetEnv clears three Codex sandbox markers so a jind-ai session
-// spawned from inside a Codex-created sandbox does not inherit "we're
-// already inside a sandbox" state. The three variables mirror the
-// [[cc-child-session-env]] discipline the Claude adapter follows;
-// authentication vars (CODEX_API_KEY / CODEX_ACCESS_TOKEN /
-// OPENAI_API_KEY) are intentionally left set so the spawned Codex can
-// authenticate.
+// UnsetEnv clears three Codex sandbox markers so a jind-ai session spawned
+// from inside a Codex-created sandbox does not inherit that state.
+// Authentication vars (CODEX_API_KEY / CODEX_ACCESS_TOKEN / OPENAI_API_KEY)
+// are intentionally left set so the spawned Codex can authenticate.
 func SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 	base := "codex"
 	var extraEnv map[string]string

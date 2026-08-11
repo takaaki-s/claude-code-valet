@@ -32,11 +32,10 @@ func probeShellCmd(t *testing.T, mgr *Manager) string {
 }
 
 // TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo pins the wiring from
-// NewManager's identity argument through to the agent's environment.
-//
-// The value is unique per run so that an implementation which hands out a
-// constant — the default socket path, or the state dir it sits next to —
-// cannot pass by coincidence. Nothing but this argument produces it.
+// NewManager's identity argument through to the agent's environment. The value
+// is unique per run so that an implementation handing out a constant — the
+// default socket path, or the state dir it sits next to — cannot pass by
+// coincidence.
 //
 // Leaving it to inheritance is what this replaces: a tmux pane is handed the
 // tmux server's environment, and that server outlives any one daemon, so the
@@ -44,9 +43,8 @@ func probeShellCmd(t *testing.T, mgr *Manager) string {
 // none had, the agent's hooks reached no daemon at all and said nothing about
 // it — exit 0, status unchanged.
 //
-// The quoting is part of the assertion. These values are paths, and a path may
-// contain a space; left bare, `env` would read the remainder as the command to
-// run.
+// The quoting is part of the assertion. These values are paths, and left bare
+// `env` would read the remainder as the command to run.
 func TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "this-run-only.sock")
 	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{SocketPath: socket})
@@ -62,13 +60,11 @@ func TestBuildAgentShellCmd_NamesTheDaemonTheAgentCallsBackTo(t *testing.T) {
 // pointed at the binary its identity names, not at a path this process resolves
 // for itself.
 //
-// The distinction is the whole reason a stable copy exists: this environment is
-// read once, when the agent starts, and is never revisited, so a path into
-// whatever directory the daemon launched from can stop describing the running
-// daemon — or stop existing — while the session is still going.
-// EstablishHookBinary has the full account. os.Executable() is checked for
-// explicitly because it is also a plausible non-empty path, so an assertion on
-// presence alone would accept it.
+// This environment is read once, when the agent starts, and never revisited, so
+// a path into whatever directory the daemon launched from can stop describing
+// the running daemon — or stop existing — while the session is still going.
+// os.Executable() is checked for explicitly because it is also a plausible
+// non-empty path, so an assertion on presence alone would accept it.
 func TestBuildAgentShellCmd_NamesTheBinaryTheAgentReEnters(t *testing.T) {
 	stable := filepath.Join(t.TempDir(), "bin", "jin")
 	mgr, _, _ := newTestManagerOn(t, jinenv.Identity{BinPath: stable})
@@ -124,20 +120,18 @@ func TestBuildAgentShellCmd_TellsTheAdapterTheSameBinary(t *testing.T) {
 //
 // It belongs here rather than beside an adapter because this is where the values
 // are decided. An adapter test can only ask "given these options, what comes
-// back?" — it cannot oblige anyone to fill them, and each adapter answers an
-// absent path by quietly dropping what depended on it: claude its --settings and
-// opencode its OPENCODE_CONFIG_DIR when StateDir is empty, codex its whole hook
-// injection when ExecPath is. (Measured, and not symmetric: an empty StateDir
-// alone leaves codex injecting hooks as usual, because its payload is built from
-// ExecPath.) All three still return a runnable command, so a builder that
-// quietly stopped passing either value would leave three adapters silently
-// unconfigured — measured with every test in ./internal/agent/... still green.
+// back?" — and each adapter answers an absent path by quietly dropping what
+// depended on it: claude its --settings and opencode its OPENCODE_CONFIG_DIR
+// when StateDir is empty, codex its whole hook injection when ExecPath is.
+// (Measured, and not symmetric: an empty StateDir alone leaves codex injecting
+// hooks as usual, because its payload is built from ExecPath.) All three still
+// return a runnable command, so a builder that quietly stopped passing either
+// value would leave three adapters silently unconfigured — measured with every
+// test in ./internal/agent/... still green.
 //
-// The agreement half is what earns the type duplication. SetupContext is
-// deliberately narrower than SpawnOptions (see its doc), so its three fields are
-// written twice from one call site; that is only safe while the two copies
-// cannot disagree. Setup prepares a directory and SpawnCommand points at it, so
-// a skew means pointing at something nobody prepared.
+// The agreement half is what earns the type duplication: SetupContext is
+// deliberately narrower than SpawnOptions, so its three fields are written twice
+// from one call site, and that is only safe while the two cannot disagree.
 func TestBuildAgentShellCmd_TellsTheAdapterOneStory(t *testing.T) {
 	stable := filepath.Join(t.TempDir(), "bin", "jin")
 	workDir := t.TempDir()
@@ -188,22 +182,18 @@ func TestBuildAgentShellCmd_TellsTheAdapterOneStory(t *testing.T) {
 		t.Errorf("Setup wired callbacks through %q while the spawn names %q", setup.ExecPath, spawn.ExecPath)
 	}
 	// Both WorkDirs must be the TILDE-EXPANDED directory, which is a stronger
-	// requirement than agreeing with each other. snapshotForSpawn carries two
-	// work dirs — StartDir as the session recorded it, which may still begin
-	// with "~" (workDirForShell exists to expand it for the shell), and
-	// ExpandedWorkDir, which is what the pane is actually created in
-	// (tmuxClient.NewSessionWithCmdInDir). The Claude Code adapter records trust
-	// for the one Setup is handed, and EnsureTrustState only calls filepath.Abs,
-	// so handing it the unexpanded form registers a literal "~" directory under
-	// the daemon's own cwd — a trust dialog nobody is watching, for a path that
-	// does not exist. Measured: a mutant putting StartDir on both structs
-	// satisfies an equality-only check.
+	// requirement than agreeing with each other. snapshotForSpawn carries two work
+	// dirs — StartDir as the session recorded it, which may still begin with "~",
+	// and ExpandedWorkDir, which is what the pane is actually created in. The
+	// Claude Code adapter records trust for the one Setup is handed, and
+	// EnsureTrustState only calls filepath.Abs, so handing it the unexpanded form
+	// registers a literal "~" directory under the daemon's own cwd — a trust dialog
+	// nobody is watching, for a path that does not exist. Measured: a mutant
+	// putting StartDir on both structs satisfies an equality-only check.
 	//
 	// SpawnOptions.WorkDir has no adapter reading it today — zero non-test hits
-	// for opts.WorkDir under internal/agent/, which is the only place a
-	// SpawnOptions is consumed. It is pinned anyway because it is part of the
-	// interface an adapter may start using at any time, and it should not be
-	// the wrong directory when one does.
+	// under internal/agent/ — but is pinned anyway, because it is part of the
+	// interface an adapter may start using at any time.
 	if setup.WorkDir != workDir {
 		t.Errorf("SetupContext.WorkDir = %q, want the expanded work dir %q", setup.WorkDir, workDir)
 	}
@@ -252,17 +242,14 @@ func TestBuildAgentShellCmd_NamesTheSessionItStarts(t *testing.T) {
 // agent this line starts is not continuing one.
 //
 // What it prevents is inheritance rather than a wrong value written here.
-// startSessionTmux forks the inner tmux server from the daemon's own process
-// (NewSessionWithCmdInDir, with no environment of its own), so a daemon started
-// from something that carried a depth hands one to that server, and the server
-// hands it to every pane it opens. `jin plugin run` from such a pane reads it
-// back as its caller's depth and the dispatcher refuses the run as a chain —
-// see maxDepth, which separates that from the chains it means to bound.
+// startSessionTmux forks the inner tmux server from the daemon's own process, so
+// a daemon started from something that carried a depth hands one to that server,
+// and the server hands it to every pane it opens. `jin plugin run` from such a
+// pane reads it back as its caller's depth and the dispatcher refuses the run as
+// a chain — see maxDepth.
 //
-// The closing quote is part of the assertion. shellEscape quotes the whole
-// assignment, so 'JIN_PLUGIN_DEPTH=' matches only the empty one; a number would
-// bound a chain nobody started, and README's "Loop residual risk" says a run
-// begun from a pane starts over at depth 1.
+// The closing quote is part of the assertion: shellEscape quotes the whole
+// assignment, so 'JIN_PLUGIN_DEPTH=' matches only the empty one.
 func TestBuildAgentShellCmd_TellsTheAgentItIsNotInAPluginChain(t *testing.T) {
 	mgr, _, _ := newTestManager(t)
 

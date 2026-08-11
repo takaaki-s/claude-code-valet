@@ -2,16 +2,14 @@ package config
 
 import "strings"
 
-// normalizeTmuxKey coerces both tmux bind-key notation ("M-f", "C-]",
-// "S-Tab") and the more common "+"-separated form ("ctrl+f", "alt+f",
-// "shift+tab") into the tmux form. Modifier names are matched
-// case-insensitively; the trailing key token is preserved verbatim so
-// tmux's own case sensitivity (e.g. "M-p" vs "M-P") is not smoothed away.
-// Any input lacking a "+" — including bare "M-p" or symbols like "M-\" —
-// is returned unchanged, so this function is safe to fan through every
-// outer-tmux key config value. An unknown modifier segment (e.g.
-// "hyper+f") also passes through unchanged so tmux surfaces the real
-// error rather than silently binding a mangled key.
+// normalizeTmuxKey coerces both tmux bind-key notation ("M-f", "C-]", "S-Tab")
+// and the more common "+"-separated form ("ctrl+f", "alt+f", "shift+tab") into
+// the tmux form. Modifier names are matched case-insensitively; the trailing key
+// token is preserved verbatim so tmux's own case sensitivity ("M-p" vs "M-P") is
+// not smoothed away. Any input lacking a "+" is returned unchanged, so this is
+// safe to fan through every outer-tmux key config value. An unknown modifier
+// segment also passes through unchanged, so tmux surfaces the real error rather
+// than silently binding a mangled key.
 func normalizeTmuxKey(s string) string {
 	if s == "" || !strings.Contains(s, "+") {
 		return s

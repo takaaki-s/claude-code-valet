@@ -77,11 +77,9 @@ Example:
 // *tmux.Client satisfies it; a test supplies a recording double.
 //
 // The interface, and the variable below, exist because the send is otherwise
-// unobservable — and that is measured, not assumed. With the resolution wired
-// straight into each runner, deleting the identity from both --here paths
-// passed the entire suite, including under -tags e2e. A helper that assembles
-// the options is not enough: what regresses is the call, and nothing obliged
-// anyone to make it.
+// unobservable — and that is measured, not assumed: with the resolution wired
+// straight into each runner, deleting the identity from both --here paths passed
+// the entire suite, including under -tags e2e.
 type callerPaneOps interface {
 	tmux.PaneSlotOps
 	DisplayPopup(tmux.DisplayPopupOptions) error
@@ -90,11 +88,10 @@ type callerPaneOps interface {
 // resolveCallerTmux resolves the caller's own tmux server and anchor pane for
 // --here mode, bypassing the daemon. The server is discovered from $TMUX (human
 // invocation) or JIN_CALLER_TMUX_SOCKET (plugin action invocation); the anchor
-// pane likewise from $TMUX_PANE or JIN_CALLER_TMUX_PANE (may be empty; popup
-// treats empty as "active client", so this variant does not require it).
+// pane likewise from $TMUX_PANE or JIN_CALLER_TMUX_PANE, which may be empty
+// since a popup treats empty as "active client".
 //
-// A variable so a test can stand in for the tmux server. Production never
-// reassigns it.
+// A variable so a test can stand in for the tmux server.
 var resolveCallerTmux = func() (callerPaneOps, string, error) {
 	socketPath := envFallback(tmux.SocketPathFromEnv(os.Getenv("TMUX")), "JIN_CALLER_TMUX_SOCKET")
 	if socketPath == "" {
@@ -126,20 +123,17 @@ func callerTmuxWithPane() (callerPaneOps, string, error) {
 //
 // --here never reaches the daemon, so this process is the composition root for
 // the pane it opens — and it does not know the answers, it was told them. The
-// caller here is a plugin the dispatcher started or a shell inside an agent's
-// pane, and either way its own environment already names the jin that started
-// it. So this passes those on rather than working them out again:
+// caller is a plugin the dispatcher started or a shell inside an agent's pane,
+// and either way its own environment already names the jin that started it:
 //
 //   - BinPath comes from JIN_BIN and nowhere else; jinenv.Identity.BinPath says
-//     why a spawn site must not work it out. A --here caller was handed the
-//     daemon's answer already.
-//   - SocketPath goes through getSocketPath() rather than os.Getenv, so a
-//     caller that was never given JIN_SOCKET still names a socket. Resolving it
-//     here rather than leaving the pane to do it is the point: the pane's
-//     XDG_RUNTIME_DIR comes from the tmux server, which is exactly the value
-//     this whole change stops trusting.
-//   - Debug is this process's own flag, which is the one the child is being
-//     told the meaning of.
+//     why a spawn site must not work it out for itself.
+//   - SocketPath goes through getSocketPath() rather than os.Getenv, so a caller
+//     never given JIN_SOCKET still names a socket. Resolving it here rather than
+//     leaving the pane to do it is the point: the pane's XDG_RUNTIME_DIR comes
+//     from the tmux server, which is exactly the value this stops trusting.
+//   - Debug is this process's own flag, which is the one the child is being told
+//     the meaning of.
 //
 // Asking the daemon for its identity instead would also work, and was rejected
 // because --here runs today with the daemon down and that is worth keeping.

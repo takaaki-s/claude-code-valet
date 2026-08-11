@@ -19,24 +19,14 @@ const maxRepoRootWalk = 100
 //   - non-git dir:   "<dir-basename>"
 //   - empty input:   "session"
 //
-// The result is always non-empty.
+// The result is always non-empty. The worktree case omits the main repo name on
+// purpose: the session list shows the repo in its own field, so repeating it
+// would spend the session's only identifying column on a string every row
+// already shares.
 //
-// The worktree case deliberately omits the main repo name even though
-// ResolveRepoName can recover it: the session list shows the repo as its own
-// field, and a baseline that repeats it spends the session's only identifying
-// column on a string every row already shares. What is left — the worktree
-// name — is the part that differs per session. Main-repo sessions keep the
-// repo name because they have no other token to be named after.
-//
-// This function only depends on filepath + os.Lstat / os.ReadFile; it never
-// invokes the git subprocess. That matters because CreateWithOptions calls
-// this on the hot path, and shelling out to git would add tens of milliseconds
-// per create.
-//
-// isWorktree and tmuxHint are accepted for signature stability across the
-// three call sites documented in the F001/F004 review notes; the actual
-// worktree detection is done by inspecting workDir on disk here so the three
-// sites can pass isWorktree=false without silently disabling the branch.
+// It never shells out to git — CreateWithOptions calls this on the hot path —
+// and it detects a worktree by inspecting workDir on disk, so a caller may pass
+// isWorktree=false without silently disabling that branch.
 func GenerateBaselineDescription(workDir, currentBranch string, isWorktree bool, tmuxHint string) string {
 	_ = isWorktree
 	_ = tmuxHint
@@ -45,10 +35,9 @@ func GenerateBaselineDescription(workDir, currentBranch string, isWorktree bool,
 }
 
 // legacyBaselineDescription reproduces the pre-master-detail baseline format,
-// which prefixed a worktree's label with the main repo name
-// ("<main-repo>:<worktree-name>"). It exists ONLY so baselineDescriptions can
-// still recognise descriptions written by an older jind-ai; never write its
-// result to a session.
+// which prefixed a worktree's label with the main repo name. It exists ONLY so
+// baselineDescriptions can recognise descriptions written by an older jind-ai;
+// never write its result to a session.
 func legacyBaselineDescription(workDir string) string {
 	return baselineDescription(workDir, "", true)
 }
@@ -56,15 +45,13 @@ func legacyBaselineDescription(workDir string) string {
 // baselineDescriptions returns every string that counts as "this session's
 // description is still the untouched Layer A baseline" for workDir. Index 0 is
 // the format written today; any further entry is a historical format that
-// sessions created by an older jind-ai still carry on disk.
+// sessions on disk may still carry.
 //
-// The set exists because Session.DescriptionLayer is json:"-": a daemon
-// restart resets it to DescriptionLayerBaseline while the persisted
-// Description keeps whatever an earlier process wrote. Comparing against the
-// current format alone would make every pre-existing worktree session look
-// drifted, and TryUpgradeDescription's Guard 1 would then refuse to ever
-// promote it to Layer C — the F001/F004 failure mode, except silent and
-// permanent.
+// The historical entries are needed because Session.DescriptionLayer is
+// json:"-": a daemon restart resets it to Baseline while the persisted
+// Description keeps an older format. Comparing against today's format alone
+// would make every pre-existing worktree session look drifted, and Guard 1 in
+// TryUpgradeDescription would then refuse to promote it, permanently.
 func baselineDescriptions(workDir string) []string {
 	current := GenerateBaselineDescription(workDir, "", false, "")
 	legacy := legacyBaselineDescription(workDir)
@@ -119,12 +106,8 @@ func baselineDescription(workDir, currentBranch string, includeMainRepo bool) st
 // directory is named after the session that created it ("jin-b63188fe"), which
 // tells a reader nothing about which project they are looking at.
 //
-// Returns "" when workDir is empty or outside any git repo; callers treat that
-// as "no repository to show".
-//
-// Like the rest of this file it only touches filepath + os.Lstat /
-// os.ReadFile, never the git subprocess. It does stat the filesystem, so
-// callers must evaluate it BEFORE taking Manager.mu.
+// Returns "" when workDir is empty or outside any git repo. It stats the
+// filesystem, so callers must evaluate it BEFORE taking Manager.mu.
 func ResolveRepoName(workDir string) string {
 	if workDir == "" {
 		return ""
@@ -140,11 +123,10 @@ func ResolveRepoName(workDir string) string {
 	return filepath.Base(localRoot)
 }
 
-// resolveMainRepoIfWorktree inspects the ".git" entry at localRoot. When it is
-// a regular file containing "gitdir: /path/to/main/.git/worktrees/<name>",
-// returns the main repo root plus isWorktree=true. Otherwise (".git" absent,
-// a directory, or a malformed pointer) returns (localRoot, false) so the
-// caller can treat localRoot as the repo root.
+// resolveMainRepoIfWorktree reads the ".git" entry at localRoot. A regular file
+// holding "gitdir: /path/to/main/.git/worktrees/<name>" means a worktree and
+// yields the main repo root; anything else (absent, a directory, malformed)
+// makes localRoot the repo root.
 func resolveMainRepoIfWorktree(localRoot string) (mainRoot string, isWorktree bool) {
 	gitPath := filepath.Join(localRoot, ".git")
 	fi, err := os.Lstat(gitPath)
@@ -174,10 +156,9 @@ func resolveMainRepoIfWorktree(localRoot string) (mainRoot string, isWorktree bo
 	return mainRepo, true
 }
 
-// findRepoRoot walks up from dir looking for a directory that contains a .git
-// entry (either a directory in the main repo, or a regular file in a
-// worktree). Bounded by maxRepoRootWalk as a safety net against symlink loops
-// or unexpectedly deep paths.
+// findRepoRoot walks up from dir looking for a .git entry (a directory in the
+// main repo, a regular file in a worktree). Bounded by maxRepoRootWalk against
+// symlink loops and unexpectedly deep paths.
 func findRepoRoot(dir string) (string, bool) {
 	if dir == "" {
 		return "", false
@@ -197,55 +178,39 @@ func findRepoRoot(dir string) (string, bool) {
 }
 
 // DescriptionLayer classifies the source that last wrote a session's
-// Description. Larger values represent higher-quality, more informative
-// sources. Manager.TryUpgradeDescription only accepts a candidate whose layer
-// is strictly greater than the session's current layer, so promotion is
-// monotonic within a daemon lifetime.
-//
-// The zero value (DescriptionLayerBaseline) is what freshly-created sessions
-// carry and what daemon restart resets in-memory sessions to, since the layer
-// is runtime-only (see Session.DescriptionLayer).
+// Description. Larger values are better sources: TryUpgradeDescription only
+// accepts a candidate whose layer is strictly greater, so promotion is
+// monotonic within a daemon lifetime. The layer is runtime-only (see
+// Session.DescriptionLayer), so a daemon restart resets it to zero.
 type DescriptionLayer int
 
 const (
 	// DescriptionLayerBaseline is Layer A: the repo:branch label produced by
 	// GenerateBaselineDescription. Always present, never informative on its own.
 	DescriptionLayerBaseline DescriptionLayer = 0
-	// DescriptionLayerAgentNameDerived is Layer C-name (weak): the agent
-	// wrote a session name but flagged it as externally supplied (Claude Code
-	// 2.x nameSource="derived", i.e. round-tripped from the tmux window name
-	// jind-ai itself handed the process). Slightly better than nothing —
-	// it at least matches CC's own /resume picker — but a genuinely
-	// conversation-derived name should still be allowed to overwrite it.
+	// DescriptionLayerAgentNameDerived is Layer C-name (weak): the agent wrote
+	// a session name but flagged it as externally supplied (Claude Code 2.x
+	// nameSource="derived", i.e. round-tripped from the tmux window name jind-ai
+	// handed the process). A genuinely conversation-derived name may overwrite it.
 	DescriptionLayerAgentNameDerived DescriptionLayer = 1
-	// DescriptionLayerAgentName is Layer C-name (strong): an agent-supplied
-	// session name whose source is NOT the "derived" hint round-trip
-	// (e.g. Claude Code has renamed the session from the conversation topic).
-	// Available as early as the SessionStart hook when the agent already had
-	// a strong name; otherwise arrives on a later hook once the agent
-	// re-classifies the name field.
+	// DescriptionLayerAgentName is Layer C-name (strong): an agent-supplied name
+	// whose source is NOT the "derived" round-trip. Available as early as the
+	// SessionStart hook, or on a later hook once the agent re-classifies the name.
 	DescriptionLayerAgentName DescriptionLayer = 2
-	// DescriptionLayerTranscript is Layer C-transcript: the first meaningful
-	// user prompt mined from the agent transcript, only available after the
-	// first user turn has been flushed to disk. Not used by the Claude Code
-	// adapter (see internal/agent/claude/description.go — the CC enhancer
-	// stops at Layer C-name because CC produces its own topic-derived name).
-	// Reserved for future adapters that lack a native session-name field.
+	// DescriptionLayerTranscript is Layer C-transcript: the first meaningful user
+	// prompt mined from the agent transcript. Unused by the Claude Code adapter,
+	// which stops at C-name because CC produces its own topic-derived name;
+	// reserved for adapters with no native session-name field.
 	DescriptionLayerTranscript DescriptionLayer = 3
 )
 
 // descriptionDriftedFrom reports whether the session's Description has moved
 // off every accepted Layer A baseline while DescriptionLayer is still zero.
 //
-// That combination means the drift did not come from this daemon process:
-// most commonly a restart lost the runtime layer while the persisted
-// Description still carries a Layer C value written earlier. It is the signal
-// TryUpgradeDescription's Guard 1 refuses to overwrite, since there is no way
-// to tell whether an incoming candidate is better than what is already there.
-//
-// baselines is a set rather than a single string so a description written in
-// an older baseline format is not mistaken for such a Layer C value; see
-// baselineDescriptions.
+// That combination means the drift did not come from this daemon process —
+// most often a restart lost the runtime layer while the persisted Description
+// still carries a Layer C value. Guard 1 in TryUpgradeDescription refuses to
+// overwrite it, since nothing can tell whether a candidate is better.
 func (s *Session) descriptionDriftedFrom(baselines []string) bool {
 	if s.DescriptionLayer != DescriptionLayerBaseline {
 		return false

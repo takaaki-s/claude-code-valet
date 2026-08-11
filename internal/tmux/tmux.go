@@ -164,14 +164,13 @@ func DefaultSocketName() string {
 }
 
 // DefaultMgrSocketName returns the socket name NewMgrClient targets, honoring
-// JIN_TMUX_MGR_SOCKET the same way DefaultSocketName honors JIN_TMUX_SOCKET
-// for the inner socket — lets `jin ui`/`jin tui` point at a throwaway outer
-// tmux server during manual verification instead of the real "jin-mgr".
+// JIN_TMUX_MGR_SOCKET the same way DefaultSocketName honors JIN_TMUX_SOCKET for
+// the inner socket — which lets `jin ui` point at a throwaway outer tmux server
+// during manual verification instead of the real "jin-mgr".
 //
-// Resolved via a live os.Getenv read rather than cached in a package var, for
-// the same reason as DefaultSocketName: NewMgrClient() is already called
-// fresh per CLI invocation, so a live read costs nothing extra and keeps the
-// two env vars behaviorally identical.
+// Resolved via a live os.Getenv read rather than a cached package var, for the
+// same reason as DefaultSocketName: NewMgrClient() is already called fresh per
+// CLI invocation, so a live read costs nothing extra.
 func DefaultMgrSocketName() string {
 	if v := os.Getenv("JIN_TMUX_MGR_SOCKET"); v != "" {
 		return v
@@ -688,19 +687,19 @@ func buildSendKeysLiteralArgs(target, text string) []string {
 
 // SendKeysLiteral sends literal text to a pane (no key name lookup).
 //
-// The `--` terminates option parsing so text beginning with a dash reaches
-// the pane instead of being read as a flag. Without it tmux fails one of two
-// ways, and the quiet one is the dangerous one:
+// The `--` terminates option parsing so text beginning with a dash reaches the
+// pane instead of being read as a flag. Without it tmux fails one of two ways,
+// and the quiet one is the dangerous one:
 //
 //	send-keys -t %0 -l "-abc"   -> exit 1, "unknown flag -a"
 //	send-keys -t %0 -l "-R"     -> exit 0, and NOTHING is sent
 //
 // The second case reports success while silently dropping the payload, so
-// Manager.SendPrompt would carry on and commit a prompt with a hole in it.
-// That matters here because SendPrompt splits long prompts on a fixed byte
-// boundary: a chunk can start with a dash even when the prompt does not, and
-// bullet lists and diffs make leading dashes common in exactly the large
-// prompts this path exists to carry.
+// Manager.SendPrompt would carry on and commit a prompt with a hole in it. That
+// matters here because SendPrompt splits long prompts on a fixed byte boundary:
+// a chunk can start with a dash even when the prompt does not, and bullet lists
+// and diffs make leading dashes common in exactly the large prompts this path
+// exists to carry.
 func (c *Client) SendKeysLiteral(target, text string) error {
 	return c.runSilent(buildSendKeysLiteralArgs(target, text)...)
 }
@@ -734,8 +733,7 @@ func (c *Client) LoadBuffer(name, content string) error {
 //     multi-line prompt is SUBMITTED ONE LINE AT A TIME. Measured against a
 //     real OpenCode pane: a three-line buffer became three separate messages.
 //   - With it the TUI inserts the payload in one operation instead of
-//     simulating thousands of keystrokes, which is the whole reason the paste
-//     transport exists — see docs/gotchas.md "Session send".
+//     simulating thousands of keystrokes — see docs/gotchas.md "Session send".
 //
 // `-d` drops the buffer afterwards so the prompt does not linger in tmux's
 // buffer stack where any client could read it back.
@@ -946,38 +944,35 @@ func parsePanePID(out string) (int, error) {
 	return pid, nil
 }
 
-// TerminatePaneProcess hangs up the process tmux started in target, leaving
-// the pane itself in place. On a pane carrying remain-on-exit (every managed
-// pane — see TagManagedPane) the pane survives as a dead pane, keeping its
-// scrollback and, more importantly, its slot in the window layout, so
-// RespawnPane can later revive the agent exactly where it was.
+// TerminatePaneProcess hangs up the process tmux started in target, leaving the
+// pane itself in place. On a pane carrying remain-on-exit (every managed pane —
+// see TagManagedPane) the pane survives as a dead pane, keeping its scrollback
+// and its slot in the window layout, so RespawnPane can later revive the agent
+// exactly where it was.
 //
-// The signal is SIGHUP, not SIGTERM, because of what actually sits at the end
-// of a pane's pid. tmux starts the command through `/bin/sh -c`, but that
-// wrapper execs its way down the chain, so for a command shaped like the one
-// session.Manager builds (`cd …; env … $SHELL -ic '<agent>'`) the pane's pid
-// is the *interactive* shell — and interactive shells ignore SIGTERM.
-// Measured on zsh 5.9: SIGTERM leaves it in Ss with pane_dead=0, SIGHUP takes
-// it and its jobs down. SIGHUP is also what the pane's processes already
-// receive today when kill-pane closes the pty, so agents see the same signal
-// they always have; this only spares the pane itself.
+// The signal is SIGHUP, not SIGTERM, because of what actually sits at the end of
+// a pane's pid. tmux starts the command through `/bin/sh -c`, but that wrapper
+// execs its way down the chain, so for a command shaped like the one
+// session.Manager builds the pane's pid is the *interactive* shell — and
+// interactive shells ignore SIGTERM. Measured on zsh 5.9: SIGTERM leaves it in
+// Ss with pane_dead=0, SIGHUP takes it and its jobs down. SIGHUP is also what a
+// pane's processes already receive when kill-pane closes the pty.
 //
-// It goes to the pane's own pid rather than its process group: the agent
-// running under that shell sits in a job of its own, which a killpg on the
-// pane's group would miss entirely. Hanging up the shell is enough — it HUPs
-// its jobs on the way out, and tmux closes the pty behind it.
+// It goes to the pane's own pid rather than its process group: the agent runs in
+// a job of its own, which a killpg on the pane's group would miss entirely.
+// Hanging up the shell is enough — it HUPs its jobs on the way out, and tmux
+// closes the pty behind it.
 //
 // A pane whose process ignores SIGHUP too stays alive and reports no error;
 // callers that need the stop guaranteed must confirm via IsPaneDead and fall
-// back to KillPane. Note that IsPaneDead only answers for that direct child:
-// a descendant that escaped the shell's job control and the pty (double-forked,
-// setsid'd) keeps running with the pane reported dead. No agent adapter
-// shipped so far does that, but it is the assumption to re-check when adding
-// one.
+// back to KillPane. IsPaneDead only answers for that direct child: a descendant
+// that escaped the shell's job control and the pty (double-forked, setsid'd)
+// keeps running with the pane reported dead. No agent adapter shipped so far
+// does that, but it is the assumption to re-check when adding one.
 //
-// Do not call this on a pane that has already exited. tmux keeps reporting
-// the pid such a pane started with, and the OS is free to have reissued that
-// number to an unrelated process — check IsPaneDead first.
+// Do not call this on a pane that has already exited. tmux keeps reporting the
+// pid such a pane started with, and the OS is free to have reissued that number
+// to an unrelated process — check IsPaneDead first.
 func (c *Client) TerminatePaneProcess(target string) error {
 	out, err := c.run("display-message", "-t", target, "-p", "#{pane_pid}")
 	if err != nil {

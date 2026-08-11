@@ -20,16 +20,14 @@ var pluginLog = debug.NewLogger("plugin-debug.log")
 const logFieldMax = 256
 
 // untrusted is debug.Untrusted at this package's bound, named once so that a
-// field added later gets the bound and the quoting together — remembering only
-// one of the two is the mistake the pair exists to prevent.
+// field added later gets the bound and the quoting together.
 //
-// The rule here is uniform rather than per value: everything this package
+// The rule is uniform rather than per value: everything this package
 // interpolates into a log line goes through it, except the constants and
 // integers it produced itself. Deciding per value meant deciding what each one
 // had already been checked against, and that reasoning was wrong twice — a
 // manifest error quoting the file it could not parse, and a plugin name whose
-// only validation lives in a caller two packages away. A rule with no
-// exceptions costs a few characters per line and needs no census to stay true.
+// only validation lives in a caller two packages away.
 func untrusted(s string) string { return debug.Untrusted(s, logFieldMax) }
 
 // untrustedErr is the same rule for an error, which is most of what this
@@ -47,17 +45,7 @@ func untrustedErr(err error) string { return untrusted(fmt.Sprint(err)) }
 // pane split` is given the four identity variables and not this one, so a
 // plugin that runs another plugin from inside a popup starts it back at depth
 // 1 — and nothing else stops it, because that run arrives through RunAction,
-// which bypasses debounce by design. The indirect loop's reasoning does not
-// carry over: that one comes back as a status event through publish, the only
-// caller of passDebounce.
-//
-// That paragraph is measured, 3 trials of 3: a plugin at depth 1 opened a popup
-// with `jin pane popup --here`, the `jin plugin run` issued from there was
-// accepted, and the second plugin ran at depth 1 again. The depth read back as
-// 0 — at the time of that measurement because the key was unset inside the
-// pane, and now because jinenv.TmuxEnviron assigns it empty, which the CLI's
-// strconv.Atoi reads the same way. Either spelling is why the guard has nothing
-// to bite on rather than something too small.
+// which bypasses debounce by design. Measured, 3 trials of 3.
 //
 // Left this way on purpose. Propagating the depth into panes would bound the
 // chain, and would also refuse the run a user makes by pressing a button in a
@@ -67,10 +55,8 @@ func untrustedErr(err error) string { return untrusted(fmt.Sprint(err)) }
 //
 // The inverse — a depth arriving where no plugin put one — is guarded, since
 // there the accident refuses runs rather than allowing them. A tmux server
-// forked by a process that carried a depth hands it to every pane, and each
-// `jin plugin run` from those panes is then refused as a chain;
-// jinenv.TmuxEnviron writes the key empty for that reason, on every pane
-// jind-ai opens through tmux rather than only on the one server `jin ui` owns.
+// forked by a process that carried a depth hands it to every pane, which is why
+// jinenv.TmuxEnviron writes the key empty on every pane jind-ai opens.
 const maxDepth = 2
 
 // DefaultDebounce is the minimum interval between deliveries of the same
@@ -84,12 +70,10 @@ const DefaultDebounce = 3 * time.Second
 const debouncePruneThreshold = 128
 
 // PopupSizeResolver resolves the popup size a plugin action should receive as
-// JIN_PLUGIN_POPUP_* env when it runs. Returning empty strings means "no
-// explicit size" and the caller of `jin pane popup --here` falls through to
-// tmux's built-in default. The resolver takes precedence in the order:
-// user config > manifest declaration > global plugin default > hardcoded.
-// actionID identifies which of the plugin's actions is running so resolvers
-// can look up per-action user config.
+// JIN_PLUGIN_POPUP_* env when it runs. Empty strings mean "no explicit size"
+// and `jin pane popup --here` falls through to tmux's built-in default.
+// Precedence: user config > manifest declaration > global plugin default >
+// hardcoded. actionID identifies which action is running, for per-action config.
 type PopupSizeResolver func(pluginName, actionID string, m *manifest.PopupConfig) (width, height string)
 
 // EventDispatcher fans events out to installed plugins. Publish never blocks:
@@ -107,15 +91,12 @@ type EventDispatcher struct {
 	mu        sync.Mutex
 	lastFired map[string]time.Time
 	warned    map[string]bool
-	// log is where this dispatcher's diagnostics go, and it is under mu with
-	// the rest of the mutable state rather than beside the immutable
-	// configuration above. A field at all so a test can read what a run
-	// recorded — the package logger writes nothing from a test binary — and
-	// under the lock because the readers are this dispatcher's own goroutines:
-	// Publish dispatches on one, and a run it started can still be logging when
-	// a test installs its recorder. An unsynchronised field was measured racing
-	// there, which is the same fault the package variable it replaced had, one
-	// scope smaller.
+	// log is where this dispatcher's diagnostics go, under mu with the rest of
+	// the mutable state rather than beside the immutable configuration above. A
+	// field at all so a test can read what a run recorded; under the lock because
+	// the readers are this dispatcher's own goroutines — a run Publish started can
+	// still be logging when a test installs its recorder, and an unsynchronised
+	// field was measured racing there.
 	log func(string, ...any)
 }
 
@@ -146,8 +127,7 @@ func (d *EventDispatcher) setLog(fn func(string, ...any)) func(string, ...any) {
 
 // NewDispatcher returns a dispatcher that resolves plugins through registry
 // and injects identity into every run. debounce <= 0 selects DefaultDebounce.
-// A nil popupResolver is replaced with one that always returns empty strings
-// (no popup size hints exported).
+// A nil popupResolver is replaced with one that always returns empty strings.
 //
 // identity is supplied by the caller so that a plugin and an agent started by
 // the same daemon get the same one.
@@ -215,25 +195,22 @@ func (d *EventDispatcher) publish(ev Event) {
 // RunAction executes one plugin action on demand (the `jin plugin run` path).
 // It bypasses matcher and debounce but still enforces state and depth checks.
 // actionID selects which of the plugin's actions runs; "" means the default
-// action (actions[0]) and an unknown id is a synchronous error. The run
-// itself is async. actx carries the invoking CLI's tmux context (empty when
-// not applicable).
+// action (actions[0]) and an unknown id is a synchronous error. The run itself
+// is async. actx carries the invoking CLI's tmux context.
 //
 // Every run that does not start is logged as well as returned, because the
 // caller that most needs to know is the one that cannot report: a plugin key
 // binding fires `jin plugin run` through tmux's `run-shell -b` with stdout and
-// stderr discarded, so the returned error reaches no one. A run refused that way
-// left no trace at all — measured with a depth inherited from a tmux server,
-// where every binding was refused and the screen showed nothing.
+// stderr discarded, so the returned error reaches no one. Measured with a depth
+// inherited from a tmux server, where every binding was refused and the screen
+// showed nothing.
+//
+// Under JIN_DEBUG=1, that is. pluginLog is a no-op otherwise, so on a default
+// install the binding is still silent; making it diagnosable without the flag
+// would need a channel this package does not have.
 //
 // "not started" rather than "refused" because a registry read failure comes out
-// of here too, and that is this daemon's fault rather than the caller's. One
-// word covering both would be ambiguous exactly when someone is grepping for
-// why a binding does nothing.
-//
-// Under JIN_DEBUG=1, that is: pluginLog is a no-op otherwise, so on a default
-// install the binding is still silent. Making it diagnosable without the flag
-// would mean a channel this package does not have.
+// of here too, and that is this daemon's fault rather than the caller's.
 func (d *EventDispatcher) RunAction(name, actionID string, ev Event, callerDepth int, actx ActionContext) (err error) {
 	defer func() {
 		if err != nil {

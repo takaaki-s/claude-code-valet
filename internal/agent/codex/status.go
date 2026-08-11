@@ -10,14 +10,11 @@ import (
 // Manager builds StatusSignal{Kind:"hook", Payload:{event, notification_type,
 // stop_reason, cwd}} from the on-wire HookRequest. Codex's hook_event_name
 // values line up with Claude Code's set for the events jind-ai cares about
-// (SessionStart / UserPromptSubmit / Stop), so no cross-vocabulary
-// translation happens here — the switch below implements the mapping
-// directly.
+// (SessionStart / UserPromptSubmit / Stop), so no cross-vocabulary translation
+// happens here.
 //
-// A returned bool=false means "this event is meaningful but does not warrant
-// a status change" — Manager still runs the agent-agnostic side effects
-// (SessionStart marks AgentSessionStarted and triggers Layer C, unknown
-// events fall through to any future generic bookkeeping).
+// A returned bool=false means "meaningful but no status change" — Manager still
+// runs the agent-agnostic side effects.
 type HookStatusSource struct{}
 
 // NewHookStatusSource constructs the interpreter. Stateless, but held as a
@@ -27,8 +24,6 @@ func NewHookStatusSource() *HookStatusSource { return &HookStatusSource{} }
 
 // Interpret implements session.StatusSource.
 //
-// The event-to-Status map:
-//
 //	SessionStart       (zero, false)          side effects only (AgentSessionStarted, re-key, Layer C)
 //	UserPromptSubmit   thinking + ClearError  canonical progression signal
 //	PreToolUse         thinking + ClearError  doubles as PermissionRequest → thinking recovery
@@ -36,9 +31,8 @@ func NewHookStatusSource() *HookStatusSource { return &HookStatusSource{} }
 //	PermissionRequest  permission             ~= CC's Notification{permission_prompt}
 //	Stop               idle + ClearError + task-complete
 //
-// Codex has no SessionEnd / StopFailure event surface today; StatusStopped
-// is driven by the pane-death path in captureOutputTmux, and StopFailure
-// support waits for either upstream Codex changes or a subsequent PR.
+// Codex has no SessionEnd / StopFailure event surface today; StatusStopped is
+// driven by the pane-death path in captureOutputTmux.
 func (h *HookStatusSource) Interpret(sig agent.StatusSignal) (agent.StatusUpdate, bool) {
 	if sig.Kind != "hook" {
 		return agent.StatusUpdate{}, false

@@ -2414,14 +2414,12 @@ func TestManager_EnsureTmuxClient_NotSet(t *testing.T) {
 	// Deliberately do NOT call SetTmuxClient — tmux client remains nil so
 	// ensureTmuxClient exercises the auto-init path.
 	//
-	// Isolate the auto-init to a unique tmux socket name and register a
-	// cleanup that kills the resulting server. Without this, running this
-	// test on a machine with tmux installed leaves a stray "-L jin" server
-	// behind, and the next daemon start reuses it — the server's tmux env
-	// (including CLAUDE_CODE_CHILD_SESSION inherited from whatever launched
-	// `go test`) propagates to every CC subsequently spawned in that
-	// daemon, silently breaking Layer C description enhancement. See the
-	// spawn.go doc comment on the CLAUDE_CODE_* unset list.
+	// Isolate that auto-init to a unique socket name and kill the resulting
+	// server on cleanup. Without this, running on a machine with tmux installed
+	// leaves a stray "-L jin" server behind, and the next daemon start reuses it —
+	// the server's tmux env (including CLAUDE_CODE_CHILD_SESSION inherited from
+	// whatever launched `go test`) then propagates to every CC spawned in that
+	// daemon, silently breaking Layer C description enhancement.
 	socketName := "jin-test-" + uuid.New().String()[:8]
 	mgr.SetTmuxSocketName(socketName)
 	mgr.SetAgentResolver(newFakeAgentResolver())
@@ -3518,18 +3516,14 @@ func TestManager_CreateWithOptions_Worktree_RollsBackOnWorkDirCollision(t *testi
 // ---------------------------------------------------------------------------
 
 // stubEnhancer is a minimal DescriptionEnhancer whose response can be scripted
-// per test case. It also records how many times TryGenerate was called so the
-// "no-op" cases can assert the enhancer was never consulted.
-//
-// layer defaults to DescriptionLayerBaseline (zero); tests that expect a
-// successful promotion must set it to a layer strictly greater than the
-// session's current layer.
+// per test case. It records how many times TryGenerate was called so the "no-op"
+// cases can assert the enhancer was never consulted, and layer defaults to the
+// zero value, so a test expecting promotion must set it strictly greater.
 //
 // during, when set, runs inside TryGenerate. It stands in for the window where
-// the real enhancer is scanning a transcript with m.mu released, and may mutate
-// the manager freely — exactly what a concurrent caller can do. got records the
-// session TryGenerate was handed, so a test can check it is a snapshot copy
-// rather than the live one.
+// the real enhancer scans a transcript with m.mu released, and may mutate the
+// manager freely — exactly what a concurrent caller can do. got records the
+// session TryGenerate was handed, so a test can check it is a snapshot copy.
 type stubEnhancer struct {
 	response string
 	ok       bool
@@ -4270,19 +4264,16 @@ func TestBuildAgentShellCmd_SnapshotIsolatesFromConcurrentWrites(t *testing.T) {
 // SendPrompt / verify-by-capture tests
 // ---------------------------------------------------------------------------
 
-// withShortSendVerify shortens the send tuning knobs for the duration of
-// the test so timeout / retry cases finish in milliseconds instead of
-// seconds. Restore is registered on t.Cleanup, so callers don't need a
-// defer at the call site.
+// withShortSendVerify shortens the send tuning knobs for the duration of the
+// test so timeout / retry cases finish in milliseconds. Restore is registered on
+// t.Cleanup.
 //
-// timeout lands on sendVerifyTimeoutBase and the two per-unit coefficients
-// are zeroed, so the effective budget is exactly what the caller asked for
-// regardless of how many chunks or clear presses the prompt implies.
-// sendChunkDelay is zeroed too: at its production 20ms a multi-chunk test
-// would really sleep once per chunk.
+// timeout lands on sendVerifyTimeoutBase and the two per-unit coefficients are
+// zeroed, so the effective budget is exactly what the caller asked for whatever
+// the prompt implies. sendChunkDelay is zeroed too: at its production 20ms a
+// multi-chunk test would really sleep once per chunk.
 //
-// Not safe under t.Parallel(): rewrites package-level vars. If parallel
-// send-verify tests are ever added, migrate to a config field on Manager.
+// Not safe under t.Parallel(): rewrites package-level vars.
 func withShortSendVerify(t *testing.T, timeout, settle, backoff time.Duration) {
 	t.Helper()
 	setForTest(t, &sendVerifyTimeoutBase, timeout)
@@ -5041,10 +5032,8 @@ func TestSendPrompt_ClearRepeatsCapped(t *testing.T) {
 // TestSendVerifyBudget, and passing it (0, 0) would restore the flat timeout
 // this scaling exists to replace while leaving that test green.
 //
-// The timeout error reports the budget it enforced, so the assertion reads
-// it back out of the message instead of timing the call, which keeps it
-// deterministic. Coefficients are shrunk to keep the deadline in
-// milliseconds.
+// The timeout error reports the budget it enforced, so the assertion reads it
+// back out of the message instead of timing the call.
 func TestSendPrompt_BudgetWiredFromPromptShape(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -5133,12 +5122,10 @@ func TestSendPrompt_DelaysBetweenChunks(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Overlay dismissal before Enter
 //
-// Verify proves the prompt is rendered in the input area. It does not prove
-// Enter will submit it: an agent holding a completion overlay open consumes
-// Enter to accept a candidate instead, rewriting the input and committing
-// nothing while every check here still reads as success. These tests pin the
-// step that closes the overlay first, and the re-check that keeps that step
-// from becoming a new way to commit the wrong thing.
+// Verify proves the prompt is rendered in the input area, not that Enter will
+// submit it: an agent holding a completion overlay open consumes Enter to accept
+// a candidate instead. These tests pin the step that closes the overlay, and the
+// re-check that keeps that step from becoming a new way to commit the wrong thing.
 // ---------------------------------------------------------------------------
 
 // withShortSendDismiss shortens the post-dismiss settle so these tests don't
@@ -5202,15 +5189,13 @@ func TestSendPrompt_DismissesOverlayBeforeEnter(t *testing.T) {
 }
 
 // TestSendPrompt_DismissRecheckComparesAgainstBaseline pins the rule the
-// re-check shares with the verify loop: the prompt counts as present only if
-// it appears MORE often than it did at the baseline, not merely somewhere on
-// screen.
+// re-check shares with the verify loop: the prompt counts as present only if it
+// appears MORE often than it did at the baseline, not merely somewhere on screen.
 //
-// The distinction has teeth whenever the pane already carries the prompt —
-// re-sending the same text, or a transcript that still shows the previous
-// turn. A presence test would then be satisfied by that old copy, so a
-// dismiss key that emptied the input would sail through and Enter would
-// commit nothing.
+// The distinction has teeth whenever the pane already carries the prompt — a
+// re-send, or a transcript still showing the previous turn. A presence test
+// would be satisfied by that old copy, so a dismiss key that emptied the input
+// would sail through and Enter would commit nothing.
 func TestSendPrompt_DismissRecheckComparesAgainstBaseline(t *testing.T) {
 	mgr, mock, _ := newTestManager(t)
 	withShortSendVerify(t, 2*time.Second, time.Millisecond, time.Millisecond)
@@ -5956,16 +5941,15 @@ func legacyVerifyOK(before, after, prompt string) bool {
 	return nAfter > strings.Count(collapse(before), tail)
 }
 
-// TestSendVerifyOK_CapturedPanes replays real capture-pane output taken
-// from Claude Code and OpenCode driven through a throwaway tmux server.
-// Every specimen is a prompt that genuinely landed in the input area, so
-// verify must accept all of them.
+// TestSendVerifyOK_CapturedPanes replays real capture-pane output taken from
+// Claude Code and OpenCode driven through a throwaway tmux server. Every
+// specimen is a prompt that genuinely landed, so verify must accept all of them.
 //
 // The `regression` flag marks specimens where the prompt's 32-byte tail
-// straddles a wrapped row — the case that used to fail. Those are the only
-// ones with any diagnostic power: the others repeat a phrase often enough
-// that some occurrence avoids the seam, so they passed before the fix too
-// and would keep passing if it were reverted.
+// straddles a wrapped row — the case that used to fail, and the only ones with
+// diagnostic power. The others repeat a phrase often enough that some occurrence
+// avoids the seam, so they passed before the fix and would keep passing if it
+// were reverted.
 func TestSendVerifyOK_CapturedPanes(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -6033,11 +6017,9 @@ func TestSendVerifyOK_CapturedPanes(t *testing.T) {
 //
 // TestManager_ConcurrentHookEventsAndKill can catch a race there, but only by
 // luck: that exit is taken when the session's identity changes mid-kill, which
-// twelve unsynchronised goroutines almost never arrange. Measured at roughly
-// one detection per 600 runs — a guard that weak lets the bug back in. Here the
-// branch is forced every time by mutating the session inside the window where
-// Kill has released m.mu to signal the pane, so a concurrent SetDescription has
-// the whole of that exit to collide with.
+// twelve unsynchronised goroutines almost never arrange — measured at roughly
+// one detection per 600 runs. Here the branch is forced every time by mutating
+// the session inside the window where Kill has released m.mu.
 func TestManager_KillReadsDescriptionUnderLock(t *testing.T) {
 	mgr, mock, _ := newTestManager(t)
 	sess := newIdleSessionWithPane(t, mgr, t.TempDir(), "killdesc", "%killdesc")

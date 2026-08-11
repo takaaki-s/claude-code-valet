@@ -1,11 +1,10 @@
 // Package claude is the Claude Code adapter. It owns every CC-specific
-// concern jind-ai used to inline into internal/session — hook language,
-// hooks-settings.json generation, trust-dialog suppression, the shell
-// command shape, and the transcript-derived description enhancer.
+// concern: hook language, hooks-settings.json generation, trust-dialog
+// suppression, the shell command shape, and the transcript-derived description
+// enhancer.
 //
-// The type-name Agent implements session.Agent (via the aliases exposed in
-// internal/agent). Register instances via the internal/agent/register
-// blank-import package so the daemon can Lookup("claude") them at start-up.
+// Register instances via the internal/agent/register blank-import package so
+// the daemon can Lookup("claude") them at start-up.
 package claude
 
 import (
@@ -20,18 +19,10 @@ import (
 var claudeLog = debug.NewLogger("daemon-debug.log")
 
 // Agent is the Claude Code adapter state. One instance serves every session,
-// because the registry holds one per kind for the whole process
-// (internal/agent/registry.go). Nothing here comes from a Setup:
-//
-//   - enhancer is the Layer C description enhancer, holding a transcript
-//     reader whose only state is the ~/.claude directory path.
-//   - statusSrc is stateless but held as a value so we don't allocate one per
-//     hook event.
-//
-// Both are built in New and never reassigned, so neither needs a lock. The
-// hooks file SpawnCommand points at is found from SpawnOptions.StateDir on
-// each call rather than remembered here — see that field for why no adapter
-// keeps one.
+// so nothing here may come from a Setup: enhancer holds a transcript reader
+// whose only state is the ~/.claude directory path, and statusSrc is stateless
+// but held as a value so a hook event does not allocate one. Both are built in
+// New and never reassigned, so neither needs a lock.
 type Agent struct {
 	enhancer  *CCDescriptionEnhancer
 	statusSrc *HookStatusSource
@@ -49,12 +40,9 @@ func New() *Agent {
 func (a *Agent) Kind() string { return "claude" }
 
 // RecognizesSessionID accepts anything written as a UUID. Claude Code is told
-// its session id rather than minting one — SpawnCommand passes --session-id
-// with the UUID Manager pre-minted — so the id a hook reports is normally the
-// one jind-ai already holds, and a re-key is the exception rather than the
-// rule. That makes this the cheapest of the three adapters to refuse: the
-// value kept on a refusal is the one Claude Code was launched with, so the
-// resume still lands on the operator's conversation.
+// its session id rather than minting one, so a re-key is the exception rather
+// than the rule — and the value kept on a refusal is the one CC was launched
+// with, which makes this the cheapest of the three adapters to refuse.
 func (a *Agent) RecognizesSessionID(id string) bool { return agent.LooksLikeUUID(id) }
 
 // StatusSource returns the CC hook interpreter.
@@ -64,33 +52,23 @@ func (a *Agent) StatusSource() agent.StatusSource { return a.statusSrc }
 // a better human-readable label.
 func (a *Agent) Description() agent.DescriptionSource { return a.enhancer }
 
-// Transcript returns the Claude Code transcript reader. It is the reference
-// implementation of the interface — transcript.Reader's ReadEntries already
-// has the signature TranscriptSource declares, so this hands it over as-is
-// rather than wrapping it.
-//
-// Built per call, unlike enhancer and statusSrc above; see the same method on
-// the Codex adapter for why caching it buys nothing.
+// Transcript returns the Claude Code transcript reader. transcript.Reader's
+// ReadEntries already has the signature TranscriptSource declares, so this
+// hands it over unwrapped, built per call — caching it buys nothing.
 func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader() }
 
 // Setup writes hooks-settings.json into ctx.StateDir and the per-workDir trust
-// flag. Both failures are logged but do not abort the session start — the
-// historical behaviour is "warn and continue", matching what Claude Code
-// itself tolerates.
+// flag. Both failures are logged but do not abort the session start.
 //
 // It writes on every spawn rather than once, which makes the file
 // self-healing: one deleted or hand-edited by mistake comes back at the next
-// session start instead of staying broken for the daemon's life. The write is
-// published by rename, so a session starting alongside this one never reads a
-// half-written file.
+// session start. The write is published by rename, so a session starting
+// alongside this one never reads a half-written file.
 //
-// A failed write is not repaired here, and does not need to be. SpawnCommand
+// A failed write is not repaired here and does not need to be: SpawnCommand
 // asks ctx.StateDir what it can still serve, so a session whose own write
-// failed still gets --settings from the file a previous spawn left there — and
-// one transient failure cannot strip --settings off a concurrent session that
-// shares the directory and whose own Setup succeeded, which is every pair of
-// sessions in production. With nothing usable there the flag is simply omitted
-// and the session starts without status hooks.
+// failed still gets --settings from an earlier spawn's file, and with nothing
+// usable there the flag is simply omitted.
 func (a *Agent) Setup(ctx agent.SetupContext) error {
 	if _, err := EnsureHooksSettingsFile(ctx.StateDir, ctx.ExecPath); err != nil {
 		claudeLog("[HOOKS] Warning: failed to generate hooks settings: %v", err)
@@ -101,12 +79,9 @@ func (a *Agent) Setup(ctx agent.SetupContext) error {
 	return nil
 }
 
-// ClearInputKeys returns the tmux key sequence Manager.SendPrompt sends
-// before each attempt to wipe Claude Code's input line to empty, preventing
-// residual text from concatenating with the new prompt. C-u is the standard
-// readline kill-line binding and Claude Code's TUI honours it. Adapters may
-// return nil to opt out; empty here would mean "opt out" and disable the
-// residual-concat protection for claude sessions.
+// ClearInputKeys returns the tmux keys Manager.SendPrompt sends before each
+// attempt to wipe Claude Code's input line. C-u is the standard readline
+// kill-line binding and Claude Code's TUI honours it.
 func (a *Agent) ClearInputKeys() []string { return []string{"C-u"} }
 
 // PastePlaceholder returns "": Claude Code receives prompts as keystrokes because
@@ -129,20 +104,15 @@ func (a *Agent) PastePlaceholder(string) string { return "" }
 //	/<exact-command>           ran as sent                   ran as sent
 //	say pong only              submitted                     submitted
 //
-// The third row is the one that justifies returning keys for bare slash
-// commands even though nothing is drawn on screen: a burst
-// `send-keys -l` write does not render the slash overlay at all — only
-// character-by-character typing does (3/3 either way) — yet the selection is
-// live, and SendPrompt's nudge key walks it onto a different entry. Measured
-// with a prefix matching two commands: without the nudge the first entry ran,
-// with it the second did. Escape discards that selection, so the prompt runs
-// as the caller wrote it.
+// The third row is what justifies returning keys for bare slash commands even
+// though nothing is drawn on screen: a burst `send-keys -l` write does not
+// render the overlay at all, yet the selection is live and SendPrompt's nudge
+// key walks it onto a different entry. Escape discards that selection.
 //
-// Why not every prompt: Escape also interrupts a running turn (2/3, the
-// third run's turn finished first). SendPrompt only sends while a session
-// reads as idle, but jin is known to report idle while a sub-agent runs, so
-// restricting the key to prompts that can actually open an overlay keeps
-// that misfire away from ordinary sends.
+// Not for every prompt, because Escape also interrupts a running turn (2/3).
+// SendPrompt only sends while a session reads as idle, but jin is known to
+// report idle while a sub-agent runs, so restricting the key to prompts that
+// can open an overlay keeps that misfire away from ordinary sends.
 func (a *Agent) DismissOverlayKeys(prompt string) []string {
 	if !opensCompletionOverlay(prompt) {
 		return nil
@@ -155,23 +125,17 @@ func (a *Agent) DismissOverlayKeys(prompt string) []string {
 //
 // The overlay survives only while the caret sits inside the token that opened
 // it. Measured 3/3 per case: "list @internal/agent" keeps it open, "list
-// @internal/agent and say ok" does not, and "explain the fix/send-deadlock
-// branch" never opens one because the slash is not the first character of the
-// input.
+// @internal/agent and say ok" does not, and a slash that is not the first
+// character of the input never opens one. Requiring "@" at the START of the
+// final token is measured too, at the counts each case got: a backtick-wrapped
+// path (3/3), a double-quoted one (2/2) and a mid-sentence email address (1/1)
+// all drew no overlay and submitted verbatim. See overlay_test.go for the
+// exact prompts.
 //
-// Requiring the "@" at the START of the final token is measured, not assumed —
-// a closing delimiter puts the caret outside the token and the overlay is
-// gone. A backtick-wrapped path (3/3), a double-quoted one (2/2) and an email
-// address mid-sentence (1/1) all drew no overlay and submitted verbatim, so
-// returning false for them is right rather than a gap. See overlay_test.go for
-// the exact prompts.
-//
-// Whitespace is dropped before the check, which errs toward returning true for
-// a trailing space. That is the safe direction for the cases the two rules
-// cover: an unnecessary Escape was measured harmless on a prompt with no
-// overlay (3/3), while a missed one leaves the defect exactly as it was. It
-// says nothing about a trigger neither rule names — that is missed, not
-// caught.
+// Whitespace is dropped before the check, which errs toward true for a
+// trailing space. That is the safe direction: an unnecessary Escape was
+// measured harmless (3/3), while a missed one leaves the defect as it was. It
+// says nothing about a trigger neither rule names.
 //
 // "#" was measured to draw no overlay (3/3) and is deliberately absent. What
 // its Enter does was not measured: "#" opens a save-destination dialog, and

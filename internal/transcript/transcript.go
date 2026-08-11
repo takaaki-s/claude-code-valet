@@ -56,24 +56,20 @@ type Entry struct {
 	Usage     *Usage  `json:"usage,omitempty"` // assistant only
 
 	// Injected reports that the agent produced this entry on the operator's
-	// behalf rather than the operator writing it — an environment block, the
-	// body of an invoked skill, an interruption notice the agent files in the
-	// user's voice.
-	//
-	// Sidechain reports that the entry belongs to a subagent's own thread
-	// rather than the main conversation.
+	// behalf rather than the operator writing it — an environment block, the body
+	// of an invoked skill, an interruption notice filed in the user's voice.
+	// Sidechain reports that the entry belongs to a subagent's own thread rather
+	// than the main conversation.
 	//
 	// Both carry a reader's *conclusion*, not the evidence it reached that
-	// conclusion from, and that distinction is the whole point. Claude Code
-	// marks injections with an isMeta flag and with the absence of a
-	// promptSource stamp; Codex writes them under a `developer` role and
-	// behind recognisable prefixes. A shared field holding "promptSource was
-	// missing" would be a Claude Code fact wearing a neutral name, and
-	// applying it to Codex — which stamps nothing and whose user entries are
-	// text-only — would silently discard every prompt the operator typed.
+	// conclusion from, and that distinction is the whole point. Claude Code marks
+	// injections with isMeta and with the absence of a promptSource stamp; Codex
+	// writes them under a `developer` role and behind recognisable prefixes. A
+	// shared field holding "promptSource was missing" would be a Claude Code fact
+	// wearing a neutral name, and applying it to Codex — which stamps nothing —
+	// would silently discard every prompt the operator typed.
 	//
-	// A reader that filters injections while reading leaves both false, which
-	// is correct: there is nothing left to warn a view about.
+	// A reader that filters injections while reading leaves both false.
 	Injected  bool `json:"injected,omitempty"`
 	Sidechain bool `json:"sidechain,omitempty"`
 }
@@ -142,13 +138,12 @@ func (r *Reader) GetLastMessages(workDir, sessionID string) (*LastMessages, erro
 }
 
 // GetConversation returns the last N exchanges from the transcript, where an
-// exchange is a user prompt plus the assistant's reply to it (see lastExchanges).
-// workDir may be empty: a glob fallback locates the JSONL by sessionID.
-// lastN is the number of exchanges to return and must be at least 1: "no
-// exchanges asked for" is rejected rather than answered with the whole
-// conversation, which is the direction of failure that hurts — callers pipe
-// this into another agent's context.
-// Returns ErrNoTranscript when no transcript file exists (yet), and an empty
+// exchange is a user prompt plus the assistant's reply to it (see
+// lastExchanges). workDir may be empty: a glob fallback locates the JSONL by
+// sessionID. lastN must be at least 1 — "no exchanges asked for" is rejected
+// rather than answered with the whole conversation, which is the direction of
+// failure that hurts, since callers pipe this into another agent's context.
+// Returns ErrNoTranscript when no transcript file exists yet, and an empty
 // slice when one exists but carries no plain-text message.
 func (r *Reader) GetConversation(workDir, sessionID string, lastN int) ([]Message, error) {
 	if lastN < 1 {
@@ -216,17 +211,13 @@ func (r *Reader) readConversation(filePath string, lastN int) ([]Message, error)
 //
 // An exchange starts at a user message that either opens the transcript or
 // follows an assistant reply, and runs until the next such message — so one
-// exchange is a prompt plus everything the agent said in response, however
-// many entries that took. A trailing run of user messages with no reply yet
-// counts as an exchange of its own, which is what makes `--last 1` show the
-// question the agent is still working on.
+// exchange is a prompt plus everything the agent said in response, however many
+// entries that took. A trailing run of user messages with no reply yet counts
+// as an exchange of its own, which is what makes `--last 1` show the question
+// the agent is still working on.
 //
-// Slicing a fixed 2n messages instead, as this used to, only lines up with
-// exchanges when every turn happens to be exactly one message; in practice it
-// returned two consecutive assistant messages and no prompt at all. Fewer
-// than n boundaries — or none, as in a transcript that is all assistant
-// text — returns everything rather than guessing at a cut point. n comes from
-// GetConversation, which refuses anything below 1.
+// Fewer than n boundaries — or none, as in a transcript that is all assistant
+// text — returns everything rather than guessing at a cut point.
 func lastExchanges(msgs []Message, n int) []Message {
 	seen := 0
 	for i := len(msgs) - 1; i >= 0; i-- {
@@ -247,21 +238,14 @@ func lastExchanges(msgs []Message, n int) []Message {
 // readLastMessages reads the transcript file and returns the last user and
 // assistant messages, as the shared view over Entry sees them.
 //
-// It used to walk the file itself and reach the same answer through different
-// vocabulary — isConversationEntry and extractContent where LastMessagesFrom
-// uses the Injected/Sidechain flags. Two implementations of "what counts as
-// the operator's words" is one too many: that rule is the load-bearing
-// decision in this package, and the copy nothing called was the one most of
-// the package's tests pinned. Delegating makes the parity structural instead
-// of asserted, and points those tests at the path production actually takes.
+// It delegates to LastMessagesFrom rather than walking the file itself, so
+// "what counts as the operator's words" — the load-bearing decision in this
+// package — has one implementation instead of two. Verified equal before the
+// collapse: over 246 real Claude Code transcripts the two agreed on user
+// content, assistant content, timestamps and nil-ness with no exceptions.
 //
-// Verified equal before the collapse: over 246 real Claude Code transcripts
-// the two agreed on user content, assistant content, timestamps and nil-ness
-// with no exceptions.
-//
-// The cost is that this materializes every entry where it used to stream. That
-// is the same trade Manager.AttachLastMessages already makes on the list path,
-// which is where the previews are actually read.
+// The cost is that this materializes every entry where it used to stream, the
+// same trade Manager.AttachLastMessages already makes on the list path.
 func (r *Reader) readLastMessages(filePath string) (*LastMessages, error) {
 	entries, err := readEntries(filePath, "")
 	if err != nil {
@@ -374,23 +358,19 @@ func (r *Reader) readLastMessage(filePath string) (*Message, error) {
 // Only user and assistant entries qualify. Sidechain entries are a subagent's
 // own turns — treating them as the main thread makes a subagent's prompt look
 // like the user's. Meta entries are context Claude Code injects on the user's
-// behalf: the body of an invoked skill, environment reminders, command
-// caveats. They are stored as user messages but nobody said them, and a
-// single injected skill body runs to thousands of lines, so admitting them
-// drowns the conversation it is supposed to show.
+// behalf: skill bodies, environment reminders, command caveats. They are stored
+// as user messages but nobody said them, and a single injected skill body runs
+// to thousands of lines.
 //
-// TurnState calls this for the same reason, which is why the test is made of
-// nothing but the flags the transcript itself sets: a session's live status is
-// re-derived from which role spoke last, and that classification must not move
-// because of what an entry happens to say. Exclusions that depend on the
-// content live in conversationTextBlocks instead.
+// The test is made of nothing but the flags the transcript itself sets, because
+// TurnState calls this too: a session's live status is re-derived from which
+// role spoke last, and that classification must not move because of what an
+// entry happens to say. Exclusions that depend on the content live in
+// conversationTextBlocks instead.
 //
 // The flags alone do not separate a prompt from the entries Claude Code writes
-// in the user's voice; that second test is advancesTurn, and TurnState applies
-// it on top of this one. It stays there rather than here because the two paths
-// need opposite behaviour when the evidence runs out: conversationTextBlocks
-// degrades to shape alone so a transcript still shows its messages, whereas a
-// status verdict is better withheld than guessed.
+// in the user's voice; that second test is advancesTurn, which TurnState
+// applies on top of this one.
 func isConversationEntry(entry *transcriptEntry) bool {
 	if entry.Type != "user" && entry.Type != "assistant" {
 		return false
@@ -398,10 +378,9 @@ func isConversationEntry(entry *transcriptEntry) bool {
 	return !entry.IsSidechain && !entry.IsMeta
 }
 
-// collectTextBlocks pulls the text out of an entry's content. Content is a
-// bare string on some entries and an array of blocks on others, and either
-// shape can appear for either role, so this stays role-agnostic — which of
-// those texts count as conversation is conversationTextBlocks' decision.
+// collectTextBlocks pulls the text out of an entry's content. Content is a bare
+// string on some entries and an array of blocks on others, and either shape can
+// appear for either role, so this stays role-agnostic.
 //
 // Blocks other than text are skipped on purpose. A tool_result rides along
 // inside a user entry but is what a tool wrote back, not something the user
@@ -436,13 +415,10 @@ func collectTextBlocks(content any) []string {
 // something its author actually said.
 //
 // Claude Code stamps a promptSource on every user entry it was handed as input:
-// "typed" for a terminal prompt, "sdk" for one fed to `claude -p
-// --input-format stream-json`. A user entry with no promptSource was supplied
-// by nobody, and when its content is an array of nothing but text it is the
-// agent writing in the user's voice — on real transcripts, always an
-// interruption notice. That is the same class of entry as isMeta (see
-// isConversationEntry), and admitting it puts the agent's own bookkeeping where
-// the last real reply belongs on the default `session output` path.
+// "typed" for a terminal prompt, "sdk" for one fed to `claude -p --input-format
+// stream-json`. A user entry with no promptSource was supplied by nobody, and
+// when its content is an array of nothing but text it is the agent writing in
+// the user's voice — on real transcripts, always an interruption notice.
 //
 // The promptSource half of the test is what keeps a genuine prompt out of the
 // rule: the shape alone does not separate them, because stream-json input
@@ -462,11 +438,10 @@ func conversationTextBlocks(entry *transcriptEntry) []string {
 // isUnstampedUser reports whether an entry is a user entry Claude Code was not
 // handed as input: no promptSource stamp, so nobody supplied it.
 //
-// This is the Claude-Code-specific half of two separate rules — the message
-// readers' exclusion (conversationTextBlocks) and TurnState's turn test
-// (advancesTurn). It lives in one function so the stamp is written down once
-// and a change to how Claude Code marks its input lands on both at the same
-// time.
+// This is the Claude-Code-specific half of two separate rules —
+// conversationTextBlocks and advancesTurn. It lives in one function so the
+// stamp is written down once and a change to how Claude Code marks its input
+// lands on both at the same time.
 func isUnstampedUser(entry *transcriptEntry) bool {
 	return entry.Type == "user" && entry.PromptSource == ""
 }
@@ -474,17 +449,16 @@ func isUnstampedUser(entry *transcriptEntry) bool {
 // advancesTurn reports whether an entry moves the conversation forward.
 //
 // An assistant entry always does — that is the agent speaking. A user entry
-// does only when it is input the agent was handed and owes a reply to,
-// because Claude Code writes plenty into the transcript in the user's voice
-// that nobody submitted: the stdout of a local slash command, the notice
-// raised when a command is invoked, the echo of a `!` bash line. None of those
-// is a request and none will be answered, so a transcript ending on one
-// belongs to a session that is idle, not one whose reply is still coming.
+// does only when it is input the agent was handed and owes a reply to, because
+// Claude Code writes plenty into the transcript in the user's voice that nobody
+// submitted: the stdout of a local slash command, the notice raised when a
+// command is invoked, the echo of a `!` bash line. None of those is a request
+// and none will be answered, so a transcript ending on one belongs to a session
+// that is idle, not one whose reply is still coming.
 //
 // The user test is two positive signals rather than a list of those shapes,
 // because the list is open-ended — a survey of real transcripts turned up six
-// distinct ones and nothing stops Claude Code from adding a seventh. Asking
-// what makes an entry real does not need extending:
+// distinct ones and nothing stops Claude Code from adding a seventh:
 //
 //   - promptSource is the stamp Claude Code puts on everything it was handed
 //     as input. Across ~21k user entries, every entry an operator actually
@@ -494,22 +468,20 @@ func isUnstampedUser(entry *transcriptEntry) bool {
 //   - a tool_result block is the agent's own turn continuing: a tool wrote
 //     back and the reply is still owed.
 //
-// Deliberately structural. Which words an entry happens to carry must not
-// move a status verdict — see TurnState.
+// Deliberately structural. Which words an entry happens to carry must not move
+// a status verdict — see TurnState.
 //
-// Entry.Injected answers a neighbouring question and disagrees on these
-// shapes. It derives provenance from conversationTextBlocks, whose rule only
-// fires for a text-only array, so an injected entry that arrives as a bare
-// string — a slash command's stdout, a `!` bash echo — is reported as
-// operator-written. That is a gap in isInjected, not a decision: this test is
-// the one with the evidence behind it, and the two are not interchangeable
-// until that is reconciled.
+// Entry.Injected answers a neighbouring question and disagrees on these shapes.
+// It derives provenance from conversationTextBlocks, whose rule only fires for
+// a text-only array, so an injected entry that arrives as a bare string — a
+// slash command's stdout, a `!` bash echo — is reported as operator-written.
+// That is a gap in isInjected, not a decision.
 //
 // The rule leans entirely on Claude Code stamping what it was handed. A build
 // that stopped doing so would make every session read as idle rather than
 // thinking; no fallback is attempted, because "no stamps anywhere" cannot be
-// told apart from a session driven only by slash commands and tool calls,
-// which 39 of 235 surveyed transcripts turned out to be.
+// told apart from a session driven only by slash commands and tool calls, which
+// 39 of 235 surveyed transcripts turned out to be.
 func advancesTurn(entry *transcriptEntry) bool {
 	if !isUnstampedUser(entry) {
 		return true
@@ -517,17 +489,16 @@ func advancesTurn(entry *transcriptEntry) bool {
 	return hasBlockKind(entry.Message.Content, "tool_result")
 }
 
-// decidesTurn reports whether an entry settles what state the turn is in:
-// input the agent owes a reply to, or an interruption that ended one.
-// Everything else — the entries Claude Code writes in the user's voice — is
-// passed over, so whatever decided last goes on deciding.
+// decidesTurn reports whether an entry settles what state the turn is in: input
+// the agent owes a reply to, or an interruption that ended one. Everything else
+// — the entries Claude Code writes in the user's voice — is passed over, so
+// whatever decided last goes on deciding.
 //
 // Keeping the interruption marker rather than acting on it is what makes two
-// rules fall out of the scan instead of needing to be enforced: a slash
-// command typed after an interruption does not reopen the turn (the marker is
-// simply still the last entry that decided), and TurnState's closing test on
-// advancesTurn settles which of the two a single entry carrying both signals
-// counts as.
+// rules fall out of the scan instead of needing to be enforced: a slash command
+// typed after an interruption does not reopen the turn, and TurnState's closing
+// test on advancesTurn settles which of the two a single entry carrying both
+// signals counts as.
 func decidesTurn(entry *transcriptEntry) bool {
 	return advancesTurn(entry) || entry.InterruptedMessageID != ""
 }
@@ -654,11 +625,10 @@ func (r *Reader) findTranscriptPath(workDir, sessionID string) (string, error) {
 // entry with no timestamp would compare as "at or before" every bound and
 // disappear the moment a caller read incrementally.
 //
-// Exported because it is protocol rather than implementation. Every
-// session.TranscriptSource promises these semantics, and the promise is only
-// worth making if the adapters share the sentence that defines it: a fix to
-// the cursor has to land for all of them at once, or `--since` starts meaning
-// different things per agent kind.
+// Exported because it is protocol rather than implementation: every
+// session.TranscriptSource promises these semantics, so a fix to the cursor has
+// to land for all of them at once, or `--since` starts meaning different things
+// per agent kind.
 func Newer(ts, since string) bool {
 	return since == "" || ts == "" || ts > since
 }
@@ -684,19 +654,16 @@ func (r *Reader) ReadEntries(workDir, sessionID, since string) ([]Entry, error) 
 
 // isInjected reports whether Claude Code wrote this entry in the user's voice
 // rather than the operator supplying it. blocks is what parseBlocks already
-// produced for raw, so the text is read back off it rather than collected a
-// second time.
+// produced for raw, so the text is read back off it rather than collected twice.
 //
 // Two shapes qualify, and they are the same two the message readers already
-// exclude — this is that decision named, so a view working from Entry can
-// reach it without re-deriving it from fields Entry does not carry. isMeta is
-// the explicit marker: skill bodies, environment reminders, command caveats.
-// The second is the rule conversationTextBlocks applies, restated: a user
-// entry that carries text but that conversationTextBlocks refuses is one with
-// no promptSource stamp and nothing but text in it, which on real transcripts
-// is always the agent filing a notice on the user's behalf. The stamp test
-// stays in isUnstampedUser rather than being repeated here, so the
-// Claude-Code-specific rule lives in one function.
+// exclude — this is that decision named, so a view working from Entry can reach
+// it without re-deriving it from fields Entry does not carry. isMeta is the
+// explicit marker: skill bodies, environment reminders, command caveats. The
+// second is conversationTextBlocks' rule restated: a user entry that carries
+// text but that conversationTextBlocks refuses has no promptSource stamp and
+// nothing but text in it, which on real transcripts is always the agent filing
+// a notice on the user's behalf. The stamp test stays in isUnstampedUser.
 //
 // Why the conclusion is stored rather than promptSource itself: see the
 // Injected field on Entry.
@@ -810,34 +777,30 @@ const (
 
 // TurnState returns the classification of the last conversational turn.
 //
-// Two filters decide which entries count. isConversationEntry's flag test
-// drops what is outside the main conversation: system/summary types, sidechain
+// Two filters decide which entries count. isConversationEntry's flag test drops
+// what is outside the main conversation: system/summary types, sidechain
 // entries (a subagent's turns would otherwise read as the main thread
 // finishing), and meta messages. On top of it, a user entry counts only if it
 // is input the agent owes a reply to (advancesTurn) — the rest is Claude Code
 // writing in the user's voice, and reading one of those as a prompt reports a
-// finished session as still working. What that costs the caller is written
-// down where the caller lives; see docs/session-lifecycle.md.
+// finished session as still working. See docs/session-lifecycle.md for what
+// that costs the caller.
 //
-// Both filters are structural: which words an entry happens to carry must
-// never move a status verdict. The content-based exclusion the message readers
-// apply (conversationTextBlocks) is deliberately not reused, and neither test
-// contains the other — they answer different questions. A tool_result-only
-// user entry is nothing to show but is very much a turn in flight; a slash
-// command's stdout arrives as a bare string, so the readers keep it while this
-// drops it. Only the stamp itself is shared, in isUnstampedUser.
+// Both filters are structural: which words an entry happens to carry must never
+// move a status verdict. The content-based exclusion the message readers apply
+// (conversationTextBlocks) is deliberately not reused, and neither test
+// contains the other — a tool_result-only user entry is nothing to show but is
+// very much a turn in flight, while a slash command's stdout arrives as a bare
+// string, so the readers keep it while this drops it. Only the stamp itself is
+// shared, in isUnstampedUser.
 //
-// An interruption ends the turn rather than being passed over. Whatever the
+// An interruption ends the turn rather than being passed over: whatever the
 // operator cut short is not in flight, so the marker outranks the tool_result
-// or half-written reply beneath it and the answer is TurnStateComplete.
+// or half-written reply beneath it.
 //
 // Any failure (missing file, empty transcript, read error) folds into
-// TurnStateUnknown, so callers can treat it as "cannot determine" without
-// guard code.
-//
-// The file is streamed keeping only the last main-conversation entry — a
-// ReadEntries call would materialize every block (including re-marshalled
-// tool payloads) just to look at the tail.
+// TurnStateUnknown, so callers can treat it as "cannot determine" without guard
+// code.
 func (r *Reader) TurnState(workDir, sessionID string) TurnState {
 	path, err := r.findTranscriptPath(workDir, sessionID)
 	if err != nil {
@@ -909,17 +872,15 @@ func (r *Reader) TurnState(workDir, sessionID string) TurnState {
 	return TurnStateUserPending
 }
 
-// ReadAITitle returns the AI-generated session title Claude Code writes to
-// the transcript when it names the conversation from context (the same value
-// CC surfaces as "Session name" in `/status`). Each line of the JSONL is
-// checked for `{"type":"ai-title","aiTitle":"…"}` and the most recent
-// non-empty value wins — CC may re-title the session later in the
-// conversation, and callers should see the latest title, not the first.
+// ReadAITitle returns the AI-generated session title Claude Code writes to the
+// transcript when it names the conversation from context (the same value CC
+// surfaces as "Session name" in `/status`). Each line of the JSONL is checked
+// for `{"type":"ai-title","aiTitle":"…"}` and the most recent non-empty value
+// wins — CC may re-title the session later in the conversation.
 //
-// Returns ("", false) on any miss: empty sessionID, no transcript file yet
-// (silent), malformed lines (skipped), or no ai-title entry present. Never
-// returns an error — all failure modes are silent fallbacks by design so the
-// Layer C-name enhancer can call this on every hook without guard code.
+// Returns ("", false) on any miss and never returns an error — every failure
+// mode is a silent fallback by design, so the Layer C-name enhancer can call
+// this on every hook without guard code.
 func (r *Reader) ReadAITitle(workDir, sessionID string) (string, bool) {
 	if sessionID == "" {
 		return "", false

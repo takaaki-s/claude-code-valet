@@ -21,12 +21,10 @@ import (
 var pluginSource string
 
 // execPathPlaceholder is replaced with the absolute path of the running jin
-// binary, quoted, when the plugin is materialised. The plugin needs an
-// absolute path because opencode's Bun runtime does not inherit the
-// interactive shell's PATH resolution.
-//
-// It stands alone in the template rather than inside quotes because the
-// substituted value brings its own — see quoteForJS.
+// binary, quoted, when the plugin is materialised. The plugin needs an absolute
+// path because opencode's Bun runtime does not inherit the interactive shell's
+// PATH resolution. It stands alone in the template rather than inside quotes
+// because the substituted value brings its own — see quoteForJS.
 const execPathPlaceholder = "__JIN_BIN__"
 
 // pluginFileMode is the permission the materialised plugin gets. opencode only
@@ -37,10 +35,9 @@ const pluginFileMode os.FileMode = 0o644
 // configFileName is the config that points opencode at it.
 //
 // opencode has no hook-style channel for injecting context: the plugin runs
-// `jin hook` with stdout set to "ignore", so the SessionStart output the
-// Claude Code and Codex adapters rely on could never reach it. What it does
-// have is `instructions`, a list of files merged into the session's prompt —
-// and jind-ai already owns a directory on opencode's config search path.
+// `jin hook` with stdout set to "ignore", so the SessionStart output the Claude
+// Code and Codex adapters rely on could never reach it. What it does have is
+// `instructions`, a list of files merged into the session's prompt.
 const (
 	contextFileName = "jin-agent.md"
 	configFileName  = "opencode.json"
@@ -72,32 +69,28 @@ type openCodeConfig struct {
 // which is what keeps it from importing a half-written module.
 //
 // A temp file stranded by a crash between create and rename is inert for the
-// same reason, but nothing here reclaims it — there is no counterpart to the
-// session Store's cleanupTempFiles, since WritePlugin has no construction point
-// safe to sweep from.
+// same reason, but nothing here reclaims it: WritePlugin has no construction
+// point safe to sweep from.
 const pluginTmpPattern = ".jin-plugin-*.tmp"
 
-// WritePlugin materialises the embedded plugin under stateDir and returns
-// the directory to hand to opencode as OPENCODE_CONFIG_DIR.
+// WritePlugin materialises the embedded plugin under stateDir and returns the
+// directory to hand to opencode as OPENCODE_CONFIG_DIR.
 //
 // Layout, matching opencode's ConfigPlugin.load glob ({plugin,plugins}/*.{ts,js}):
 //
 //	<stateDir>/opencode/            ← OPENCODE_CONFIG_DIR
 //	<stateDir>/opencode/plugin/jin.ts
 //
-// opencode also treats this directory as one of its own: on start it writes
-// a .gitignore there and installs @opencode-ai/plugin into a node_modules
-// beside it. That is expected — it does the same to ~/.config/opencode —
-// and is precisely why the directory belongs under jind-ai's state rather
-// than anywhere the user owns.
+// opencode also treats this directory as one of its own: on start it writes a
+// .gitignore there and installs @opencode-ai/plugin into a node_modules beside
+// it. That is expected — it does the same to ~/.config/opencode — and is
+// precisely why the directory belongs under jind-ai's state rather than
+// anywhere the user owns.
 //
 // The file is rewritten on every call rather than only when missing, which
-// makes it self-healing: a plugin the user deleted, truncated or edited by
-// hand is restored on the next session start. (It does not exist to track a
-// moved binary: execPath is a parameter here, not a value this package
-// remembers, so a caller that resolves a different one simply passes it.) The
-// write costs well under a millisecond next to spawning tmux and the agent
-// itself.
+// makes it self-healing: a plugin the user deleted, truncated or edited by hand
+// is restored on the next session start. (It does not exist to track a moved
+// binary: execPath is a parameter here, not a value this package remembers.)
 func WritePlugin(stateDir, execPath string) (string, error) {
 	if stateDir == "" {
 		return "", fmt.Errorf("opencode: empty state dir")
@@ -131,23 +124,22 @@ func pluginPath(stateDir string) string {
 	return filepath.Join(configDirFor(stateDir), "plugin", "jin.ts")
 }
 
-// installedConfigDir answers what SpawnCommand should hand opencode for a
-// spawn rooted at stateDir: the config directory when a plugin is actually
-// there to load, and "" when there is none — which is what makes the spawn
-// omit OPENCODE_CONFIG_DIR and start opencode without jind-ai's status
-// reporting rather than pointing it at nothing.
+// installedConfigDir answers what SpawnCommand should hand opencode for a spawn
+// rooted at stateDir: the config directory when a plugin is actually there to
+// load, and "" when there is none — which is what makes the spawn omit
+// OPENCODE_CONFIG_DIR and start opencode without jind-ai's status reporting
+// rather than pointing it at nothing.
 //
 // The empty-stateDir guard is not defensive noise. filepath.Join("", "opencode")
 // is the RELATIVE path "opencode", which opencode would resolve against a
 // working directory this package does not choose.
 //
 // It stats where the Claude Code adapter's equivalent reads, and the asymmetry
-// has a reason rather than being an oversight. existingHooksSettings reads
-// because a settings file could have been left zero-length by a jind-ai old
-// enough to have written it in place, and Claude Code treats an unparsable one
-// as a whole-config failure. This plugin has only ever been published by rename
-// (see WritePlugin), so a half-written jin.ts has never been observable, and
-// there is no torn state for a read to detect that a stat would miss.
+// has a reason. existingHooksSettings reads because a settings file could have
+// been left zero-length by a jind-ai old enough to have written it in place,
+// and Claude Code treats an unparsable one as a whole-config failure. This
+// plugin has only ever been published by rename, so a half-written jin.ts has
+// never been observable.
 func installedConfigDir(stateDir string) string {
 	if stateDir == "" {
 		return ""
@@ -172,10 +164,9 @@ func installedConfigDir(stateDir string) string {
 // opencode.json is not merely this feature failing but opencode's whole config
 // load failing.
 //
-// The path recorded in instructions is absolute. opencode resolves these
+// The path recorded in instructions is absolute: opencode resolves these
 // entries relative to a directory this package does not get to choose, and
-// guessing wrong would fail silently — the session would simply start without
-// the context.
+// guessing wrong would fail silently.
 func WriteAgentContext(configDir string) error {
 	if configDir == "" {
 		return fmt.Errorf("opencode: empty config dir")
@@ -201,11 +192,10 @@ func WriteAgentContext(configDir string) error {
 // included.
 //
 // JSON is the right tool rather than strconv.Quote: JSON's escape set is a
-// strict subset of JavaScript's, whereas Go emits \a for U+0007, which
-// JavaScript does not recognise as an escape at all — it would silently
-// decode as a plain "a". Control characters become \uXXXX and printable
-// UTF-8 passes through, so ordinary paths stay readable in the generated
-// file.
+// strict subset of JavaScript's, whereas Go emits a backslash-a for U+0007,
+// which JavaScript does not recognise as an escape at all — it would silently
+// decode as a plain "a". Control characters become unicode escapes and
+// printable UTF-8 passes through, so ordinary paths stay readable.
 //
 // Marshalling a string cannot fail; the error is checked only so a future
 // change of input type cannot make it silently wrong.

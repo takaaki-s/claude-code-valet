@@ -1,12 +1,10 @@
 // Package codex is the OpenAI Codex CLI adapter. It owns every Codex-specific
-// concern jind-ai used to inline into internal/session — hook injection via
-// per-invocation -c overrides, the SessionStart write-back path Codex needs
-// because it has no `--session-id` equivalent, the shell command shape, and
-// the rollout-derived Layer C-transcript enhancer.
+// concern: hook injection via per-invocation -c overrides, the SessionStart
+// write-back path Codex needs because it has no `--session-id` equivalent, the
+// shell command shape, and the rollout-derived Layer C-transcript enhancer.
 //
-// The type-name Agent implements session.Agent (via the aliases exposed in
-// internal/agent). Register instances via the internal/agent/register
-// blank-import package so the daemon can Lookup("codex") them at start-up.
+// Register instances via the internal/agent/register blank-import package so
+// the daemon can Lookup("codex") them at start-up.
 package codex
 
 import (
@@ -16,23 +14,19 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/agent"
 )
 
-// Agent is the Codex adapter state, one instance shared by the whole process
-// (internal/agent/registry.go). Nothing here comes from a Setup:
+// Agent is the Codex adapter state, one instance shared by the whole process,
+// so nothing here may come from a Setup:
 //
-//   - locator is built once, from os.UserHomeDir() resolved eagerly at
-//     construction (invariant for a running daemon; tests set CODEX_HOME
-//     directly), and shared by enhancer and every TranscriptReader
-//     Transcript() hands out, so a rollout path either one resolves is
-//     cached for both — see rollout.go's Locator cache.
+//   - locator is built once, from a home directory resolved eagerly at
+//     construction, and shared by enhancer and every TranscriptReader
+//     Transcript() hands out, so a rollout path either resolves is cached for
+//     both — see rollout.go's Locator cache.
 //   - enhancer and statusSrc are cached instances so hot-path calls to
-//     Description() / StatusSource() don't reallocate on every hook.
+//     Description() / StatusSource() do not reallocate on every hook.
 //
-// All three are built in New and never reassigned, so the FIELDS are read
-// without a lock. What locator points at is not still: it caches uuid->rollout
-// paths behind its own mutex, and SpawnCommand writes to that cache on a resume
-// (rollout.go's invalidate). The jin binary the `-c 'hooks.X=[...]'` payloads
-// name arrives on SpawnOptions instead of being remembered here — see
-// session.SpawnOptions.ExecPath for why no adapter keeps it.
+// The FIELDS are read without a lock, but what locator points at is not still:
+// it caches uuid->rollout paths behind its own mutex, and SpawnCommand writes
+// to that cache on a resume.
 type Agent struct {
 	locator   *Locator
 	enhancer  *DescriptionEnhancer
@@ -58,35 +52,28 @@ func (a *Agent) Kind() string { return "codex" }
 
 // RecognizesSessionID accepts anything written as a UUID. Codex has no
 // --session-id equivalent, so the real id only ever arrives through the
-// SessionStart hook payload and this predicate is what stands between that
+// SessionStart hook payload, and this predicate is what stands between that
 // payload and the record. Refusing a genuine id leaves the pre-minted UUID in
 // place, which `codex resume` rejects within seconds — the quick-fail retry
-// then starts a fresh session, so the cost is a visible restart rather than a
-// session that quietly turns out to be empty.
+// then starts fresh, so the cost is a visible restart rather than a session
+// that quietly turns out to be empty.
 func (a *Agent) RecognizesSessionID(id string) bool { return agent.LooksLikeUUID(id) }
 
 // Setup does nothing, and this adapter is the one where that is the whole
-// story rather than an omission. Codex hooks are injected per-invocation on the
-// command line, so there is no file to write: ~/.codex/hooks.json and
+// story rather than an omission. Codex hooks are injected per-invocation on
+// the command line, so there is no file to write: ~/.codex/hooks.json and
 // config.toml both stay untouched. See "Agent Adapters" in
 // docs/architecture.md for the design principle behind that.
-//
-// It used to record ctx.ExecPath for SpawnCommand to read back. SpawnCommand is
-// handed the same value now (session.SpawnOptions.ExecPath), which left this
-// with nothing to do — and left nothing travelling from here to there, so the
-// setupMu that guarded the hand-off went with it. The rollout cache keeps its
-// own lock; it was never part of this.
 func (a *Agent) Setup(agent.SetupContext) error { return nil }
 
 // SpawnCommand delegates to the package-level builder, which reads the jin
 // binary straight off opts. An empty ExecPath — reachable in production when
 // the daemon could resolve none — falls back to a hook-less `codex` invocation.
 //
-// A resume (isResume(opts)) evicts AgentSessionID from locator's cache
-// first. Whether `codex resume` can retarget a UUID onto a different rollout
-// file is unverified (see rollout.go), but if it does, the next Find must
-// re-glob rather than keep answering with whatever the cache resolved before
-// the resume.
+// A resume evicts AgentSessionID from locator's cache first. Whether `codex
+// resume` can retarget a UUID onto a different rollout file is unverified (see
+// rollout.go), but if it can, the next Find must re-glob rather than keep
+// answering with whatever the cache resolved before the resume.
 func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 	if isResume(opts) {
 		a.locator.invalidate(opts.AgentSessionID)
@@ -104,23 +91,18 @@ func (a *Agent) Description() agent.DescriptionSource { return a.enhancer }
 // Transcript returns the rollout reader. It is a partial view of what Claude
 // Code's reader gives — Codex records no token usage per message, no error
 // flag on a tool result, and one tool name for every call — and transcript.go
-// documents each gap where the mapping loses something.
+// marks each gap where the mapping loses something.
 //
-// The TranscriptReader wrapper is still built fresh per call, unlike enhancer
-// and statusSrc above: it holds nothing but a Locator pointer, and
-// constructing it measured at 240ns against a read that takes milliseconds.
-// What it wraps is not fresh, though — it shares locator with enhancer, so a
-// `jin session result` call and a hook-driven description attempt for the
-// same session hit the same uuid->path cache instead of each re-globbing
-// every day shard.
+// The wrapper is built fresh per call, unlike enhancer and statusSrc above: it
+// holds nothing but a Locator pointer, and constructing it measured at 240ns
+// against a read that takes milliseconds. What it wraps is not fresh, though —
+// it shares locator with enhancer, so a `jin session result` call and a
+// hook-driven description attempt hit the same uuid->path cache.
 func (a *Agent) Transcript() agent.TranscriptSource { return NewTranscriptReader(a.locator) }
 
-// ClearInputKeys returns the tmux key sequence Manager.SendPrompt sends
-// before each attempt to wipe Codex's input line to empty, preventing
-// residual text from concatenating with the new prompt. C-u is the standard
-// readline kill-line binding and Codex's TUI honours it. Adapters may
-// return nil to opt out; empty here would mean "opt out" and disable the
-// residual-concat protection for codex sessions.
+// ClearInputKeys returns the tmux keys Manager.SendPrompt sends before each
+// attempt to wipe Codex's input line. C-u is the standard readline kill-line
+// binding and Codex's TUI honours it.
 func (a *Agent) ClearInputKeys() []string { return []string{"C-u"} }
 
 // PastePlaceholder returns "": Codex receives prompts as keystrokes because
@@ -133,36 +115,29 @@ func (a *Agent) PastePlaceholder(string) string { return "" }
 // DismissOverlayKeys returns nil: Codex's completion behaviour has not been
 // measured, so there is nothing to base a key on.
 //
-// Claude Code was found to leave a completion overlay open for prompts that
-// end in an in-progress token, which then eats the Enter that SendPrompt
-// presses. Codex has slash commands too, so it may well share the defect —
-// but the run that would have settled it could not be made: the account hit
-// its API usage limit, and the pane dies before a prompt can be typed.
-//
-// Opting out keeps this adapter byte-identical to its pre-fix behaviour.
-// Guessing a key here would be the same mistake in the other direction:
-// Escape is destructive on a running turn, and nothing yet says Codex needs
-// it. Measure first, then return keys.
+// Claude Code was found to leave a completion overlay open for prompts ending
+// in an in-progress token, which then eats the Enter SendPrompt presses. Codex
+// has slash commands too, so it may well share the defect — but the run that
+// would have settled it could not be made. Guessing a key here would be the
+// same mistake in the other direction: Escape is destructive on a running
+// turn. Measure first, then return keys.
 func (a *Agent) DismissOverlayKeys(string) []string { return nil }
 
 // DetectBlock reports BlockNone always: what Codex puts on screen while it
-// waits for an approval has not been measured, so there is no literal to
-// match against.
+// waits for an approval has not been measured, so there is no literal to match
+// against.
 //
-// The attempt was made and is worth recording, because the next person will
-// otherwise repeat it. Reaching an approval dialog needs a model turn that
-// asks to run something, and the account was over its usage limit on both
-// the default model and the cheaper one it offers to fall back to (2/2
-// refused). Two OTHER Codex menus were reachable — the directory-trust
+// The attempt is worth recording, because the next person will otherwise
+// repeat it. Reaching an approval dialog needs a model turn that asks to run
+// something, and the account was over its usage limit on both models it offers
+// (2/2 refused). Two OTHER Codex menus were reachable — the directory-trust
 // prompt and a rate-limit model switch — and both are numbered `› 1. ...`
-// lists where a bare digit selects and confirms (2/2). That is suggestive
-// and it is not evidence: neither of them is the approval dialog, and this
-// adapter does not get to guess that they render the same way.
+// lists where a bare digit selects and confirms (2/2). That is suggestive and
+// it is not evidence.
 //
-// The cost of guessing is not symmetric with the cost of waiting. A wrong
-// literal here makes DetectBlock report a block that is not there, and
+// The cost of guessing is not symmetric with the cost of waiting: a wrong
+// literal makes DetectBlock report a block that is not there, and
 // RespondToBlock then types a digit into whatever the pane actually holds.
-// Measure the approval dialog, then write the literal.
 func (a *Agent) DetectBlock(string) agent.BlockKind { return agent.BlockNone }
 
 // AnswerBlockKeys refuses always, for the reason DetectBlock returns

@@ -196,10 +196,8 @@ type Model struct {
 
 	// identity is the jin every popup this Model opens must reach: the daemon
 	// `jin ui` validated, rather than whichever one the environment a popup
-	// happens to start from names. Handed in at construction so that a popup
-	// and the list behind it cannot answer "which jin" differently — the
-	// process that made the answer is `jin ui`, and it is one process further
-	// out than this one.
+	// happens to start from names. Handed in at construction so a popup and the
+	// list behind it cannot answer "which jin" differently.
 	identity jinenv.Identity
 }
 
@@ -230,20 +228,17 @@ func NewModel(client *daemon.Client) Model {
 // The outer tmux (-L jin-mgr) has a fixed 2-pane layout:
 // left pane (TUI) + right pane (session display via RespawnPane).
 //
-// identity travels as a parameter, and is not defaulted, because a Model that
-// resolved one for itself is exactly the bug this closes: every popup it opens
-// would answer "which jin" from the outer tmux server's environment, and that
-// environment named a different daemon than `jin ui` had just validated in 3 of
-// 3 trials. There is one construction site, so there is one place to answer it.
+// identity travels as a parameter and is not defaulted: a Model that resolved
+// one for itself would answer "which jin" from the outer tmux server's
+// environment, which named a different daemon than `jin ui` had just validated
+// in 3 of 3 trials.
 func NewModelWithTmux(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID, displayPaneID string, identity jinenv.Identity) Model {
 	m := NewModel(client)
 	m.tmuxClient = tc
 	m.identity = identity
-	// The same client, narrowed to the one call openPopup makes. No nil guard
-	// here on purpose: tc is dereferenced a few lines down, so this constructor
-	// already requires a live client, and a guard would be an untested branch
-	// claiming to protect a case that panics before reaching it. The Models
-	// that legitimately have no tmux come from NewModel, which leaves this nil.
+	// The same client, narrowed to the one call openPopup makes. No nil guard:
+	// tc is dereferenced a few lines down, so this constructor already requires a
+	// live client. Models with no tmux come from NewModel, which leaves it nil.
 	m.popups = tc
 	m.innerTmuxClient = innerTC
 	m.tuiPaneID = tuiPaneID
@@ -261,23 +256,19 @@ func NewModelWithTmux(client *daemon.Client, tc, innerTC *tmux.Client, tuiPaneID
 	// not confuse a popup that opens before the first sessionsMsg arrives.
 	m.writeCursorEnv()
 	// Same reason, higher stakes: the outer tmux server outlives the TUI, so a
-	// confirm answered in the last 250ms of a previous run is still sitting in
-	// its env, and our first envTick would replay it as an approval to kill or
-	// delete a session this run never asked about. Leftovers also let a
-	// hand-run `jin confirm-popup` open a prompt for a target nobody chose.
-	// Nothing useful to do with a failure here: the TUI is still being built,
-	// and a key that survives is inert until it is paired with an answer this
-	// run would have to write itself (writeConfirmRequest clears again).
+	// confirm answered in the last 250ms of a previous run is still sitting in its
+	// env, and our first envTick would replay it as an approval to kill or delete
+	// a session this run never asked about. Nothing useful to do with a failure
+	// here: a key that survives is inert until paired with an answer this run
+	// would have to write itself.
 	_ = clearConfirmEnv(tc, staleConfirmKeys(env))
 	return m
 }
 
 // noticeLines returns how many rows the error / warning notices occupy above
-// the list header. Kept in sync with renderListContent's prologue by
-// construction — if the notices change shape there, change the counts here in
-// the same commit. Sole owner of that arithmetic: everything below the notices
-// (contentAreaLines, and the row the mouse hit-test counts from) derives from
-// it, so a layout change cannot desync them.
+// the list header, and is the sole owner of that arithmetic: everything below
+// them — contentAreaLines, and the row the mouse hit-test counts from —
+// derives from it. Kept in sync with renderListContent's prologue by hand.
 func (m *Model) noticeLines() int {
 	rows := 0
 	if m.err != nil {
@@ -291,9 +282,7 @@ func (m *Model) noticeLines() int {
 
 // helpChromeLines is what View() spends below the pane: the rule that cuts the
 // detail pane off from the chrome, plus the help line itself. Both View() and
-// contentAreaLines subtract it, which is the whole reason it is a constant —
-// the same row count was written out by hand in two places before, and a third
-// row of chrome would have had to find them both.
+// contentAreaLines subtract it, which is the whole reason it is a constant.
 const helpChromeLines = 2
 
 // contentAreaLines returns the number of lines available below the notices —
@@ -311,70 +300,53 @@ const (
 	// sessionRowHeight is the number of rows one session occupies in the list.
 	// Constant by construction: renderSession emits exactly this many lines
 	// whatever the session carries, so the scroll and hit-test arithmetic below
-	// cannot desync from the renderer. See renderSession for the hand-maintained
-	// contract this replaced, and for what each of the two lines holds.
+	// cannot desync from the renderer.
 	//
-	// Two rows rather than one buys two things a one-row list could not have: a
-	// pointer target the list is tapped with over SSH from a phone, where one
-	// cell is thinner than a fingertip, and somewhere to put the repo / branch
-	// so the list reads as a table instead of a column of names. It costs half
-	// the list's density.
+	// Two rows rather than one buys a pointer target the list is tapped with over
+	// SSH from a phone, where one cell is thinner than a fingertip, and somewhere
+	// to put the repo / branch so the list reads as a table instead of a column of
+	// names. It costs half the list's density.
 	sessionRowHeight = 2
 	// listHeaderLines covers the count line plus one blank spacer. Without the
 	// spacer the header collides visually with the first fleet header.
 	listHeaderLines = 2
 	// detailNameLines is how many rows the detail pane reserves for the session
-	// name. The pane exists to show more than a list row does, and on one row it
-	// showed exactly as much — the same name cut at the same column. Two rows is
-	// the smallest budget that beats the row above it.
+	// name. On one row the pane showed exactly what a list row did — the same name
+	// cut at the same column — so two is the smallest budget that beats it.
 	//
-	// The name gets both rows whether or not it fills them; a short name pads
-	// with a blank. Sizing the block to the name instead — the obvious
-	// implementation — would put the session under the cursor back into the list
-	// height that adjustScrollForCursor derives the viewport from: move the
-	// cursor, the list resizes, the viewport scrolls, repeat. It would also
-	// revive the hand-synced height contract sessionRowHeight retired.
+	// The name gets both rows whether or not it fills them. Sizing the block to
+	// the name instead would put the session under the cursor back into the list
+	// height adjustScrollForCursor derives the viewport from: move the cursor, the
+	// list resizes, the viewport scrolls, repeat.
 	detailNameLines = 2
 	// detailMsgLines is how many rows the pane gives each of the last user and
-	// assistant messages. One row held about 16 Japanese characters at the
-	// widths this pane runs at — enough to say a message exists, not enough to
-	// say which one it is. Two rows is not "readable" either, and is not meant
-	// to be: reading a session is what attaching to it is for. It is the point
-	// where a message becomes identifiable.
+	// assistant messages. One row held about 16 Japanese characters at the widths
+	// this pane runs at — enough to say a message exists, not enough to say which
+	// one. Two rows is not "readable" either and is not meant to be: it is where
+	// a message becomes identifiable, and reading one is what attaching is for.
 	detailMsgLines = 2
 	// detailPaneLines covers rule + name (detailNameLines rows) + status + the
-	// last user and assistant messages (detailMsgLines rows each). Fixed even
-	// when fields are empty: every scroll and hit-test calculation is built on
-	// the height, so it must not depend on the session under the cursor.
+	// last user and assistant messages (detailMsgLines rows each). Fixed even when
+	// fields are empty: every scroll and hit-test calculation is built on the
+	// height, so it must not depend on the session under the cursor.
 	//
-	// There is no repo/branch row any more. It moved onto the second row of
-	// every list row (renderSession), where it describes all the sessions at
-	// once instead of only the one under the cursor — and the row it vacated
-	// here is what paid for the second message row.
+	// The repo/branch row moved onto the second row of every list row, and the row
+	// it vacated here is what paid for the second message row.
 	detailPaneLines = 2 + detailNameLines + 2*detailMsgLines
 	// minListLines is the smallest list we shrink to before the detail pane is
-	// dropped whole. Degrading the detail pane gradually instead would make
-	// its height a third variable in every geometry test, which is exactly the
-	// property detailPaneLines exists to avoid.
+	// dropped whole. Degrading the pane gradually instead would make its height a
+	// third variable in every geometry test.
 	//
-	// A multiple of sessionRowHeight, because the floor is the one list height
-	// we choose outright: an odd floor would spend its last row drawing half of
-	// a session nobody can read. It bounds the LIST rather than the pane, and
-	// it went up with the row height instead of down to hold the drop-the-pane
-	// threshold where it was — the list is what makes the pane worth drawing at
-	// all, so the pane is what gives way.
+	// A multiple of sessionRowHeight, because the floor is the one list height we
+	// choose outright: an odd floor would spend its last row drawing half of a
+	// session nobody can read. Only the floor is even — any other height may leave
+	// the list odd, and the bottom session then shows one of its two rows. That is
+	// accepted: adjustScrollForCursor pulls the session under the cursor fully
+	// into view, so a half-drawn row is never the one the next action hits.
 	//
-	// Only the floor is even. Any other height may leave the list odd — a fleet
-	// header costs a row, so it usually does — and the bottom session then shows
-	// one of its two rows. That is accepted: adjustScrollForCursor pulls the
-	// session under the cursor fully into view, so a half-drawn row is never the
-	// one the next action hits.
-	//
-	// What that costs is worth stating plainly, since it is not the one-row
-	// change it sounds like: with sessionRowHeight and detailPaneLines where
-	// they now are, the pane appears only from m.height >= 18 (20 with one
-	// notice, 22 with two), where it used to appear from 15. Below the threshold
-	// the pane goes whole, so the user sees it vanish rather than shrink.
+	// With sessionRowHeight and detailPaneLines where they now are, the pane
+	// appears only from m.height >= 18 (20 with one notice, 22 with two). Below
+	// the threshold it goes whole, so the user sees it vanish rather than shrink.
 	minListLines = 6
 )
 
@@ -388,22 +360,19 @@ func (m *Model) headerLines() int {
 }
 
 // detailVisible reports whether the detail pane is drawn for the session under
-// the cursor. It deliberately derives from contentAreaLines and the constants
-// alone and never calls listAreaLines — listAreaLines subtracts detailLines, so
-// consulting it here would be a cycle.
+// the cursor. It derives from contentAreaLines and the constants alone and
+// never calls listAreaLines — listAreaLines subtracts detailLines, so consulting
+// it here would be a cycle.
 //
 // With no notices and a valid cursor the threshold works out to m.height >= 18.
 //
 // The cursor-range check is not merely defensive: renderListContent indexes the
 // session slice with m.cursor to pick the pane's subject, so an out-of-range
-// cursor is a panic rather than a blank pane. The sessionsMsg handler clamps on
-// every path, which is what keeps that from happening; this is the second lock
-// on the door.
+// cursor is a panic rather than a blank pane.
 //
-// Note that a scrolled-away cursor still gets its pane. PageUp / PageDown move
-// the viewport and deliberately leave the cursor put, so the pane keeps
-// describing the session the next action will actually hit — which is the
-// question worth answering while the user is looking somewhere else.
+// A scrolled-away cursor still gets its pane. PageUp / PageDown move the
+// viewport and deliberately leave the cursor put, so the pane keeps describing
+// the session the next action will actually hit.
 func (m *Model) detailVisible() bool {
 	sessions := m.getDisplaySessions()
 	if m.cursor < 0 || m.cursor >= len(sessions) {
@@ -438,11 +407,9 @@ func (m *Model) pageScrollLines() int {
 
 // sessionCardTop returns the line offset (within the scrollable list area,
 // 0 = first row of the first fleet header or session row) where the session at
-// display-index `idx` starts, and its height. Returns (-1, 0) if idx is
-// out of range.
-//
-// The scan survives the move to a constant row height because fleet headers
-// still insert rows that belong to no session.
+// display-index `idx` starts, and its height. Returns (-1, 0) if idx is out of
+// range. The scan survives the move to a constant row height because fleet
+// headers still insert rows that belong to no session.
 func (m *Model) sessionCardTop(idx int) (top, height int) {
 	sessions := m.getDisplaySessions()
 	if idx < 0 || idx >= len(sessions) {
@@ -492,23 +459,19 @@ func (m *Model) adjustScrollForCursor() {
 // scrollBy moves the viewport by lines (negative = towards the top), clamped to
 // the content bounds and then pulled back to the top of whatever session row it
 // landed inside. The cursor deliberately stays put — every scroll-only input
-// (PageUp / PageDown, wheel) shares that contract, so looking around never
-// changes what the next action targets.
+// shares that contract, so looking around never changes what the next action
+// targets.
 //
-// The pull-back is not cosmetic and cannot be replaced by a friendlier step
-// size. A session is sessionRowHeight rows while a fleet header is one, so no
-// step stays in phase with the grid: over one fleet header, wheelScrollLines
-// lands mid-session on half its notches and a step of sessionRowHeight lands
-// there on every one of them. A viewport that opens mid-session puts a row's
-// repo/branch line directly under the list header with its name scrolled away,
-// which reads as a session that has no name rather than as the tail of the one
-// above.
+// The pull-back cannot be replaced by a friendlier step size. A session is
+// sessionRowHeight rows while a fleet header is one, so no step stays in phase
+// with the grid: over one fleet header, wheelScrollLines lands mid-session on
+// half its notches and a step of sessionRowHeight lands there on every one of
+// them. A viewport that opens mid-session puts a row's repo/branch line directly
+// under the list header with its name scrolled away, which reads as a session
+// that has no name.
 //
-// Alignment belongs here and NOT in adjustScrollForCursor. That one owes the
-// cursor's row whole — it anchors on the row's bottom for exactly that reason —
-// and pulling the viewport back to a row top would push the cursor's own last
-// line off the fold. Cursor-driven scrolling does not align to the grid,
-// because the cursor's row wins the argument.
+// Alignment belongs here and NOT in adjustScrollForCursor, which owes the
+// cursor's row whole and anchors on that row's bottom for exactly that reason.
 //
 // Two landings are deliberately left where they fall:
 //
@@ -516,8 +479,7 @@ func (m *Model) adjustScrollForCursor() {
 //     Pulling back there would put the final row permanently out of reach.
 //   - A step the pull-back would swallow whole (top == from). PageDown moves
 //     listAreaLines-1 rows, which is a single row on a two-row list, and taking
-//     that row back on every press would pin the viewport where it stands —
-//     the same unreachable tail by another route.
+//     it back on every press would pin the viewport where it stands.
 func (m *Model) scrollBy(lines int) {
 	from := m.scrollOffset
 	m.scrollOffset += lines
@@ -538,9 +500,8 @@ func (m *Model) scrollBy(lines int) {
 
 // maxScrollOffset is the last page: the largest scrollOffset the content
 // allows, or 0 while the list is shorter than its viewport. clampScroll bounds
-// against it and scrollBy tests for it — scrollBy leaves the last page
-// unaligned, and if the two disagreed about where it starts, an alignment could
-// pull the final row back out of reach.
+// against it and scrollBy tests for it — if the two disagreed about where the
+// last page starts, an alignment could pull the final row out of reach.
 func (m *Model) maxScrollOffset() int {
 	return max(m.totalCardLines()-m.listAreaLines(), 0)
 }
@@ -555,21 +516,17 @@ func (m *Model) clampScroll() {
 // sessionIndexAtLine is the inverse of sessionCardTop: it maps a line offset
 // inside the scrollable list area to the display-index of the session drawn on
 // that line. Fleet header rows belong to no session and report false, as does
-// any line past the last row — a session row is exactly sessionRowHeight tall
-// and owns no surrounding whitespace, so there is nothing else to attribute.
+// any line past the last row.
 //
 // Implemented by scanning sessionCardTop rather than re-walking the groups, so
 // the layout is described in exactly one place.
 //
 // The scan runs to the end rather than stopping at the first top past `line`.
-// Stopping early would assume row tops ascend with the display index, and they
-// only do so while m.sessions happens to arrive grouped the same way
-// groupSessionsByFleet groups it. That holds today because session.SortInfos
-// and groupSessionsByFleet independently put DefaultFleet last and sort the
-// rest alphabetically — an agreement between two packages that nothing checks
-// and a reordering on either side would quietly break, turning every click
-// below the first out-of-order session into a hit on the wrong one. The list
-// is at most a few dozen rows; correctness is worth more than the early exit.
+// Stopping early would assume row tops ascend with the display index, which only
+// holds while session.SortInfos and groupSessionsByFleet keep agreeing — an
+// agreement between two packages that nothing checks, and a reordering on either
+// side would turn every click below the first out-of-order session into a hit on
+// the wrong one.
 func (m *Model) sessionIndexAtLine(line int) (int, bool) {
 	for i := range m.getDisplaySessions() {
 		top, height := m.sessionCardTop(i)
@@ -583,12 +540,10 @@ func (m *Model) sessionIndexAtLine(line int) (int, bool) {
 	return 0, false
 }
 
-// sessionIndexAtRow maps a mouse event's pane-relative row to the
-// display-index of the session drawn there, accounting for the notice and list
-// header rows above the list area and the current scroll offset.
-//
-// Only the list area is live: a click in the header band or in the detail pane
-// below it names no session, because neither region draws one.
+// sessionIndexAtRow maps a mouse event's pane-relative row to the display-index
+// of the session drawn there, accounting for the notice and list header rows
+// above the list area and the current scroll offset. Only the list area is
+// live: neither the header band nor the detail pane below it draws a session.
 func (m *Model) sessionIndexAtRow(y int) (int, bool) {
 	top := m.noticeLines() + m.headerLines()
 	if y < top || y >= top+m.listAreaLines() {
@@ -641,11 +596,10 @@ const (
 	// reflect in the parent TUI without user-visible lag.
 	envTickInterval = 250 * time.Millisecond
 
-	// sessionTickInterval controls how often the TUI refetches the session
-	// list from the daemon. Longer than envTickInterval because refetches
-	// touch the daemon socket and re-render the full list. The display-pane
-	// attach poll (pollAttachedSessionCmd) piggybacks on this tick, so this
-	// value is also the upper bound on how long a tmux-side session switch
+	// sessionTickInterval controls how often the TUI refetches the session list
+	// from the daemon. Longer than envTickInterval because refetches touch the
+	// daemon socket and re-render the full list. The display-pane attach poll
+	// rides on this tick, so it also bounds how long a tmux-side session switch
 	// takes to reflect in the TUI.
 	sessionTickInterval = 2 * time.Second
 )
@@ -665,10 +619,8 @@ func sessionTickCmd() tea.Cmd {
 // pollAttachedSessionCmd returns a Cmd that reads which inner tmux session the
 // display-pane client is attached to, so adoptAttachedSession can follow a
 // switch the user made from inside the pane (choose-tree etc.). Returns nil
-// unless the display pane is locally attached and both tmux clients are wired,
-// since a placeholder / remote pane has no inner session to poll. The two tmux
-// calls run in the Cmd closure to keep them off the Update loop, mirroring
-// fetchSessions.
+// unless the display pane is locally attached and both tmux clients are wired.
+// The two tmux calls run in the Cmd closure to keep them off the Update loop.
 func (m *Model) pollAttachedSessionCmd() tea.Cmd {
 	if !m.displayLocalAttach || m.tmuxClient == nil || m.innerTmuxClient == nil || m.displayPaneID == "" {
 		return nil
@@ -715,34 +667,27 @@ func (m *Model) resolveFocusSession() bool {
 // buildInnerAttachCmd assembles the shell command the display pane runs to
 // attach to an inner tmux session. socketName must be the *resolved* inner
 // socket (tmux.DefaultSocketName), never the tmux.SocketName constant: this
-// string is handed to a fresh `tmux` process, so it is the one place the
-// display pane's socket is chosen independently of the Client objects the
-// Model holds. Passing the constant sends the pane to the real "jin" server
-// even when JIN_TMUX_SOCKET points everything else somewhere else.
-//
-// Kept as a pure function so the socket wiring is unit-testable without tmux,
-// mirroring buildSplitArgs / buildSendKeysArgs in internal/tmux.
+// string is handed to a fresh `tmux` process, so it is the one place the display
+// pane's socket is chosen independently of the Client objects the Model holds.
+// Passing the constant sends the pane to the real "jin" server even when
+// JIN_TMUX_SOCKET points everything else somewhere else.
 func buildInnerAttachCmd(socketName, innerSession string) string {
-	// Unset $TMUX so tmux does not refuse with "sessions should be nested with
-	// care": the display pane runs inside the outer tmux, so $TMUX points to
-	// the outer session. Without env -u TMUX, attaching to the inner tmux on
-	// the same host is rejected as nesting. This mirrors the env -u TMUX
-	// pattern used in session/manager.go when launching CC processes.
+	// Unset $TMUX so tmux does not refuse with "sessions should be nested
+	// with care": the display pane runs inside the outer tmux, so $TMUX points
+	// to the outer session and attaching to the inner one on the same host is
+	// rejected as nesting.
 	//
-	// Chain `tail -f /dev/null` after attach so a quick attach failure (or a
-	// later user-initiated detach) leaves the pane with a still-running
-	// process. Without the tail, the shell exits, and remain-on-exit=on on
-	// this pane surfaces tmux's "Pane is dead" overlay until the next
-	// respawn — a jarring flash on first-session startup that the user would
-	// see between the placeholder and a successful attach.
+	// Chain `tail -f /dev/null` after attach so a quick attach failure — or a
+	// later user-initiated detach — leaves the pane with a still-running
+	// process. Without it the shell exits, and remain-on-exit=on surfaces
+	// tmux's "Pane is dead" overlay until the next respawn.
 	return fmt.Sprintf("env -u TMUX tmux -L %s attach -t %s; tail -f /dev/null", socketName, innerSession)
 }
 
-// switchToSession displays the given session in the right pane via RespawnPane.
-// For local sessions, attaches to the inner tmux session (-L jin by default,
-// or whatever JIN_TMUX_SOCKET resolves to).
-// For remote sessions, runs SSH attach command.
-// For stopped/error sessions, shows a placeholder with session info.
+// switchToSession displays the given session in the right pane via RespawnPane:
+// an inner tmux attach for local sessions (-L jin by default, or whatever
+// JIN_TMUX_SOCKET resolves to), an SSH attach for remote ones, and a
+// placeholder carrying session info for stopped or errored ones.
 func (m *Model) switchToSession(sessionID string) {
 	if m.tmuxClient == nil || m.displayPaneID == "" || sessionID == "" {
 		return
@@ -837,13 +782,11 @@ func (m *Model) switchToSession(sessionID string) {
 	m.recordDisplayedSession(sess)
 }
 
-// adoptAttachedSession aligns TUI state (currentSessionID, cursor, @session_name
-// label, JIN_CURRENT_SESSION env) to the inner session the display pane is
-// actually attached to, after the user switched it from inside the pane
-// (choose-tree etc.). State adoption only: unlike switchToSession /
-// resolveFocusSession it never issues switch-client back, so a user's tmux-side
-// switch and a TUI-side switch cannot ping-pong — each side just records the
-// last event as fact.
+// adoptAttachedSession aligns TUI state (currentSessionID, cursor,
+// @session_name label, JIN_CURRENT_SESSION env) to the inner session the display
+// pane is actually attached to, after the user switched it from inside the pane
+// (choose-tree etc.). State adoption only: it never issues switch-client back,
+// so a tmux-side switch and a TUI-side switch cannot ping-pong.
 func (m *Model) adoptAttachedSession(attached string) {
 	if attached == "" || !m.displayLocalAttach {
 		return
@@ -869,12 +812,10 @@ func (m *Model) adoptAttachedSession(attached string) {
 	m.moveCursorToSession(sess.ID)
 }
 
-// detachInnerClient detaches the inner tmux client running in the display pane.
-// This makes the "tmux attach" process exit cleanly, preventing "pane is dead".
-// No-op when the pane is not running an attach.
-//
-// Owns displayLocalAttach so the flag cannot drift from the detach: every
-// caller used to repeat the same guard-and-reset pair around this call.
+// detachInnerClient detaches the inner tmux client running in the display pane,
+// so the "tmux attach" process exits cleanly and the pane does not go dead.
+// No-op when the pane is not running an attach. It owns displayLocalAttach, so
+// the flag cannot drift from the detach.
 func (m *Model) detachInnerClient() {
 	if !m.displayLocalAttach {
 		return
@@ -958,12 +899,10 @@ func (m *Model) refreshDisplayedDescription() {
 }
 
 // respawnPlaceholder replaces the display pane with a placeholder command and
-// strips every trace of the session it used to show. Detaches any active inner
-// tmux client first to avoid "pane is dead".
-//
-// Idempotent via the placeholder sentinel: callers may reach it on every poll
-// (an empty list, or a cursor parked on a session that is still being deleted)
-// and only the first one respawns.
+// strips every trace of the session it used to show, detaching any active inner
+// tmux client first. Idempotent via the placeholder sentinel: callers may reach
+// it on every poll — an empty list, or a cursor parked on a session still being
+// deleted — and only the first one respawns.
 func (m *Model) respawnPlaceholder() {
 	if m.currentSessionID == placeholderSessionID {
 		return
@@ -980,14 +919,12 @@ func (m *Model) respawnPlaceholder() {
 
 // showCursorSession points the display pane at the session under the cursor,
 // falling back to the placeholder when there is nothing attachable there — an
-// empty list, or a cursor sitting on a session that is itself being deleted
-// (sessionAt rejects those).
+// empty list, or a cursor sitting on a session that is itself being deleted.
 //
-// force re-points the pane even when it already claims the cursor session.
-// Only the kill path needs it: a killed session stays in the list, so the pane
-// looks settled while actually holding an attach to a tmux session that is
-// gone. Everywhere else the claim can be trusted, and skipping saves a full
-// detach / respawn / re-attach cycle the user would see as a flash.
+// force re-points the pane even when it already claims the cursor session. Only
+// the kill path needs it: a killed session stays in the list, so the pane looks
+// settled while actually holding an attach to a tmux session that is gone.
+// Everywhere else skipping saves a detach / respawn / re-attach the user sees.
 func (m *Model) showCursorSession(force bool) {
 	sess, ok := m.cursorSession()
 	if !ok {
@@ -1086,46 +1023,36 @@ func (m Model) handleSelectSession() (tea.Model, tea.Cmd) {
 // Three is the conventional terminal step and keeps part of a card in view
 // across a notch, so the list never jumps without a reference row.
 //
-// It is deliberately NOT a multiple of sessionRowHeight. That looks like the
-// way to keep the viewport on row boundaries and is measurably worse: a fleet
-// header is one row, so over a single fleet a step of sessionRowHeight lands
-// mid-session on every notch, where three lands there on half of them. scrollBy
-// aligns the landing instead.
+// Deliberately NOT a multiple of sessionRowHeight. That looks like the way to
+// keep the viewport on row boundaries and is measurably worse: a fleet header is
+// one row, so a step of sessionRowHeight lands mid-session on every notch where
+// three lands there on half of them. scrollBy aligns the landing instead.
 const wheelScrollLines = 3
 
 // handleMouse handles pointer input over the session list: the wheel scrolls,
 // and a left click takes two taps to switch sessions — the first moves the
 // cursor onto the row, the second acts on it. A click on a fleet header, on
 // empty space, or on a session being deleted does nothing — unlike keyboard
-// movement, which slides past deleting cards, a click names one specific target.
+// movement, a click names one specific target.
 //
 // Stated exactly, the rule is not "two taps" but "a click on the cursor's row
 // acts, any other click moves the cursor there" — so a row the cursor already
-// sits on acts on the FIRST tap, whether the cursor got there by keyboard or by
-// a previous tap. That is not a corner case: the cursor starts on the first
-// session, which makes the top row the one a new user is likeliest to try. The
-// user-facing text says "two clicks" because that is what the pointer does from
-// a standing start; this is where the exception is written down.
+// sits on acts on the FIRST tap. That is not a corner case: the cursor starts on
+// the first session, which makes the top row the one a new user is likeliest to
+// try. The user-facing text says "two clicks" because that is what the pointer
+// does from a standing start; this is where the exception is written down.
 //
 // The two taps exist because this list is driven by a fingertip over SSH as
 // often as by a mouse, and a row is two cells tall against a finger that covers
-// more. Doubling the row height cut the mistakes; splitting look from act is
-// what makes the ones that remain harmless — a mis-tap becomes "I looked at the
-// wrong session", which the next tap fixes, instead of "I switched to the wrong
-// session", which costs a switch back.
-//
-// It also puts the pointer back in step with the structure: the detail pane
-// exists so a session can be read WITHOUT switching to it (see
-// renderDetailPane), and a pointer that switched on first contact never let
-// that happen. The keyboard keeps its one-key Enter — the cursor is already
-// where the user put it, so there is no mis-aim to absorb.
+// more. Splitting look from act makes a mis-tap "I looked at the wrong session",
+// which the next tap fixes, instead of a switch that costs a switch back. The
+// keyboard keeps its one-key Enter — the cursor is already where the user put it.
 //
 // What the first tap arms is a ROW, not a session: the list is replaced whole
-// every two seconds and m.cursor does not follow a session across the swap, so
-// a second tap after one lands on whatever session now sits under the pointer.
-// That is the same target a one-tap click would have hit and the same one
-// Enter has always acted on; the only thing the swap costs is the promise that
-// the second tap acts on the session the first one previewed.
+// every two seconds and m.cursor does not follow a session across the swap, so a
+// second tap lands on whatever session now sits under the pointer. That is the
+// same target a one-tap click would have hit; the only thing the swap costs is
+// the promise that the second tap acts on the session the first one previewed.
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
@@ -1214,22 +1141,18 @@ func (m Model) writeCursorEnv() {
 // that actually spawns the popup. *tmux.Client satisfies it directly; tests
 // inject a recorder.
 //
-// The interface, and the field below, exist because that spawn is otherwise
-// unobservable — and that is measured, not assumed. With the call wired
-// straight to the concrete client, replacing openPopup's whole body with a
-// no-op passed the entire suite, including under -tags e2e; so did deleting
-// only the percent-fallback retry below. A test on popupDisplayOptions does
-// not cover it: what regresses is the spawn, and nothing obliged anyone to
-// make it.
+// The interface exists because that spawn is otherwise unobservable, and that is
+// measured rather than assumed: with the call wired straight to the concrete
+// client, replacing openPopup's whole body with a no-op passed the entire suite
+// including under -tags e2e, and so did deleting only the fallback retry below.
 type popupOpener interface {
 	DisplayPopup(tmux.DisplayPopupOptions) error
 }
 
-// openPopup runs one of the hidden `jin <name>-popup` UIs inside a tmux
-// popup, sized via configMgr.GetPopupSize(name). No-op when the popup opener
-// or configMgr is unwired (tests, legacy mode); popup errors are swallowed
-// since there is no useful recovery from a failed popup spawn mid-Bubble
-// Tea update loop.
+// openPopup runs one of the hidden `jin <name>-popup` UIs inside a tmux popup,
+// sized via configMgr.GetPopupSize(name). No-op when the popup opener or
+// configMgr is unwired; popup errors are swallowed, since there is no useful
+// recovery from a failed spawn mid-update-loop.
 func (m Model) openPopup(name, title string) {
 	if m.popups == nil || m.configMgr == nil {
 		return
@@ -1238,14 +1161,12 @@ func (m Model) openPopup(name, title string) {
 	if err := m.popups.DisplayPopup(opts); err == nil {
 		return
 	}
-	// A popup sized in absolute cells is refused outright by tmux when the
-	// client is smaller than the request rather than being shrunk to fit, and
-	// the failure is invisible from here. Retry at the percentage fallback,
-	// which cannot exceed the client — otherwise a client too small for the
-	// confirm dialog would turn a destructive keypress into a no-op. The
-	// fallback reports false when this popup was not sized in cells to begin
-	// with, in which case the first attempt already used a percentage and a
-	// second identical spawn could only fail the same way.
+	// A popup sized in absolute cells is refused outright by tmux when the client
+	// is smaller than the request rather than being shrunk to fit, and the failure
+	// is invisible from here. Retry at the percentage fallback, which cannot
+	// exceed the client — otherwise a client too small for the confirm dialog
+	// would turn a destructive keypress into a no-op. The fallback reports false
+	// when this popup was not sized in cells to begin with.
 	w, h, ok := m.configMgr.PopupFallbackPercent(name)
 	if !ok {
 		return
@@ -1254,36 +1175,28 @@ func (m Model) openPopup(name, title string) {
 	_ = m.popups.DisplayPopup(opts)
 }
 
-// popupDisplayOptions resolves the tmux display-popup arguments for a
-// canonical popup name. Split out from openPopup so the size/subcmd
-// resolution is unit-testable without a live tmux client. Both the size
-// and the subcommand are looked up from config's popup catalog, so config
-// keys and cobra subcommand names cannot silently drift.
+// popupDisplayOptions resolves the tmux display-popup arguments for a canonical
+// popup name. Both the size and the subcommand are looked up from config's popup
+// catalog, so config keys and cobra subcommand names cannot silently drift.
 //
-// Cmd and Env answer two different questions, and only one of them is about
-// this build. What these popups open is more of this UI, so os.Executable() is
-// the right binary to run — jinenv.Identity.BinPath says why it is the wrong
-// one to advertise as JIN_BIN, which is a callback address rather than a
-// program to launch.
+// Cmd and Env answer two different questions, and only one is about this build.
+// What these popups open is more of this UI, so os.Executable() is the right
+// binary to run — jinenv.Identity.BinPath says why it is the wrong one to
+// advertise as JIN_BIN, which is a callback address rather than a program.
 //
 // Env carries the identity this Model was handed, because leaving it unset does
 // not mean "inherit sensibly". A popup tmux opens is given the tmux server's
-// environment with the session's entries layered over it — neither of which
-// this process writes, and both of which outlive it: with a stale JIN_SOCKET on
-// the outer server, this TUI and its popups alike reached a daemon `jin ui` had
-// not validated, 3 of 3 trials. -e beats both layers (3 of 3), and
-// jinenv.Identity.TmuxEnviron has why every key is emitted even when its value
-// is empty.
+// environment with the session's entries layered over it — neither of which this
+// process writes, and both of which outlive it: with a stale JIN_SOCKET on the
+// outer server, this TUI and its popups alike reached a daemon `jin ui` had not
+// validated, 3 of 3 trials. -e beats both layers (3 of 3).
 //
-// JIN_PLUGIN_DEPTH is among them, always empty. A popup is not continuing a
-// plugin's process, and a depth the outer server happens to hold would
-// otherwise make every `jin plugin run` issued from inside this popup refuse
-// itself as a chain, with nothing on screen to say so.
-//
-// The session id is empty on purpose: a popup is this UI, not work belonging to
-// one of the sessions it lists. Emitting it empty is also what clears a stale
-// id the outer server may be holding — TmuxEnviron records that one as the
-// value to fear, since a leftover UUID is plausible where an absent one is not.
+// JIN_PLUGIN_DEPTH is among them, always empty: a depth the outer server happens
+// to hold would otherwise make every `jin plugin run` issued from inside this
+// popup refuse itself as a chain, with nothing on screen to say so. The session
+// id is empty on purpose — a popup is this UI, not work belonging to one of the
+// sessions it lists — and emitting it empty is also what clears a stale id the
+// outer server may be holding.
 func (m Model) popupDisplayOptions(name, title string) tmux.DisplayPopupOptions {
 	width, height := m.configMgr.GetPopupSize(name)
 	selfBin, _ := os.Executable()
@@ -1304,22 +1217,20 @@ func (m Model) handleNew() (tea.Model, tea.Cmd) {
 }
 
 // openConfirmPopup asks the standalone `jin confirm-popup` UI to confirm a
-// destructive action. The prompt runs in its own tmux popup rather than in
-// this pane because a popup owns keyboard focus while open — when the action
-// palette launched the action, focus sits on the display pane, so an in-pane
-// prompt could not be answered without a manual pane switch.
+// destructive action. The prompt runs in its own tmux popup rather than in this
+// pane because a popup owns keyboard focus while open — when the action palette
+// launched the action, focus sits on the display pane, so an in-pane prompt
+// could not be answered without a manual pane switch.
 //
-// No-op without an outer tmux client (legacy mode / tests), like
-// writeCursorEnv.
+// No-op without an outer tmux client (legacy mode / tests).
 func (m Model) openConfirmPopup(req confirmRequest) {
 	if m.tmuxClient == nil {
 		return
 	}
 	// A prompt this process could not describe in full must not be shown: the
 	// popup would name whichever fragment of req landed while
-	// dispatchConfirmResult acted on whatever the failed write left behind.
-	// writeConfirmRequest wipes the handshake on its way out of a failure, so
-	// the user simply sees no popup and can press the key again.
+	// dispatchConfirmResult acted on the rest. writeConfirmRequest wipes the
+	// handshake on its way out of a failure, so the user just presses again.
 	if err := writeConfirmRequest(m.tmuxClient, req); err != nil {
 		return
 	}
@@ -1335,12 +1246,10 @@ type confirmRequest struct {
 }
 
 // Outer-tmux env keys carrying the confirm handshake: the parent writes the
-// prompt, the popup writes the answer, the parent consumes all four on its
-// next envTick. Spelled once because four sites — the write, the consume, the
-// startup clear, and the `jin confirm-popup` process in cmd/jin/cmd — have to
-// agree on them exactly, and a key only one site knows about is a destructive
-// request stranded in a tmux server that outlives this process. Exported for
-// the fourth of those, which lives in another package (and another process).
+// prompt, the popup writes the answer, the parent consumes all four on its next
+// envTick. Spelled once because four sites have to agree on them exactly, and a
+// key only one site knows about is a destructive request stranded in a tmux
+// server that outlives this process. Exported for the fourth, another process.
 const (
 	EnvConfirmMode       = "JIN_CONFIRM_MODE"
 	EnvConfirmTargetID   = "JIN_CONFIRM_TARGET_ID"
@@ -1363,9 +1272,9 @@ type confirmEnvWriter interface {
 }
 
 // writeConfirmRequest publishes one confirm-popup invocation to the outer tmux
-// env. These three values are the popup's whole input; the target ID is
-// written for our own benefit, since the popup never reads it but it comes
-// back alongside the answer so dispatchConfirmResult knows what to act on.
+// env. These three values are the popup's whole input; the target ID is written
+// for our own benefit, since the popup never reads it but it comes back
+// alongside the answer so dispatchConfirmResult knows what to act on.
 //
 // The whole handshake — not just the previous answer — is wiped before any of
 // the new values land, and a failed write wipes it again before returning. Both
@@ -1375,11 +1284,9 @@ type confirmEnvWriter interface {
 //     this tick would otherwise pair with the target being written here,
 //     destroying a session the user answered "no" to, or never saw.
 //   - A dismissed popup (Ctrl+C) deliberately leaves its mode/target behind, so
-//     writing only some of the new values on top would splice two requests: the
-//     popup would name the new session while the answer came back carrying the
-//     old target's ID. Clearing turns any partial write into an *empty* key,
-//     and both the popup (empty mode → quiet exit) and dispatchConfirmResult
-//     (empty target → no-op) already refuse to act on it.
+//     writing only some of the new values on top would splice two requests.
+//     Clearing turns any partial write into an *empty* key, which both the popup
+//     and dispatchConfirmResult already refuse to act on.
 //
 // A non-nil error therefore means "the env holds no request at all", which is
 // what lets openConfirmPopup answer it by simply not opening the popup.
@@ -1416,11 +1323,9 @@ func clearConfirmEnv(tc confirmEnvWriter, keys []string) error {
 }
 
 // staleConfirmKeys returns the handshake keys present in env, a snapshot of the
-// outer tmux env. The startup clear narrows to these rather than wiping all
-// four unconditionally: unsetting a key that was never set leaves exactly the
-// state as never touching it, so the guarantee is unchanged, while the usual
-// case — a previous run that left nothing behind — costs no tmux calls at all
-// on the path to the first frame.
+// outer tmux env. The startup clear narrows to these rather than wiping all four
+// unconditionally: unsetting a key that was never set changes nothing, so the
+// guarantee holds while the usual case costs no tmux calls before the first frame.
 func staleConfirmKeys(env map[string]string) []string {
 	var stale []string
 	for _, key := range confirmEnvKeys {
@@ -1449,22 +1354,18 @@ type envRequests struct {
 }
 
 // consumeEnvRequests drains the popup→parent env handshake for one tick.
-// consume returns a key's value and unsets it on tmux, so anything read here
-// is gone whether or not the caller acts on it.
+// consume returns a key's value and unsets it on tmux, so anything read here is
+// gone whether or not the caller acts on it.
 //
-// The confirm answer is read on this pass, alongside the focus IDs, rather
-// than further into the tick: the caller's focus handling can return early
-// from Update, and an answer left in the tmux env outlives this TUI process —
-// the next one would find a destructive request it has no context for and
-// carry it out. The description is display-only, so it is consumed and dropped
-// rather than left behind to label a later prompt.
+// The confirm answer is read on this pass, alongside the focus IDs, rather than
+// further into the tick: the caller's focus handling can return early from
+// Update, and an answer left in the tmux env outlives this TUI process — the
+// next one would find a destructive request it has no context for.
 func consumeEnvRequests(consume func(key string) string) envRequests {
 	var req envRequests
-	// Any popup that wants the parent TUI to focus a session pushes the ID
-	// here. JIN_CREATED_SESSION (create popup), JIN_NOTIFY_SESSION (external
-	// notifier plugin via jin session focus), JIN_FOCUS_SESSION
-	// (session-filter-popup) all share the same downstream (switchToSession)
-	// via focusSessionID.
+	// Any popup that wants the parent TUI to focus a session pushes the ID here.
+	// JIN_CREATED_SESSION, JIN_NOTIFY_SESSION and JIN_FOCUS_SESSION all share the
+	// same downstream (switchToSession) via focusSessionID.
 	for _, key := range []string{"JIN_CREATED_SESSION", "JIN_NOTIFY_SESSION", "JIN_FOCUS_SESSION"} {
 		if id := consume(key); id != "" {
 			req.focusSessionID = id
@@ -1483,14 +1384,11 @@ func consumeEnvRequests(consume func(key string) string) envRequests {
 }
 
 // handleEnvTick is the whole body of one envTick: it drains the popup→parent
-// handshake out of env and acts on whatever was waiting. env is the snapshot
-// the caller read from tmux and unset removes a key from the tmux server, so a
-// test can drive every branch below — including the destructive one — against a
-// synthetic env instead of a live tmux client.
-//
-// Split from the envTickMsg case for exactly that reason: the confirm answer
-// arrives here and nowhere else, so without a seam the entire feature could be
-// deleted from the Update loop with the test suite still green.
+// handshake out of env and acts on whatever was waiting. env is the snapshot the
+// caller read from tmux and unset removes a key from the tmux server, so a test
+// can drive every branch below — including the destructive one — against a
+// synthetic env instead of a live tmux client. Without that seam the entire
+// feature could be deleted from the Update loop with the suite still green.
 func (m Model) handleEnvTick(env map[string]string, unset func(key string)) (tea.Model, tea.Cmd) {
 	// consume reads a JIN_* key and, if set, unsets it on tmux so the same
 	// value isn't picked up again on the next tick.
@@ -1550,12 +1448,10 @@ func (m Model) handleEnvTick(env map[string]string, unset func(key string)) (tea
 // which asks an extra question. The bool is false when the action is not one
 // that confirms, or there is no actionable target under the cursor.
 //
-// Split out from handleDestructiveAction (as popupDisplayOptions was from
-// openPopup) so the action→dialog mapping stays unit-testable: once the prompt
-// moved into a popup, the handler's only remaining effect is a tmux env write,
-// which a test Model cannot observe. Keeping the mapping keyed by action ID
-// also means the palette and the direct keys resolve through one table rather
-// than two that could drift.
+// Split out so the action→dialog mapping stays unit-testable: once the prompt
+// moved into a popup, the handler's only remaining effect is a tmux env write.
+// Keying it by action ID also means the palette and the direct keys resolve
+// through one table rather than two that could drift.
 func (m Model) confirmRequestForAction(actionID string) (confirmRequest, bool) {
 	var mode string
 	switch actionID {
@@ -1681,16 +1577,14 @@ func (m Model) handlePluginRun(name, actionID string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// dispatchConfirmResult carries out the destructive action the user approved
-// in the confirm popup. mode and targetID come back from the tmux env this
-// Model wrote before opening the popup; result is what the popup wrote there.
+// dispatchConfirmResult carries out the destructive action the user approved in
+// the confirm popup. mode and targetID come back from the tmux env this Model
+// wrote before opening the popup; result is what the popup wrote there.
 //
-// Every branch below destroys something, and the inputs are shared tmux env
-// that can go stale (an older binary's leftovers, a prompt answered after the
-// session vanished, a hand-set value). So the routing is exhaustive by
-// construction: only the listed mode/result pairs act, and everything else —
-// any "no", an unrecognized mode or result, a mismatched pair, an empty
-// target — falls through to the no-op return.
+// Every branch below destroys something, and the inputs are shared tmux env that
+// can go stale. So the routing is exhaustive by construction: only the listed
+// mode/result pairs act, and everything else — any "no", an unrecognized mode or
+// result, a mismatched pair, an empty target — falls through to the no-op return.
 func (m Model) dispatchConfirmResult(mode, targetID, result string) (tea.Model, tea.Cmd) {
 	if targetID == "" {
 		return m, nil
@@ -1738,14 +1632,11 @@ func (m Model) killSession(targetID string) (tea.Model, tea.Cmd) {
 // deleteSession greys out targetID, slides the cursor off it, and issues the
 // daemon Delete. The removeWorktree/force pair matches daemon.Client.Delete.
 //
-// The two worktree sentinels are handled here for every flag combination even
-// though only one can raise them: internal/session's PreCheckDelete returns
-// ErrWorktreeDirty only for removeWorktree && !force, and ErrNotWorktree only
-// for removeWorktree, so the other combinations reach the generic branch
-// unchanged. The dirty case is the one call that can come back asking another
-// question — worktreeDirtyMsg re-opens the popup for a force decision — and it
-// carries the description resolved before the Cmd runs, so the follow-up prompt
-// and the error text name the session the user saw.
+// Both worktree sentinels are handled here for every flag combination even
+// though only one can raise them. The dirty case is the one call that can come
+// back asking another question — worktreeDirtyMsg re-opens the popup for a force
+// decision — and it carries the description resolved before the Cmd runs, so the
+// follow-up prompt and the error text name the session the user saw.
 func (m Model) deleteSession(targetID string, removeWorktree, force bool) (tea.Model, tea.Cmd) {
 	name := m.sessionDescription(targetID)
 	m.deletingIDs[targetID] = true
@@ -1931,12 +1822,10 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessions = msg
 		m.err = nil
 
-		// Check if any deleting sessions have been resolved: either the
-		// record disappeared (successful async finalize) or it flipped back
-		// to Stopped with ErrorMessage set (async finalize failed and
-		// MarkDeletionFailed rolled the record back). In both cases the
-		// grey-out treatment must clear; only the record-gone case triggers
-		// a reswitch since the slot itself changed.
+		// Check whether any deleting session has resolved: either the record
+		// disappeared (successful async finalize) or it flipped back to Stopped
+		// with ErrorMessage set (MarkDeletionFailed rolled it back). Both clear the
+		// grey-out; only the record-gone case triggers a reswitch.
 		deleteCompleted := false
 		if len(m.deletingIDs) > 0 {
 			current := make(map[string]session.Info, len(m.sessions))
@@ -1960,10 +1849,9 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Align cursor to the session restored from JIN_CURRENT_SESSION so a
-		// relaunched TUI selects whatever the right pane is showing. Runs once
-		// per TUI startup (armed in NewModelWithTmux only when currentSessionID
-		// is non-empty); if the target no longer exists between runs, IndexFunc
-		// returns -1 and the cursor keeps its default.
+		// relaunched TUI selects whatever the right pane is showing. Runs once per
+		// startup; if the target no longer exists between runs, IndexFunc returns
+		// -1 and the cursor keeps its default.
 		if m.pendingCursorRestore {
 			m.pendingCursorRestore = false
 			if i := slices.IndexFunc(m.getDisplaySessions(), func(s session.Info) bool {
@@ -1974,11 +1862,9 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Clamp before the focus fast path below, not after: that path returns
-		// early, and a frame where sessions disappeared and a pending focus
-		// missed would otherwise reach the renderer with a cursor past the end
-		// of the list — which indexes the slice to pick the detail pane's
-		// subject. resolveFocusSession sets its own cursor when it succeeds, so
-		// clamping first costs it nothing.
+		// early, and a frame where sessions disappeared and a pending focus missed
+		// would otherwise reach the renderer with a cursor past the end of the list
+		// — which indexes the slice to pick the detail pane's subject.
 		displaySessions := m.getDisplaySessions()
 		if m.cursor >= len(displaySessions) {
 			m.cursor = max(len(displaySessions)-1, 0)
@@ -1999,18 +1885,14 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// card, and ensure the cursor's card stays in view.
 		m.adjustScrollForCursor()
 		// A kill has landed once the list says so, not when the next snapshot
-		// happens to arrive: the session poll runs on its own clock and can
-		// answer "still running" from a read that predates the Kill. Acting on
-		// that snapshot re-points the pane at the session being killed, after
-		// which nothing re-points it at all — see docs/gotchas.md.
+		// happens to arrive: the session poll runs on its own clock and can answer
+		// "still running" from a read that predates the Kill — see docs/gotchas.md.
 		//
-		// Resolved here rather than beside the deletingIDs bookkeeping above so
-		// the focus fast path cannot return between the arm being cleared and
-		// the re-point it was cleared for. One slot is enough for overlapping
-		// kills: the re-point target is the cursor rather than the killed
-		// session, and the force below keys off the pane instead of the arm, so
-		// collapsing to the newest request still frees a pane left on an
-		// earlier victim.
+		// Resolved here rather than beside the deletingIDs bookkeeping above so the
+		// focus fast path cannot return between the arm being cleared and the
+		// re-point it was cleared for. One slot is enough for overlapping kills: the
+		// re-point target is the cursor rather than the killed session, and the
+		// force below keys off the pane instead of the arm.
 		killCompleted, displayedIsDead := false, false
 		if m.pendingKillID != "" {
 			// "Not listed as alive" is both landings at once: the record
@@ -2027,24 +1909,19 @@ func (m Model) updateListMode(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Re-point the display pane whenever it is not showing a session that
-		// is still in the list: the list went empty, the displayed session
-		// disappeared between polls, nothing has been displayed yet (initial
-		// load), or the placeholder is up and a session became attachable
-		// again. showCursorSession settles on the placeholder when the cursor
-		// has no attachable target, and is a no-op once it is already there.
+		// Re-point the display pane whenever it is not showing a session that is
+		// still in the list: the list went empty, the displayed session disappeared
+		// between polls, nothing has been displayed yet, or the placeholder is up
+		// and a session became attachable again.
 		//
-		// A finished delete/kill re-points unconditionally, since the slot the
-		// pane was on has changed under it. Force is for the one arrangement
-		// that still looks settled: the pane holding an attach to a session
-		// that is listed but no longer alive. Testing the pane rather than
-		// "was this the newest kill's target?" is deliberate — the latter
-		// strands a pane parked on an earlier kill whose arm this one
-		// overwrote. A delete does not need force, and must not have it —
-		// deleteSession already moved the pane at request time, and forcing
-		// here would tear the same attach down and rebuild it as a visible
-		// flash. Nor does a kill while the pane watches a session that is still
-		// alive, for the same reason.
+		// A finished delete/kill re-points unconditionally, since the slot the pane
+		// was on has changed under it. Force is for the one arrangement that still
+		// looks settled: the pane holding an attach to a session that is listed but
+		// no longer alive. Testing the pane rather than "was this the newest kill's
+		// target?" is deliberate — the latter strands a pane parked on an earlier
+		// kill. A delete must NOT have force: deleteSession already moved the pane
+		// at request time, and forcing here would tear the same attach down and
+		// rebuild it as a visible flash.
 		if killCompleted || deleteCompleted || !m.displaysLiveSession() {
 			m.showCursorSession(displayedIsDead)
 		}
@@ -2181,19 +2058,16 @@ func (m *Model) skipDeletingSessions(dir int) {
 //	[session rows]          <- listAreaLines(), windowed by m.scrollOffset
 //	[detail pane]           <- detailLines(), the session under the cursor
 //
-// There is no separate title: renderListHeader's count line is it. The tmux
-// pane border above deliberately carries no label (see tuiPaneBorderLabel in
-// cmd/jin/cmd/tui.go), so the content area starts directly with err/warn (if
-// any) or the header.
+// There is no separate title: renderListHeader's count line is it. The tmux pane
+// border above deliberately carries no label (see tuiPaneBorderLabel in
+// cmd/jin/cmd/tui.go).
 func (m Model) renderListContent(contentWidth int) string {
 	var content strings.Builder
 
 	// Both notices go through one emitter so they cannot drift apart. It
-	// truncates to the content width and always writes exactly two rows, which
-	// is what noticeLines() promises and what everything below — the header
-	// offset, the list window, the mouse hit-test origin — counts from. A notice
-	// long enough to wrap would quietly turn two rows into three and shift every
-	// session row out from under the cursor.
+	// truncates to the content width and always writes exactly two rows, which is
+	// what noticeLines() promises and what the header offset, the list window and
+	// the mouse hit-test origin all count from.
 	writeNotice := func(color lipgloss.Color, text string) {
 		content.WriteString(lipgloss.NewStyle().Foreground(color).Render(truncateString(text, contentWidth)))
 		content.WriteString("\n\n")
@@ -2239,11 +2113,10 @@ func (m Model) renderListContent(contentWidth int) string {
 		}
 	}
 
-	// Slice by rows and take a window starting at scrollOffset. The window
-	// height is computed the same way adjustScrollForCursor does, so the two
-	// stay in agreement. Every row ends in a newline, so the trailing one is
-	// dropped before the split — otherwise the phantom empty element would
-	// count as a row against the window budget.
+	// Slice by rows and take a window starting at scrollOffset. The window height
+	// is computed the same way adjustScrollForCursor does, so the two stay in
+	// agreement. The trailing newline is dropped before the split, or the phantom
+	// empty element would count as a row against the window budget.
 	rows := strings.Split(strings.TrimSuffix(cards.String(), "\n"), "\n")
 	avail := m.listAreaLines()
 	start := m.scrollOffset
@@ -2263,10 +2136,9 @@ func (m Model) renderListContent(contentWidth int) string {
 	// --- Detail pane (fixed, bottom) ---
 	if m.detailVisible() {
 		// Pad the window out to exactly avail rows first. View() renders this
-		// string inside a fixed-height pane style, which pads at the bottom —
-		// so without the padding a short list would leave the detail pane
-		// floating directly under the last session row instead of sitting on
-		// the pane's bottom edge. One more newline starts the pane itself.
+		// string inside a fixed-height pane style, which pads at the bottom, so
+		// without this a short list would leave the detail pane floating directly
+		// under the last session row instead of on the pane's bottom edge.
 		content.WriteString(strings.Repeat("\n", avail-len(window)+1))
 		content.WriteString(m.renderDetailPane(displaySessions[m.cursor], contentWidth))
 	}
@@ -2278,9 +2150,8 @@ func (m Model) renderListContent(contentWidth int) string {
 // m.deletingIDs is the TUI's own optimistic mark, set the moment a delete is
 // accepted and cleared when the record goes away — the daemon does not report
 // StatusDeleting until its next poll. Three places draw a session's status on
-// the same frame (its list row, the detail pane, the header breakdown), so all
-// three ask here rather than each deciding for itself; otherwise the header
-// counts a session as IDLE while the row under it already shows "⟳".
+// the same frame, so all three ask here rather than each deciding for itself;
+// otherwise the header counts a session as IDLE while its row shows "⟳".
 func (m Model) effectiveStatus(sess session.Info) session.Status {
 	if m.deletingIDs[sess.ID] {
 		return session.StatusDeleting
@@ -2293,10 +2164,9 @@ func (m Model) effectiveStatus(sess session.Info) session.Status {
 //
 // Both halves matter. m.deletingIDs alone misses a session another client
 // deleted, and one whose delete was still running when this TUI last started —
-// deletingIDs lives only in memory, so a restart forgets it while the daemon
-// keeps reporting StatusDeleting. Those sessions render dim with the ⟳ icon,
-// and anything that reads only the optimistic mark would still let a keypress
-// attach to, start, or open an editor on a session that is being removed.
+// deletingIDs lives only in memory, so a restart forgets it. Anything reading
+// only the optimistic mark would let a keypress attach to, start, or open an
+// editor on a session that is being removed.
 func (m Model) isDeleting(sess session.Info) bool {
 	return m.effectiveStatus(sess) == session.StatusDeleting
 }
@@ -2308,20 +2178,18 @@ type statusCount struct {
 }
 
 // statusCounts returns the non-zero per-status counts in urgency order, most
-// urgent first. Statuses no session carries are omitted entirely, and every
-// status the display vocabulary does not know is collapsed into one trailing
+// urgent first. A status no session carries is omitted entirely, and every
+// status the display vocabulary does not know collapses into one trailing
 // bucket (getStatusDisplay renders it as UNKNOWN).
 //
 // PERMISSION leads because "stuck until a human acts" is not the same wait as
 // IDLE's "finished": folding them into one number hides the one that needs
-// attention, which is the whole reason this breakdown exists.
+// attention, which is the whole reason this breakdown exists — and why
+// session.Manager.CountActive is deliberately not reused, since it lumps
+// permission in with running/thinking.
 //
 // Statuses come from effectiveStatus, so the breakdown agrees with the rows
 // beneath it while an optimistic delete is in flight.
-//
-// session.Manager.CountActive is deliberately not reused — it lumps permission
-// in with running/thinking, precisely the distinction the header is here to
-// make.
 func (m Model) statusCounts(sessions []session.Info) []statusCount {
 	order := []session.Status{
 		session.StatusPermission,
@@ -2362,21 +2230,18 @@ func (m Model) statusCounts(sessions []session.Info) []statusCount {
 //
 //	7 SESSIONS  /  ? 1   ⚡ 2   ○ 4
 //
-// The label is upper-case because this line is the pane's only title (the tmux
-// border above carries none), and the total is separated from the breakdown so
-// the two are read as "how many" and "of what" rather than as one run of
-// numbers. The separator is dimColor, a step darker than the counts around it:
-// it divides the line and must not compete with what it divides.
-//
-// Each group is coloured with its own status style, which is what puts the
-// PERMISSION count in the warning colour without a special case here.
+// The label is upper-case because this line is the pane's only title, and the
+// total is separated from the breakdown so the two are read as "how many" and
+// "of what" rather than as one run of numbers. The separator is dimColor, a step
+// darker than the counts around it: it divides the line and must not compete
+// with what it divides. Each group is coloured with its own status style, which
+// is what puts the PERMISSION count in the warning colour without a special case.
 //
 // Groups are dropped from the right when the line does not fit — statusCounts
-// orders them by urgency exactly so the ones that fall off a narrow pane are
-// the least urgent. The total is never dropped: it is the one number that is
-// always true. The separator is charged to the first group that fits, so a pane
-// too narrow for any of them ends at the total instead of trailing a divider
-// with nothing after it.
+// orders them by urgency exactly so the least urgent fall off first. The total
+// is never dropped: it is the one number that is always true. The separator is
+// charged to the first group that fits, so a pane too narrow for any of them
+// ends at the total instead of trailing a divider with nothing after it.
 func (m Model) renderListHeader(sessions []session.Info, width int) string {
 	total := fmt.Sprintf("%d SESSIONS", len(sessions))
 	if len(sessions) == 1 {
@@ -2420,39 +2285,34 @@ const sessionRowLead = 5
 // sanitizeRowText takes out of a string everything that could break the
 // fixed-height block it is about to be drawn in. Every piece of text this file
 // draws that was authored somewhere else goes through here: a session's name
-// (sessionNameParts), the last user / assistant messages (renderDetailPane),
-// and the repo / branch pair (renderRepoBranch).
+// (sessionNameParts), the last user / assistant messages (renderDetailPane), and
+// the repo / branch pair (renderRepoBranch).
 //
-// Both classes below arrive verbatim from outside the TUI — a name is whatever
-// the IPC caller handed SetDescription, a message is whatever the agent wrote
-// into its transcript, and the working directory behind a repo-less row is
-// whatever the filesystem holds — and each defeats a different bound this file
-// is built on:
+// Both classes below arrive verbatim from outside the TUI, and each defeats a
+// different bound this file is built on:
 //
-//   - Escape sequences break the WRAP. ansi.Truncate re-emits the styles open
-//     at its cut and closes them, so its result is NOT a prefix of its input;
+//   - Escape sequences break the WRAP. ansi.Truncate re-emits the styles open at
+//     its cut and closes them, so its result is NOT a prefix of its input;
 //     wrapFixedLines advances by trimming off the prefix it just drew, so with
-//     one of these in hand it makes no progress and draws the same text on
-//     every row it was given. They are also a hole straight to the terminal:
-//     "\x1b[2J" is a clear-screen the TUI would faithfully forward — and an
-//     agent whose subject is terminal output writes such sequences out as a
-//     matter of course.
+//     one of these in hand it makes no progress and draws the same text on every
+//     row it was given. They are also a hole straight to the terminal: a
+//     clear-screen sequence is one the TUI would faithfully forward, and an agent
+//     whose subject is terminal output writes such sequences as a matter of course.
 //   - C0 control characters break the ROW COUNT, and ansi.Strip leaves them
-//     alone. A newline is the one that bites: it costs nothing in width, so
-//     every truncation here happily keeps it, and then splits the "one line" it
-//     was measured as into two — breaking sessionRowHeight in the list and
+//     alone. A newline is the one that bites: it costs nothing in width, so every
+//     truncation here happily keeps it, and then splits the "one line" it was
+//     measured as into two — breaking sessionRowHeight in the list and
 //     detailPaneLines in the pane, both of which the scroll and hit-test
 //     arithmetic treats as fact. View() clips the overflow from the BOTTOM,
 //     silently, so the symptom is a missing last row rather than an error.
 //
-// The two do not arrive together on both paths, which is the reason this is one
-// function and not a rule each caller applies for itself: transcript's
-// TruncateMessage already folds a message's \n, \r and \t into spaces, so only
-// the escape half is live there, while nothing folds either of them for a name.
-// A caller that needs half of this today is one upstream change away from
-// needing all of it.
+// One function rather than a rule each caller applies for itself, because the
+// two do not arrive together on both paths: transcript's TruncateMessage already
+// folds a message's control characters into spaces, so only the escape half is
+// live there, while nothing folds either of them for a name.
 //
-// Replaced with a space rather than dropped, so "a\nb" reads as two words.
+// Replaced with a space rather than dropped, so "a" and "b" split by a newline
+// read as two words.
 func sanitizeRowText(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
@@ -2464,9 +2324,7 @@ func sanitizeRowText(s string) string {
 
 // sessionNameParts returns the text a session's name is drawn from and the
 // marker that trails it — "*" when the name was set by hand and the agent may
-// not overwrite it, "" otherwise. A name with nothing left in it gets no
-// marker: there is nothing there to be locked.
-//
+// not overwrite it, "" otherwise. A name with nothing left in it gets no marker.
 // The text is the Description put through sanitizeRowText; see there for what
 // the sequences it takes out would otherwise do to the row.
 func sessionNameParts(sess session.Info) (name, mark string) {
@@ -2477,11 +2335,10 @@ func sessionNameParts(sess session.Info) (name, mark string) {
 	return name, mark
 }
 
-// sessionNameText fits a session's name into avail display columns.
-//
-// The lock marker is taken out of the budget rather than appended past it: both
-// callers draw fixed-height blocks, and one column of overflow wraps the line
-// into a second physical row.
+// sessionNameText fits a session's name into avail display columns. The lock
+// marker is taken out of the budget rather than appended past it: both callers
+// draw fixed-height blocks, and one column of overflow wraps the line into a
+// second physical row.
 func sessionNameText(sess session.Info, avail int) string {
 	name, mark := sessionNameParts(sess)
 	return truncateString(name, avail-lipgloss.Width(mark)) + mark
@@ -2490,39 +2347,30 @@ func sessionNameText(sess session.Info, avail int) string {
 // wrapFixedLines lays text across exactly `lines` rows of `avail` columns,
 // returning one string per row — blank rows included. What is left over after
 // the last row is cut with an ellipsis, exactly as a list row cuts it. `mark`
-// trails the text and comes out of the budget rather than past it, for the
-// reason sessionNameText gives.
+// trails the text and comes out of the budget rather than past it.
 //
 // The row count is the contract, not a maximum: every caller draws a
 // fixed-height block whose height the list geometry is subtracted from, so the
-// text may neither claim a row more nor give one back (see detailNameLines and
-// detailMsgLines).
+// text may neither claim a row more nor give one back.
 //
-// Three details worth stating:
+// Details worth stating:
 //
 //   - The break is by display column, not by word. The text is as often
 //     Japanese — where there is no space to break on — as English, so a
 //     word-aware wrap would help one language and still break mid-word in the
 //     other. Whitespace at a break is dropped rather than opening the next row.
 //   - It does not reuse wrapText, which accumulates width rune by rune. A VS16
-//     emoji ("⚠️" — base plus selector) measures as its base alone that way, so
-//     a "wrapped" line can still come out wider than avail; here that overflow
-//     wraps in the terminal and costs the block a row. truncateToWidth walks
-//     grapheme clusters with the same ruler that finally measures the line.
-//     (wrapText itself has no callers left in this package and only that bug
-//     to its name; removing it is a cleanup this change stayed out of.)
-//   - The loop advances by trimming off the prefix it just drew, which holds
-//     only while the text carries no escape sequences — the caller owes it
-//     that, and every caller pays with sanitizeRowText. See there for what
-//     happens when one does not.
+//     emoji (base plus selector) measures as its base alone that way, so a
+//     "wrapped" line can still come out wider than avail, wrap in the terminal,
+//     and cost the block a row. truncateToWidth walks grapheme clusters with the
+//     same ruler that finally measures the line.
+//   - The loop advances by trimming off the prefix it just drew, which holds only
+//     while the text carries no escape sequences — every caller pays that with
+//     sanitizeRowText.
 //   - The marker must fit: `mark` wider than `avail` comes back on a row of its
 //     own, over budget, because the last-row branch appends it past a truncation
-//     that was already given nothing to keep. Both callers are comfortably
-//     inside that today — the only marker is sessionNameParts' one-column "*",
-//     and neither caller reaches here with avail below 1 — so this is a
-//     precondition rather than a case worth branching on. It is stated because
-//     the row it overflows wraps in the terminal, which costs the fixed-height
-//     block a row, which View() then clips from the bottom without a word.
+//     already given nothing to keep. Both callers are comfortably inside that
+//     today, so this is a precondition rather than a case worth branching on.
 func wrapFixedLines(text, mark string, avail, lines int) []string {
 	out := make([]string, max(lines, 0))
 	if avail < 1 {
@@ -2576,20 +2424,16 @@ func sessionNameLines(sess session.Info, avail, lines int) []string {
 //	└────────── sessionRowLead ────────┘
 //
 // It always returns exactly sessionRowHeight lines. That is what makes
-// sessionRowHeight a constant and retires the old hand-maintained "cardHeight
-// must match this function" contract — content can no longer change a row's
-// height, so the scroll and hit-test arithmetic cannot desync from what is
-// drawn. The status label and the 👤 / 🤖 message lines the multi-line card
-// used to carry still live in the detail pane, which shows them for the one
-// session the cursor is on instead of for all of them at once.
+// sessionRowHeight a constant: content can no longer change a row's height, so
+// the scroll and hit-test arithmetic cannot desync from what is drawn. The
+// status label and the message lines the multi-line card used to carry live in
+// the detail pane instead, which shows them for the one session the cursor is on.
 //
-// The second line is the repo / branch pair lifted back out of that pane. It
-// earns its row three times over:
+// The second line is the repo / branch pair, and it earns its row three times:
 //
-//   - Right alignment only reads as alignment when something anchors the left
-//     of the same line. The branch alone on a row would leave a gap that is
-//     empty rather than a channel, and a blank second row under a viewed
-//     session would be a band of colour with nothing in it.
+//   - Right alignment only reads as alignment when something anchors the left of
+//     the same line. The branch alone would leave a gap that is empty rather
+//     than a channel.
 //   - The pair cannot share line one. Real session names run to 38 columns in
 //     Japanese, and 38 + a 12-column branch + sessionRowLead needs 55 the left
 //     pane does not have.
@@ -2598,20 +2442,12 @@ func sessionNameLines(sess session.Info, avail, lines int) []string {
 //     than read.
 //
 // Line two always uses helpStyle, selected and deleting rows included: the
-// hierarchy above only holds if the metadata is grey on every row. (Nothing is
-// lost by not dimming a deleting row's metadata — deletingStyle and helpStyle
-// are the same colour.)
+// hierarchy above only holds if the metadata is grey on every row.
 //
-// Two orthogonal indicators:
-//
-//   - selected → blue cursor bar '▎' in the first column
-//   - viewed   → subdued row background painted to the end of the row
-//
-// The two indicators compose freely: a row can be selected, viewed, both, or
-// neither. Roles are visually separate (bar = pointer, background = current
-// location) so users never have to disambiguate a single glyph. Consecutive
-// viewed rows now touch, since the blank spacer between cards is gone — that
-// is the intent: a table, not a stack of blocks.
+// Two orthogonal indicators — selected paints a blue cursor bar in the first
+// column, viewed paints a subdued background to the end of the row. They compose
+// freely, and the roles are visually separate (bar = pointer, background =
+// current location) so a single glyph never has to be disambiguated.
 func (m Model) renderSession(sess session.Info, selected bool, viewed bool, width int) string {
 	// Deleting sessions are dim and not selectable, but keep the row shape:
 	// the geometry must not depend on a session's state.
@@ -2619,11 +2455,10 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 	deleting := m.isDeleting(sess)
 	statusIcon, _, statusStyle := getStatusDisplay(status)
 
-	// withBg composes any inline style with the viewed row background when
-	// the session is being displayed on the right. Applying the background per
-	// styled segment (rather than wrapping the whole line) sidesteps ANSI
-	// reset artifacts between segments — every visible cell carries the bg
-	// SGR codes so the background stays continuous.
+	// withBg composes any inline style with the viewed row background when the
+	// session is being displayed on the right. Applying it per styled segment
+	// rather than wrapping the whole line sidesteps ANSI reset artifacts between
+	// segments — every visible cell carries the bg SGR codes.
 	withBg := func(s lipgloss.Style) lipgloss.Style {
 		if viewed {
 			return s.Background(viewedRowBg)
@@ -2643,11 +2478,9 @@ func (m Model) renderSession(sess session.Info, selected bool, viewed bool, widt
 
 	// Narrower than the fixed lead plus a single column of name: the lead alone
 	// would overflow, and a row that overflows wraps into more physical rows,
-	// which is the one thing sessionRowHeight may never allow. Emit blank rows
-	// of exactly `width` columns instead — still sessionRowHeight of them, since
-	// returning fewer breaks the same invariant from the other side. View()
-	// clamps the pane to minTUIWidth, so this is a floor under the arithmetic
-	// rather than a case a user reaches.
+	// which is the one thing sessionRowHeight may never allow. Emit blank rows of
+	// exactly `width` columns instead — still sessionRowHeight of them, since
+	// returning fewer breaks the same invariant from the other side.
 	if width < sessionRowLead+1 {
 		return strings.Repeat(padBg(width)+"\n", sessionRowHeight)
 	}
@@ -2706,9 +2539,8 @@ const (
 	detailIndentWidth = 1
 	// msgIconWidth is what "👤 " and "🤖 " occupy: a 2-column emoji plus its
 	// space. It sits out here with the other widths because it is load-bearing
-	// twice over — it is subtracted from the message budget, and it is the hang
-	// the continuation rows are indented by, so the two cannot be given
-	// different answers without the block coming apart mid-message.
+	// twice over — subtracted from the message budget, and the hang the
+	// continuation rows are indented by — and the two may not disagree.
 	msgIconWidth = 3
 )
 
@@ -2768,8 +2600,7 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 	// --- Lines 2-3: session name, one row per detailNameLines ---
 	// Dimmed while deleting, exactly as the list row dims it. Every reserved row
 	// is emitted, blank ones included — the list geometry subtracts this block's
-	// height, so it may not follow the name it happens to be showing (see
-	// detailNameLines).
+	// height, so it may not follow the name it happens to be showing.
 	nameStyle := sessionNameStyle
 	if deleting {
 		nameStyle = deletingStyle
@@ -2800,26 +2631,21 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 
 	// --- Lines 5-8: the last message from each side, detailMsgLines rows each ---
 	// Below four columns there is room for the icon and nothing after it, which
-	// says less than a blank line does, so the whole message goes. Deliberately
-	// no floor on the budget: clamping it up to 1 would emit a line wider than
-	// the pane, and a wrapped line costs this fixed-height block a row.
+	// says less than a blank line does, so the whole message goes. Deliberately no
+	// floor on the budget: clamping to 1 would emit a line wider than the pane.
 	msgAvail := avail - msgIconWidth
 
-	// msgRows lays one message across exactly detailMsgLines rows: the icon
-	// leads the first row, continuation rows hang under the text so the message
-	// reads as one block instead of two entries. A row the message never
-	// reaches stays blank rather than carrying a lone icon — an icon with
-	// nothing after it is noisier than the blank line it replaces, and either
-	// way the row is already paid for.
+	// msgRows lays one message across exactly detailMsgLines rows: the icon leads
+	// the first row, continuation rows hang under the text so the message reads as
+	// one block instead of two entries. A row the message never reaches stays
+	// blank rather than carrying a lone icon, which is noisier than the blank.
 	msgRows := func(icon, text string, fromEnd bool) []string {
 		out := make([]string, detailMsgLines)
-		// A message is agent-authored text arriving here verbatim, and the
-		// second row it now gets is what would make an escape sequence in it
-		// visible as a wrap that never advances. Where this sanitizing sits
-		// relative to the emptiness test below does not change what is drawn —
-		// the lone icon is kept off the row by the `row == ""` continue further
-		// down, which is the only guard on it and covers a message that
-		// sanitizes to nothing as well as one that never reached this row.
+		// A message is agent-authored text arriving here verbatim, and the second
+		// row it now gets is what would make an escape sequence in it visible as a
+		// wrap that never advances. Where this sits relative to the emptiness test
+		// below does not change what is drawn — the `row == ""` continue further
+		// down is the only guard on the lone icon, and covers both cases.
 		text = sanitizeRowText(text)
 		if msgAvail < 1 || text == "" {
 			return out
@@ -2832,11 +2658,9 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 			// The -(detailMsgLines-1) is not slack. A wrap may only break in
 			// front of a grapheme cluster, so a 2-column cluster straddling the
 			// edge leaves its row one column unspent — with an odd msgAvail,
-			// full-width text does that on every row. Those unspent columns
-			// push the same number of columns past the last row, where
-			// wrapFixedLines cuts them with an ellipsis: the tail we went out
-			// of our way to keep is exactly what disappears. Handing back one
-			// column per row boundary makes the budget fit any text.
+			// full-width text does that on every row. Those columns push past
+			// the last row, where wrapFixedLines cuts exactly the tail we went
+			// out of our way to keep.
 			text = truncateStringFromEnd(text, msgAvail*detailMsgLines-(detailMsgLines-1))
 		}
 		for i, row := range wrapFixedLines(text, "", msgAvail, detailMsgLines) {
@@ -2868,41 +2692,29 @@ func (m Model) renderDetailPane(sess session.Info, width int) string {
 // on the left, branch on the right. It is the second row of a list row
 // (renderSession), and the only place either string is drawn.
 //
-// Everything here is rendered through the caller's style, the gaps included.
-// The gap between repo and branch is the one stretch of the row with no glyph
-// of its own, so filling it with a bare strings.Repeat(" ", n) would drop the
-// background out of a viewed row exactly where the row is widest — a band with
-// a hole in its middle. The style is a parameter rather than a bool for the
-// same reason renderSession composes rather than branches: the row's two
-// indicators (cursor bar, viewed background) are orthogonal and neither belongs
-// in here.
+// Everything here is rendered through the caller's style, the gaps included. The
+// gap between repo and branch is the one stretch of the row with no glyph of its
+// own, so filling it with a bare strings.Repeat(" ", n) would drop the background
+// out of a viewed row exactly where the row is widest.
 //
-// The branch wins the width fight and is truncated from the end, so a long
-// name keeps the part that identifies it ("...multi-action-dispatch" rather
-// than "feat/"); the repo gets what is left and is dropped once too little
-// remains to be readable. The reasoning is that the main use is several
-// sessions on one repo, where the repo name is identical on every row and
-// carries no information, while the branch is what tells them apart.
+// The branch wins the width fight and is truncated from the end, so a long name
+// keeps the part that identifies it ("...multi-action-dispatch" rather than
+// "feat/"); the repo gets what is left. The main use is several sessions on one
+// repo, where the repo name is identical on every row and the branch is what
+// tells them apart.
 //
-// The repo is shown in full or not at all. A repo name is a disambiguator, and
-// a truncated one disambiguates nothing — "jind-..." fits both jind-ai and
-// jind-ai-notifier — while this row is the only place it appears, so there is
-// nowhere to resolve the ambiguity. Spending five columns on "ji..." buys less
-// than leaving them to the branch.
+// The repo is shown in full or not at all: a truncated disambiguator
+// disambiguates nothing — "jind-..." fits both jind-ai and jind-ai-notifier —
+// and this row is the only place it appears. With no repo name, the working
+// directory stands in, truncated from the END, since its tail is what identifies
+// it while its head is shared by everything under the same root.
 //
-// With no repo name — a session outside any git repo — the working directory
-// stands in, so this row never goes empty on the sessions that have the least
-// other context. That is the one piece the old multi-line card carried here.
-// A path IS truncated, from the end: its tail ("~/dev/.../notes") is what
-// identifies it, while its head is shared by everything under the same root.
-//
-// Both strings go through sanitizeRowText before anything measures them. A repo
-// name and a branch name come from git, which forbids control characters in a
-// refname — but the working directory that stands in for a missing repo name
-// comes from the filesystem, and POSIX lets a directory name hold a newline.
-// One of those here does not merely overflow a pane: this row is drawn for
-// every session in the list, all the time, so the extra line desyncs
-// sessionRowHeight from every hit-test and scroll offset derived from it.
+// Both strings go through sanitizeRowText before anything measures them. git
+// forbids control characters in a refname, but the working directory that stands
+// in for a missing repo name comes from the filesystem, and POSIX lets a
+// directory name hold a newline. One of those here does not merely overflow a
+// pane: this row is drawn for every session in the list, all the time, so the
+// extra line desyncs sessionRowHeight from every hit-test and scroll offset.
 func renderRepoBranch(sess session.Info, avail int, style lipgloss.Style) string {
 	repo, repoTruncatable := sess.RepoName, false
 	if repo == "" {
@@ -2915,15 +2727,13 @@ func renderRepoBranch(sess session.Info, avail int, style lipgloss.Style) string
 		}
 		repoTruncatable = true
 	}
-	// After the fallbacks, not before. Only one kind of value tells the two
-	// orders apart, and it is not the obvious one: a repo name of control
-	// characters alone comes out of sanitizeRowText as spaces, which are
-	// non-empty either way, so it suppresses the stand-in on both paths. An
-	// escape sequence is what differs — ansi.Strip removes it whole, leaving
-	// "". Sanitizing first would let that empty result fall through to the
-	// working directory and print a path beside a repo the session HAS but
-	// never names. Leaving the column blank says the truer thing: there is a
-	// repo name here and it cannot be drawn.
+	// After the fallbacks, not before. Only one kind of value tells the two orders
+	// apart, and it is not the obvious one: a repo name of control characters
+	// alone comes out of sanitizeRowText as spaces, which are non-empty either
+	// way. An escape sequence is what differs — ansi.Strip removes it whole,
+	// leaving "". Sanitizing first would let that empty result fall through to the
+	// working directory and print a path beside a repo the session HAS but never
+	// names.
 	repo = sanitizeRowText(repo)
 
 	branch := sanitizeRowText(sess.CurrentBranch)
@@ -2972,22 +2782,22 @@ func padLine(s string, width int) string {
 }
 
 // Display width in this file is measured with exactly one ruler: ansi
-// (ansi.StringWidth, which is what lipgloss.Width calls). Everything that
-// bounds a string must agree with whatever finally measures the composed line,
-// or a "truncated" string still overflows its column.
+// (ansi.StringWidth, which is what lipgloss.Width calls). Everything that bounds
+// a string must agree with whatever finally measures the composed line, or a
+// "truncated" string still overflows its column.
 //
 // go-runewidth, which this file used to truncate with, is NOT that ruler and
 // disagrees in two ways that both reach production:
 //
-//   - Variation-Selector-16 emoji ("⚠️", "✔️", a common way for an agent to
-//     end a message) are one cell to runewidth and two to ansi. Cutting a
-//     name to 33 runewidth cells could therefore emit 66 real columns, wrap
-//     the row, and turn one session row into two physical rows — breaking
-//     sessionRowHeight and every hit-test offset below it.
-//   - go-runewidth picks its East-Asian ambiguous-width table from the
-//     process locale at init, so "○", "■" and "▶" become two cells under
-//     LANG=ja_JP.UTF-8 and one under C.UTF-8. ansi does not follow the
-//     locale, so the two rulers disagree per user.
+//   - Variation-Selector-16 emoji (a common way for an agent to end a message)
+//     are one cell to runewidth and two to ansi. Cutting a name to 33 runewidth
+//     cells could therefore emit 66 real columns, wrap the row, and turn one
+//     session row into two physical rows — breaking sessionRowHeight and every
+//     hit-test offset below it.
+//   - go-runewidth picks its East-Asian ambiguous-width table from the process
+//     locale at init, so "○", "■" and "▶" become two cells under
+//     LANG=ja_JP.UTF-8 and one under C.UTF-8. ansi does not follow the locale,
+//     so the two rulers disagree per user.
 //
 // ansi also walks grapheme clusters rather than runes, so a cluster is never
 // split down the middle.
@@ -3035,11 +2845,10 @@ func truncateToWidth(s string, maxWidth int) string {
 // truncateFromEndToWidth keeps at most the last maxWidth columns of s.
 //
 // The loop is not decoration: TruncateLeft drops whole grapheme clusters, so
-// cutting exactly (width - maxWidth) columns off a string whose cluster
-// straddles the cut returns a result one column too wide — a full-width
-// character cannot be half-removed. Widening the cut by one column at a time
-// is the smallest correction that still keeps as much of the tail as fits, and
-// it terminates because n reaches the string's full width.
+// cutting exactly (width - maxWidth) columns off a string whose cluster straddles
+// the cut returns a result one column too wide — a full-width character cannot
+// be half-removed. Widening the cut one column at a time is the smallest
+// correction that still keeps as much of the tail as fits.
 func truncateFromEndToWidth(s string, maxWidth int) string {
 	if maxWidth <= 0 {
 		return ""

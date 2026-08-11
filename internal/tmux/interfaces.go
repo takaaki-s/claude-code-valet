@@ -5,8 +5,7 @@ package tmux
 //
 // PaneSlotOps is embedded rather than restated: EnsureNamedPane takes the
 // smaller interface and session.Manager hands it a Runner, so the superset
-// relation is load-bearing and belongs to the compiler rather than to a comment
-// that two signatures have to be kept matching by hand.
+// relation is load-bearing and belongs to the compiler.
 type Runner interface {
 	PaneSlotOps
 

@@ -21,17 +21,12 @@ import (
 // scannerMaxLine caps a single rollout line at 16 MiB, matching
 // maxTranscriptLineBytes in internal/transcript.
 //
-// The ceiling used to be 4 MiB, which was defensible while the only readers
-// stopped early — ReadMeta reads one line and FirstUserPrompt stops at the
-// first prompt, so neither had to get past a large tool output. The transcript
-// reader walks every line, and one line over the limit fails the whole read.
-// A rollout only grows, so that failure would be permanent for the session:
-// `jin session result` would report an error from then on, and everything read
-// before the oversized line would be discarded on every attempt.
-//
-// A tool output holding a build or test log reaches this range without being
-// unusual, which is exactly the output an orchestrator is reading the
-// transcript to see. Real sessions still peak around 17 KiB.
+// The ceiling was 4 MiB while the only readers stopped early. The transcript
+// reader walks every line, and one line over the limit fails the whole read —
+// permanently, since a rollout only grows: `jin session result` would report an
+// error from then on and discard everything read before the oversized line. A
+// tool output holding a build or test log reaches this range without being
+// unusual. Real sessions still peak around 17 KiB.
 const scannerMaxLine = 16 << 20
 
 // Meta is the parsed form of the first line of a rollout JSONL (`type:
@@ -63,8 +58,7 @@ type Locator struct {
 //  1. `$CODEX_HOME/sessions` when CODEX_HOME is set (Codex's dev override)
 //  2. `<home>/.codex/sessions` otherwise
 //
-// The caller passes the home dir explicitly so tests can substitute a
-// t.TempDir() without touching real $HOME.
+// The home dir is passed explicitly so tests can substitute a t.TempDir().
 func NewLocator(home string) *Locator {
 	if codexHome := os.Getenv("CODEX_HOME"); codexHome != "" {
 		return &Locator{SessionsDir: filepath.Join(codexHome, "sessions")}
@@ -73,36 +67,29 @@ func NewLocator(home string) *Locator {
 }
 
 // Find returns the absolute path of the rollout file whose filename embeds
-// uuid, together with ok=true. Returns ("", false) when uuid is empty, when
-// the glob does not match, or when the glob fails.
+// uuid, together with ok=true. Returns ("", false) when uuid is empty, when the
+// glob does not match, or when the glob fails.
 //
-// A resolved uuid is cached, since a caller that already knows the answer
-// asks again routinely: `jin session result --since` polls the same session
-// repeatedly, and DescriptionEnhancer retries on every hook until it
-// succeeds. A cache hit is re-verified with a single os.Stat before being
-// trusted, so a file that was deleted or moved out from under a stale entry
-// falls back to a fresh glob instead of handing back a dead path. A miss is
-// never cached — nothing here distinguishes "not written yet" (the rollout
-// appears moments after SessionStart) from "never will be", and caching the
-// former would make it permanent.
+// A resolved uuid is cached, since a caller that already knows the answer asks
+// again routinely: `jin session result --since` polls the same session, and
+// DescriptionEnhancer retries on every hook until it succeeds. A cache hit is
+// re-verified with a single os.Stat, so a file deleted or moved out from under
+// a stale entry falls back to a fresh glob. A miss is never cached — nothing
+// here distinguishes "not written yet" (the rollout appears moments after
+// SessionStart) from "never will be".
 //
-// The glob itself still spans every day shard because jind-ai does not know
-// when the session was originally created — a resume may happen many days
-// later. When several files match (theoretically impossible, but real
-// filesystems have clocks that go backwards), the newest one by mtime wins.
+// The glob spans every day shard because jind-ai does not know when the session
+// was created; a resume may happen many days later. When several files match,
+// the newest by mtime wins.
 //
-// The cache assumes one uuid maps to one file for the life of the process,
-// which is what the glob above already assumes (multiple real matches are
-// "theoretically impossible"). Whether `codex resume <UUID>` can retarget a
-// UUID onto a different rollout file is unverified — jind-ai itself issues
-// that command (see Agent.SpawnCommand), and evicts the cache entry first so
-// a Find made after the resume re-globs instead of trusting a pre-resume
-// answer. That eviction happens before the resumed process starts, so a
-// narrow window remains: a concurrent Find landing between the eviction and
-// the resumed file actually existing would re-cache the pre-resume path,
-// which then survives (its stat still succeeds) until the next resume. This
-// is accepted rather than closed, since it is a race around a Codex behaviour
-// that is not even confirmed to happen.
+// The cache assumes one uuid maps to one file for the life of the process.
+// Whether `codex resume <UUID>` can retarget a UUID onto a different rollout
+// file is unverified; SpawnCommand evicts the entry first so a Find made after
+// the resume re-globs. That eviction happens before the resumed process starts,
+// so a narrow window remains: a concurrent Find landing between the eviction
+// and the resumed file actually existing would re-cache the pre-resume path,
+// which then survives until the next resume. Accepted rather than closed, being
+// a race around a Codex behaviour that is not even confirmed to happen.
 func (l *Locator) Find(uuid string) (string, bool) {
 	if uuid == "" || l == nil || l.SessionsDir == "" {
 		return "", false
@@ -264,18 +251,16 @@ func ReadMeta(path string) (Meta, error) {
 // pseudoUserPrefixes lists the substrings Codex injects as the first
 // `<message role="user">` bodies before any real user turn. They carry
 // environment/context metadata rather than the operator's own words, so the
-// Layer C-transcript enhancer must step past them to find the first prompt
-// the user actually typed.
+// Layer C-transcript enhancer must step past them to find the first prompt the
+// user actually typed.
 //
-// The `<system` / `<instructions` prefixes are defensive against future Codex
-// builds adding similar wrappers.
-// Measured against 14 real rollouts (35 `role: "user"` items, ground-truthed
-// against the 20 `event_msg/user_message` lines those files carry): with these
-// prefixes the check rejects every injection and passes every human prompt.
-// `<recommended_plugins>` and `<skill>` were added after that measurement
-// found them leaking — `<recommended_plugins>` became the session description
-// for 2 of the 14 sessions, both non-interactive `codex exec` runs, where the
-// operator's actual first words were two lines further down.
+// `<system` / `<instructions` are defensive against future Codex builds adding
+// similar wrappers. Measured against 14 real rollouts (35 `role: "user"` items,
+// ground-truthed against the 20 `event_msg/user_message` lines those files
+// carry): the check rejects every injection and passes every human prompt.
+// `<recommended_plugins>` and `<skill>` were added after that measurement found
+// them leaking — the former became the session description for 2 of the 14,
+// both non-interactive `codex exec` runs.
 var pseudoUserPrefixes = []string{
 	"<environment_context>",
 	"<recommended_plugins>",
@@ -284,15 +269,14 @@ var pseudoUserPrefixes = []string{
 	"<instructions",
 }
 
-// FirstUserPrompt streams the rollout at path and returns the text of the
-// first genuine user turn — a `response_item` line whose payload is a
-// `message` with `role: "user"` whose first content block is not one of the
-// pseudo-user injections above.
+// FirstUserPrompt streams the rollout at path and returns the text of the first
+// genuine user turn — a `response_item` line whose payload is a `message` with
+// `role: "user"` whose first content block is not one of the pseudo-user
+// injections above.
 //
 // Returns ("", false) when the file has no such turn yet (common right after
-// SessionStart, before the operator has said anything), when the file is
-// empty, or when the file cannot be opened. Broken lines mid-stream are
-// silently skipped — Codex may flush mid-write, so the tail can be truncated.
+// SessionStart), is empty, or cannot be opened. Broken lines mid-stream are
+// silently skipped: Codex may flush mid-write, so the tail can be truncated.
 func FirstUserPrompt(path string) (string, bool) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -319,13 +303,11 @@ func firstUserPromptFrom(r io.Reader) (string, bool) {
 		if row.Payload.Type != "message" || row.Payload.Role != "user" {
 			continue
 		}
-		// Look past the injected blocks rather than judging the item by its
-		// first one. Codex packs several blocks into one user item, and the
-		// order is not fixed: the `<recommended_plugins>` items in the
-		// measured corpus carry the injection at index 0 and
-		// `<environment_context>` at index 1, so the reverse arrangement —
-		// injection first, the operator's words after — is one Codex build
-		// away, and a first-block-only test would answer "" for it.
+		// Look past the injected blocks rather than judging the item by its first
+		// one. Codex packs several blocks into one user item and the order is not
+		// fixed: the `<recommended_plugins>` items in the measured corpus carry the
+		// injection at index 0 and `<environment_context>` at index 1, so the
+		// reverse arrangement is one Codex build away.
 		text, ok := firstGenuineBlock(row.Payload.Content)
 		if !ok {
 			continue
@@ -340,9 +322,7 @@ func firstUserPromptFrom(r io.Reader) (string, bool) {
 //
 // One rule, two readers. The description enhancer wants the first of these and
 // the transcript reader wants all of them joined, but "which blocks did the
-// operator write" has to be the same question for both: a prefix added here
-// would otherwise reach one caller and not the other, and the two would answer
-// differently for the same item.
+// operator write" has to be the same question for both.
 func genuineBlocks(content []contentBlock) []string {
 	var out []string
 	for _, c := range content {

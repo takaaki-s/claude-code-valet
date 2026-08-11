@@ -15,10 +15,10 @@ type Store struct {
 
 // tmpSuffixPattern is appended to a session id to form the os.CreateTemp
 // pattern Save hands to atomicfile.Write. The trailing ".tmp" keeps LoadAll
-// from picking the file up mid-write, since LoadAll only considers a ".json"
-// extension, and cleanupTempFiles globs this same suffix to reclaim strays.
-// The pattern is therefore a contract between three places, not a detail of
-// Save — which is why atomicfile.Write takes it rather than choosing a name.
+// (which only considers ".json") from picking the file up mid-write, and
+// cleanupTempFiles globs the same suffix to reclaim strays. It is a contract
+// between three places, which is why atomicfile.Write takes it rather than
+// choosing a name.
 const tmpSuffixPattern = ".json.*.tmp"
 
 // sessionFileMode is the permission new session files are created with.
@@ -26,14 +26,10 @@ const tmpSuffixPattern = ".json.*.tmp"
 // world-readable.
 const sessionFileMode os.FileMode = 0600
 
-// atomicWrite is the write Save publishes through. It is a variable so tests
-// can capture the temp pattern Save builds: that pattern is a contract with
-// LoadAll and cleanupTempFiles, and now that it crosses a package boundary as
-// an argument, nothing else would catch it drifting.
-//
-// Extracting the pattern into a helper and testing that instead would not do
-// the same job — it would pin what the helper returns, not what Save passes,
-// leaving Save free to hand over something else entirely.
+// atomicWrite is a variable so tests can capture the temp pattern Save builds.
+// That pattern is a contract with LoadAll and cleanupTempFiles, and now that it
+// crosses a package boundary as an argument, nothing else would catch it
+// drifting.
 var atomicWrite = atomicfile.Write
 
 // NewStore creates a new store
@@ -46,13 +42,12 @@ func NewStore(dataDir string) (*Store, error) {
 	return s, nil
 }
 
-// cleanupTempFiles removes temp files stranded by a Save that was interrupted
-// between CreateTemp and Rename (daemon killed, power loss). They are inert —
-// LoadAll ignores them — but nothing else would ever reclaim them.
+// cleanupTempFiles removes temp files stranded by a Save interrupted between
+// CreateTemp and Rename (daemon killed, power loss). They are inert — LoadAll
+// ignores them — but nothing else would ever reclaim them.
 //
 // Only safe to call at construction: it would delete the in-flight temp file of
-// a Save running concurrently in another process. The daemon socket keeps a
-// single daemon per state dir, so that does not arise in practice.
+// a Save running concurrently in another process.
 func (s *Store) cleanupTempFiles() {
 	matches, err := filepath.Glob(filepath.Join(s.dataDir, "*"+tmpSuffixPattern))
 	if err != nil {
@@ -68,18 +63,12 @@ func (s *Store) cleanupTempFiles() {
 // Save persists a session.
 //
 // The write is atomic (see atomicfile.Write). Several goroutines reach Save
-// without holding a shared lock, so a plain os.WriteFile could interleave two
-// truncate/write pairs and leave a half-written record — which LoadAll then
-// skips, making the session disappear. The rename buys atomicity, not
-// durability: a machine crash can still lose the most recent save.
+// without holding a shared lock, and a half-written record is one LoadAll
+// skips — the session disappears. The rename buys atomicity, not durability.
 //
-// Save takes session by value: it marshals every field, so a caller reading a
-// live *Session outside a lock would race with concurrent mutators. Taking
-// the parameter by value forces that copy to happen at the call site. A
-// caller that unlocks before calling Save must take the copy first — see
-// Manager.snapshotAndUnlock and its callers for the pattern. A caller that
-// holds its lock for Save's whole duration (e.g. startSessionTmux, which runs
-// under StartBackground's lock) has no such window and may just dereference.
+// Save takes session by value so the copy happens at the call site: a caller
+// reading a live *Session outside a lock would otherwise race with concurrent
+// mutators. See Manager.snapshotAndUnlock and its callers for the pattern.
 func (s *Store) Save(session Session) error {
 	path := filepath.Join(s.dataDir, session.ID+".json")
 	data, err := json.MarshalIndent(&session, "", "  ")
@@ -125,12 +114,10 @@ func (s *Store) Load(id string) (*Session, error) {
 	return &session, nil
 }
 
-// LoadAll loads all sessions.
-//
-// Files that fail Load (unparseable JSON, migration write-back failure, missing
-// permissions, ...) are skipped instead of aborting so a single corrupt file
-// doesn't strand every session. The individual failure is emitted via
-// debugLog so it still surfaces under JIN_DEBUG=1.
+// LoadAll loads all sessions. A file that fails Load (unparseable JSON,
+// migration write-back failure, missing permissions, ...) is skipped rather
+// than aborting the lot, so one corrupt file cannot strand every session; the
+// individual failure still surfaces via debugLog.
 func (s *Store) LoadAll() ([]*Session, error) {
 	entries, err := os.ReadDir(s.dataDir)
 	if err != nil {

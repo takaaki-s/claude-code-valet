@@ -24,13 +24,12 @@ var confirmPopupCmd = &cobra.Command{
 			return nil
 		}
 		// One tmux call for the whole request: this runs on the popup's cold
-		// start, with the user watching an empty popup until the dialog paints.
-		// A tmux failure yields an empty map, which the guard below rejects for
-		// the same reason it rejects a stale mode.
+		// start, with the user watching an empty popup until the dialog paints. A
+		// tmux failure yields an empty map, which the guard below rejects for the
+		// same reason it rejects a stale mode.
 		//
 		// JIN_CONFIRM_TARGET_ID is intentionally not read here: the popup only
-		// needs to render and answer. The parent wrote the ID and the parent
-		// consumes it when dispatching the result.
+		// needs to render and answer. The parent wrote the ID and consumes it.
 		env := tc.ListEnvironment(tmux.SessionName)
 		model, ok := tui.NewConfirmPopupModel(env[tui.EnvConfirmMode], env[tui.EnvConfirmTargetDesc])
 		if !ok {
