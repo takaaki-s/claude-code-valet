@@ -314,3 +314,43 @@ func (r *overlapDetectingRunner) Run(dir string, args ...string) ([]byte, error)
 	}
 	return nil, fmt.Errorf("unexpected git call: %s", joined)
 }
+
+// A model dropped here goes unnoticed by everything below: session and the
+// adapters are handed whatever CreateOptions holds, and a session that names no
+// model is valid all the way down. Reading it back off the create response is
+// what pins the mapping.
+//
+// The request is spelled as wire text rather than marshalled from NewRequest,
+// because docs/ipc-protocol.md publishes these key names: a struct that
+// round-trips through itself agrees with whatever tag it happens to carry, so
+// renaming one would break other clients with the suite still green.
+func TestHandleNew_CarriesTheModelOntoTheSession(t *testing.T) {
+	s := newAsyncTestServer(t)
+	data := json.RawMessage(fmt.Sprintf(
+		`{"work_dir":%q,"agent_kind":"claude","model":"opus"}`, t.TempDir()))
+
+	resp := s.handleNew(data)
+	if !resp.Success {
+		t.Fatalf("Success = false: %s", resp.Error)
+	}
+
+	var out NewResponse
+	if err := json.Unmarshal(resp.Data, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Info.Model != "opus" {
+		t.Errorf("Info.Model = %q, want %q — the request's model never reached the session", out.Info.Model, "opus")
+	}
+
+	// The response key for the same reason as the request key: `jin session
+	// info --json` is documented output that scripts read, and decoding into
+	// NewResponse would accept any spelling the struct happens to carry.
+	var wire map[string]any
+	if err := json.Unmarshal(resp.Data, &wire); err != nil {
+		t.Fatalf("unmarshal wire: %v", err)
+	}
+	if wire["model"] != "opus" {
+		t.Errorf("response key `model` = %v, want %q", wire["model"], "opus")
+	}
+	waitForHandleNewGoroutine(t, s)
+}

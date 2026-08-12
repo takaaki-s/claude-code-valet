@@ -149,3 +149,50 @@ func TestSpawnCommand_UnsetsCCInheritanceEnv(t *testing.T) {
 		}
 	}
 }
+
+// hostileModel is what a model name can look like by the time it reaches a
+// builder: it is persisted and replayed on every resume, which is the route
+// that made `ses_x$(...)` execute in the opencode adapter and produced
+// SpawnPlan's shell-safety contract. The leak assertion below looks for the
+// payload's own text rather than for a quoting scheme; the flag assertion does
+// pin this adapter's spelling, and the property that no adapter may splice
+// either value lives in internal/agent/register's conformance test.
+const hostileModel = "opus$(touch PWNED)`touch PWNED2`; touch PWNED3"
+
+func TestSpawnCommand_ModelNamesEnvNeverText(t *testing.T) {
+	// The no-id case is not redundant: it is the only one where ExtraEnv is
+	// still nil when the model is added, so it is what catches an assignment
+	// into a map nobody made.
+	cases := []struct {
+		name string
+		opts agent.SpawnOptions
+	}{
+		{"no session id", agent.SpawnOptions{Model: hostileModel}},
+		{"fresh session", agent.SpawnOptions{AgentSessionID: realSessionID, Model: hostileModel}},
+		{"resuming", agent.SpawnOptions{AgentSessionID: realSessionID, AgentSessionStarted: true, Model: hostileModel}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := New().SpawnCommand(tc.opts)
+			if !strings.Contains(plan.Command, `--model "$`+modelArgEnv+`"`) {
+				t.Errorf("Command = %q, want it to name the model through %s", plan.Command, modelArgEnv)
+			}
+			if strings.Contains(plan.Command, "touch") {
+				t.Errorf("Command = %q carries the model's own text; it must only name %s", plan.Command, modelArgEnv)
+			}
+			if got := plan.ExtraEnv[modelArgEnv]; got != hostileModel {
+				t.Errorf("%s = %q, want %q", modelArgEnv, got, hostileModel)
+			}
+		})
+	}
+}
+
+func TestSpawnCommand_NoModelOmitsTheFlag(t *testing.T) {
+	plan := New().SpawnCommand(agent.SpawnOptions{AgentSessionID: realSessionID})
+	if strings.Contains(plan.Command, "--model") {
+		t.Errorf("Command = %q, want no --model when the session names none", plan.Command)
+	}
+	if _, ok := plan.ExtraEnv[modelArgEnv]; ok {
+		t.Errorf("ExtraEnv = %v, want no %s when the command never mentions it", plan.ExtraEnv, modelArgEnv)
+	}
+}

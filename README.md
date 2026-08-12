@@ -114,6 +114,27 @@ The TUI create form includes an **agent picker step** whenever more than one ada
 jin ui --agent codex   # transient default; ends when TUI exits
 ```
 
+### Picking a model
+
+`--model` selects the model for one session:
+
+```bash
+jin session new --model opus                    # Claude Code
+jin session new --agent opencode --model anthropic/claude-opus-4-5
+```
+
+The value is handed to the agent's own CLI untouched, so it is spelled the way
+that CLI spells it — an alias or full name for Claude Code, `provider/model`
+for opencode. jind-ai does not check it against a model list, and the agents do
+not agree on what to do with a name they do not know: Claude Code starts and
+warns inside the pane, opencode starts and says nothing at all. **Either way a
+typo produces a session jind-ai reports as running** — and on opencode nothing
+in the pane will tell you, so check the spelling rather than the session.
+
+The choice sticks to the session and is replayed whenever it is resumed,
+including after a daemon restart. It can only be set at creation time — there
+is no config default and no TUI picker for it.
+
 ## Quick Start
 
 ### 1. Set up

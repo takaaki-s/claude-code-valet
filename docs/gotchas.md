@@ -1075,8 +1075,8 @@ Common pitfalls and caveats that agents tend to fall into.
   same kind — it answers a question about shape. Authenticating the hook channel
   is a separate problem and is not addressed.
 
-- **Adapters must never concatenate the session id into `SpawnPlan.Command`,
-  and `TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand`
+- **Adapters must never concatenate the session id or the model into
+  `SpawnPlan.Command`, and `TestSpawnCommand_NoAdapterPutsUntrustedValuesInTheCommand`
   (`internal/agent/register`) enforces it for every registered kind.** It is
   written over `agent.Kinds()` rather than per adapter because a per-package
   test cannot fail for a package that does not exist yet: a fourth adapter
@@ -1087,10 +1087,11 @@ Common pitfalls and caveats that agents tend to fall into.
   directory. All three adapters pass the id through `ExtraEnv` (which Manager
   quotes) and name it from the command: `--resume "$JIN_CLAUDE_SESSION"`,
   `codex resume "$JIN_CODEX_SESSION"`, `opencode --session
-  "$JIN_OPENCODE_SESSION"`. This is independent of the validation above, and it
-  has to be: a record written by an older jind-ai, or edited by hand, reaches
-  `SpawnCommand` having passed no gate. See the shell-safety contract on
-  `session.SpawnPlan`.
+  "$JIN_OPENCODE_SESSION"`. The model gets the same treatment for the same
+  reason (`--model "$JIN_<KIND>_MODEL"`), and it never had a validation gate at
+  all. This is independent of the validation above, and it has to be: a record
+  written by an older jind-ai, or edited by hand, reaches `SpawnCommand` having
+  passed no gate. See the shell-safety contract on `session.SpawnPlan`.
 
 - **`stopped` has no automatic exit, so a stop written by mistake persists
   until a hook happens to disagree.** Nothing re-derives the status from the

@@ -221,6 +221,7 @@ type NewOptions struct {
 	Start       bool
 	Fleet       string // Fleet name for session grouping
 	AgentKind   string // Adapter identifier; daemon defaults from config when empty
+	Model       string // Agent model in the CLI's own spelling; empty = the agent's own default
 
 	Worktree       bool   // Create a git worktree for this session
 	WorktreeName   string // Override auto-generated worktree name

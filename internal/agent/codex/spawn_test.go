@@ -241,3 +241,54 @@ func TestSpawnCommand_ResumePlusHooks(t *testing.T) {
 		t.Errorf("`codex resume UUID` must precede `--enable hooks`: %q", plan.Command)
 	}
 }
+
+// hostileModel — see the identical constant in the claude adapter for what the
+// assertions below are looking at. Unlike the session id, the model gives this
+// adapter no weaker a claim than the other two: it is operator input persisted
+// at creation for all of them, and it is the persistence, not the source, that
+// makes it arrive ungated.
+const hostileModel = "gpt-5$(touch PWNED)`touch PWNED2`; touch PWNED3"
+
+func TestSpawnCommand_ModelNamesEnvNeverText(t *testing.T) {
+	// Both lines, because the flag rides on the shared args rather than on
+	// `base`: a change that moved it would silently drop it from one of them.
+	cases := []struct {
+		name string
+		opts agent.SpawnOptions
+	}{
+		{"fresh", agent.SpawnOptions{ExecPath: testExecPath, Model: hostileModel}},
+		{"resume", agent.SpawnOptions{
+			AgentSessionID:      "01900000-0000-7000-8000-000000000abc",
+			AgentSessionStarted: true,
+			ExecPath:            testExecPath,
+			Model:               hostileModel,
+		}},
+		// No ExecPath: HookArgs contributes nothing, so this is the one case
+		// where the model is the only thing appended to configArgs.
+		{"no exec path", agent.SpawnOptions{Model: hostileModel}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := SpawnCommand(tc.opts)
+			if !strings.Contains(plan.Command, `--model "$`+modelArgEnv+`"`) {
+				t.Errorf("Command = %q, want it to name the model through %s", plan.Command, modelArgEnv)
+			}
+			if strings.Contains(plan.Command, "touch") {
+				t.Errorf("Command = %q carries the model's own text; it must only name %s", plan.Command, modelArgEnv)
+			}
+			if got := plan.ExtraEnv[modelArgEnv]; got != hostileModel {
+				t.Errorf("%s = %q, want %q", modelArgEnv, got, hostileModel)
+			}
+		})
+	}
+}
+
+func TestSpawnCommand_NoModelOmitsTheFlag(t *testing.T) {
+	plan := SpawnCommand(agent.SpawnOptions{ExecPath: testExecPath})
+	if strings.Contains(plan.Command, "--model") {
+		t.Errorf("Command = %q, want no --model when the session names none", plan.Command)
+	}
+	if _, ok := plan.ExtraEnv[modelArgEnv]; ok {
+		t.Errorf("ExtraEnv = %v, want no %s when the command never mentions it", plan.ExtraEnv, modelArgEnv)
+	}
+}

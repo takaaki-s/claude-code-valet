@@ -158,7 +158,16 @@ var hostileSessionIDs = []string{
 	"0198f1b2-4c3d-7a1e-8b2f-000000000abc$(touch /tmp/jin-should-not-exist)",
 }
 
-// TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand is the conformance
+// hostileModel is the second value an adapter may name on the command line and
+// did not choose. It reaches SpawnCommand by the same route the ids above do —
+// persisted at creation, replayed on every later resume — so it is checked in
+// the same loop rather than in a test of its own.
+//
+// Its payload names a different file from theirs so a leak can still be
+// attributed to one field or the other.
+const hostileModel = "m$(touch /tmp/jin-model-should-not-exist)"
+
+// TestSpawnCommand_NoAdapterPutsUntrustedValuesInTheCommand is the conformance
 // check for the one rule that, if forgotten, restores arbitrary code execution.
 //
 // It is written over agent.Kinds() rather than per adapter, and that is the
@@ -169,10 +178,14 @@ var hostileSessionIDs = []string{
 // would reintroduce the defect with nothing to catch it. Registering a kind is
 // what enrols it here.
 //
+// Both untrusted values ride together rather than in two loops: an adapter
+// builds one command line from both, and pairing them checks the model on the
+// resume branches the ids reach as well as on the fresh one.
+//
 // It lives in register_test because that package imports both internal/agent
 // and internal/session, so it can reach every adapter at once. An adapter's own
 // package cannot: internal/agent imports internal/session.
-func TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand(t *testing.T) {
+func TestSpawnCommand_NoAdapterPutsUntrustedValuesInTheCommand(t *testing.T) {
 	for _, kind := range agent.Kinds() {
 		a, err := agent.Lookup(kind)
 		if err != nil {
@@ -183,14 +196,19 @@ func TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand(t *testing.T) {
 				plan := a.SpawnCommand(session.SpawnOptions{
 					AgentSessionID:      id,
 					AgentSessionStarted: started,
+					Model:               hostileModel,
 					WorkDir:             t.TempDir(),
 				})
 				if strings.Contains(plan.Command, id) {
 					t.Errorf("%s.SpawnCommand(started=%v) spliced the session id into Command: %q",
 						kind, started, plan.Command)
 				}
+				if strings.Contains(plan.Command, hostileModel) {
+					t.Errorf("%s.SpawnCommand(started=%v) spliced the model into Command: %q",
+						kind, started, plan.Command)
+				}
 				// Catches a partial splice too — an adapter that escaped or
-				// trimmed the value still hands the shell something to run.
+				// trimmed either value still hands the shell something to run.
 				if strings.Contains(plan.Command, "touch") {
 					t.Errorf("%s.SpawnCommand(started=%v) put a payload fragment into Command: %q",
 						kind, started, plan.Command)
@@ -199,9 +217,9 @@ func TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand(t *testing.T) {
 				// Manager quotes every ExtraEnv value, so pre-escaping here
 				// would double-escape at the shell.
 				for k, v := range plan.ExtraEnv {
-					if strings.Contains(v, "touch") && v != id {
-						t.Errorf("%s.SpawnCommand(started=%v) pre-escaped the id in ExtraEnv[%s] = %q, want %q",
-							kind, started, k, v, id)
+					if strings.Contains(v, "touch") && v != id && v != hostileModel {
+						t.Errorf("%s.SpawnCommand(started=%v) pre-escaped a value in ExtraEnv[%s] = %q, want %q or %q",
+							kind, started, k, v, id, hostileModel)
 					}
 				}
 			}

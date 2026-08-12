@@ -59,7 +59,7 @@ func TestSpawnCommand_Resume(t *testing.T) {
 
 	// The id is named, not spliced. See sessionArgEnv for what splicing it cost;
 	// the rule itself is enforced for every registered adapter by
-	// TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand.
+	// TestSpawnCommand_NoAdapterPutsUntrustedValuesInTheCommand.
 	want := `opencode --session "$JIN_OPENCODE_SESSION"`
 	if plan.Command != want {
 		t.Errorf("Command = %q, want %q", plan.Command, want)
@@ -208,5 +208,53 @@ func TestRecognizesSessionID_MatchesTheResumeGate(t *testing.T) {
 			t.Errorf("RecognizesSessionID(%q) = %v but the resume gate says %v — the two have drifted",
 				id, got, resumes)
 		}
+	}
+}
+
+// hostileModel — this is the adapter where the lesson was measured, so the
+// model gets the posture sessionArgEnv's doc describes. opencode spells models
+// `provider/model`; nothing here checks that, which is the point of the
+// pass-through and the reason the value needs the same handling as an id.
+const hostileModel = "anthropic/opus$(touch PWNED)`touch PWNED2`; touch PWNED3"
+
+func TestSpawnCommand_ModelNamesEnvNeverText(t *testing.T) {
+	cases := []struct {
+		name      string
+		opts      agent.SpawnOptions
+		configDir string
+	}{
+		{"fresh", agent.SpawnOptions{Model: hostileModel}, testConfigDir},
+		{"resume", agent.SpawnOptions{
+			AgentSessionID:      realSessionID,
+			AgentSessionStarted: true,
+			Model:               hostileModel,
+		}, testConfigDir},
+		// Setup never succeeded: the adapter fails open to a bare `opencode`,
+		// and the model must still survive that path.
+		{"no config dir", agent.SpawnOptions{Model: hostileModel}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := SpawnCommand(tc.opts, tc.configDir)
+			if !strings.Contains(plan.Command, `--model "$`+modelArgEnv+`"`) {
+				t.Errorf("Command = %q, want it to name the model through %s", plan.Command, modelArgEnv)
+			}
+			if strings.Contains(plan.Command, "touch") {
+				t.Errorf("Command = %q carries the model's own text; it must only name %s", plan.Command, modelArgEnv)
+			}
+			if got := plan.ExtraEnv[modelArgEnv]; got != hostileModel {
+				t.Errorf("%s = %q, want %q", modelArgEnv, got, hostileModel)
+			}
+		})
+	}
+}
+
+func TestSpawnCommand_NoModelOmitsTheFlag(t *testing.T) {
+	plan := SpawnCommand(agent.SpawnOptions{}, testConfigDir)
+	if strings.Contains(plan.Command, "--model") {
+		t.Errorf("Command = %q, want no --model when the session names none", plan.Command)
+	}
+	if _, ok := plan.ExtraEnv[modelArgEnv]; ok {
+		t.Errorf("ExtraEnv = %v, want no %s when the command never mentions it", plan.ExtraEnv, modelArgEnv)
 	}
 }

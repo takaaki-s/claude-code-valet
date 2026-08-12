@@ -44,6 +44,10 @@ const rootSessionEnv = "JIN_OPENCODE_ROOT_SESSION"
 // not be able to silently stop a resume.
 const sessionArgEnv = "JIN_OPENCODE_SESSION"
 
+// modelArgEnv keeps the model out of Command for the reason the paragraphs
+// above keep the id out; SpawnOptions.Model states it.
+const modelArgEnv = "JIN_OPENCODE_MODEL"
+
 // SpawnCommand builds the `opencode ...` command line the daemon splices into
 // its fixed shell wrapper. Manager owns cwd, JIN_SESSION_ID and the
 // unconditional `env -u TMUX`; this owns the agent-specific pieces:
@@ -56,11 +60,17 @@ const sessionArgEnv = "JIN_OPENCODE_SESSION"
 //     ses_ prefix rather than by AgentSessionStarted alone.
 //   - OPENCODE_CONFIG_DIR pointing at the directory Setup wrote the plugin
 //     into, which is what makes status reporting work at all.
+//   - `--model "$JIN_OPENCODE_MODEL"` when the session names one. opencode
+//     spells this `provider/model`; jind-ai does not check that, and omits the
+//     flag entirely when no model was named.
 //
-// configDir == "" means Setup never succeeded: emit a bare `opencode` with no
-// env addition, so the operator gets a working agent whose status is tracked
-// only by pane death. Same fail-open posture the Codex adapter takes when it
-// has no executable path to build hook arguments from.
+// configDir == "" means Setup never succeeded: contribute none of the pieces
+// that depend on it — no OPENCODE_CONFIG_DIR, so nothing points opencode at the
+// plugin — and the operator gets a working agent whose status is tracked only by
+// pane death. What the operator asked for directly still stands on that path,
+// model included. Same fail-open
+// posture the Codex adapter takes when it has no executable path to build hook
+// arguments from.
 func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
 	resuming := opts.AgentSessionStarted && hasSessionIDPrefix(opts.AgentSessionID)
 
@@ -86,6 +96,10 @@ func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
 		if resuming {
 			plan.ExtraEnv[rootSessionEnv] = opts.AgentSessionID
 		}
+	}
+	if opts.Model != "" {
+		plan.Command += ` --model "$` + modelArgEnv + `"`
+		plan.ExtraEnv[modelArgEnv] = opts.Model
 	}
 	if len(plan.ExtraEnv) == 0 {
 		plan.ExtraEnv = nil

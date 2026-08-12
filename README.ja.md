@@ -110,6 +110,26 @@ TUI の作成フォームには、adapter が2つ以上登録されている場�
 jin ui --agent codex   # 一時的なデフォルト。TUI 終了で戻る
 ```
 
+### model を指定する
+
+`--model` でセッション単位に model を選べる:
+
+```bash
+jin session new --model opus                    # Claude Code
+jin session new --agent opencode --model anthropic/claude-opus-4-5
+```
+
+値は agent 自身の CLI にそのまま渡されるので、**その CLI の書き方**で書く。
+Claude Code なら alias か完全名、opencode なら `provider/model` 形式。
+jind-ai は model 一覧との照合を行わない。agent 側も必ず弾くとは限らず、しかも
+挙動が揃っていない。Claude Code は起動して pane の中で警告を出すが、
+opencode は起動して**何も言わない**。
+**いずれにせよ打ち間違えても jin は「稼働中」と報告する。**opencode では pane を
+見ても分からないので、セッションではなく綴りのほうを確認すること。
+
+指定はセッションに保存され、resume のたびに再適用される（daemon 再起動後も同じ）。
+設定できるのは作成時のみで、config のデフォルトも TUI の picker も無い。
+
 ## クイックスタート
 
 ### 1. デーモンを起動

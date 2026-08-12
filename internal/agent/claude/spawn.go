@@ -16,6 +16,10 @@ import (
 // gate at all.
 const sessionArgEnv = "JIN_CLAUDE_SESSION"
 
+// modelArgEnv keeps the model out of Command for the reason sessionArgEnv keeps
+// the id out; SpawnOptions.Model states it.
+const modelArgEnv = "JIN_CLAUDE_MODEL"
+
 // SpawnCommand builds the `claude ...` command line the daemon splices into
 // its fixed shell wrapper. The wrapper handles cwd + JIN_SESSION_ID + env -u
 // TMUX; this owns the agent-specific pieces:
@@ -27,6 +31,8 @@ const sessionArgEnv = "JIN_CLAUDE_SESSION"
 //     `--resume` once the session has been started at least once. An empty
 //     AgentSessionID falls through both branches and yields a plain `claude`.
 //     The id itself travels in ExtraEnv — see sessionArgEnv.
+//   - `--model "$JIN_CLAUDE_MODEL"` when the session names one. Omitted
+//     entirely when it does not, so the CLI picks its own default.
 //
 // UnsetEnv includes CLAUDECODE because Claude Code sets it when it runs jin
 // via a hook, and a *new* CC must not think it is already inside a CC session.
@@ -52,6 +58,14 @@ func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 		// unescaped — see sessionArgEnv.
 		cmd += " " + flag + ` "$` + sessionArgEnv + `"`
 		extraEnv = map[string]string{sessionArgEnv: opts.AgentSessionID}
+	}
+
+	if opts.Model != "" {
+		cmd += ` --model "$` + modelArgEnv + `"`
+		if extraEnv == nil {
+			extraEnv = map[string]string{}
+		}
+		extraEnv[modelArgEnv] = opts.Model
 	}
 
 	return agent.SpawnPlan{

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/takaaki-s/jind-ai/internal/daemon"
 	"github.com/takaaki-s/jind-ai/internal/session"
 )
 
@@ -128,5 +129,65 @@ func TestNewCmd_AgentFlagParse(t *testing.T) {
 	got, err := flags.GetString("agent")
 	if err != nil || got != "claude" {
 		t.Errorf("agent: got (%q, %v), want (%q, nil)", got, err, "claude")
+	}
+}
+
+// TestNewSessionOptions_CarriesEveryFlagToTheDaemon puts the seam where the
+// values are resolved rather than where they are parsed. The tests above prove
+// pflag stores what it was given; none of them can fail for a flag that is
+// stored and then never copied into the request, which from the daemon's side
+// is indistinguishable from a flag nobody passed.
+//
+// Every flag is asserted at once because they all ride the same hop, and
+// because a whole-struct comparison is what makes a field silently dropped
+// during a later edit fail here.
+func TestNewSessionOptions_CarriesEveryFlagToTheDaemon(t *testing.T) {
+	workDir := t.TempDir()
+	set := map[string]string{
+		"workdir":         workDir,
+		"description":     "a description",
+		"fleet":           "backend",
+		"agent":           "codex",
+		"model":           "anthropic/opus",
+		"no-start":        "true",
+		"worktree":        "true",
+		"worktree-name":   "wt-name",
+		"worktree-branch": "wt-branch",
+		"worktree-base":   "wt-base",
+		"no-hook":         "true",
+	}
+
+	flags := newCmd.Flags()
+	t.Cleanup(func() {
+		for name := range set {
+			_ = flags.Set(name, flags.Lookup(name).DefValue)
+		}
+	})
+	for name, value := range set {
+		if err := flags.Set(name, value); err != nil {
+			t.Fatalf("Set(%s): %v", name, err)
+		}
+	}
+
+	opts, err := newSessionOptions(newCmd)
+	if err != nil {
+		t.Fatalf("newSessionOptions: %v", err)
+	}
+
+	want := daemon.NewOptions{
+		Description:    "a description",
+		WorkDir:        workDir,
+		Start:          false, // --no-start is the inverse of Start
+		Fleet:          "backend",
+		AgentKind:      "codex",
+		Model:          "anthropic/opus",
+		Worktree:       true,
+		WorktreeName:   "wt-name",
+		WorktreeBranch: "wt-branch",
+		WorktreeBase:   "wt-base",
+		NoHook:         true,
+	}
+	if opts != want {
+		t.Errorf("newSessionOptions() = %+v\nwant %+v", opts, want)
 	}
 }

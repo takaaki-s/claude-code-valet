@@ -64,6 +64,12 @@ type Session struct {
 	// once with AgentSessionID; adapters use it to switch between "start" and
 	// "resume" command lines.
 	AgentSessionStarted bool `json:"agent_session_started,omitempty"`
+	// Model is the agent model this session was created with, in the agent
+	// CLI's own spelling (see SpawnOptions.Model). Persisted because every
+	// respawn — quick-fail retry, revive, daemon-restart recovery — rebuilds
+	// the command from this record: dropping it would move a running
+	// conversation onto a different model without saying so.
+	Model string `json:"model,omitempty"`
 
 	// Fleet grouping
 	Fleet string `json:"fleet"` // Fleet name for session grouping
@@ -113,6 +119,7 @@ type Info struct {
 	CreationWarning   string    `json:"creation_warning,omitempty"` // Non-fatal warning from async provisioning (see Session.CreationWarning)
 	AgentKind         string    `json:"agent_kind,omitempty"`       // Adapter identifier ("claude" etc.)
 	AgentSessionID    string    `json:"agent_session_id,omitempty"` // Adapter-side persistent session id (transcript lookup, resume)
+	Model             string    `json:"model,omitempty"`            // Agent model in the CLI's own spelling (see Session.Model)
 	TmuxWindowName    string    `json:"tmux_window_name,omitempty"` // tmux window name
 	Fleet             string    `json:"fleet"`                      // Fleet name for session grouping
 
@@ -161,6 +168,7 @@ func (s *Session) ToInfo() Info {
 		CreationWarning:   s.CreationWarning,
 		AgentKind:         s.AgentKind,
 		AgentSessionID:    s.AgentSessionID,
+		Model:             s.Model,
 		TmuxWindowName:    s.TmuxWindowName,
 		Fleet:             s.Fleet,
 		CurrentWorkDir:    s.CurrentWorkDir,

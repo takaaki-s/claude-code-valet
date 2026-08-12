@@ -200,6 +200,7 @@ type NewRequest struct {
     Start       bool   `json:"start"`
     Fleet       string `json:"fleet"`                     // Fleet name for session grouping
     AgentKind   string `json:"agent_kind,omitempty"`      // Adapter kind ("claude" etc.); daemon defaults from config's default_agent when empty
+    Model       string `json:"model,omitempty"`           // Agent model, spelled as that agent's CLI spells it; passed through unvalidated, persisted, and replayed on every resume
 
     Worktree       bool   `json:"worktree,omitempty"`        // Create a git worktree for this session
     WorktreeName   string `json:"worktree_name,omitempty"`   // Override auto-generated worktree name
