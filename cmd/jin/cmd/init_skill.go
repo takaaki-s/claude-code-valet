@@ -25,15 +25,13 @@ var initStdinIsTerminal = func() bool { return term.IsTerminal(int(os.Stdin.Fd()
 //
 // Installing a skill for an agent the user does not have would create a
 // directory they never asked for, in their home, to serve a tool that is not
-// there. Probing PATH keeps the offer honest — and makes the prompt say
-// "the agents you actually use" rather than "everything jin knows about".
+// there. Probing PATH keeps the offer honest.
 //
 // The set probed comes from agentdocs.SkillKinds rather than a list held here:
-// there is no point probing for an agent whose skill location is unknown, and
-// a second hand-maintained list would drift without anything failing.
-//
-// Kind name == executable name holds for all three agents today. If that ever
-// stops being true, the mapping belongs to the adapter, not here.
+// there is no point probing for an agent whose skill location is unknown, and a
+// second hand-maintained list would drift without anything failing. Kind name ==
+// executable name holds for all three agents today; if that stops being true,
+// the mapping belongs to the adapter.
 func detectInstalledKinds() []string {
 	var kinds []string
 	for _, k := range agentdocs.SkillKinds() {
@@ -56,10 +54,8 @@ type skillPlan struct {
 }
 
 // resolveSkillPlan works out where the skill would go and what is already
-// there.
-//
-// --skill-dir overrides detection entirely: someone who names a directory has
-// already decided, and second-guessing it against PATH would make the flag
+// there. --skill-dir overrides detection entirely: someone who names a directory
+// has already decided, and second-guessing it against PATH would make the flag
 // useless for the project-local case it exists to serve.
 func resolveSkillPlan(skillDir string, force bool) (skillPlan, error) {
 	var plan skillPlan
@@ -86,12 +82,10 @@ func resolveSkillPlan(skillDir string, force bool) (skillPlan, error) {
 	return plan, nil
 }
 
-// runSkillStep is the whole skill half of `jin init`.
-//
-// It never returns an error for "did not install": a user declining, or an
-// environment with no agent on PATH, is a normal outcome of `jin init` and
-// must not make the command look like it failed. Only a genuine write failure
-// propagates.
+// runSkillStep is the whole skill half of `jin init`. It never returns an error
+// for "did not install": a user declining, or an environment with no agent on
+// PATH, is a normal outcome of `jin init` and must not make the command look
+// like it failed. Only a genuine write failure propagates.
 func runSkillStep(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 
@@ -230,9 +224,9 @@ const skillTmpPattern = ".jin-skill-*.tmp"
 // writeSkillFile creates the skill's directory and writes it.
 //
 // The directory is created here, after consent, and never during planning: a
-// `jin init` the user declined must leave no trace, and an empty
-// ~/.agents/skills/jind-ai/ left behind by a refused prompt is exactly the
-// kind of residue that makes people distrust a tool's install step.
+// `jin init` the user declined must leave no trace, and an empty directory left
+// behind by a refused prompt is exactly the kind of residue that makes people
+// distrust a tool's install step.
 //
 // This is the one place in jin that writes into a directory the user owns, so
 // the write has to land exactly where the consent screen said it would. Two
@@ -243,26 +237,21 @@ const skillTmpPattern = ".jin-skill-*.tmp"
 //     never saw while the "Created: ..." line still named the agreed path —
 //     which invalidates the consent rather than merely misplacing a file.
 //     Planting such a link is within reach: jin exists to run semi-autonomous
-//     agents under the user's own account, so "something in $HOME made a
-//     symlink" is routine, not exotic.
+//     agents under the user's own account.
 //   - The prompt itself. Planning and writing are separated by a wait with no
 //     bound, and a file appearing in that window must not be overwritten
-//     without --force (B-4).
+//     without --force.
 //
 // So the guard has two halves, because one flag cannot cover both:
 //
 //   - The final element is handled by the open mode. Without --force, O_EXCL
 //     fails on anything already there, symlink included, and does so
-//     atomically — no window between checking and creating. With --force,
-//     atomicfile.Write publishes through a rename, which replaces a symlink
-//     rather than following it, and never leaves the path empty on a crash the
-//     way unlink-then-create would.
+//     atomically. With --force, atomicfile.Write publishes through a rename,
+//     which replaces a symlink rather than following it, and never leaves the
+//     path empty on a crash the way unlink-then-create would.
 //   - Directory components are checked by the caller, before we are reached.
 //     Neither open mode can see them: O_EXCL and rename both judge the last
 //     element only.
-//
-// (O_NOFOLLOW would state the final-element rule more directly, but it is not
-// reachable through the os package without build tags.)
 func writeSkillFile(path string, force bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("failed to create skill directory: %w", err)
@@ -302,19 +291,16 @@ var errSkillPathUnsafe = errors.New("skill path passes through a symlink")
 // checkSkillPathUnderHome rejects a target whose directory components below
 // home include a symlink.
 //
-// O_EXCL and rename each judge only the final element, so a link one level up
-// — `~/.claude/skills` pointing elsewhere — still redirects the whole write
-// while the consent screen names the original path. Walking the components is
-// the only way to see that.
+// O_EXCL and rename each judge only the final element, so a link one level up —
+// `~/.claude/skills` pointing elsewhere — still redirects the whole write while
+// the consent screen names the original path. Walking the components is the only
+// way to see that.
 //
 // home itself is not examined. A symlinked home directory is a normal, chosen
 // arrangement (and the standard one on some systems), not something planted
 // between planning and writing; refusing it would break real setups to defend
-// against nothing. Everything the user did not explicitly choose — every
-// component below home — is checked.
-//
-// Components that do not exist yet are fine: they are about to be created by
-// MkdirAll, and nothing can be hiding in a directory that is not there.
+// against nothing. Components that do not exist yet are fine: nothing can be
+// hiding in a directory that is not there.
 func checkSkillPathUnderHome(home, target string) error {
 	rel, err := filepath.Rel(home, filepath.Dir(target))
 	if err != nil || strings.HasPrefix(rel, "..") {

@@ -12,11 +12,9 @@ const DefaultFleet = "default"
 type Status string
 
 const (
-	// StatusCreating covers both worktree/session provisioning (before the
-	// agent has been launched) and the agent's own startup window (before the
-	// first hook arrives). The union is intentional: both are "not yet usable"
-	// and the UI treats them identically, so one status keeps the state
-	// machine small.
+	// StatusCreating covers both worktree/session provisioning and the agent's
+	// own startup window. The union is intentional: both are "not yet usable"
+	// and the UI treats them identically.
 	StatusCreating   Status = "creating"
 	StatusStopped    Status = "stopped"    // Process stopped
 	StatusRunning    Status = "running"    // Running (details unknown)
@@ -24,11 +22,9 @@ const (
 	StatusThinking   Status = "thinking"   // Processing (UserPromptSubmit hook)
 	StatusPermission Status = "permission" // Waiting for permission (Notification hook)
 	// StatusDeleting marks a session whose deletion has been accepted but not
-	// yet finalized. The daemon handles delete asynchronously so `git worktree
-	// remove` (an rm -rf of a checkout) does not hold up the client; the
-	// session sits in this state from the moment the request is accepted
-	// until either the record is dropped (success) or the status flips back
-	// to Stopped with ErrorMessage set (failure).
+	// finalized — the daemon removes the worktree asynchronously so `git worktree
+	// remove` does not hold up the client. It ends either with the record
+	// dropped, or back at Stopped with ErrorMessage set.
 	StatusDeleting Status = "deleting"
 )
 
@@ -50,13 +46,10 @@ type Session struct {
 	ErrorMessage string `json:"error_message,omitempty"` // Error message
 
 	// CreationWarning carries a non-fatal message produced during async
-	// provisioning (e.g. "post-create hook detected but not allowed"). It is
-	// distinct from ErrorMessage — a warning does not fail the creation, and
-	// the session becomes usable regardless — but the client still needs a
-	// way to see it, so it lives on the record and is surfaced through Info
-	// on every `get`. It is intentionally not cleared automatically: the
-	// warning was true at creation time, and clearing it would erase the
-	// audit trail; the record is dropped when the session is deleted.
+	// provisioning (e.g. "post-create hook detected but not allowed"). Unlike
+	// ErrorMessage it does not fail the creation, and it is never cleared
+	// automatically: the warning was true at creation time. The record is
+	// dropped when the session is deleted.
 	CreationWarning string `json:"creation_warning,omitempty"`
 
 	// AgentKind identifies the adapter (registry key) that owns this session.
@@ -85,18 +78,13 @@ type Session struct {
 	SSHAuthSock      string           `json:"-"` // SSH_AUTH_SOCK (for git operations, not persisted)
 	DescriptionLayer DescriptionLayer `json:"-"` // Runtime-only enhancer layer; see DescriptionLayer docs + TryUpgradeDescription's restart guard
 	PersistedStatus  Status           `json:"-"` // Status read from disk at load time, before the in-memory normalization to Stopped; consumed once by recovery
-	// killSeq counts the stops Kill has recorded for this session. Unexported
-	// and runtime-only: its whole job is to let code that dropped m.mu tell
-	// whether a Kill landed while it was away. TmuxWindowName used to answer
-	// that (a kill cleared it), but a kill now keeps the window standing so
-	// the session can be revived in place, and a session reloaded from disk
-	// looks Stopped whether or not anyone killed it — neither can be read as
-	// evidence any more.
+	// killSeq counts the stops Kill has recorded, so code that dropped m.mu can
+	// tell whether a Kill landed while it was away. Nothing else answers that any
+	// more: a kill now leaves the tmux window standing so the session can be
+	// revived in place, and a session reloaded from disk looks Stopped either way.
 	//
-	// Kill is the only writer. Stops from other sources (a hook reporting the
-	// agent exited, the monitor finding the pane dead) do not bump it: those
-	// are observations of a session that stopped by itself, and the next
-	// monitor tick reconverges anything a stale decision got wrong.
+	// Kill is the only writer. A stop observed from elsewhere — a hook, the
+	// monitor finding the pane dead — is a session that stopped by itself.
 	killSeq uint64
 
 	// Tracked runtime fields (CurrentWorkDir is persisted so worktree/subdir
@@ -106,11 +94,9 @@ type Session struct {
 	IsGitRepo      bool   `json:"-"`                          // Whether CurrentWorkDir is inside a git repository
 	IsWorktree     bool   `json:"-"`                          // Whether CurrentWorkDir is a git worktree (not the main repo)
 	// RepoName is the human-facing repository name (ResolveRepoName): for a
-	// worktree it is the main repo's name, not the worktree directory's.
-	// Runtime-only for the same reason as CurrentBranch — it describes where
-	// the agent currently is, which the next poll re-derives — but unlike the
-	// branch it is also seeded at create, provision and load time so stopped
-	// and freshly-restored sessions still have one.
+	// worktree the main repo's name, not the worktree directory's. Runtime-only
+	// like CurrentBranch, but also seeded at create, provision and load time so
+	// stopped and freshly-restored sessions still have one.
 	RepoName string `json:"-"`
 }
 

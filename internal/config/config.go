@@ -248,12 +248,11 @@ const (
 type popupSpec struct {
 	DefaultSize PopupSizeConfig
 	// DefaultCells, when non-nil, is an absolute cell count used in place of
-	// DefaultSize for a popup whose contents have fixed dimensions — a
-	// percentage of an arbitrary client would leave such a popup swimming in
-	// empty space on a wide terminal. It applies only when the user has
-	// configured no size at all; DefaultSize stays as the percentage fallback,
-	// since tmux refuses an absolute size larger than the client outright
-	// (a percentage can never exceed it). See PopupFallbackPercent.
+	// DefaultSize for a popup whose contents have fixed dimensions — a percentage
+	// of an arbitrary client would leave such a popup swimming in empty space. It
+	// applies only when the user has configured no size at all; DefaultSize stays
+	// the percentage fallback, since tmux refuses an absolute size larger than the
+	// client outright. See PopupFallbackPercent.
 	DefaultCells *PopupSizeConfig
 	Subcmd       string
 }
@@ -266,15 +265,13 @@ var popupCatalog = map[string]popupSpec{
 	PopupSessionFilter: {DefaultSize: PopupSizeConfig{Width: 70, Height: 70}, Subcmd: "session-filter-popup"},
 	PopupHelp:          {DefaultSize: PopupSizeConfig{Width: 60, Height: 60}, Subcmd: "help-popup"},
 	PopupAction:        {DefaultSize: PopupSizeConfig{Width: 70, Height: 70}, Subcmd: "action-popup"},
-	// The one popup with fixed content dimensions, so it is sized in cells
-	// rather than as a share of the client. tmux's -w/-h include the border
-	// it draws, leaving an inner pty of 46x8 (measured: the border costs one
-	// cell per side). The dialog draws no frame of its own and clamps its
-	// content to confirmDialogMaxInner (44) columns by at most 6 lines — the
-	// `delete_worktree` and `delete_worktree_force` dialogs — so centering
-	// that block inside 46x8 leaves exactly one cell of padding on every side
-	// at maximum content, and more for the shorter prompts. Changing either
-	// number here or that clamp without the other eats the padding.
+	// The one popup with fixed content dimensions, so it is sized in cells rather
+	// than as a share of the client. tmux's -w/-h include the border it draws,
+	// leaving an inner pty of 46x8 (measured: the border costs one cell per side).
+	// The dialog draws no frame of its own and clamps its content to
+	// confirmDialogMaxInner (44) columns by at most 6 lines, so centering that
+	// block inside 46x8 leaves exactly one cell of padding on every side at
+	// maximum content. Changing either number without the other eats the padding.
 	//
 	// DefaultSize is the fallback percentage for a client too small to hold
 	// 48x10, which tmux would refuse rather than shrink.
@@ -293,12 +290,10 @@ var popupCatalog = map[string]popupSpec{
 var defaultUnknownPopup = PopupSizeConfig{Width: 70, Height: 70}
 
 // DefaultPopupSizes returns a snapshot of the canonical default sizes, keyed by
-// popup name. Each value is in that popup's own unit — percent of the client
-// for most, absolute cells for one whose dialog has fixed dimensions — so the
-// numbers are not comparable across popups and are not tmux-formatted.
-// GetPopupSize is authoritative for what a popup actually opens at, since it
-// also applies user config. The returned map is a fresh copy — callers may
-// mutate it freely without touching the shared catalog.
+// popup name. Each value is in that popup's own unit — percent of the client for
+// most, absolute cells for one whose dialog has fixed dimensions — so the numbers
+// are not comparable across popups and are not tmux-formatted. GetPopupSize is
+// authoritative for what a popup actually opens at. The map is a fresh copy.
 func DefaultPopupSizes() map[string]PopupSizeConfig {
 	out := make(map[string]PopupSizeConfig, len(popupCatalog)+1)
 	for name, spec := range popupCatalog {
@@ -356,13 +351,11 @@ func (m *Manager) load() error {
 }
 
 // dropDeprecatedPluginKeybindings detects plugins still configured with the
-// pre-0.8 shape — `keys` directly under keybindings.plugins.<name> instead
-// of nested under `actions.<id>` — and drops their bindings from cfg. The
-// new struct doesn't declare a `keys` field, so viper's Unmarshal silently
-// ignores it; only the raw viper data reveals the old shape. Each affected
-// plugin gets one warning per Manager lifetime (stderr via log; the daemon's
-// debug log captures the same stream) telling the user to rewrite the entry.
-// Must be called with m.mu held (writes m.warned directly).
+// pre-0.8 shape — `keys` directly under keybindings.plugins.<name> instead of
+// nested under `actions.<id>` — and drops their bindings from cfg. The new
+// struct declares no `keys` field, so viper's Unmarshal silently ignores it;
+// only the raw viper data reveals the old shape. Each affected plugin gets one
+// warning per Manager lifetime. Must be called with m.mu held.
 func (m *Manager) dropDeprecatedPluginKeybindings(cfg *Config) {
 	raw, ok := m.v.Get("keybindings.plugins").(map[string]interface{})
 	if !ok {
@@ -751,9 +744,8 @@ func (m *Manager) GetDetachKeyTmux() string {
 //   - nil (field unset in config) ⇒ default from DefaultKeybindings
 //   - explicit empty slice ⇒ feature disabled by the user (no bind-key issued)
 //
-// The returned strings are passed straight to tmux bind-key, so they use tmux
-// notation (e.g. "M-\\" for Alt+Backslash) rather than the "ctrl+]" style used
-// by Detach.
+// The returned strings go straight to tmux bind-key, so they use tmux notation
+// ("M-\\" for Alt+Backslash) rather than the "ctrl+]" style used by Detach.
 func (m *Manager) GetTogglePaneKeys() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -769,8 +761,7 @@ func (m *Manager) GetTogglePaneKeys() []string {
 //   - nil (field unset in config) ⇒ default from DefaultKeybindings
 //   - explicit empty slice ⇒ feature disabled by the user (no bind-key issued)
 //
-// The returned strings are passed straight to tmux bind-key, so they use tmux
-// notation (e.g. "M-p" for Alt+p).
+// The returned strings go straight to tmux bind-key, in tmux notation.
 func (m *Manager) GetActionPanelKeys() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -782,17 +773,15 @@ func (m *Manager) GetActionPanelKeys() []string {
 }
 
 // GetPluginKeybindings returns the per-plugin-action outer-tmux bindings as
-// plugin name → action ID → tmux keys. Returns a fresh copy (never the
-// internal maps, never nil) so callers can iterate or mutate without
-// touching Manager state — same defensive-copy policy as GetEnv. Semantics:
-//   - plugin absent from map ⇒ no bindings (plugins whose actions all
-//     filtered down to empty Keys are omitted entirely)
+// plugin name → action ID → tmux keys. Returns a fresh copy (never the internal
+// maps, never nil), the same defensive-copy policy as GetEnv. Semantics:
+//   - plugin absent from map ⇒ no bindings (a plugin whose actions all filtered
+//     down to empty Keys is omitted entirely)
 //   - action absent / Keys nil / empty ⇒ that action has no binding
 //   - Keys non-empty ⇒ each string is passed straight to tmux bind-key
 //
-// Plugins whose config still uses the deprecated pre-0.8 shape were already
-// dropped at load time (see dropDeprecatedPluginKeybindings) and never
-// appear here.
+// Plugins still on the deprecated pre-0.8 shape were dropped at load time (see
+// dropDeprecatedPluginKeybindings) and never appear here.
 func (m *Manager) GetPluginKeybindings() map[string]map[string][]string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -951,18 +940,15 @@ func hasPopupOverride(user *PopupSizeConfig) bool {
 }
 
 // PopupFallbackPercent returns the percentage size to retry with when a popup
-// sized in absolute cells fails to open. tmux rejects an absolute size taller
-// or wider than the client ("height too large") instead of shrinking it, and
-// the caller cannot know the client's dimensions; a percentage cannot exceed
-// the client, so it always opens. Without this, a client smaller than the
-// dialog turns a destructive confirmation into a keypress that appears to do
-// nothing.
+// sized in absolute cells fails to open. tmux rejects an absolute size taller or
+// wider than the client ("height too large") instead of shrinking it, and the
+// caller cannot know the client's dimensions; a percentage cannot exceed the
+// client, so it always opens. Without this, a client smaller than the dialog
+// turns a destructive confirmation into a keypress that appears to do nothing.
 //
-// ok is false whenever the first attempt was not in cells — the popup has no
-// absolute default, or the user configured a size, which drops it back to
-// percentages (see resolvePopupSize). Retrying a percentage with the same
-// percentage costs a second doomed spawn and cannot succeed where the first
-// failed, so those callers must not retry at all.
+// ok is false whenever the first attempt was not in cells — no absolute default,
+// or a user-configured size that drops it back to percentages. Retrying a
+// percentage with the same percentage cannot succeed where the first failed.
 func (m *Manager) PopupFallbackPercent(name string) (width, height string, ok bool) {
 	spec, found := popupCatalog[name]
 	if !found || spec.DefaultCells == nil {

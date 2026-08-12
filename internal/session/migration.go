@@ -2,19 +2,14 @@ package session
 
 import "encoding/json"
 
-// migrateSessionJSON reads raw session JSON, applies schema migrations in-place,
-// and returns the (possibly rewritten) JSON along with a flag indicating whether
-// any change was applied. It is idempotent: running it twice on the same input
-// produces the same output on the second call with changed=false.
+// migrateSessionJSON applies schema migrations to raw session JSON in place and
+// reports whether anything changed. It is idempotent.
 //
-// Currently handled migrations:
-//   - v1 → v2: rename "name" to "description" and set "description_locked" = true
-//     (the historical "name" value was manually chosen by the user, so lock it).
-//   - v2 → v3: rename "claude_session_id" / "claude_session_started" to their
-//     agent-agnostic equivalents ("agent_session_id" / "agent_session_started")
-//     and backfill "agent_kind" with "claude". Legacy records predate the
-//     agent-abstraction split, so every unmarked session is by definition a
-//     Claude Code session.
+//   - v1 → v2: "name" → "description", and "description_locked" = true (the
+//     historical value was chosen by the user, so lock it).
+//   - v2 → v3: "claude_session_id" / "claude_session_started" → their
+//     agent-agnostic names, and backfill "agent_kind" with "claude" — records
+//     predating the agent split are by definition Claude Code sessions.
 func migrateSessionJSON(raw []byte) ([]byte, bool, error) {
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -35,19 +30,14 @@ func migrateSessionJSON(raw []byte) ([]byte, bool, error) {
 		changed = true
 	}
 
-	// v2 → v3 -----------------------------------------------------------
-	// AgentKind is the invariant "always present" identifier; use "claude"
-	// as the backfill because every pre-migration record was a Claude Code
-	// session. A record that already carries a non-empty agent_kind is
-	// left untouched (idempotency + future-agent compatibility).
+	// v2 → v3. A record that already carries a non-empty agent_kind is left
+	// alone, for idempotency and for agents added later.
 	if k, _ := m["agent_kind"].(string); k == "" {
 		m["agent_kind"] = "claude"
 		changed = true
 	}
-	// Rename claude_session_id → agent_session_id. Do not clobber a value
-	// the new field already carries — that only happens when someone
-	// hand-edited a record mid-migration, but preserving the newer field
-	// is the safer resolution.
+	// Do not clobber a value the new field already carries. That only happens
+	// after a hand-edit mid-migration, and keeping the newer field is safer.
 	if rawCC, ok := m["claude_session_id"]; ok {
 		if id, isString := rawCC.(string); isString && id != "" {
 			if existing, _ := m["agent_session_id"].(string); existing == "" {

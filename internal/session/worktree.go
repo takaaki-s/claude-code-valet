@@ -7,10 +7,9 @@ import (
 	"strings"
 )
 
-// maxWorktreeNameAttempts caps the number of suffixes (-2, -3, ...) tried
-// during collision resolution. Ten is well above the point where a UUID-based
-// prefix could realistically collide — beyond it, something is structurally
-// wrong and the caller should hear about it instead of silently spinning.
+// maxWorktreeNameAttempts caps the suffixes (-2, -3, ...) tried during
+// collision resolution. Beyond ten something is structurally wrong and the
+// caller should hear about it instead of silently spinning.
 const maxWorktreeNameAttempts = 10
 
 // WorktreePlacement is the resolved worktree name, branch, and filesystem
@@ -33,10 +32,9 @@ func deriveWorktreeName(sessionID, override string) string {
 	return "jin-" + sessionID[:8]
 }
 
-// deriveBranchName picks the branch name. An explicit override wins;
-// otherwise the branch is prefix + worktreeName with the auto "jin-" prefix
-// stripped — so a "jin-abcd1234" worktree pairs with a "jin/abcd1234" branch
-// instead of the doubled "jin/jin-abcd1234".
+// deriveBranchName picks the branch name. An explicit override wins; otherwise
+// it is prefix + worktreeName with the auto "jin-" prefix stripped, so a
+// "jin-abcd1234" worktree pairs with "jin/abcd1234" and not "jin/jin-abcd1234".
 func deriveBranchName(worktreeName, prefix, override string) string {
 	if override != "" {
 		return override
@@ -49,14 +47,11 @@ func deriveBranchName(worktreeName, prefix, override string) string {
 // dir the Manager was built over.
 //
 // The state dir is threaded in rather than read from paths.State(), because a
-// Manager honours the one it was given for every other artifact it writes —
-// hooks-settings.json, and bin/jin, which hookBinaryPath already describes as a
-// sibling of worktrees/. Reading the global instead left worktrees outside that
-// set, silently, for every Manager not built over the process's own state dir.
-//
-// An empty stateDir yields a relative template, which expandBaseDir rejects.
-// That is the intended failure — the alternative is a worktree in whatever the
-// working directory happens to be.
+// Manager honours the one it was given for every other artifact it writes.
+// Reading the global instead left worktrees outside that set, silently, for
+// every Manager not built over the process's own state dir. An empty stateDir
+// yields a relative template, which expandBaseDir rejects — the intended
+// failure, the alternative being a worktree in whatever the cwd happens to be.
 func worktreeTemplate(cfgBaseDir, stateDir string) string {
 	if cfgBaseDir != "" {
 		return cfgBaseDir
@@ -67,8 +62,7 @@ func worktreeTemplate(cfgBaseDir, stateDir string) string {
 // expandBaseDir expands {name}, {repo}, and ${ENV} in a base_dir template.
 // Returns an absolute path, or an error if the template contains an unknown
 // {xxx} variable or does not resolve to an absolute path. worktreeTemplate owns
-// the default for an unset base_dir; an empty template arriving here is a
-// caller bug.
+// the default, so an empty template arriving here is a caller bug.
 func expandBaseDir(template, worktreeName, repoBasename string) (string, error) {
 	expanded := os.ExpandEnv(template)
 	replaced := strings.ReplaceAll(expanded, "{name}", worktreeName)
@@ -87,10 +81,9 @@ func expandBaseDir(template, worktreeName, repoBasename string) (string, error) 
 	return replaced, nil
 }
 
-// findAvailableWorktreeName tries baseName, baseName-2, baseName-3, ...
-// up to maxWorktreeNameAttempts times. collides is called once per candidate
-// and should return true if either the worktree directory or the branch would
-// clash with an existing artifact.
+// findAvailableWorktreeName tries baseName, baseName-2, baseName-3, ... up to
+// maxWorktreeNameAttempts times. collides is called once per candidate and
+// reports whether the worktree directory or the branch would clash.
 func findAvailableWorktreeName(baseName string, collides func(candidate string) bool) (string, error) {
 	for i := 1; i <= maxWorktreeNameAttempts; i++ {
 		candidate := baseName

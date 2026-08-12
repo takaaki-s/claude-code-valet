@@ -31,29 +31,25 @@ const sessionStartEvent = "SessionStart"
 // daemon can push into the seconds.
 const hookTimeoutMillis = 10000
 
-// HookArgs builds the `--enable hooks` flag plus one `-c 'hooks.X=[...]'`
-// pair per managedEvent, ready to be appended to `codex` when spawning a
-// jind-ai session.
+// HookArgs builds the `--enable hooks` flag plus one `-c 'hooks.X=[...]'` pair
+// per managedEvent, ready to be appended to `codex` when spawning a jind-ai
+// session.
 //
-// The returned slice is meant to be joined with spaces and spliced into the
-// SpawnPlan.Command string. Each -c value is wrapped in shell single quotes
-// so the space in `"execPath hook"` cannot leak out into argv splitting;
-// Manager's outer `'` escape then handles the wrapping-around-wrapping.
-// Single quotes that would otherwise break the shell grouping are encoded
-// as `'` in the TOML string so they never reach the shell parser.
+// The returned slice is joined with spaces and spliced into
+// SpawnPlan.Command. Each -c value is wrapped in shell single quotes so the
+// space in `"execPath hook"` cannot leak out into argv splitting; Manager's
+// outer escape then handles the wrapping-around-wrapping. Single quotes are
+// encoded as a TOML unicode escape so they never reach the shell parser.
 //
-// Returns nil when execPath is empty — the caller (SpawnCommand) then
-// spawns `codex` without hooks so the session still starts. Status will
-// only reflect running/idle via pane-death detection, but the operator
-// gets a working prompt rather than a spawn failure.
+// Returns nil when execPath is empty — SpawnCommand then spawns `codex` without
+// hooks, so status follows only pane death but the operator gets a prompt.
 func HookArgs(execPath string) []string {
 	if execPath == "" {
 		return nil
 	}
-	// Escaped first, then handed to HookCommand: the flag it appends contains
-	// no character tomlEscapeForShell would have touched, so the command lands
-	// inside the TOML basic string without disturbing the nesting this value
-	// lives in (TOML string, inside shell quotes, inside Manager's own quoting).
+	// Escaped first, then handed to HookCommand: the flag it appends contains no
+	// character tomlEscapeForShell would have touched, so the command lands inside
+	// the TOML basic string without disturbing the nesting this value lives in.
 	//
 	// SessionStart alone carries the context flag — Codex adds that hook's
 	// additionalContext to the model's context, which is how a child learns
@@ -73,17 +69,14 @@ func HookArgs(execPath string) []string {
 // tomlEscapeForShell returns s in a form safe to embed inside a TOML basic
 // string that itself lives inside a shell single-quoted context.
 //
-//   - single quote → the six-character sequence backslash-u-0-0-2-7
-//     (TOML unicode escape). The shell never sees a real single quote,
-//     so the outer `-c '...'` grouping stays intact even for exotic
-//     install paths.
-//   - `"` → `\"` (TOML basic string terminator).
-//   - `\` → `\\` (TOML escape lead-in).
+//   - single quote → its six-character TOML unicode escape. The shell never
+//     sees a real single quote, so the outer `-c '...'` grouping stays intact
+//     even for exotic install paths.
+//   - the basic-string terminator and the escape lead-in are backslashed.
 //
-// Everything else — spaces, unicode, control chars — is left as-is. Spaces
-// are fine because the outer shell single quotes group them, and unicode
-// bytes pass through both shell (which is byte-transparent inside `'...'`)
-// and TOML (which accepts UTF-8 basic strings verbatim).
+// Everything else — spaces, unicode, control chars — is left as-is: the outer
+// single quotes group spaces, and unicode passes through both the shell (byte-
+// transparent inside `'...'`) and TOML (UTF-8 basic strings verbatim).
 func tomlEscapeForShell(s string) string {
 	if !strings.ContainsAny(s, `'"\`) {
 		return s

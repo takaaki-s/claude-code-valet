@@ -17,9 +17,7 @@ import (
 // every key jind-ai does not understand survives the round-trip. That file is
 // not a settings file: it carries the user's OAuth session, their user- and
 // local-scope MCP server configuration, and every cache Claude Code keeps —
-// roughly 76 top-level keys on a working install. Decoding it into a typed
-// struct and marshalling the struct back, which is what this file used to do
-// against a different path, would delete all of them.
+// roughly 76 top-level keys on a working install.
 type rawConfig map[string]json.RawMessage
 
 // rawProject is one entry of the "projects" map, kept undecoded for the same
@@ -55,33 +53,29 @@ const (
 // trustMu serialises the read-modify-write below against other goroutines in
 // this process. Two callers that read the same snapshot both write it back, and
 // the second rename discards the first one's entry — on a direct-call harness
-// that costs 85 of 100 entries, which turns the bug this file exists to fix
-// back on for whichever caller lost.
+// that costs 85 of 100 entries.
 //
 // Ordinary session starts do not race: Manager.StartBackground holds m.mu
-// across startSessionTmux (internal/session/manager.go:2060), so they queue up.
-// The window this closes is the quick-fail resume retry at manager.go:2471,
-// which rebuilds the spawn command after releasing m.mu precisely so it can run
-// while the manager is busy — concurrently with another session's start.
+// across startSessionTmux, so they queue up. The window this closes is the
+// quick-fail resume retry, which rebuilds the spawn command after releasing
+// m.mu precisely so it can run while the manager is busy.
 //
 // NOTE this is an auxiliary lock taken *while* m.mu is held, which
 // docs/conventions.md otherwise forbids. It is safe because trustMu is a leaf:
-// nothing under it calls back into session.Manager. The cost is that a session
-// start now waits out another goroutine's file write, tens of milliseconds at
-// worst. The exception is recorded in conventions.md next to the others.
+// nothing under it calls back into session.Manager. The exception is recorded
+// in conventions.md next to the others.
 //
-// What it does not cover is Claude Code writing the same file from its own
-// process, which no lock jind-ai can take would help with. That window is real
-// and is documented in docs/gotchas.md rather than papered over here.
+// It does not cover Claude Code writing the same file from its own process,
+// which no lock jind-ai can take would help with. That window is real and is
+// documented in docs/gotchas.md rather than papered over here.
 var trustMu sync.Mutex
 
 // EnsureTrustState sets hasTrustDialogAccepted=true for the absolute path of
-// workDir in ~/.claude.json, which is where Claude Code actually looks; the
-// documentation describes that file as holding "per-project state (allowed
-// tools, trust settings)". Without the flag, `claude` opens with a trust
-// dialog in a tmux pane nobody is watching and the session hangs forever.
+// workDir in ~/.claude.json, which is where Claude Code actually looks. Without
+// the flag, `claude` opens with a trust dialog in a tmux pane nobody is watching
+// and the session hangs forever.
 //
-// Note this is NOT any of the settings files. ~/.claude/settings.json,
+// This is NOT any of the settings files. ~/.claude/settings.json,
 // ~/.claude/settings.local.json and <project>/.claude/settings.local.json are a
 // separate system with a validated schema that has no "projects" key at all;
 // writing trust state there is silently ignored. jind-ai wrote to
@@ -95,18 +89,16 @@ var trustMu sync.Mutex
 //
 // Degenerate workDirs are not rejected. A session started directly in $HOME or
 // / writes an entry there and so trusts everything beneath it, which is a lot;
-// refusing would be worse, because the only thing it could produce is the
-// hung trust dialog this function exists to prevent, on a directory the user
-// explicitly asked for a session in. The scope of the grant is the user's
-// choice of workDir, and docs/gotchas.md says so where users will read it.
+// refusing would be worse, because the only thing it could produce is the hung
+// trust dialog this function exists to prevent, on a directory the user
+// explicitly asked for a session in.
 //
 // A malformed or unreadable ~/.claude.json is reported rather than repaired.
 // The worst outcome of returning an error here is a trust dialog; the worst
 // outcome of rewriting that file from a partial read is logging the user out.
-// Claude Code already handles the corrupt case better than jind-ai could:
-// it names the file and the parse error on stderr, moves it aside into
-// ~/.claude/backups/, and starts fresh. Repairing it here would race that
-// recovery and skip the backup.
+// Claude Code already names the file and the parse error on stderr, moves it
+// aside into ~/.claude/backups/, and starts fresh — repairing it here would
+// race that recovery and skip the backup.
 func EnsureTrustState(workDir string) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -222,8 +214,8 @@ type configStamp struct {
 // compares unequal to a file that appeared in the meantime, which is exactly
 // the change worth retrying on.
 //
-// It is a variable so that tests can make the file appear to change underneath
-// the write. Production code never reassigns it.
+// A variable so that tests can make the file appear to change underneath the
+// write. Production code never reassigns it.
 var statConfig = func(path string) (configStamp, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -244,16 +236,13 @@ var statConfig = func(path string) (configStamp, error) {
 // rather than the file behind it, so writing to the unresolved path would turn
 // a user's dotfiles symlink into a plain file in $HOME and leave the repo copy
 // orphaned at its old contents — a silent break of their dotfiles sync that no
-// error would report. os.WriteFile, which this code used before, followed the
-// link; keeping that property is not optional just because the write became
-// atomic.
+// error would report.
 //
 // A dangling link — target deleted, dotfiles repo not cloned yet, volume not
 // mounted — is followed too, via os.Readlink, because EvalSymlinks refuses a
 // path it cannot stat. Writing to the link path instead would replace the link
 // with a regular file and never create the target, which is the same damage
-// this function exists to prevent, only harder to notice because the target is
-// already missing.
+// only harder to notice.
 //
 // A path that resolves to nothing at all is returned unchanged: that is the
 // machine with no ~/.claude.json yet, where creating the file where we were
@@ -262,8 +251,7 @@ var statConfig = func(path string) (configStamp, error) {
 // The temp file atomicfile creates lands next to the resolved target, so on a
 // symlinked config it exists inside the user's dotfiles directory for the
 // duration of the write. That is forced — the rename has to stay on one
-// filesystem — and it is removed on every path out of Write, but it is the
-// reason configTmpPattern has to be recognisable rather than random.
+// filesystem — and it is why configTmpPattern has to be recognisable.
 func resolveConfigPath(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return resolved
@@ -285,13 +273,12 @@ func resolveConfigPath(path string) string {
 // HTML escaping.
 //
 // The escaping matters more than it looks. encoding/json rewrites <, >, & and
-// U+2028/U+2029 as \u escapes by default, and it does so inside json.RawMessage
-// too — an MCP server URL carrying a query string ("?a=1&b=2") comes back with
-// each ampersand replaced by its six-character backslash-u escape. The value
-// parses to the same string, but the whole point of
-// holding untouched keys as raw messages is that they survive byte for byte,
-// and JavaScript's JSON.stringify — what actually produced the file — does not
-// escape them either.
+// U+2028/U+2029 as backslash-u escapes by default, and it does so inside
+// json.RawMessage too — an MCP server URL carrying a query string ("?a=1&b=2")
+// comes back with each ampersand replaced. The value parses to the same string,
+// but the whole point of holding untouched keys as raw messages is that they
+// survive byte for byte, and JavaScript's JSON.stringify — what actually
+// produced the file — does not escape them either.
 //
 // Key order is still not preserved: Go sorts map keys on marshal. The file is
 // not version-controlled and Claude Code rewrites it in its own order on the
@@ -326,14 +313,12 @@ func loadConfig(path string) (rawConfig, error) {
 
 	// Bytes that are not valid UTF-8 are refused before they reach Unmarshal.
 	// Holding values as json.RawMessage protects them, but there is no raw
-	// equivalent for object *keys*: those decode into Go strings, and the
-	// decoder silently substitutes U+FFFD. Since the keys of the projects map
-	// are filesystem paths, and a Linux path is bytes rather than text, one
-	// stray byte in somebody else's project path would come back renamed —
-	// carrying that project's allowedTools, mcpServers and trust flag into an
-	// entry nothing will ever look up again. Refusing keeps the promise the
-	// rest of this file makes; JSON is defined over UTF-8 anyway, so the input
-	// was not valid JSON text to begin with.
+	// equivalent for object *keys*: those decode into Go strings, and the decoder
+	// silently substitutes U+FFFD. The keys of the projects map are filesystem
+	// paths, and a Linux path is bytes rather than text, so one stray byte in
+	// somebody else's project path would come back renamed — carrying that
+	// project's allowedTools, mcpServers and trust flag into an entry nothing will
+	// ever look up again.
 	if !utf8.Valid(data) {
 		return nil, fmt.Errorf("refusing to rewrite malformed %s: not valid UTF-8", path)
 	}
@@ -374,11 +359,9 @@ func decodeProjects(cfg rawConfig, path string) (map[string]rawProject, error) {
 // session: once the user trusts a worktree base directory, every session under
 // it is a no-op here.
 //
-// Note what the write itself grants. Because Claude Code inherits trust
-// downwards, an entry for the session's workDir trusts that whole subtree, not
-// just the one directory — the same thing accepting the dialog there would have
-// done. jind-ai never writes an entry *above* workDir, so the tree it grants is
-// always exactly the one the user pointed the session at.
+// Note what the write itself grants. An entry for the session's workDir trusts
+// that whole subtree, not just the one directory — the same thing accepting the
+// dialog there would have done. jind-ai never writes an entry *above* workDir.
 func isTrusted(projects map[string]rawProject, dir string) bool {
 	for {
 		if entryTrusted(projects[dir]) {

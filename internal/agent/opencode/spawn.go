@@ -5,21 +5,15 @@ import (
 )
 
 // sessionIDPrefix is the prefix opencode stamps on every session id
-// (packages/opencode/src/id/id.ts: prefixes.session = "ses", joined with
-// "_"). jind-ai pre-mints Session.AgentSessionID as a UUID, which can never
-// collide with this, so the prefix is a reliable "has opencode told us its
-// real id yet?" test. hasSessionIDPrefix in transcript.go asks exactly that,
-// and it is what the resume decision below uses. isSessionID beside it asks
-// the stricter question, and the two are deliberately not one predicate — see
-// isSessionID's doc comment for why the resume path must have the looser of
-// them.
+// (packages/opencode/src/id/id.ts: prefixes.session = "ses", joined with "_").
+// jind-ai pre-mints Session.AgentSessionID as a UUID, which can never collide
+// with this, so the prefix is a reliable "has opencode told us its real id
+// yet?" test — which is what the resume decision below uses, through
+// hasSessionIDPrefix.
 //
-// This matters because startSessionTmux flips AgentSessionStarted to true
-// before the process is even spawned, so that flag alone cannot distinguish
-// "resumable" from "spawned once, never reported an id". The Codex adapter
-// resolves the same ambiguity by betting that `codex resume <bad-uuid>`
-// fails fast enough for the 10s quick-fail retry window to catch it; here
-// the id format removes the need for that bet entirely.
+// It matters because startSessionTmux flips AgentSessionStarted to true before
+// the process is even spawned, so that flag alone cannot distinguish
+// "resumable" from "spawned once, never reported an id".
 const sessionIDPrefix = "ses_"
 
 // configDirEnv is the env var that adds a directory to opencode's config
@@ -27,63 +21,46 @@ const sessionIDPrefix = "ses_"
 // project .opencode still load — so pointing it at jind-ai state is safe.
 const configDirEnv = "OPENCODE_CONFIG_DIR"
 
-// rootSessionEnv names the session the plugin should report on, and is set
-// only when resuming. Resuming publishes no session.created, so without it
-// the plugin would have to ask opencode to classify the id — which it can,
-// but only once the server is answering. Naming the session up front makes
-// the first status of a resumed session correct even before then, and saves
-// the lookup afterwards.
-//
-// The name is adapter-scoped on purpose: unlike JIN_SESSION_ID, which
-// Manager exports for every session of every kind, this is written by one
-// adapter and read by one plugin.
+// rootSessionEnv names the session the plugin should report on, and is set only
+// when resuming. Resuming publishes no session.created, so without it the
+// plugin could only classify the id once the server is answering. Naming the
+// session up front makes the first status of a resumed session correct even
+// before then.
 const rootSessionEnv = "JIN_OPENCODE_ROOT_SESSION"
 
 // sessionArgEnv carries the id that `--session` resumes, and exists so that id
-// never reaches a shell as text.
-//
-// Manager splices Command into `$SHELL -ic '<cmd>'`. The single quotes stop the
-// OUTER shell from touching it, but the inner shell is being handed a command
-// to interpret — that is what -c means — so anything in Command that looks like
-// substitution is substitution. Concatenating the id into the string made
-// `ses_x$(...)`, `ses_x;...` and backticks all execute; measured, all three ran.
-// Nothing about the escaping was broken: `'` is escaped correctly and an
-// attacker does not need one.
+// never reaches a shell as text. The rule is the shell-safety contract on
+// session.SpawnPlan; this adapter is where it was learned. Concatenating the id
+// into Command made `ses_x$(...)`, `ses_x;...` and backticks all execute, all
+// three measured. Nothing about the escaping was broken: `'` is escaped
+// correctly and an attacker does not need one.
 //
 // The id is not trustworthy. It arrives from a hook payload and is persisted
-// unvalidated, so whatever a hook says becomes this value — and it is then run
-// the next time the session resumes, which puts the execution at a different
-// time and under a different trigger than the write.
+// unvalidated, so whatever a hook says is run the next time the session
+// resumes — a different time and trigger than the write.
 //
-// ExtraEnv is the channel Manager already quotes (see SpawnPlan), and a shell
-// does not re-scan the result of a parameter expansion for substitutions, so
-// `--session "$JIN_OPENCODE_SESSION"` receives the value verbatim however it is
-// spelled. Deliberately NOT rootSessionEnv, though the value is the same on
-// this path: that one exists for the plugin, and a change made for the plugin's
-// sake should not be able to silently stop a resume — which is the failure this
-// adapter is least able to afford, because it starts a new session and the
-// operator's conversation is simply gone.
+// Deliberately NOT rootSessionEnv, though the value is the same on this path:
+// that one exists for the plugin, and a change made for the plugin's sake must
+// not be able to silently stop a resume.
 const sessionArgEnv = "JIN_OPENCODE_SESSION"
 
-// SpawnCommand builds the `opencode ...` command line the daemon splices
-// into its fixed shell wrapper. Manager owns cwd, JIN_SESSION_ID and the
-// unconditional `env -u TMUX`; we only own the agent-specific pieces:
+// SpawnCommand builds the `opencode ...` command line the daemon splices into
+// its fixed shell wrapper. Manager owns cwd, JIN_SESSION_ID and the
+// unconditional `env -u TMUX`; this owns the agent-specific pieces:
 //
 //   - `opencode` on the first spawn. opencode has no flag that assigns a
-//     session id up front (`--session` only continues an existing one), so
-//     we start fresh and let the plugin's session.created → SessionStart
-//     event carry the real id back into Session.AgentSessionID via
-//     HandleHookEvent's re-key path.
-//   - `opencode --session <id>` once that re-key has happened, detected by
-//     the ses_ prefix rather than by AgentSessionStarted alone.
+//     session id up front (`--session` only continues an existing one), so we
+//     start fresh and let the plugin's session.created → SessionStart carry the
+//     real id back through HandleHookEvent's re-key path.
+//   - `opencode --session <id>` once that re-key has happened, detected by the
+//     ses_ prefix rather than by AgentSessionStarted alone.
 //   - OPENCODE_CONFIG_DIR pointing at the directory Setup wrote the plugin
 //     into, which is what makes status reporting work at all.
 //
-// configDir == "" means Setup never succeeded. We then emit a bare
-// `opencode` with no env addition: the operator gets a working agent whose
-// status is only tracked via pane death, which beats failing the spawn.
-// This is the same fail-open posture the Codex adapter takes when it has no
-// executable path to build hook arguments from.
+// configDir == "" means Setup never succeeded: emit a bare `opencode` with no
+// env addition, so the operator gets a working agent whose status is tracked
+// only by pane death. Same fail-open posture the Codex adapter takes when it
+// has no executable path to build hook arguments from.
 func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
 	resuming := opts.AgentSessionStarted && hasSessionIDPrefix(opts.AgentSessionID)
 

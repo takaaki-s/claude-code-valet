@@ -20,16 +20,14 @@ import (
 const exportBinary = "opencode"
 
 // exportTimeout bounds one export. Measured cost is 1.45–1.77s across sessions
-// from 3 to 117 parts — the work is opencode's start-up, not the conversation,
-// so the ceiling is set against that constant rather than against session size.
-// It is deliberately far above it: the point is to stop a wedged process
-// holding the daemon's handler, not to police a slow one. It has an upper
-// bound too — daemon.defaultRequestTimeout, the 60s the client waits — because
-// past that the client reports a timeout while the daemon is still exporting.
-// A wedged export can take procgroup.TeardownBudget longer than this to
-// unblock Wait — the grace before the SIGKILL, plus what Wait holds on for I/O
-// after it. 30s plus that budget still leaves room under the client's 60s, and
-// a test in internal/daemon holds the inequality rather than this sentence.
+// from 3 to 117 parts — the work is opencode's start-up, not the conversation —
+// so the ceiling is set against that constant and deliberately far above it:
+// the point is to stop a wedged process holding the daemon's handler, not to
+// police a slow one. It has an upper bound too, daemon.defaultRequestTimeout,
+// past which the client reports a timeout while the daemon is still exporting.
+// A wedged export can take procgroup.TeardownBudget longer than this to unblock
+// Wait; 30s plus that budget still leaves room under the client's 60s, and a
+// test in internal/daemon holds the inequality rather than this sentence.
 const exportTimeout = 30 * time.Second
 
 // ExportTimeout is exportTimeout, exported so the daemon can assert the
@@ -82,24 +80,23 @@ func (t *stderrTail) String() string {
 // transcript.Entry form. It satisfies session.TranscriptSource.
 //
 // opencode keeps its conversation in a SQLite database, and jind-ai reads
-// neither the database nor a copy of its own. Reading the database directly
-// would mean a pure-Go SQLite driver (+25 modules, +6.2MB) and a dependency on
-// opencode's schema — which already carries an unused `session_message` table
-// waiting to become the live one. Keeping a copy, which an earlier revision of
-// this adapter did, meant jind-ai owning a growing set of files with nothing to
-// reclaim them. Asking opencode to read its own database costs a process.
+// neither the database nor a copy of its own. Reading it directly would mean a
+// pure-Go SQLite driver (+25 modules, +6.2MB) and a dependency on opencode's
+// schema, which already carries an unused `session_message` table waiting to
+// become the live one. Keeping a copy meant jind-ai owning a growing set of
+// files with nothing to reclaim them. Asking opencode to read its own database
+// costs a process.
 //
 // `--pure` is not optional. It stops opencode loading plugins, including
 // jind-ai's own, which keeps this read off the status-reporting path entirely.
 //
 // Entry.Injected and Entry.Sidechain are left false throughout, which is the
 // "drop them while reading" half of the TranscriptSource contract rather than
-// an omission. Injected text is dropped by partBlocks. A subagent's turns
-// cannot arrive at all: the task tool gives a child its own session, and an
-// export names one session — measured on a parent with 4 children and 39
-// messages between them, 0 reached the parent's document, while its 4 task
-// calls are there as ordinary tool blocks, which is the right level of detail
-// for reading what the parent did.
+// an omission: injected text is dropped by partBlocks, and a subagent's turns
+// cannot arrive at all — the task tool gives a child its own session, and an
+// export names one. Measured on a parent with 4 children and 39 messages
+// between them, 0 reached the parent's document, while its 4 task calls are
+// there as ordinary tool blocks.
 type TranscriptReader struct {
 	// export runs the command and returns the document. Replaced in tests so
 	// the parsing can be exercised without a real opencode install.
@@ -116,20 +113,18 @@ func NewTranscriptReader() *TranscriptReader {
 //
 // workDir does not decide which session is read — opencode finds that by id,
 // and the same session exported from two directories comes back byte for byte
-// identical. It is used as the directory to run the subprocess in, because a
-// process has to start somewhere and the daemon's own working directory is a
-// bad answer: it is wherever the daemon was first auto-started and never
-// changes, jind-ai creates and removes worktrees under it, and a command
+// identical. It is the directory to run the subprocess in, because the daemon's
+// own is a bad answer: it is wherever the daemon was first auto-started and
+// never changes, jind-ai creates and removes worktrees under it, and a command
 // launched from a directory that has been removed fails outright ("The current
 // working directory was deleted"). That would take out every opencode read on
 // the box, permanently, with an error naming nothing that suggests why.
 //
 // An id without opencode's own prefix returns (nil, nil) rather than an error.
 // That is the window every session passes through: jind-ai pre-mints
-// Session.AgentSessionID as a UUID and only learns opencode's `ses_` id when
-// the plugin reports session.created. Asking opencode about a UUID would fail,
-// and "the agent has not started yet" is not a failure. The Codex adapter has
-// the same window; see docs/gotchas.md.
+// Session.AgentSessionID as a UUID and only learns opencode's `ses_` id when the
+// plugin reports session.created. The Codex adapter has the same window; see
+// docs/gotchas.md.
 //
 // Everything past that point is loud — an id that carries the prefix but is
 // malformed, and a session opencode cannot produce, are both read failures and
@@ -168,27 +163,23 @@ func hasSessionIDPrefix(s string) bool {
 // prefix followed by base62 characters.
 //
 // Two predicates for what looks like one question, and the split is the point.
-// They are asked by callers whose failure modes are opposites.
+// They are asked by callers whose failure modes are opposites:
 //
 //   - SpawnCommand asks the loose one, because being wrong there is silent and
 //     unrecoverable: refusing to resume starts a NEW opencode session, and the
 //     operator's conversation is simply not there, with nothing saying why. So
-//     it fails open — attempt the resume, and let opencode complain if the id
-//     is nonsense.
+//     it fails open — attempt the resume, and let opencode complain.
 //   - This one guards a value about to become a subprocess's argv. Being wrong
 //     here costs a second and a confusing error message, which is recoverable,
 //     so it can afford to be strict.
-//
-// Collapsing them into the strict one, as an earlier revision did, gave the
-// resume path the strict predicate's failure mode — the worse of the two.
 //
 // The alphabet is known: across 877 real ids (sessions, messages and parts)
 // every character after the prefix is base62 and every body is exactly 26
 // characters. The length is evidence that the alphabet is settled, not a rule
 // this applies — pinning a width would reject a longer real id. If opencode
 // ever widens the alphabet, a read fails loudly (see ReadEntries) rather than
-// answering empty, which is the whole reason the strict test is allowed here
-// and not on the resume path.
+// answering empty, which is why the strict test is allowed here and not on the
+// resume path.
 func isSessionID(s string) bool {
 	rest, ok := strings.CutPrefix(s, sessionIDPrefix)
 	if !ok || rest == "" {
@@ -282,10 +273,9 @@ func newExportCmd(ctx context.Context, bin, workDir, sessionID string, stdout, s
 //
 // The session's own is the honest first choice, but it is not guaranteed to be
 // there: a worktree can be removed while the session record outlives it. The
-// temp directory is the fallback because it is the one place already assumed
-// to exist — the export writes its output there. Leaving Dir empty is what
-// must not happen; that inherits the daemon's, which is set once at start-up
-// and may be a worktree jind-ai has since deleted.
+// temp directory is the fallback because the export already writes its output
+// there. Leaving Dir empty is what must not happen — that inherits the daemon's,
+// which is set once at start-up and may be a worktree jind-ai has since deleted.
 func runnableDir(workDir string) string {
 	if workDir != "" {
 		if fi, err := os.Stat(workDir); err == nil && fi.IsDir() {
@@ -297,19 +287,15 @@ func runnableDir(workDir string) string {
 
 // exportArgs is the command line, split out so a test can pin it.
 //
-// `--pure` is the load-bearing one. Without it opencode loads plugins,
-// including jind-ai's own status reporter, which would put a `jin hook` call
-// and an event handler on a path whose only job is to print a session — and
-// would do it once per read. Dropping the flag breaks nothing a parser test
-// would notice.
+// `--pure` is the load-bearing one. Without it opencode loads plugins, including
+// jind-ai's own status reporter, which would put a `jin hook` call and an event
+// handler on a path whose only job is to print a session — once per read.
+// Dropping the flag breaks nothing a parser test would notice.
 //
 // sessionID arrives as a bare positional argument, so what keeps it from being
 // read as a flag is the caller: ReadEntries checks isSessionID first, and that
-// predicate anchors on the "ses_" prefix. A leading "-" would otherwise make
-// the id an option to `opencode export` — argument injection needs no shell.
-// Manager refuses to record such an id (safeAgentSessionID), so this is the
-// second of two lines rather than the only one; loosening isSessionID at its
-// front is what would matter here.
+// predicate anchors on the "ses_" prefix. A leading "-" would otherwise make the
+// id an option to `opencode export` — argument injection needs no shell.
 func exportArgs(sessionID string) []string {
 	return []string{"export", "--pure", sessionID}
 }
@@ -319,9 +305,8 @@ func exportArgs(sessionID string) []string {
 // messages are read, and only the fields below are declared, so a field added
 // upstream is ignored rather than a parse failure.
 //
-// The nesting is worth noticing: a part arrives inside its own message rather
-// than carrying a messageID to be joined on. There is no id to key that join
-// wrongly, and no orphan part to drop.
+// A part arrives inside its own message rather than carrying a messageID to be
+// joined on, so there is no id to key that join wrongly and no orphan to drop.
 type exportDoc struct {
 	Messages []exportMessage `json:"messages"`
 }
@@ -427,13 +412,10 @@ func entriesFromExport(doc []byte, since string) ([]transcript.Entry, error) {
 			b.addPart(&m.Info, i, &m.Parts[j], since)
 		}
 		// A turn that ended in failure is reported after the content it
-		// interrupted, which is where opencode itself records it.
-		//
-		// The text is decided before the clock is touched. An error carrying
-		// neither a name nor a message produces no entry, and advancing for it
-		// would let a turn nobody can read push the next real entry forward —
-		// the same rule addPart applies to a part, for the same reason. That
-		// is why this is not one call with the stamp as an argument.
+		// interrupted, which is where opencode itself records it. The text is
+		// decided before the clock is touched: an error carrying neither a name
+		// nor a message produces no entry, and advancing for it would let a turn
+		// nobody can read push the next real entry forward.
 		text, ok := failureText(&m.Info)
 		if !ok {
 			continue
@@ -533,21 +515,18 @@ func toolBlocks(p *partRow) []transcript.Block {
 // state.status is not the answer, and believing it was is what made
 // `--errors-only` wrong here for a while. In the 194-call corpus every one of
 // the 5 bash calls that exited non-zero is recorded `completed`; the single
-// `error` status belongs to a `read` that could not open a file. Reading the
-// status alone, `--errors-only` returned none of the five — the same trap this
-// project documents for Codex, reintroduced while the docs claimed the
-// opposite.
+// `error` status belongs to a `read` that could not open a file.
 //
 // metadata.exit is the real exit status, and Codex records nothing like it.
 // Only bash carries it (32 of 33 as a number, 1 as null); read, grep, glob,
-// task, skill, websearch and write have no exit field at all — 0 of 161,
-// which is every tool call in the corpus that is not bash.
+// task, skill, websearch and write have no exit field at all — 0 of 161, which
+// is every tool call in the corpus that is not bash.
 //
-// So false here means one of two different things, and callers must not read
-// it as the second: either the tool reported an exit status and it was zero, or
-// the tool reports no exit status and jind-ai cannot tell. `--errors-only` is
-// therefore trustworthy for bash and blind for everything else, which is
-// stated in docs/gotchas.md rather than papered over.
+// So false here means one of two different things, and callers must not read it
+// as the second: either the tool reported an exit status and it was zero, or the
+// tool reports no exit status and jind-ai cannot tell. `--errors-only` is
+// therefore trustworthy for bash and blind for everything else, which is stated
+// in docs/gotchas.md rather than papered over.
 func nonZeroExit(p *partRow) bool {
 	// Absent, null, or anything that is not a number: the tool did not report
 	// an exit status this reader understands, which lands on "cannot tell".
@@ -590,8 +569,7 @@ func asText(raw json.RawMessage) string {
 // alone is indistinguishable from a turn still being thought about. Without it
 // an orchestrator waits on a session that is never going to answer.
 //
-// Both fields opencode records are kept and neither is invented — Name is the
-// classifier a caller can match on, Data.Message the sentence a human reads.
+// Both fields opencode records are kept and neither is invented.
 func failureText(m *messageRow) (string, bool) {
 	if m.Error == nil {
 		return "", false
@@ -630,19 +608,18 @@ type entryBuilder struct {
 
 // stamp renders an opencode timestamp, never going backwards.
 //
-// The value is opencode's own, except where opencode's own clock disagrees with
-// the order of the conversation, in which case the previous entry's value is
-// carried forward. That is not tidying: parallel tool calls mean a call issued
-// first can finish last, so a truthful sequence of real times is genuinely
-// out of order — measured across 34 real sessions, 13 of 620 blocks need the
-// correction and the largest is 204s.
+// The value is opencode's own, except where opencode's clock disagrees with the
+// order of the conversation, in which case the previous entry's value is carried
+// forward. That is not tidying: parallel tool calls mean a call issued first can
+// finish last, so a truthful sequence of real times is genuinely out of order —
+// measured across 34 real sessions, 13 of 620 blocks need the correction and the
+// largest is 204s.
 //
-// Carrying forward rather than nudging by a millisecond keeps every value a
-// time opencode actually recorded. The cost is that two entries can then share
-// a timestamp — 12 of 478 in the corpus — and `--since` is an exclusive bound,
-// so a caller polling across one of those boundaries can lose the second. That
-// is the same hazard Claude Code and Codex carry, and it is written down in
-// docs/gotchas.md rather than hidden behind an invented number.
+// Carrying forward rather than nudging by a millisecond keeps every value a time
+// opencode actually recorded. The cost is that two entries can then share a
+// timestamp — 12 of 478 in the corpus — and `--since` is an exclusive bound, so
+// a caller polling across one of those boundaries can lose the second. See
+// docs/gotchas.md.
 func (b *entryBuilder) stamp(ms *int64) string {
 	return renderStamp(b.advance(ms))
 }
@@ -736,10 +713,9 @@ func partEnd(p *partRow, msg *messageRow) *int64 {
 //
 // The entry's Timestamp tracks its LAST block. That is what makes incremental
 // reads exact: a caller passing the timestamp of the last entry it saw as
-// `since` needs every block already folded into that entry to compare as "at
-// or before" it. Stamping the first block instead would leave the group's
-// later blocks above the bound, and they would come back as a partial
-// duplicate of an entry the caller already has.
+// `since` needs every block already folded into that entry to compare as "at or
+// before" it. Stamping the first block instead would leave the group's later
+// blocks above the bound, returning a partial duplicate.
 func (b *entryBuilder) add(role, ts string, blk transcript.Block) {
 	if b.cur != nil && b.cur.Type == role {
 		b.cur.Blocks = append(b.cur.Blocks, blk)
@@ -756,10 +732,10 @@ func (b *entryBuilder) add(role, ts string, blk transcript.Block) {
 // across the whole result.
 //
 // Consecutive assistant messages are the steps of one turn, so the entry that
-// holds them reports their sum — the cost of the turn, which is the question a
-// caller reading usage is asking. A message split across several entries is
-// billed to the first of them. opencode's reasoning token count has no field in
-// transcript.Usage and is dropped rather than folded into another number.
+// holds them reports their sum — the cost of the turn, which is what a caller
+// reading usage is asking. A message split across several entries is billed to
+// the first. opencode's reasoning token count has no field in transcript.Usage
+// and is dropped rather than folded into another number.
 func (b *entryBuilder) credit(msgIndex int, msg *messageRow) {
 	if b.cur == nil || msg.Tokens == nil {
 		return

@@ -8,9 +8,8 @@ import (
 // Canonical event names. opencode's own bus vocabulary (session.created,
 // session.status, session.idle, permission.asked, ...) does not line up with
 // the names HandleHookEvent keys its agent-agnostic side effects on, so the
-// bundled plugin translates before calling `jin hook`. Keeping the constants
-// here — next to the switch that consumes them — makes the contract with
-// plugin/jin.ts explicit; the mapping table lives in that file's header.
+// bundled plugin translates before calling `jin hook`. The mapping table lives
+// in plugin/jin.ts.
 const (
 	eventSessionStart     = "SessionStart"
 	eventUserPromptSubmit = "UserPromptSubmit"
@@ -28,10 +27,6 @@ const errorMessage = "opencode reported an error"
 
 // EventStatusSource translates the canonical event names the bundled plugin
 // emits into StatusUpdates.
-//
-// Stateless, but held as a pointer so a future revision can add per-session
-// memoisation without changing callers — same shape as the Codex adapter's
-// HookStatusSource.
 type EventStatusSource struct{}
 
 // NewEventStatusSource constructs the interpreter.
@@ -44,11 +39,6 @@ func NewEventStatusSource() *EventStatusSource { return &EventStatusSource{} }
 //	PermissionRequest  permission             agent is blocked on the user
 //	Stop               idle + ClearError      turn finished
 //	StopFailure        idle + ErrorMessage    turn ended in an error
-//
-// A false verdict means "meaningful, but no status change" — Manager still
-// runs its agent-agnostic bookkeeping for SessionStart, which is exactly how
-// Session.AgentSessionID gets re-keyed from the pre-minted UUID to
-// opencode's real ses_… id.
 func (s *EventStatusSource) Interpret(sig agent.StatusSignal) (agent.StatusUpdate, bool) {
 	if sig.Kind != "hook" {
 		return agent.StatusUpdate{}, false

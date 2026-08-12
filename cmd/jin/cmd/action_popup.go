@@ -67,16 +67,15 @@ func init() {
 }
 
 // actionKeyBindingsFromConfig builds the narrow action.KeyBindings used to
-// resolve palette Shortcut display from the full config.KeybindingsConfig.
-// A nil manager (config load failure) yields empty bindings so CoreActions
-// still returns rows, just without shortcut hints.
+// resolve palette Shortcut display from the full config.KeybindingsConfig. A
+// nil manager (config load failure) yields empty bindings so CoreActions still
+// returns rows, just without shortcut hints.
 //
-// TogglePane and Search are resolved via their dedicated getters because
+// TogglePane and Search go through their dedicated getters because
 // GetKeybindings intentionally omits both from its len==0 fallback: they
-// preserve a nil↔empty distinction (nil=default binding, empty=user
-// disabled). Reading kb.TogglePane / kb.Search directly leaks a raw nil
-// into the palette on any install without a config file, blanking the
-// corresponding shortcut hint.
+// preserve a nil↔empty distinction (nil=default, empty=user disabled), and
+// reading them directly leaks a raw nil into the palette on any install
+// without a config file.
 func actionKeyBindingsFromConfig(mgr *config.Manager) action.KeyBindings {
 	if mgr == nil {
 		return action.KeyBindings{}

@@ -29,11 +29,10 @@ const sessionStartEvent = "SessionStart"
 // and Codex both read from a SessionStart hook — the two products document the
 // same shape and the same field name, so one struct serves both.
 //
-// No per-kind branch belongs here, and if a future agent needs a different
-// shape, the escape hatch is to give agentdocs.HookContextFlag a value
-// (--emit-context=<format>) rather than to switch on the kind: which agent is
-// calling is something this command deliberately does not know. What decides
-// whether to emit is the adapter that wrote the command line.
+// No per-kind branch belongs here: which agent is calling is something this
+// command deliberately does not know, and what decides whether to emit is the
+// adapter that wrote the command line. A future agent needing a different shape
+// gets a value on agentdocs.HookContextFlag rather than a switch on the kind.
 //
 // opencode is deliberately absent. Its plugin invokes `jin hook` with stdout
 // set to "ignore", so nothing written here could reach it; opencode receives
@@ -78,11 +77,9 @@ var hookCmd = &cobra.Command{
 		var input hookInput
 		if err := json.Unmarshal(data, &input); err != nil {
 			// Bounded and quoted, for the same reason as the event line below:
-			// stdin is chosen by the caller, so an unbounded raw echo lets
-			// anyone who can run `jin hook` write arbitrary lines into this
-			// log — including ones that look like entries jind-ai wrote. Bounded
-			// before the []byte becomes a string, so a huge payload is not
-			// copied onto the heap only to be thrown away.
+			// stdin is chosen by the caller, so an unbounded raw echo lets anyone
+			// who can run `jin hook` write arbitrary lines into this log —
+			// including ones that look like entries jind-ai wrote.
 			hookLog("failed to parse JSON: %v (data: %s)", err, debug.UntrustedBytes(data, hookLogFieldMax))
 			return nil
 		}
@@ -135,10 +132,10 @@ var hookCmd = &cobra.Command{
 
 // emitAgentContext writes the SessionStart context JSON.
 //
-// Failures are logged and swallowed: a hook that cannot describe jin must
-// still let the session start, and the caller keeps its exit-0 contract. The
-// payload is one line and nothing else may share stdout — anything extra
-// would land in front of the JSON and break the agent's parse.
+// Failures are logged and swallowed: a hook that cannot describe jin must still
+// let the session start, and the caller keeps its exit-0 contract. The payload
+// is one line and nothing else may share stdout — anything extra would land in
+// front of the JSON and break the agent's parse.
 func emitAgentContext(w io.Writer) {
 	payload := hookContextOutput{
 		HookSpecificOutput: hookSpecificOutput{

@@ -60,21 +60,15 @@ type Manager struct {
 
 // Identity is the jin the agents this Manager starts are told to call back
 // into — whatever NewManager was handed, unchanged.
-//
-// Exported so the hand-off is checkable from where it is made: nothing inside
-// this package can tell a Manager built over the daemon's identity from one
-// built over a value that daemon assembled a second time, and assembling it a
-// second time is the defect this argument exists to prevent.
 func (m *Manager) Identity() jinenv.Identity {
 	return m.identity
 }
 
-// SetTmuxClient sets the tmux client for tmux-based session management.
-//
-// One-shot setup-time setter: call before the daemon serves requests.
-// tmuxClient is read without m.mu on hot paths (recovery probes, pane
-// polling), which is sound only because after setup the field is written
-// at most once more, by ensureTmuxClient under both tmuxInitMu and m.mu.
+// SetTmuxClient sets the tmux client for tmux-based session management. It is
+// a one-shot setup-time setter: call before the daemon serves requests.
+// tmuxClient is read without m.mu on hot paths, which is sound only because
+// after setup the field is written at most once more, by ensureTmuxClient
+// under both tmuxInitMu and m.mu.
 func (m *Manager) SetTmuxClient(tc tmux.Runner) {
 	m.tmuxClient = tc
 }
@@ -108,13 +102,9 @@ func (m *Manager) SetPluginDispatcher(d plugin.Dispatcher) {
 
 // SetTmuxSocketName overrides the tmux socket name used by ensureTmuxClient's
 // lazy fallback (production leaves this empty and gets tmux.DefaultSocketName,
-// i.e. JIN_TMUX_SOCKET or "jin").
-// Tests set an isolated per-run name so a test that exercises the auto-init
-// path — where the caller deliberately skips SetTmuxClient — cannot leak a
-// real "-L jin" server that would then pollute a subsequent daemon start's
-// environment inheritance.
-//
-// Set exactly once before the first session start; no lock is taken.
+// i.e. JIN_TMUX_SOCKET or "jin"). Tests set an isolated per-run name so the
+// auto-init path cannot leak a real "-L jin" server that a later daemon start
+// would inherit its environment from. Set once, before the first session start.
 func (m *Manager) SetTmuxSocketName(name string) {
 	m.tmuxSocketName = name
 }
@@ -124,25 +114,21 @@ func (m *Manager) SetTmuxSocketName(name string) {
 // an error rather than defaulting silently.
 //
 // Must be called exactly once at startup, before any goroutine reads the
-// resolver (daemon.NewServer wires this before returning; tests inject a
-// stub before touching the Manager). No lock is taken here to match the
-// other one-shot setters (SetTmuxClient / SetHookRunner) — installing at
-// runtime while other goroutines are already reading would race regardless.
+// resolver. No lock is taken, as with the other one-shot setters: installing
+// at runtime while other goroutines are already reading would race regardless.
 func (m *Manager) SetAgentResolver(ar AgentResolver) {
 	m.agentResolver = ar
 }
 
-// RecoverTmuxSessions checks for sessions with existing tmux windows after daemon restart
-// and resumes monitoring for live ones, or clears stale TmuxWindowName for dead ones.
+// RecoverTmuxSessions checks for sessions with existing tmux windows after a
+// daemon restart and resumes monitoring for live ones, or clears stale
+// TmuxWindowName for dead ones.
 //
-// The tmux probes and the adapter's recover verdict (Claude Code: a transcript
-// read) are I/O and recovery pays them once per session, so none of it runs
-// under m.mu — that is the Manager's central lock, and holding it across the
-// loop would stall the whole daemon for the duration. The work is split into
-// phases: snapshot under the lock, probe without it, re-take the lock to
-// apply. applyRecovery re-validates each session against live state, so a
-// session that was deleted, killed, or started while the probes ran keeps its
-// live state (see the guards there).
+// The tmux probes and the adapter's recover verdict are I/O, so none of it runs
+// under m.mu — holding the Manager's central lock across the loop would stall
+// the whole daemon. The phases are: snapshot under the lock, probe without it,
+// re-take it to apply. applyRecovery re-validates each session against live
+// state, so one deleted, killed or started while the probes ran keeps it.
 func (m *Manager) RecoverTmuxSessions() {
 	snaps, tc := m.snapshotForRecovery()
 	if tc == nil {
@@ -198,15 +184,13 @@ type recoverDecision struct {
 }
 
 // snapshotForRecovery copies every session under the lock so the probe phase
-// can run I/O against the copies (safe: no Session field aliases mutable
-// state — same reasoning as snapshotForUpgrade). Each copy retains the
-// on-disk PersistedStatus while the live field is consumed (cleared) at pass
-// start, as before, so a later recovery pass cannot resurrect a stale value.
+// can run I/O against the copies. Each copy retains the on-disk
+// PersistedStatus while the live field is consumed at pass start, so a later
+// pass cannot resurrect a stale value.
 //
-// The tmux client is captured under the same lock and returned for the probe
-// phase, so recovery never reads m.tmuxClient unsynchronized. tc is nil when
-// no client is installed; nothing is snapshotted or consumed then, and the
-// caller skips the pass entirely.
+// The tmux client is captured under the same lock, so recovery never reads
+// m.tmuxClient unsynchronized. tc is nil when no client is installed, and the
+// caller then skips the pass entirely.
 func (m *Manager) snapshotForRecovery() (snaps []Session, tc tmux.Runner) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -246,12 +230,9 @@ func (m *Manager) decideRecovery(snaps []Session, tc tmux.Runner) []recoverDecis
 		default:
 			d.outcome = recoverResume
 			// Hooks fired while the daemon was down are lost, so the
-			// persisted value itself can be stale (e.g. a missed Stop hook
-			// leaves the session "thinking" forever). Let the adapter
-			// re-derive the status from its own persistent data; a false
-			// verdict keeps the fallback decision applyRecovery computes.
-			// The persisted_status hint is the snapshot-time estimate —
-			// apply recomputes the authoritative one from live state.
+			// persisted value can be stale (a missed Stop leaves the
+			// session "thinking" forever). Let the adapter re-derive it;
+			// a false verdict keeps applyRecovery's fallback decision.
 			persisted := resumeStatusSource(snap.Status, snap.PersistedStatus)
 			d.verdict, d.verdictOK = m.recoverStatusVerdict(snap, persisted)
 		}
@@ -306,13 +287,11 @@ func (m *Manager) applyRecovery(decisions []recoverDecision) (saves []Session, m
 		if live.TmuxWindowName != d.windowName {
 			continue
 		}
-		// The ordinary Kill leaves that name in place — it stops the pane's
-		// process and keeps the window standing — so the check above cannot
-		// see it, and Status cannot stand in either: a session reloaded from
-		// disk is already Stopped before anyone kills anything. The counter is
-		// the one mark a kill always leaves. Every probe behind this decision
-		// predates it, so resuming on their say-so would revive a session
-		// someone just stopped.
+		// The ordinary Kill leaves the window standing, so the check above
+		// cannot see it, and Status cannot stand in either: a session reloaded
+		// from disk is already Stopped before anyone kills anything. The counter
+		// is the one mark a kill always leaves, and every probe behind this
+		// decision predates it.
 		if live.killSeq != d.killSeq {
 			debugLog("[RECOVER] Session %s killed while probing, dropping the stale decision", live.Description)
 			continue
@@ -355,12 +334,10 @@ func (m *Manager) applyRecovery(decisions []recoverDecision) (saves []Session, m
 			debugLog("[RECOVER] Session %s tmux pane dead, kept TmuxWindowName (session preserved)", live.Description)
 		case recoverResume:
 			// A persisted StatusDeleting means the user was already
-			// deleting this session when the daemon went down. The
-			// delete intent wins over the pane being alive — resuming
-			// a session the user asked to remove would silently reverse
-			// their action. Mark stopped with the interruption message
-			// so a retry via `jin session delete` is obvious; monitoring
-			// is intentionally skipped.
+			// deleting this session when the daemon went down, and that
+			// intent wins over the pane being alive. Mark stopped with the
+			// interruption message so a retry is obvious; monitoring is
+			// intentionally skipped.
 			if d.fromDisk == StatusDeleting {
 				live.Status = StatusStopped
 				live.ErrorMessage = interruptedAsyncMessage(StatusDeleting)
@@ -376,12 +353,11 @@ func (m *Manager) applyRecovery(decisions []recoverDecision) (saves []Session, m
 				// agent-side data and the next hook reconverges.
 				live.Status = d.verdict.Status
 			} else {
-				// Fallback: the hook-driven status persisted before the
-				// restart (idle/thinking/permission) is the best estimate
-				// of the session's real state; only detail-less states fall
-				// back to Running. Recomputed from live status so a hook
-				// that fired during the probe window still wins over the
-				// on-disk value.
+				// Fallback: the hook-driven status persisted
+				// before the restart is the best estimate; only
+				// detail-less states fall back to Running.
+				// Recomputed from live status so a hook that fired
+				// during the probe window still wins.
 				switch persisted := resumeStatusSource(live.Status, d.fromDisk); persisted {
 				case StatusIdle, StatusThinking, StatusPermission:
 					live.Status = persisted
@@ -398,14 +374,11 @@ func (m *Manager) applyRecovery(decisions []recoverDecision) (saves []Session, m
 	return saves, monitors
 }
 
-// recoverStatusVerdict asks the session's agent adapter to re-derive the
-// status of a recovered pane-alive session from agent-side persistent data
-// (the Claude Code adapter reads the transcript's last turn). session is the
-// snapshot copy from the probe phase — the call runs WITHOUT m.mu held, which
-// is the point: the adapter may scan a large transcript. persisted is the
-// snapshot-time estimate from resumeStatusSource. Returns false when no
-// resolver is configured, the kind is unknown, or the adapter cannot tell —
-// the caller then keeps its own decision.
+// recoverStatusVerdict asks the session's agent adapter to re-derive the status
+// of a recovered pane-alive session from agent-side persistent data. session is
+// the probe-phase snapshot copy, and the call runs WITHOUT m.mu held, which is
+// the point: the adapter may scan a large transcript. Returns false when no
+// resolver is configured, the kind is unknown, or the adapter cannot tell.
 func (m *Manager) recoverStatusVerdict(session *Session, persisted Status) (StatusUpdate, bool) {
 	if m.agentResolver == nil {
 		return StatusUpdate{}, false
@@ -426,25 +399,19 @@ func (m *Manager) recoverStatusVerdict(session *Session, persisted Status) (Stat
 }
 
 // ensureTmuxClient lazily initializes the inner tmux client (-L jin).
-// Each CC session creates its own tmux session, so no shared session is needed.
 //
 // Must be called WITHOUT m.mu held: on a fresh init it runs recovery, which
-// takes and releases the lock per phase. tmuxInitMu is held for the whole
-// init INCLUDING that recovery pass, so when two callers race, the loser
-// blocks until the winner's recovery has been applied — its caller then
-// observes post-recovery state (StartBackground's isProcessRunning check
-// depends on this to not double-start a session whose pane is still alive),
-// and recovery runs at most once, so captureOutputTmux monitors cannot be
-// spawned twice.
+// takes and releases the lock per phase. tmuxInitMu is held for the whole init
+// INCLUDING that recovery, so a racing loser blocks until the winner's recovery
+// has been applied — StartBackground's isProcessRunning check depends on that
+// not to double-start a session whose pane is still alive — and recovery runs
+// at most once, so captureOutputTmux monitors cannot be spawned twice.
 //
 // Lock order: tmuxInitMu → m.mu. Nothing takes them in reverse.
 //
-// Uses tmux.DefaultSocketName() in production — JIN_TMUX_SOCKET wins over the
-// built-in "jin" so the e2e suite can redirect implicit tmux access; tests can
-// also override at the Manager level via SetTmuxSocketName, which takes
-// precedence over the env resolution when set. Either way, the auto-init must
-// not leak a server on the shared socket that the next daemon start would
-// inherit env from.
+// The socket name comes from tmux.DefaultSocketName() unless SetTmuxSocketName
+// overrode it. Either way the auto-init must not leak a server on the shared
+// socket that the next daemon start would inherit its environment from.
 func (m *Manager) ensureTmuxClient() {
 	m.tmuxInitMu.Lock()
 	defer m.tmuxInitMu.Unlock()
@@ -473,16 +440,15 @@ func (m *Manager) ensureTmuxClient() {
 	m.RecoverTmuxSessions()
 }
 
-// configureInnerTmux applies jin-specific settings to the inner tmux server.
-// User's ~/.tmux.conf is automatically loaded by tmux on server startup.
-// Must only be called after the inner tmux server is confirmed to exist (i.e., after
-// a session has been created).
-// This is called every time a session is started (not just once) because the inner
-// tmux server may have exited and restarted between sessions. The overhead is minimal.
+// configureInnerTmux applies jin-specific settings to the inner tmux server
+// (the user's ~/.tmux.conf is loaded by tmux itself on server startup). Only
+// valid once that server is confirmed to exist. It runs on every session start
+// rather than once, because the inner server may have exited and restarted in
+// between; the overhead is minimal.
 //
-// Note: remain-on-exit is NOT set globally. It is set per-pane only on managed
-// (tagged) panes via TagManagedPane, so user-added panes are immediately destroyed
-// on exit instead of showing "Pane is dead".
+// remain-on-exit is NOT set globally. TagManagedPane sets it per-pane on
+// managed panes only, so user-added panes are destroyed on exit instead of
+// showing "Pane is dead".
 func (m *Manager) configureInnerTmux() {
 	if m.tmuxClient == nil {
 		return
@@ -498,12 +464,11 @@ func (m *Manager) configureInnerTmux() {
 // artifacts such as hooks-settings.json are written; identity is the jin the
 // agents this Manager starts are told to call back into.
 //
-// identity is an argument rather than something buildAgentShellCmd assembles,
-// for the same reason stateDir is: a Manager honours what it was handed for
-// every other artifact it owns, and a value read from the process instead would
-// describe whichever daemon the reader happens to be, not the one that started
-// the agent. Its caller gives the same value to the plugin dispatcher, which is
-// how an agent and a plugin cannot be told to re-enter different binaries.
+// identity is an argument rather than something assembled here, for the same
+// reason stateDir is: a value read from the process would describe whichever
+// daemon the reader happens to be, not the one that started the agent. Its
+// caller gives the same value to the plugin dispatcher, so an agent and a
+// plugin cannot be told to re-enter different binaries.
 func NewManager(sessionsDir, stateDir string, identity jinenv.Identity, configMgr *config.Manager) (*Manager, error) {
 	store, err := NewStore(sessionsDir)
 	if err != nil {
@@ -572,15 +537,11 @@ type worktreeProvisioning struct {
 }
 
 // provisionWorktree runs the git subprocess chain and post-create hook that a
-// worktree-backed session needs before it is usable. All I/O runs outside
-// m.mu — this function never takes the manager lock. undo is a self-contained
-// closure that removes the worktree checkout and deletes the branch; the
-// caller must invoke it on any subsequent failure that leaves the session
-// unusable.
+// worktree-backed session needs before it is usable. All I/O runs outside m.mu.
+// undo removes the worktree checkout and deletes the branch; the caller must
+// invoke it on any later failure that leaves the session unusable.
 //
-// sessionID is used as the seed for the auto-derived worktree name. opts is
-// interpreted as if the caller had asked CreateWithOptions with the same
-// options; only the worktree path is populated (Worktree=true required).
+// sessionID seeds the auto-derived worktree name. Worktree=true is required.
 func (m *Manager) provisionWorktree(sessionID string, opts CreateOptions) (worktreeProvisioning, error) {
 	var out worktreeProvisioning
 	if !opts.Worktree {
@@ -733,26 +694,21 @@ func (m *Manager) provisionWorktree(sessionID string, opts CreateOptions) (workt
 	return out, nil
 }
 
-// ReserveCreation validates a create request, mints a session ID, and
-// registers a StatusCreating record so the client has an ID to poll
-// immediately. It does no external I/O — no git, no hook, no tmux. Callers
-// that want the whole worktree provisioning done inline (existing sync
-// tests, `CreateWithOptions`) do not use this directly.
+// ReserveCreation validates a create request, mints a session ID, and registers
+// a StatusCreating record so the client has an ID to poll immediately. It does
+// no external I/O — no git, no hook, no tmux.
 //
-// Returns both the live session pointer (used by the daemon's async
-// goroutine to pass through to ProvisionAsync — only sess.ID is read after
-// the caller releases m.mu, and sess.ID is immutable) and a value-copy Info
-// snapshot taken under the same critical section. Handlers must marshal the
-// response from that Info, not from sess.ToInfo(): once the goroutine kicks
-// off, ProvisionAsync can mutate the record and a later ToInfo() would race.
+// It returns the live session pointer (for ProvisionAsync; only the immutable
+// sess.ID is read once m.mu is released) and a value-copy Info taken in the
+// same critical section. Handlers must marshal the response from that Info,
+// not from sess.ToInfo(): once the goroutine kicks off, ProvisionAsync can
+// mutate the record and a later ToInfo() would race.
 //
-// For the worktree case, opts.WorkDir is treated as the repo root and the
-// resulting session's WorkDir is set to that path as a placeholder;
-// ProvisionAsync overwrites WorkDir with the final worktree path once
-// provisioning completes. The workDir conflict check is skipped in that
-// case because the placeholder is intentionally shared by concurrent
-// worktree sessions in the same repo — the final paths are guaranteed
-// unique by findAvailableWorktreeName.
+// For the worktree case opts.WorkDir is treated as the repo root and becomes a
+// placeholder WorkDir that ProvisionAsync overwrites. The workDir conflict
+// check is skipped there because the placeholder is deliberately shared by
+// concurrent worktree sessions in the same repo; findAvailableWorktreeName
+// guarantees the final paths are unique.
 func (m *Manager) ReserveCreation(opts CreateOptions) (*Session, Info, error) {
 	if opts.Fleet == "" {
 		opts.Fleet = DefaultFleet
@@ -833,17 +789,13 @@ func (m *Manager) ReserveCreation(opts CreateOptions) (*Session, Info, error) {
 }
 
 // ProvisionAsync runs the external provisioning work (git worktree add,
-// post-create hook) for a session previously registered by ReserveCreation.
-// On error, on-disk state is fully undone and the record is left untouched;
-// the caller decides how to surface the failure (typically via
-// MarkCreationFailed for the async handler path, or by dropping the record
-// for the sync-compat path).
+// post-create hook) for a session previously registered by ReserveCreation. On
+// error, on-disk state is fully undone and the record is left untouched; the
+// caller decides how to surface the failure.
 //
-// On success the session record's WorkDir is updated to the final worktree
-// path (worktree case), the baseline description is recomputed against that
-// path when unlocked, and the update is persisted. Status is left at
-// StatusCreating so callers can decide whether to move it forward
-// (StartBackground) or transition to StatusStopped ("ready to start").
+// On success WorkDir is updated to the final worktree path, the baseline
+// description is recomputed against it when unlocked, and the update is
+// persisted. Status is left at StatusCreating so callers decide what follows.
 func (m *Manager) ProvisionAsync(sess *Session, opts CreateOptions) (string, error) {
 	if !opts.Worktree {
 		// Nothing to provision — non-worktree sessions are usable as soon as
@@ -855,12 +807,9 @@ func (m *Manager) ProvisionAsync(sess *Session, opts CreateOptions) (string, err
 		return "", err
 	}
 
-	// ResolveRepoName stats the filesystem, so settle it before taking the
-	// lock. Note the contrast with GenerateBaselineDescription below, which is
-	// called while the lock IS held: that call is only reached when the
-	// description is unlocked, and it was accepted there as a bounded cost.
-	// Do not read it as this file's rule — walking the filesystem under m.mu
-	// stalls every other session.
+	// ResolveRepoName stats the filesystem, so settle it before taking the lock.
+	// GenerateBaselineDescription below is called while the lock IS held, as a
+	// bounded cost accepted there — do not read that as this file's rule.
 	repoName := ResolveRepoName(prov.worktreePath)
 
 	m.mu.Lock()
@@ -872,12 +821,10 @@ func (m *Manager) ProvisionAsync(sess *Session, opts CreateOptions) (string, err
 		prov.undo()
 		return "", fmt.Errorf("session %s no longer registered (deleted during provisioning)", sess.ID)
 	}
-	// Final WorkDir conflict check against the resolved worktree path. In
-	// practice findAvailableWorktreeName makes collisions extremely rare
-	// (session-id-derived names + -N suffixes), but the invariant "no two
-	// sessions manage the same directory" is preserved: the old sync path
-	// ran this check under the same critical section as the map insert, and
-	// tests pin the behaviour.
+	// Final WorkDir conflict check against the resolved worktree path.
+	// findAvailableWorktreeName makes collisions extremely rare, but "no two
+	// sessions manage the same directory" has to hold, and the map insert is in
+	// this same critical section.
 	if s := m.workDirConflictLocked(prov.worktreePath, sess.ID); s != nil {
 		m.mu.Unlock()
 		prov.undo()
@@ -885,13 +832,9 @@ func (m *Manager) ProvisionAsync(sess *Session, opts CreateOptions) (string, err
 	}
 	live.WorkDir = prov.worktreePath
 	// Recomputed against the final path rather than left on ReserveCreation's
-	// seed. The two agree in every reachable case today — a worktree resolves
-	// to the repo it was cut from, which is the repo root the reservation
-	// already saw — so this changes nothing on its own. It is here to keep the
-	// pair honest: WorkDir is being reassigned on this line, and RepoName
-	// describes WorkDir. Anything that later makes the reserved path and the
-	// provisioned path name different repos gets the right answer for free
-	// instead of a stale one nobody thought to look for.
+	// seed. The two agree in every reachable case today, so this changes nothing
+	// on its own; it keeps the pair honest, since WorkDir is being reassigned on
+	// this line and RepoName describes WorkDir.
 	live.RepoName = repoName
 	if !live.DescriptionLocked {
 		live.Description = GenerateBaselineDescription(prov.worktreePath, "", false, "")
@@ -906,15 +849,13 @@ func (m *Manager) ProvisionAsync(sess *Session, opts CreateOptions) (string, err
 	return prov.warning, nil
 }
 
-// MarkCreationFailed persists a failure verdict on a reserved session's
-// async creation: Status flips to Stopped and ErrorMessage carries err. The
-// record is kept so clients that poll `get` after the daemon accepted the
-// request can still see what happened. Idempotent — safe on already-deleted
-// or already-marked sessions.
+// MarkCreationFailed persists a failure verdict on a reserved session's async
+// creation: Status flips to Stopped and ErrorMessage carries err. The record is
+// kept so clients that poll `get` can still see what happened. Idempotent.
 //
-// The store.Save is fire-and-forget: the calling goroutine has no one to
-// report to, but a failed persist matters diagnostically (memory stays
-// authoritative and the next Save reconverges), so log rather than drop.
+// The store.Save is fire-and-forget: memory stays authoritative and the next
+// Save reconverges, but a failed persist matters diagnostically, so it is
+// logged rather than dropped.
 func (m *Manager) MarkCreationFailed(id string, err error) {
 	m.mu.Lock()
 	session, ok := m.sessions[id]
@@ -933,14 +874,12 @@ func (m *Manager) MarkCreationFailed(id string, err error) {
 	}
 }
 
-// SetCreationWarning records a non-fatal warning produced during async
-// creation (e.g. post-create hook detected but not allowed). The warning
-// lives on the session record until the session itself is deleted so
-// subsequent `get` responses can surface it. Idempotent — a repeat call
-// simply overwrites the previous value.
+// SetCreationWarning records a non-fatal warning produced during async creation
+// (e.g. post-create hook detected but not allowed). It lives on the record
+// until the session is deleted, so later `get` responses can surface it.
+// Idempotent — a repeat call overwrites the previous value.
 //
-// The store.Save is fire-and-forget (same reasoning as MarkCreationFailed):
-// log on failure so an unreachable filesystem is diagnosable.
+// The store.Save is fire-and-forget, same reasoning as MarkCreationFailed.
 func (m *Manager) SetCreationWarning(id string, warning string) {
 	m.mu.Lock()
 	session, ok := m.sessions[id]
@@ -966,20 +905,15 @@ func (m *Manager) dropSession(id string) {
 	_ = m.store.Delete(id)
 }
 
-// CreateWithOptions creates a new session with full options, synchronously.
-// It is a thin composition of ReserveCreation + ProvisionAsync + (on
-// failure) dropSession, preserving the historical contract that no session
-// record is persisted when creation fails.
+// CreateWithOptions creates a new session with full options, synchronously. It
+// is a thin composition of ReserveCreation + ProvisionAsync + (on failure)
+// dropSession, preserving the contract that no session record is persisted when
+// creation fails.
 //
-// The second return value is retained for signature compatibility and is
-// always "". Any non-fatal warning produced during provisioning is written
-// to Session.CreationWarning (via SetCreationWarning), which is the single
-// source of truth for both the sync and async paths — callers read it back
-// through Get / GetInfo.
-//
-// Prefer ReserveCreation + ProvisionAsync directly when the caller wants
-// its session ID before external I/O completes (the daemon's `new` handler
-// takes that path).
+// The second return value is retained for signature compatibility and is always
+// "": a warning goes to Session.CreationWarning, which callers read back
+// through Get / GetInfo. Prefer ReserveCreation + ProvisionAsync directly when
+// the caller wants its session ID before external I/O completes.
 func (m *Manager) CreateWithOptions(opts CreateOptions) (*Session, string, error) {
 	sess, _, err := m.ReserveCreation(opts)
 	if err != nil {
@@ -1011,19 +945,13 @@ func (m *Manager) List() []Info {
 	}
 	m.mu.RUnlock()
 
-	// Phase 2: Enrich with transcript data outside lock (slow I/O).
+	// Phase 2: enrich with transcript data outside the lock (slow I/O).
 	//
-	// Concurrently, because this is the expensive part and the rows are
-	// independent: no lock is held here (RUnlock is above), each iteration
-	// writes its own element, and every adapter's Transcript() is constructed
-	// per call rather than shared, which is what makes parallel reads safe.
-	// The daemon already serves connections one goroutine apiece, so two
-	// clients can enter List together today regardless.
-	//
-	// It matters because the TUI refetches the whole list every two seconds.
-	// Measured over 40 transcripts: 248ms serial against 133ms across four
-	// workers (1.87x, 3 runs each). The bound is what keeps peak memory to
-	// that many live []Entry rather than one per session.
+	// Concurrently, because the rows are independent: no lock is held, each
+	// iteration writes its own element, and every adapter's Transcript() is
+	// constructed per call. It matters because the TUI refetches the whole list
+	// every two seconds — measured over 40 transcripts, 248ms serial against
+	// 133ms across four workers. The bound also caps how many []Entry are live.
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 	var wg sync.WaitGroup
 	for i := range infos {
@@ -1045,35 +973,22 @@ func (m *Manager) List() []Info {
 // AttachLastMessages fills in the two message previews the list rows and
 // `session info` show, reading through the adapter that owns the session.
 //
-// It used to build the Claude Code reader directly, whatever kind the session
-// ran, so a codex or opencode row simply stayed blank — and because the read
-// error was discarded, blank was indistinguishable from a session that had not
-// spoken. `jin session result` stopped doing that; this is the same fix for
-// the surface a person actually looks at.
+// Every failure stays silent here, deliberately and unlike `session result`:
+// this decorates a row that has to render either way, and failing a whole
+// `session list` because one transcript was unreadable would be worse than a
+// row with an empty second line.
 //
-// Every failure stays silent here, which is deliberate and different from
-// `session result`: this decorates a row that has to render either way, and a
-// list command that failed because one session's transcript was unreadable
-// would be worse than a row with an empty second line.
+// A reader that has not declared itself cheap is skipped, and that is the
+// difference between this being a read and being a fork. List calls this for
+// every row, in parallel, and the TUI refreshes on a timer; the opencode
+// reader answers by running `opencode export`, a subprocess whatever the
+// session's size. Neither this function nor that reader is wrong on its own,
+// which is exactly why the guard has to be here rather than in either.
 //
-// A reader that has not declared itself cheap is skipped, and that is not
-// caution — it is the difference between this being a read and being a fork.
-// List calls this for every row, in parallel, and the TUI refreshes on a
-// timer; the opencode reader answers by running `opencode export`, which costs
-// a subprocess whatever the session's size. Left unguarded, a list holding
-// three opencode rows would start three processes every couple of seconds,
-// to fill in a second line. Neither this function nor that reader is wrong on
-// its own, which is exactly why the guard has to be here rather than in either
-// of them.
-//
-// The guard sits in here rather than at the callers, which is a trade rather
-// than a deduction: List refreshes the TUI on a timer, but handleGet also
-// serves one-shot commands — `session info`, `session output`,
-// `set-description`, the action popup — and those would happily pay a second
-// and a half for a preview. They lose it too. That is the accepted answer for
-// opencode specifically, where the preview is not wanted; a kind that both
-// needs previews and costs a subprocess would have to lift this check out to
-// the callers and let the one-shot ones through.
+// The guard sits here rather than at the callers, which is a trade: handleGet
+// also serves one-shot commands — `session info`, `session output` — that
+// would happily pay for a preview, and they lose it too. A kind that both
+// needed previews and cost a subprocess would have to lift this check out.
 func (m *Manager) AttachLastMessages(info *Info) {
 	if info.AgentSessionID == "" || info.WorkDir == "" {
 		return
@@ -1145,30 +1060,23 @@ func (m *Manager) SetStatus(id string, status Status) {
 // The values below were fixed by measurement against Claude Code 2.1.220,
 // Codex 0.144.6 and OpenCode 1.17.18 driven through a throwaway tmux server.
 var (
-	// sendVerifyTimeoutBase is the fixed part of the send-verify retry
-	// budget. The total also scales with the prompt (see sendVerifyBudget):
-	// a large prompt costs more per attempt, so a flat 5s would leave big
-	// sends with no retries at all. On timeout SendPrompt returns an error
-	// before ever pressing Enter, so buffered/dropped keystrokes never
-	// reach the agent as a half-formed prompt.
+	// sendVerifyTimeoutBase is the fixed part of the send-verify retry budget;
+	// the total also scales with the prompt (see sendVerifyBudget), since a
+	// flat 5s would leave big sends with no retries at all. On timeout
+	// SendPrompt returns an error before ever pressing Enter.
 	sendVerifyTimeoutBase = 5 * time.Second
-	// sendVerifyPerChunk and sendVerifyPerClearKey extend that budget by
-	// the cost of one chunk send and one clear keypress. Every tmux verb
-	// is a separate process (Client resolves the binary once via
-	// exec.LookPath, then execs it per call), so the dominant term is
-	// process startup — the payload barely matters.
-	//
-	// Measured against a throwaway tmux server driving a plain shell pane:
+	// sendVerifyPerChunk and sendVerifyPerClearKey extend that budget by the
+	// cost of one chunk send and one clear keypress. Every tmux verb is a
+	// separate process, so process startup dominates and the payload barely
+	// matters:
 	//
 	//	direct tmux 3.6a binary     ~1.4ms per send-keys / capture-pane
 	//	exec.Command from Go        ~3ms   (what this package actually does)
 	//	from a shell, via a shim    ~33ms  (the shim re-execs the real one)
 	//
-	// The budget is sized from the slow figure. Over-estimating only makes
-	// a genuinely stuck send take longer to report failure; under-estimating
-	// silently reduces large prompts to a single attempt with no retry,
-	// which is the failure this scaling exists to prevent. perChunk also
-	// carries sendChunkDelay, which is paid between every pair of chunks.
+	// Sized from the slow figure: over-estimating only delays reporting a
+	// genuinely stuck send, while under-estimating silently reduces large
+	// prompts to a single attempt with no retry.
 	sendVerifyPerClearKey = 35 * time.Millisecond
 	// Derived rather than written as a literal so that changing
 	// sendChunkDelay cannot silently under-budget the loop: a chunk costs one
@@ -1183,77 +1091,59 @@ var (
 	// next re-send. Kept small so a genuinely-not-ready TUI recovers
 	// within a few hundred ms once it is ready.
 	sendVerifyBackoff = 100 * time.Millisecond
-	// sendVerifyTailBytes controls how many trailing bytes of the
-	// normalized prompt we look for in the capture. Long prompts get
-	// wrapped by the TUI's input area, so matching only the tail avoids
-	// reflow false negatives while still uniquely identifying the send.
+	// sendVerifyTailBytes is how many trailing bytes of the normalized prompt
+	// are looked for in the capture. Long prompts get wrapped by the TUI's
+	// input area, so matching only the tail avoids reflow false negatives.
 	//
-	// Do not raise this hoping for a stronger anchor: a longer needle is
-	// MORE likely to straddle a wrapped row, not less. NormalizeForVerify
-	// is what makes the match robust, not the length.
+	// Do not raise this hoping for a stronger anchor: a longer needle is MORE
+	// likely to straddle a wrapped row, not less.
 	sendVerifyTailBytes = 32
-	// sendClearSettleDelay is how long we wait after sending the adapter's
-	// ClearInputKeys sequence before capturing the baseline. Long enough
-	// for a well-behaved TUI to render the empty input line; short enough
-	// that it contributes negligibly to the verify budget even across a
-	// full retry chain. Skipped entirely when the resolved adapter returns
-	// nil / empty keys (opt-out) or the resolver could not produce one.
+	// sendClearSettleDelay is the wait after the adapter's ClearInputKeys
+	// sequence before capturing the baseline — long enough for a well-behaved
+	// TUI to render the empty input line, short enough to stay negligible
+	// across a full retry chain. Skipped when the adapter returns no keys.
 	sendClearSettleDelay = 20 * time.Millisecond
-	// sendDismissSettleDelay is how long we wait after the adapter's
-	// DismissOverlayKeys sequence before re-capturing to confirm the prompt
-	// survived it.
+	// sendDismissSettleDelay is the wait after the adapter's DismissOverlayKeys
+	// sequence before re-capturing to confirm the prompt survived it.
 	//
-	// This one cannot be sized by analogy with sendClearSettleDelay above.
-	// That delay guards a step whose effect is never checked, so being short
-	// only risks a wasted keypress. Here the delay is the check: capture too
-	// early and the pane still shows the pre-dismiss state, where the prompt
-	// is present by definition — so the re-check passes no matter what the
-	// keys did, which is the failure it exists to catch.
-	//
-	// Measured against Claude Code 2.1.224 by sending the destructive case
-	// (C-u, which empties the input) and polling capture-pane until the
-	// change showed: 54, 83, 93, 116 and 161ms over five runs. 250ms clears
-	// the slowest of those with margin. It is paid only by prompts an
-	// adapter flagged as able to open an overlay, and only once per send —
-	// not per attempt — so the cost does not scale with anything.
+	// It cannot be sized by analogy with sendClearSettleDelay: that delay guards
+	// a step whose effect is never checked, so being short only risks a wasted
+	// keypress. Here the delay IS the check — capture too early and the pane
+	// still shows the pre-dismiss state, where the prompt is present by
+	// definition. Measured on Claude Code 2.1.224 with the destructive case
+	// (C-u): 54, 83, 93, 116 and 161ms over five runs. Paid once per send, and
+	// only for prompts an adapter flagged as able to open an overlay.
 	sendDismissSettleDelay = 250 * time.Millisecond
 
-	// sendVerifyLooks is how many times one attempt re-checks the pane
-	// before giving up and re-sending, and sendVerifyLookDelay is the gap
-	// between those looks (the first uses sendVerifySettleDelay, so a TUI
-	// that renders promptly stays as responsive as before).
+	// sendVerifyLooks is how many times one attempt re-checks the pane before
+	// giving up and re-sending; sendVerifyLookDelay is the gap between looks
+	// (the first uses sendVerifySettleDelay).
 	//
-	// Looking is cheap — a nudge plus a capture — while re-sending clears
-	// the input and pushes the whole prompt again, discarding whatever the
-	// TUI had drawn. Without this, an agent slower than one settle delay is
-	// reset before it can finish and never verifies at all: Codex with a
-	// 16KB prompt burned the entire budget across 16 attempts, then passed
-	// in 1.7s once the attempt looked instead of re-sending.
+	// Looking is cheap — a nudge plus a capture — while re-sending clears the
+	// input and pushes the whole prompt again, discarding whatever the TUI had
+	// drawn. Without this, an agent slower than one settle delay is reset before
+	// it can finish: Codex with a 16KB prompt burned the entire budget across 16
+	// attempts, then passed in 1.7s once the attempt looked instead of resending.
 	//
-	// The count scales with the prompt because each look sends one nudge, and
-	// on OpenCode the nudge is what walks the cursor toward the end of a
-	// multi-row input (see sendNudgeKey). One look per assumed row, plus a
-	// base for agents that just need a repaint or two. Claude and Codex
-	// verify on the first look, so the extra allowance costs them nothing.
+	// The count scales with the prompt because each look sends one nudge, and on
+	// OpenCode the nudge is what walks the cursor toward the end of a multi-row
+	// input (see sendNudgeKey).
 	sendVerifyLooksBase = 10
 	sendVerifyLooksMax  = 60
 	sendVerifyLookDelay = 200 * time.Millisecond
 
-	// sendChunkMaxBytes caps one SendKeysLiteral payload. Two separate
-	// ceilings force the split:
+	// sendChunkMaxBytes caps one SendKeysLiteral payload. Two separate ceilings
+	// force the split:
 	//
-	//   - tmux send-keys -l refuses arguments over 16341 bytes outright
-	//     ("command too long").
-	//   - the agent TUIs fold a single oversized read into a
-	//     "[Pasted Content N chars]" placeholder, which hides the prompt
-	//     tail from capture-pane and breaks verify even though the text
-	//     landed. Measured fold thresholds: Claude 801B, Codex 1001B,
-	//     OpenCode none.
+	//   - tmux send-keys -l refuses arguments over 16341 bytes outright.
+	//   - the agent TUIs fold a single oversized read into a "[Pasted Content N
+	//     chars]" placeholder, which hides the prompt tail from capture-pane and
+	//     breaks verify even though the text landed. Measured fold thresholds:
+	//     Claude 801B, Codex 1001B, OpenCode none.
 	//
-	// 800 is the largest value that stays under every measured threshold.
-	// Deliberately NOT an adapter capability: all three agents are served
-	// by one number, and no measured pain justifies the branch yet. Promote
-	// it when a fourth agent actually needs a different ceiling.
+	// 800 is the largest value under every measured threshold. One number serves
+	// all three agents; make it an adapter capability when a fourth needs a
+	// different ceiling.
 	sendChunkMaxBytes = 800
 	// sendChunkDelay separates consecutive chunk sends. With no delay,
 	// Codex coalesces adjacent chunks into a single read and folds them
@@ -1261,88 +1151,63 @@ var (
 	// produced placeholders swallowing 2400-3200B; at 20ms, zero). Claude
 	// does not need it and is unharmed by it.
 	sendChunkDelay = 20 * time.Millisecond
-	// sendNudgeKey is sent before each verify capture. Two agents need it
-	// for two different reasons:
+	// sendNudgeKey is sent before each verify capture. Two agents need it, for
+	// two different reasons:
 	//
-	//   - Codex repaints only on key events, so without one a capture can
-	//     show stale content indefinitely (measured: still stale after 37s).
-	//   - OpenCode draws only a fixed-size window of its input buffer, and
-	//     that window follows the CURSOR. A prompt taller than the window
-	//     leaves the tail undrawn — and undrawn means capture-pane cannot see
-	//     it at all: the rest of the text lives only inside OpenCode and was
-	//     never written to the terminal.
+	//   - Codex repaints only on key events, so without one a capture can show
+	//     stale content indefinitely (measured: still stale after 37s).
+	//   - OpenCode draws only a fixed-size window of its input buffer, and that
+	//     window follows the CURSOR. A prompt taller than the window leaves the
+	//     tail undrawn — and undrawn means capture-pane cannot see it at all:
+	//     the rest lives only inside OpenCode, never written to the terminal.
 	//
-	// "Down" rather than "End" because of that second case. `End` goes to the
-	// end of the current visual row, which on a wrapped multi-row input never
-	// reaches the end of the buffer, so the window never scrolls and the tail
-	// is never drawn. `Down` advances one row at a time, walking the cursor —
-	// and the window with it — toward the end. Measured on a 48-column pane:
-	// a 2KB prompt stayed invisible under `End` at every interval tried, and
-	// became visible after roughly 20 `Down` presses. `C-End`, `NPage` and
-	// `C-e` did nothing.
+	// "Down" rather than "End" because of that second case. `End` goes to the end
+	// of the current visual row, which on a wrapped input never reaches the end
+	// of the buffer, so the window never scrolls. Measured on a 48-column pane, a
+	// 2KB prompt stayed invisible under `End` at every interval tried and became
+	// visible after roughly 20 `Down` presses; `C-End`, `NPage` and `C-e` did
+	// nothing.
 	//
-	// This stays one constant instead of an adapter capability, but NOT for
-	// the reason originally recorded here. That reason was "safe to send
-	// unconditionally", resting on measurements against an empty input (five
-	// presses left the pane byte-identical — no history recall dropping text
-	// into the field) and against a filled one (twenty presses preserved
-	// every byte). Both still hold, and both were taken on inputs with no
-	// completion overlay open. On an input that has one, `Down` is not inert:
-	// it walks the overlay's selection. Measured on Claude Code 2.1.224 with a
-	// slash prefix matching two commands: without the nudge the first entry
-	// ran, with it the second did, 3/3 each — a different command from the one
-	// the caller sent.
-	//
-	// It stays a constant because the fix belongs at the other end. The
-	// adapter's DismissOverlayKeys closes the overlay before Enter, which
-	// discards the selection the nudge moved, so the same prefix submits
-	// verbatim (3/3). Making the nudge itself conditional would instead cost
-	// the thing it exists for: the look count scales with the prompt because
-	// each look nudges, and on OpenCode those nudges are what walk a tall
-	// input's tail into view at all.
+	// `Down` is NOT inert on an input holding a completion overlay: it walks the
+	// overlay's selection. Measured on Claude Code 2.1.224 with a slash prefix
+	// matching two commands, the second ran rather than the first, 3/3. The fix
+	// belongs at the other end — DismissOverlayKeys closes the overlay before
+	// Enter — because making the nudge conditional would cost the thing it
+	// exists for on OpenCode.
 	sendNudgeKey = "Down"
 	// sendPasteBufferName is the tmux buffer the paste transport reuses.
 	// A fixed name keeps the buffer stack from growing; PasteBuffer's `-d`
 	// removes it right after pasting, so a prompt is never left readable
 	// there.
 	sendPasteBufferName = "jin-prompt"
-	// sendClearWidthAssumed is the input-line width assumed when deciding
-	// how many times to repeat the clear sequence. Each press clears one
-	// visual row, so the count has to cover however many rows the residue
-	// occupies.
+	// sendClearWidthAssumed is the input-line width assumed when deciding how
+	// many times to repeat the clear sequence, since each press clears one
+	// visual row.
 	//
-	// Deliberately below every measured width (Claude 196, Codex 197,
-	// OpenCode 70): overshooting is harmless — the clear key is a no-op on
-	// empty input (verified at 80 presses on Claude, 40 on Codex and
-	// OpenCode) — while undershooting leaves residue that concatenates
-	// with the prompt at Enter time.
+	// Deliberately below every measured width (Claude 196, Codex 197, OpenCode
+	// 70): overshooting is harmless — the clear key is a no-op on empty input —
+	// while undershooting leaves residue that concatenates with the prompt at
+	// Enter time.
 	sendClearWidthAssumed = 60
-	// sendClearMaxKeys caps the repeat count so a pathological prompt
-	// cannot spin the pane for minutes. 512 repeats x 60 columns covers
-	// roughly 30KB of residue; past that SendPrompt continues best-effort
-	// with a possibly-incomplete clear (documented in docs/gotchas.md).
+	// sendClearMaxKeys caps the repeat count so a pathological prompt cannot
+	// spin the pane for minutes. 512 repeats x 60 columns covers roughly 30KB of
+	// residue; past that SendPrompt continues best-effort with a
+	// possibly-incomplete clear (documented in docs/gotchas.md).
 	//
-	// This is the dominant cost of a large send: one tmux process per
-	// press. A 16KB prompt costs 277 of them — under a second at the ~3ms
-	// the daemon actually pays, but ~9s if tmux resolves through a shell
-	// wrapper. `send-keys -N` would batch them, but it was measured to have
-	// no effect on Claude or OpenCode (only Codex honours it), so the
-	// presses cannot be collapsed.
+	// This is the dominant cost of a large send: one tmux process per press.
+	// `send-keys -N` would batch them, but only Codex honours it.
 	sendClearMaxKeys = 512
 )
 
-// Respond tuning. Kept as vars for the same reason as the send knobs above —
-// tests shorten them — but read them differently. The send values are
-// measurements; these are bounds. Nothing below was derived from timing a
-// dialog, and none of them should be quoted as if it were: they are ceilings
-// picked to be generous, so what each comment states is what happens when the
-// ceiling is reached.
+// Respond tuning. Kept as vars so tests can shorten them, like the send knobs
+// above, but read them differently: the send values are measurements, these are
+// bounds. Nothing below was derived from timing a dialog, and none of them
+// should be quoted as if it were.
 //
-// Being generous is cheap in both directions here. Overshooting costs a slower
-// error on a session that was never going to answer, and RespondToBlock reports
-// that case rather than papering over it. Undershooting would report failure on
-// an agent that simply had not repainted yet — while the keys are already in the
-// pane, which is the worse of the two.
+// Being generous is cheap in both directions. Overshooting costs a slower error
+// on a session that was never going to answer, which RespondToBlock reports
+// rather than papers over; undershooting would report failure on an agent that
+// had merely not repainted yet, with the keys already in the pane.
 var (
 	// respondClearPollDelay is the pause between two captures. Both loops use
 	// it: the one waiting for a Verify step's text to render, and the one
@@ -1358,48 +1223,41 @@ var (
 	// its own text before giving up.
 	//
 	// There is no re-send behind it, which is the difference from
-	// sendVerifyLooksBase. SendPrompt can push the whole prompt again because a
-	// TUI input line is idempotent; the keys here address a dialog by position,
-	// so sending them twice answers a different question. Exhausting the looks
-	// therefore abandons the sequence: the steps after this one — the Enter that
-	// commits — are not sent at all.
+	// sendVerifyLooksBase: a TUI input line is idempotent, but these keys address
+	// a dialog by position, so sending them twice answers a different question.
+	// Exhausting the looks abandons the sequence — the committing Enter after it
+	// is not sent at all.
 	respondVerifyLooks = 10
 )
 
-// ErrBlockNotCleared reports that a prompt was still on screen after its
-// answer was sent.
+// ErrBlockNotCleared reports that a prompt was still on screen after its answer
+// was sent.
 //
-// It is a sentinel rather than a phrase to match because the CLI maps exactly
-// this case to the timeout exit code, and the two live in different packages.
-// A reworded message would otherwise turn a documented exit 4 into a generic
-// exit 1 with nothing failing — the README, the Japanese README and the
-// embedded exit-codes doc all promise the 4.
+// It is a sentinel rather than a phrase to match, because the CLI maps exactly
+// this case to the timeout exit code and the two live in different packages. A
+// reworded message would turn a documented exit 4 into a generic exit 1 with
+// nothing failing.
 var ErrBlockNotCleared = errors.New("the prompt was still on screen")
 
 // NormalizeForVerify strips every rune that the TUI may inject into — or
-// around — the prompt while rendering it, so a needle taken from the
-// prompt still matches the captured pane.
+// around — the prompt while rendering it, so a needle taken from the prompt
+// still matches the captured pane.
 //
 // Two classes are removed:
 //
-//   - Whitespace. capture-pane emits a newline at each wrap position and
-//     the TUIs pad with cursor-positioning spaces. Collapsing runs to a
-//     single space is not enough: the wrap inserts a separator where the
-//     prompt has none, so the needle and the haystack disagree exactly at
-//     the seam. Measured failure rate for a 32-byte tail: ~16% on Claude
-//     and Codex, ~44% on OpenCode. Japanese text meets the condition
-//     essentially always.
-//   - Box-drawing runes (U+2500-U+257F). OpenCode draws a vertical bar at
-//     the start of every wrapped row, so whitespace removal alone still
-//     leaves a stray glyph inside the needle's span.
+//   - Whitespace. capture-pane emits a newline at each wrap position and the
+//     TUIs pad with cursor-positioning spaces. Collapsing runs to a single
+//     space is not enough: the wrap inserts a separator where the prompt has
+//     none, so needle and haystack disagree exactly at the seam. Measured
+//     failure rate for a 32-byte tail: ~16% on Claude and Codex, ~44% on
+//     OpenCode. Japanese text meets the condition essentially always.
+//   - Box-drawing runes (U+2500-U+257F). OpenCode draws a vertical bar at the
+//     start of every wrapped row.
 //
-// Applied to BOTH sides of the comparison, so a prompt that legitimately
-// contains box-drawing characters stays symmetric and still matches.
-//
-// Exported for the same reason as PromptVerifiable: an adapter matching its
-// own screen literals against a capture — Agent.DetectBlock does — faces the
-// wrap seam this was written for, and a second normalizer written next to it
-// would drift. Callers must apply it to both sides.
+// Apply it to BOTH sides of the comparison, so a prompt that legitimately
+// contains box-drawing characters stays symmetric and still matches. Exported
+// for the same reason as PromptVerifiable: Agent.DetectBlock faces the same
+// wrap seam, and a second normalizer written next to it would drift.
 func NormalizeForVerify(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -1422,17 +1280,14 @@ func survivesNormalize(r rune) bool { return !unicode.IsSpace(r) && !isBoxDrawin
 // use those for solid banners, which do not appear inside the input area.
 func isBoxDrawing(r rune) bool { return r >= 0x2500 && r <= 0x257F }
 
-// PromptVerifiable reports whether SendPrompt can prove that the given
-// prompt reached the pane. Verification works by finding the prompt's tail
-// in the captured pane, and NormalizeForVerify discards whitespace and
-// box-drawing runes — so a prompt built only from those normalizes to
-// nothing, leaves no needle to search for, and would be accepted without
-// any evidence it landed.
+// PromptVerifiable reports whether SendPrompt can prove that the given prompt
+// reached the pane. Verification works by finding the prompt's tail in the
+// captured pane, and NormalizeForVerify discards whitespace and box-drawing
+// runes — so a prompt built only from those normalizes to nothing, leaves no
+// needle, and would be accepted without any evidence it landed.
 //
-// Callers that accept prompts from outside should reject the ones this
-// rejects, rather than letting SendPrompt press Enter unverified. Exported
-// so that check lives next to the normalization it depends on, and shares
-// its rule via survivesNormalize.
+// Callers that accept prompts from outside should reject the ones this rejects,
+// rather than letting SendPrompt press Enter unverified.
 func PromptVerifiable(prompt string) bool {
 	// Scan for the first surviving rune rather than building the normalized
 	// copy: the answer is a bool, and an ordinary prompt decides it on the
@@ -1462,14 +1317,13 @@ func promptTail(prompt string, n int) string {
 	return s
 }
 
-// chunkPrompt splits s into consecutive pieces of at most max bytes,
-// never cutting a rune in half. Concatenating the result reproduces s
-// exactly. Returns nil for an empty string so the caller sends nothing.
+// chunkPrompt splits s into consecutive pieces of at most max bytes, never
+// cutting a rune in half. Concatenating the result reproduces s exactly.
+// Returns nil for an empty string so the caller sends nothing.
 //
-// A rune longer than max is emitted whole rather than split: the chunk
-// then exceeds max, which is still far below tmux's hard limit, and it
-// guarantees forward progress. At max=800 this is unreachable, but a
-// test shrinking the value must not deadlock.
+// A rune longer than max is emitted whole rather than split: the chunk then
+// exceeds max, which is still far below tmux's hard limit, and it guarantees
+// forward progress for a test that shrinks the value.
 func chunkPrompt(s string, max int) []string {
 	if s == "" || max <= 0 {
 		return nil
@@ -1494,21 +1348,18 @@ func chunkPrompt(s string, max int) []string {
 	return out
 }
 
-// sendClearRepeats returns how many times the adapter's clear sequence
-// must be repeated to wipe a residue of at most promptLen bytes. The count
-// is derived from the prompt's own length: a retry can only ever face
-// residue from what we sent, which makes the prompt an upper bound. The +4
-// covers the partial first row plus rounding.
+// sendClearRepeats returns how many times the adapter's clear sequence must be
+// repeated to wipe a residue of at most promptLen bytes. A retry can only ever
+// face residue from what we sent, which makes the prompt an upper bound; the
+// +4 covers the partial first row plus rounding.
 //
-// The per-row assumption comes from Claude Code, which was measured to drop
-// exactly one visual row per press (72 characters off a 270-character
-// input, 171 off a 1350-character one). Codex and OpenCode empty their
-// input on the first press, so every repeat after that is a no-op there —
-// wasteful, but harmless, and one number keeps the caller free of
-// per-adapter branching.
+// The per-row assumption comes from Claude Code, measured to drop exactly one
+// visual row per press (72 characters off a 270-character input, 171 off a
+// 1350-character one). Codex and OpenCode empty their input on the first press,
+// so every repeat after that is a harmless no-op there, and one number keeps
+// the caller free of per-adapter branching.
 //
-// The result is a repeat count for the whole sequence, not a keypress
-// count — an adapter returning two keys issues 2*n presses.
+// The result is a repeat count for the whole sequence, not a keypress count.
 func sendClearRepeats(promptLen int) int {
 	return min(promptLen/sendClearWidthAssumed+4, sendClearMaxKeys)
 }
@@ -1521,12 +1372,11 @@ func sendVerifyLookCount(promptLen int) int {
 	return min(sendVerifyLooksBase+promptLen/sendClearWidthAssumed, sendVerifyLooksMax)
 }
 
-// sendVerifyBudget returns how long the retry loop may run for a send of
-// the given shape. A large prompt costs more per attempt — more chunks,
-// each with its delay, more clear presses, each a tmux process, and more
-// looks, each with its delay — so a flat timeout would silently reduce big
-// sends to a single attempt, or cut the look loop short before the tail has
-// been walked into view.
+// sendVerifyBudget returns how long the retry loop may run for a send of the
+// given shape. A large prompt costs more per attempt — more chunks, more clear
+// presses, more looks, each with a delay — so a flat timeout would silently
+// reduce big sends to a single attempt, or cut the look loop short before the
+// tail has been walked into view.
 func sendVerifyBudget(chunks, clearPresses, looks int) time.Duration {
 	return sendVerifyTimeoutBase +
 		time.Duration(chunks)*sendVerifyPerChunk +
@@ -1534,17 +1384,14 @@ func sendVerifyBudget(chunks, clearPresses, looks int) time.Duration {
 		time.Duration(looks)*sendVerifyLookDelay
 }
 
-// sendVerifyOK reports whether the pane's captured content shows that
-// the prompt landed in the TUI's input area since the pre-send snapshot.
-// The check compares occurrence counts of promptTail(prompt) between
-// before and after so that pane content that already carried the tail
-// (previous conversation, help text, etc.) does not falsely satisfy
-// the verify.
+// sendVerifyOK reports whether the pane's captured content shows that the
+// prompt landed in the TUI's input area since the pre-send snapshot. It
+// compares occurrence counts of promptTail(prompt) between before and after, so
+// pane content that already carried the tail does not falsely satisfy it.
 //
-// A prompt that normalizes to nothing is treated as trivially accepted,
-// because there is no needle to look for. That branch is only safe as long
-// as callers reject those first — daemon.handleSend does, via
-// PromptVerifiable, which is defined as the exact complement of this case.
+// A prompt that normalizes to nothing is treated as trivially accepted, because
+// there is no needle to look for. That branch is only safe as long as callers
+// reject those first — daemon.handleSend does, via PromptVerifiable.
 func sendVerifyOK(before, after, prompt string) bool {
 	return sendVerifyLanded(NormalizeForVerify(before), after,
 		promptTail(prompt, sendVerifyTailBytes))
@@ -1553,20 +1400,16 @@ func sendVerifyOK(before, after, prompt string) bool {
 // sendVerifyLanded is sendVerifyOK with the invariant work hoisted out: the
 // needle is fixed for the whole send and the baseline for the whole attempt,
 // while only `after` changes between looks. SendPrompt normalizes `after`
-// itself and calls sendVerifyAppeared, because it looks up to
-// sendVerifyLooksMax times per attempt against as many as two needles, and
-// normalizing a 32KB capture per needle per look would cost more than the
-// capture it is checking.
+// itself and calls sendVerifyAppeared, because normalizing a 32KB capture per
+// needle per look would cost more than the capture it is checking.
 func sendVerifyLanded(beforeNorm, after, tail string) bool {
 	return sendVerifyAppeared(beforeNorm, NormalizeForVerify(after), tail)
 }
 
 // sendVerifyAppeared reports whether needle occurs more often in the pane now
-// than it did at the baseline. Both sides are already normalized.
-//
-// Comparing counts rather than testing presence is what stops pane content
-// that already carried the needle — an earlier turn in the same conversation,
-// help text — from vouching for a prompt that never arrived.
+// than it did at the baseline; both sides are already normalized. Comparing
+// counts rather than testing presence is what stops pane content that already
+// carried the needle from vouching for a prompt that never arrived.
 func sendVerifyAppeared(beforeNorm, afterNorm, needle string) bool {
 	if needle == "" {
 		return true
@@ -1578,28 +1421,27 @@ func sendVerifyAppeared(beforeNorm, afterNorm, needle string) bool {
 	return nAfter > strings.Count(beforeNorm, needle)
 }
 
-// SendPrompt sends a prompt to a session's tmux pane.
-// The session must be in idle status.
+// SendPrompt sends a prompt to a session's tmux pane. The session must be in
+// idle status.
 //
-// tmux send-keys is fire-and-forget from tmux's point of view: it
-// always reports success, even when the TUI has not finished its
-// startup redraw and drops the incoming keys. To make this observable,
-// SendPrompt captures the pane before and after each send attempt and
-// checks that the tail of prompt appeared in the visible buffer.
-// Attempts repeat with backoff until the check passes or the budget from
-// sendVerifyBudget elapses. Enter is only pressed after verify succeeds,
-// so fully-dropped prompts never get committed.
+// tmux send-keys is fire-and-forget from tmux's point of view: it always
+// reports success, even when the TUI has not finished its startup redraw and
+// drops the incoming keys. SendPrompt therefore captures the pane before and
+// after each attempt and checks that the tail of prompt appeared. Attempts
+// repeat with backoff until the check passes or sendVerifyBudget elapses, and
+// Enter is pressed only after verify succeeds, so a fully-dropped prompt is
+// never committed.
 //
-// That last guarantee does not invert. "Verify failed" does mean nothing was
-// committed; "verify passed" does NOT mean the prompt will be. Verify can
-// only see what the pane renders, and a rendered input line says nothing
-// about what the TUI will do with the next keypress — an agent holding a
-// completion overlay open consumes Enter to accept a candidate instead,
-// rewriting the input and submitting nothing. Closing that overlay is the
-// adapter's job (DismissOverlayKeys), and the step after it re-checks that
-// the prompt survived; beyond those two, a send that returns nil has
-// delivered keystrokes and pressed Enter, not proven a turn began. Callers
-// that need the stronger fact poll for it (`send --wait-running`).
+// That guarantee does not invert. "Verify failed" does mean nothing was
+// committed; "verify passed" does NOT mean the prompt will be. Verify sees only
+// what the pane renders, and a rendered input line says nothing about what the
+// TUI will do with the next keypress — an agent holding a completion overlay
+// open consumes Enter to accept a candidate instead, rewriting the input and
+// submitting nothing. Closing that overlay is the adapter's job
+// (DismissOverlayKeys), and the step after it re-checks that the prompt
+// survived. Beyond those two, a send that returns nil has delivered keystrokes
+// and pressed Enter, not proven a turn began; callers that need the stronger
+// fact poll for it (`send --wait-running`).
 //
 // One attempt is:
 //
@@ -1610,30 +1452,10 @@ func sendVerifyAppeared(beforeNorm, afterNorm, needle string) bool {
 //
 //	dismiss overlay keys -> settle -> capture -> verify again
 //
-// The inner loop looks repeatedly before the outer one re-sends, because
-// re-sending discards whatever the TUI had rendered — see the comment on
-// the look loop below.
-//
-// Chunking: the prompt goes out in sendChunkMaxBytes pieces separated by
-// sendChunkDelay, because a single oversized write either exceeds tmux's
-// own argument limit or gets folded into a "[Pasted Content N chars]"
-// placeholder that hides the tail from capture-pane. See the constants
-// for the measured thresholds.
-//
-// Input-area clear: the adapter's ClearInputKeys sequence is repeated
-// before each attempt's baseline capture — so residual text in the input
-// area (previous user typing, or a partial delivery from an earlier
-// attempt) cannot concatenate with the new prompt at Enter time. The
-// repeat count is sized for Claude Code, where one press clears one visual
-// row; a single press already empties Codex and OpenCode, so the extra
-// presses there are harmless no-ops. Adapters that
-// return nil / empty keys skip this step and keep the pre-refactor
-// behaviour; the residual-concat risk then applies to those adapters
-// (documented in docs/gotchas.md "Session send"). A missing AgentResolver
-// or an unknown kind also fall through to "no clear" — SendPrompt is best-
-// effort about the clear and never fails a send because of it, except when
-// the clear-key SendKeys itself errors (fail-fast: the pane is in an
-// unusable state).
+// The input-area clear is best-effort: an adapter returning no keys skips it
+// and carries the residual-concat risk documented in docs/gotchas.md "Session
+// send". Only an erroring SendKeys fails the send outright — that means the
+// pane is in an unusable state.
 func (m *Manager) SendPrompt(id, prompt string) error {
 	m.mu.RLock()
 	sess, ok := m.sessions[id]
@@ -1676,21 +1498,17 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		chunks = chunkPrompt(prompt, sendChunkMaxBytes)
 	}
 	// Size the clear from the residue a retry can actually face. On the
-	// keystroke path that is the whole prompt, typed out. On the paste path
-	// our own residue is at most one summary line, or a paste too small for
-	// the TUI to fold — bounded by the fold threshold, not by the prompt.
-	//
-	// Sizing it from the prompt there is pure waste: a 64KB paste would
-	// spend 512 tmux processes, one per press, clearing a single row before
-	// issuing the two calls that do the work. Measured, that was the bulk of
-	// the send — 1.12s against 114ms with the clamp, with 64KB still 3/3.
+	// keystroke path that is the whole prompt, typed out; on the paste path it
+	// is at most one summary line, bounded by the fold threshold rather than by
+	// the prompt. Sizing it from the prompt there is pure waste — a 64KB paste
+	// would spend 512 tmux processes clearing a single row. Measured, that was
+	// the bulk of the send: 1.12s against 114ms with the clamp, 64KB still 3/3.
 	//
 	// Known limit: this only covers residue a HUMAN left in the input. The
 	// clamped count wipes ~500 typed characters but not ~5000 (measured on
-	// OpenCode); anything pasted collapses to one row and clears in a single
-	// press either way. The unclamped count was never a principled defence
-	// against that case either — it scales with our prompt, which says
-	// nothing about what someone typed before it.
+	// OpenCode). The unclamped count was no principled defence against that
+	// either — it scales with our prompt, which says nothing about what someone
+	// typed before it.
 	clearRepeats := sendClearRepeats(len(prompt))
 	if pasting {
 		clearRepeats = min(clearRepeats, sendClearRepeats(sendChunkMaxBytes))
@@ -1722,11 +1540,9 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		attempts++
 
 		// Clear residual input BEFORE the baseline capture so the "before"
-		// snapshot reflects the post-clear state and sendVerifyOK's
-		// occurrence-count delta stays clean. Fail-fast on a SendKeys error:
-		// if we cannot even push a control key, the pane is unusable and
-		// nothing downstream will succeed either — so bail on the first
-		// failure rather than grinding through the remaining repeats.
+		// snapshot is post-clear and sendVerifyOK's occurrence-count delta stays
+		// clean. Fail fast on a SendKeys error: if a control key cannot be
+		// pushed, the pane is unusable and nothing downstream will succeed.
 		if len(clearKeys) > 0 {
 			for i := 0; i < clearRepeats; i++ {
 				for _, k := range clearKeys {
@@ -1767,18 +1583,14 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 
 		// Look for the prompt, nudging before each look, WITHOUT re-sending.
 		//
-		// Re-sending is destructive: the next attempt clears the input area
-		// and pushes the whole prompt again, which throws away whatever the
-		// TUI had rendered so far. A TUI slower than one settle delay then
-		// never converges — it is restarted from zero every time. Measured
-		// on Codex with a 16KB prompt: re-sending immediately produced 16
-		// failed attempts over the full budget, while looking without
-		// re-sending verified in 1.7s.
+		// Re-sending is destructive: the next attempt clears the input area and
+		// pushes the whole prompt again, throwing away whatever the TUI had
+		// rendered. A TUI slower than one settle delay then never converges —
+		// measured on Codex with a 16KB prompt, 16 failed attempts over the full
+		// budget re-sending, against verified in 1.7s looking.
 		//
-		// The nudge is what makes looking worthwhile: Codex repaints only on
-		// key events, and OpenCode's viewport does not follow the cursor on
-		// its own. It is sent even when the adapter opted out of clearing —
-		// a measured no-op, and skipping it leaves those two unverifiable.
+		// The nudge is what makes looking worthwhile: Codex repaints only on key
+		// events, and OpenCode's viewport does not follow the cursor on its own.
 		landed := false
 		for look := 0; look < looks; look++ {
 			// A pasted prompt needs no nudge: the placeholder renders where
@@ -1825,24 +1637,17 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 		time.Sleep(sendVerifyBackoff)
 	}
 
-	// Close any completion overlay the prompt opened, then prove the prompt
-	// is still there.
+	// Close any completion overlay the prompt opened, then prove the prompt is
+	// still there.
 	//
-	// Verify above establishes that the text is rendered in the input area.
-	// It does NOT establish that Enter will submit that text: an agent whose
-	// completion overlay is open consumes Enter to accept a candidate,
-	// rewriting the input in place and submitting nothing, while everything
-	// this function checks still reads as success. Measured on Claude Code
-	// 2.1.224, `list @internal/agent` was rewritten to
-	// `list @internal/agentdocs/` and left unsent 3/3 — with or without the
-	// nudge, so the nudge is not what causes it.
+	// Verify above establishes that the text is rendered in the input area, not
+	// that Enter will submit it: an agent whose completion overlay is open
+	// consumes Enter to accept a candidate. Measured on Claude Code 2.1.224,
+	// `list @internal/agent` was rewritten to `list @internal/agentdocs/` and
+	// left unsent 3/3 — with or without the nudge, so the nudge is not the cause.
 	//
-	// The re-check is what makes sending a key here safe rather than
-	// hopeful. Escape was measured to leave the input untouched on Claude
-	// Code (3/3), but that is one agent at one version, and the failure it
-	// could produce — an emptied input followed by an Enter that commits
-	// whatever remains — is worse than the bug being fixed. So: only the
-	// adapter decides whether keys go out, and if the prompt is gone
+	// The re-check is what makes sending a key here safe rather than hopeful:
+	// only the adapter decides whether keys go out, and if the prompt is gone
 	// afterwards, Enter is not pressed at all.
 	if len(dismissKeys) > 0 {
 		for _, k := range dismissKeys {
@@ -1869,30 +1674,25 @@ func (m *Manager) SendPrompt(id, prompt string) error {
 	return nil
 }
 
-// RespondToBlock answers a blocking prompt the session's agent is showing —
-// a tool-approval dialog, or a question — and returns the kind it answered.
+// RespondToBlock answers a blocking prompt the session's agent is showing — a
+// tool-approval dialog, or a question — and returns the kind it answered.
 //
-// This is a different verb from SendPrompt because it drives a different
-// thing, not because the gate is looser. SendPrompt types a prompt into an
-// input line and proves it arrived by finding it there. On a dialog there is
-// nothing to find: measured on Claude Code 2.1.226, typed prose is not drawn
-// and is not buffered (3/3), while SendPrompt's own nudge key walks the
-// dialog's selection (3/3). Pointing SendPrompt at a dialog would therefore
-// burn its whole budget, fail, and leave the selection moved — so it keeps
-// refusing anything that is not idle, and this exists instead.
+// This is a different verb from SendPrompt because it drives a different thing,
+// not because the gate is looser. SendPrompt types into an input line and
+// proves it arrived by finding it there; on a dialog there is nothing to find.
+// Measured on Claude Code 2.1.226, typed prose is neither drawn nor buffered
+// (3/3), while SendPrompt's own nudge key walks the dialog's selection (3/3).
 //
-// The post-condition here is that the block LEFT the pane. That is why only
+// The post-condition here is that the block LEFT the pane, which is why only
 // kinds reporting Answerable() are driven: a form of several questions stays
 // standing after one answer, so "the block is gone" could not tell a
 // half-filled form from an answer that never landed. The gate and the
-// post-condition are one design, not two — loosening either alone breaks the
-// other.
+// post-condition are one design, not two.
 //
 // Status is deliberately not the gate. The hook that turns a session
 // `permission` arrives about six seconds after the agent blocks, so a caller
 // that answers promptly never sees that status at all (n=9). The pane is the
-// authority on whether there is something to answer, and asking it costs
-// nothing that matters: on BlockNone no key is sent.
+// authority, and asking it costs nothing: on BlockNone no key is sent.
 func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) {
 	m.mu.RLock()
 	sess, ok := m.sessions[id]
@@ -1905,12 +1705,10 @@ func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) 
 	agentKind := sess.AgentKind
 	m.mu.RUnlock()
 
-	// The only statuses refused outright are the ones with no pane worth
-	// looking at. Everything else — including idle — falls through to the
-	// pane, because a session can sit at idle with a dialog up: recovery
-	// derives idle without consulting the screen, and nothing re-derives it
-	// afterwards. Refusing idle here would reject exactly those sessions,
-	// while allowing it costs nothing: with no dialog on screen DetectBlock
+	// The only statuses refused outright are the ones with no pane worth looking
+	// at. Everything else — including idle — falls through to the pane, because a
+	// session can sit at idle with a dialog up: recovery derives idle without
+	// consulting the screen. Allowing it costs nothing, since DetectBlock then
 	// reports BlockNone and this returns before sending a key.
 	switch status {
 	case StatusStopped, StatusCreating, StatusDeleting:
@@ -2029,16 +1827,14 @@ func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) 
 			}
 		}
 		if !landed {
-			// Abandoning here is the point of the flag. The steps left
-			// unsent are the ones that commit, so stopping means nothing was
-			// answered — which is a far better outcome than committing
-			// whatever the dialog happened to be pointing at.
+			// Abandoning here is the point of the flag: the steps left
+			// unsent are the ones that commit, so stopping means nothing
+			// was answered.
 			//
-			// The message deliberately does NOT invite a retry. The text was
-			// typed; only its appearance could not be confirmed, so the field
-			// may well be holding it. Answering again types into the same
-			// field, and the second attempt's tail could then verify against
-			// a field holding both answers run together.
+			// The message deliberately does NOT invite a retry. The text
+			// was typed and only its appearance could not be confirmed, so
+			// a second attempt's tail could verify against a field holding
+			// both answers run together.
 			return kind, fmt.Errorf(
 				"the answer text was typed but never appeared in the pane, so the keys that " +
 					"would submit it were not sent. The prompt is still waiting, and its " +
@@ -2072,10 +1868,9 @@ func (m *Manager) RespondToBlock(id string, ans BlockAnswer) (BlockKind, error) 
 // resolveAgent returns the adapter for kind, or nil when the resolver is not
 // installed or the kind is unknown.
 //
-// Errors are logged and swallowed rather than returned: SendPrompt reads
-// optional capabilities off the adapter, and every one of them has a safe
-// default, so a misconfigured resolver must degrade the send rather than
-// refuse it.
+// Errors are logged and swallowed rather than returned: every capability read
+// off the adapter has a safe default, so a misconfigured resolver must degrade
+// the send rather than refuse it.
 func (m *Manager) resolveAgent(kind string) Agent {
 	if m.agentResolver == nil {
 		return nil
@@ -2147,13 +1942,11 @@ func (m *Manager) PanePopup(id, cmd, title, width, height string) error {
 	})
 }
 
-// PaneSplit splits the session's pane in its working directory and returns
-// the new pane's ID. With name set the split becomes idempotent: when a pane
-// with that name already exists in the session's window, no new pane is
-// created — the existing pane is returned as-is (noop), respawned with
-// opts.Cmd (respawn), or reported as an error (error), per ifExists.
-// The caller (daemon handler) validates name/ifExists/opts; the manager
-// trusts them and only injects the session's working directory.
+// PaneSplit splits the session's pane in its working directory and returns the
+// new pane's ID. With name set the split becomes idempotent: when a pane with
+// that name already exists in the session's window, the existing pane is
+// returned as-is (noop), respawned with opts.Cmd (respawn), or reported as an
+// error (error), per ifExists. The daemon handler validates name/ifExists/opts.
 func (m *Manager) PaneSplit(id, name, ifExists string, opts tmux.SplitOptions) (string, error) {
 	if m.tmuxClient == nil {
 		return "", fmt.Errorf("tmux is not available")
@@ -2295,15 +2088,13 @@ func (m *Manager) SetWorkDir(id string, workDir string) error {
 	return nil
 }
 
-// SetDescription updates a session's description. Passing an empty value
-// (or a whitespace-only value) clears the manual lock and regenerates the
-// Layer A baseline from the session's WorkDir, so subsequent Layer C upgrades
-// can take over again.
+// SetDescription updates a session's description. An empty (or whitespace-only)
+// value clears the manual lock and regenerates the Layer A baseline from the
+// session's WorkDir, so subsequent Layer C upgrades can take over again.
 //
-// The baseline is regenerated with the same (WorkDir, "", false, "") arguments
-// that CreateWithOptions and TryUpgradeDescription use, keeping all three
-// call sites' notion of "the baseline" byte-identical. Any drift here would
-// silently block Layer C from firing after unlock (see F001/F004).
+// The baseline is regenerated with the same arguments CreateWithOptions and
+// TryUpgradeDescription use, keeping all three call sites' notion of "the
+// baseline" byte-identical; drift would silently block Layer C after unlock.
 func (m *Manager) SetDescription(id string, desc string) error {
 	desc = strings.TrimSpace(desc)
 
@@ -2334,10 +2125,9 @@ func (m *Manager) SetDescription(id string, desc string) error {
 		if session.WorkDir != baselineWorkDir {
 			// WorkDir moved during the unlocked walk. Writing the stale
 			// baseline would disagree with the one TryUpgradeDescription
-			// derives from the current WorkDir, so its drift guard would
-			// silently block Layer C forever (the F001/F004 failure mode).
-			// This is a user-initiated clear, so recompute under the lock
-			// (~21µs) rather than silently dropping the request.
+			// derives from the current WorkDir, whose drift guard would then
+			// block Layer C forever. This is a user-initiated clear, so
+			// recompute under the lock (~21µs) rather than drop the request.
 			baseline = GenerateBaselineDescription(session.WorkDir, "", false, "")
 		}
 		session.Description = baseline
@@ -2355,28 +2145,24 @@ func (m *Manager) SetDescription(id string, desc string) error {
 
 // TryUpgradeDescription asks the given enhancer for a Layer C description and
 // applies it when two layer guards allow the write. Callers should invoke it
-// from every hook event that might carry new signal; guard-heavy internal
-// short-circuiting is what keeps repeated calls cheap.
+// from every hook event that might carry new signal; the guards keep repeated
+// calls cheap.
 //
 // Guard 1 (restart protection) is Session.descriptionDriftedFrom: refuse to
-// overwrite a Description that a previous daemon process already upgraded.
+// overwrite a Description a previous daemon process already upgraded.
 //
-// Guard 2 (monotonic layer): reject candidates whose layer is not strictly
-// greater than the session's current layer. This lets us call the same
-// enhancer on both SessionStart (transcript miss → LayerAgentName) and later
-// UserPromptSubmit (transcript hit → LayerTranscript) without the second call
-// getting rejected by a baseline-equality check, while still preventing a
-// same-layer or lower-layer proposal from clobbering a better value.
+// Guard 2 (monotonic layer): reject a candidate whose layer is not strictly
+// greater than the session's current one. That lets the same enhancer run on
+// SessionStart (transcript miss) and again on UserPromptSubmit (transcript hit)
+// without the second call being rejected, while still stopping a same- or
+// lower-layer proposal from clobbering a better value.
 //
-// A nil enhancer (or an unknown session id, or a locked description) is a
-// silent no-op so callers do not need to guard hook wiring.
+// A nil enhancer, an unknown id, or a locked description is a silent no-op.
 //
-// The enhancer scans the agent transcript end to end and the store write hits
-// the filesystem, so neither runs under m.mu — that is the Manager's central
-// lock, and holding it across this I/O stalls every other session. Only the
-// snapshot and the commit take the lock; everything between them is lock-free,
-// which means the session can change in the gap. commitDescriptionUpgrade
-// therefore re-evaluates every guard against live state before writing.
+// The enhancer scans the transcript end to end and the store write hits the
+// filesystem, so neither runs under m.mu; only the snapshot and the commit take
+// it. The session can change in that gap, so commitDescriptionUpgrade
+// re-evaluates every guard against live state before writing.
 func (m *Manager) TryUpgradeDescription(id string, enhancer DescriptionEnhancer) {
 	if enhancer == nil {
 		return
@@ -2418,11 +2204,8 @@ func (m *Manager) TryUpgradeDescription(id string, enhancer DescriptionEnhancer)
 
 // snapshotForUpgrade returns an independent copy of the session to hand to an
 // enhancer running without the lock, or ok=false when the session is unknown or
-// its description is user-locked.
-//
-// The copy is safe because no Session field aliases mutable state: they are
-// strings, bools, ints and time.Time, whose internal *Location is immutable
-// and shared.
+// its description is user-locked. The copy is safe because no Session field
+// aliases mutable state.
 func (m *Manager) snapshotForUpgrade(id string) (Session, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2438,9 +2221,7 @@ func (m *Manager) snapshotForUpgrade(id string) (Session, bool) {
 // re-running every guard against live state. It returns the value to persist.
 //
 // Re-running the guards, rather than diffing snapshot against live field by
-// field, is what lets a write that landed during the unlocked window win: a
-// deletion misses the map, a manual SetDescription has set DescriptionLocked,
-// and a concurrent upgrade has raised DescriptionLayer past Guard 2.
+// field, is what lets a write that landed during the unlocked window win.
 func (m *Manager) commitDescriptionUpgrade(id string, snapshot *Session, baselines []string, candidate string, layer DescriptionLayer) (Session, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2452,10 +2233,8 @@ func (m *Manager) commitDescriptionUpgrade(id string, snapshot *Session, baselin
 
 	// baselines describe snapshot.WorkDir. Once the session moves they say
 	// nothing about the session in front of us, so drop the round rather than
-	// compare against stale values; the next hook recomputes both. (They also
-	// depend on the filesystem layout around WorkDir, which cannot be pinned
-	// down the same way — this is a best-effort check, and a miss only costs
-	// one skipped round.)
+	// compare against stale values; the next hook recomputes both. A miss only
+	// costs one skipped round.
 	if session.WorkDir != snapshot.WorkDir {
 		return Session{}, false
 	}
@@ -2584,13 +2363,12 @@ func snapshotForSpawn(session *Session, startDir, expandedWorkDir string) spawnS
 	}
 }
 
-// buildAgentShellCmd wraps the adapter's SpawnPlan in the fixed shell
-// template Manager uses everywhere it spawns an agent (start and quick-fail
-// retry). Centralising the assembly keeps the two call sites in lock-step
-// on env vars, shell escaping, and the Setup() invariant — which is that
-// Setup runs here, with this spawn's SetupContext, immediately before
-// SpawnCommand, on both paths alike because neither reaches an adapter
-// except through this function.
+// buildAgentShellCmd wraps the adapter's SpawnPlan in the fixed shell template
+// Manager uses everywhere it spawns an agent (start and quick-fail retry).
+// Centralising the assembly keeps the two call sites in lock-step on env vars,
+// shell escaping, and the Setup() invariant — Setup runs here, with this
+// spawn's SetupContext, immediately before SpawnCommand, on both paths alike
+// because neither reaches an adapter except through this function.
 //
 // This is also the only place that resolves the two paths every adapter builds
 // its command from (StateDir, ExecPath), and it puts them on both structs. A
@@ -2598,16 +2376,12 @@ func snapshotForSpawn(session *Session, startDir, expandedWorkDir string) spawnS
 // a stale command — it would get an empty one: all three adapters fail open on
 // absent paths, so the session would start with no --settings, no
 // OPENCODE_CONFIG_DIR and no hook injection, and every adapter's own tests
-// would still pass. TestBuildAgentShellCmd_TellsTheAdapterOneStory is what
-// stands in the way.
+// would still pass.
 //
-// Pure builder: reads only the immutable snapshot; performs NO Session
-// writes. Callers own the "started once" invariant
-// (session.AgentSessionStarted = true) and must set it inside their own
-// lock context. Callers ALSO own the read side: buildAgentShellCmd takes a
-// value-typed snapshot precisely so the retry path in captureOutputTmux
-// can call it after m.mu.Unlock() without racing HandleHookEvent's writes
-// to session.WorkDir / AgentSessionID / etc.
+// Pure builder: reads only the immutable snapshot and performs NO Session
+// writes. Callers own the "started once" invariant, and the read side too —
+// the value-typed snapshot is what lets captureOutputTmux's retry path call
+// this after m.mu.Unlock() without racing HandleHookEvent's writes.
 func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	if m.agentResolver == nil {
 		return "", fmt.Errorf("agent resolver not configured")
@@ -2646,42 +2420,29 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	customEnv := buildEnvString(m.configMgr.GetEnv())
 	envVars := "TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1"
 	// The jin that started this agent, for the same reason JIN_SESSION_ID rides
-	// along: the process this launches will run `jin hook`, and that hook is
-	// jind-ai's own binary deciding which daemon to notify and whether to record
-	// what it was handed. None of it carries across on its own — jinenv.Identity
-	// has the mechanism.
+	// along: the process this launches will run `jin hook`, and that hook decides
+	// which daemon to notify and whether to record what it was handed. None of it
+	// carries across on its own — jinenv.Identity has the mechanism.
 	//
 	// Both halves were measured. Starting the daemon under the flag used to turn
-	// on only half the exchange: the daemon logged the status transitions it
-	// chose while the hook side stayed silent, losing the half that says why —
-	// the stop_reason behind a failed turn, the notification_type that separates
-	// a permission prompt from an idle timer, the agent session id that fired —
-	// and because the daemon only writes a line when a hook changes the status, a
-	// hook that changed nothing left no trace at all. And an agent whose pane
-	// came from a tmux server the daemon did not fork reached either no daemon
-	// (3/3: hook exits 0, status never moves) or an older daemon's socket still
-	// held by that server.
+	// on only half the exchange: the daemon logged the transitions it chose while
+	// the hook side stayed silent, losing the half that says why — the stop_reason
+	// behind a failed turn, the notification_type that separates a permission
+	// prompt from an idle timer — and a hook that changed nothing left no trace at
+	// all. And an agent whose pane came from a tmux server the daemon did not fork
+	// reached either no daemon (3/3: hook exits 0, status never moves) or an older
+	// daemon's socket still held by that server.
 	//
-	// It belongs here rather than in an adapter because nothing about it is
-	// agent-specific: every kind is launched through this wrapper and every kind
-	// calls the same hook binary. Each assignment is quoted whole, which `env`
-	// reads the same as quoting the value: these are paths, and a path may
-	// contain a space. It is all written before customEnv so that a user who
-	// names one of these in their own config still wins — `env` applies
-	// assignments left to right.
+	// Each assignment is quoted whole, which `env` reads the same as quoting only
+	// the value: these are paths, and a path may contain a space. It is written
+	// before customEnv so a user who names one of these in their own config still
+	// wins — `env` applies assignments left to right.
 	//
-	// TmuxEnviron rather than Environ — its doc has why a key this prefix omits
-	// is not absent from the agent but whatever the tmux server holds. Measured
-	// here: with the daemon's flag off and a server forked from an environment
-	// that had JIN_DEBUG=1, the agent pane ran with JIN_DEBUG=1, 3/3. It carries
-	// JIN_SESSION_ID too, so this function no longer assembles that one itself.
-	//
-	// The identity travels inside this string rather than as tmux -e because
-	// three verbs consume the string — NewSessionWithCmdInDir and both respawn
-	// sites — and only the string reaches all three. Moving it to -e would turn
-	// one coupling that cannot be forgotten into three that can. The prefix is
-	// needed regardless: -e has no unset form, so `env -u TMUX` has nowhere else
-	// to go.
+	// TmuxEnviron rather than Environ — its doc has why a key this prefix omits is
+	// not absent from the agent but whatever the tmux server holds. The identity
+	// travels inside this string rather than as tmux -e because three verbs consume
+	// the string and only the string reaches all three; the prefix is needed
+	// regardless, since -e has no unset form and `env -u TMUX` has nowhere to go.
 	for _, kv := range m.identity.TmuxEnviron(snap.JinSessionID) {
 		envVars += " " + shellEscape(kv)
 	}
@@ -2716,13 +2477,12 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 
 // startSessionTmux starts a session in a tmux window.
 func (m *Manager) startSessionTmux(session *Session) error {
-	// Resume in the last known cwd (e.g. worktree) when available, so the
-	// session lands in the same directory it was in when it stopped. If the
-	// session never moved out of WorkDir, CurrentWorkDir is empty and WorkDir
-	// is used instead. We do NOT silently fall back from a missing
-	// CurrentWorkDir to WorkDir: a session that was bound to a worktree
-	// cannot be meaningfully resumed at the project root once the worktree
-	// is gone — fail loudly so the user can delete or recreate the session.
+	// Resume in the last known cwd (e.g. worktree) when available, so the session
+	// lands where it was when it stopped. If it never moved out of WorkDir,
+	// CurrentWorkDir is empty and WorkDir is used. We do NOT silently fall back
+	// from a missing CurrentWorkDir to WorkDir: a session bound to a worktree
+	// cannot be resumed at the project root once the worktree is gone — fail
+	// loudly so the user can delete or recreate the session.
 	startDir := session.WorkDir
 	if session.CurrentWorkDir != "" {
 		startDir = session.CurrentWorkDir
@@ -2829,11 +2589,9 @@ func (m *Manager) updateGitBranch(session *Session, currentPath, lastTrackedPath
 			isWorktree = fi.Mode().IsRegular()
 		}
 		// One Lstat per level walked up to the repo root, plus an Lstat and a
-		// ReadFile for the worktree pointer — all against a rev-parse
-		// fork/exec we already paid for on this same tick. Recomputing
-		// unconditionally (rather than only when currentPath moved) keeps this
-		// branch free of "is it still empty?" state, and follows the agent
-		// when it cd's into a different repo.
+		// ReadFile for the worktree pointer — against a rev-parse fork/exec
+		// already paid on this same tick. Recomputing unconditionally keeps this
+		// branch free of state and follows the agent into a different repo.
 		repoName := ResolveRepoName(currentPath)
 		m.mu.Lock()
 		session.CurrentBranch = branch
@@ -2857,8 +2615,6 @@ func (m *Manager) updateGitBranch(session *Session, currentPath, lastTrackedPath
 // .claude/workdir/) outside Claude Code's own worktree area.
 //
 // Stats the filesystem (git.IsGitRoot), so evaluate it before taking m.mu.
-// The caller-side `session.WorkDir != path` inequality reads lock-protected
-// state and stays under the lock; only the filesystem half lives here.
 func isPersistableWorkDir(path string) bool {
 	return path != "" && git.IsGitRoot(path) && !git.IsClaudeWorktreePath(path)
 }
@@ -2902,15 +2658,14 @@ const (
 	paneDeathRecordStop
 )
 
-// classifyPaneDeath decides what the monitor should do about a pane it has
-// just found dead. Caller must hold m.mu.
+// classifyPaneDeath decides what the monitor should do about a pane it has just
+// found dead. Caller must hold m.mu.
 //
-// The already-stopped case has to be tested first, and it is the whole reason
-// this is a three-way decision rather than the retry test alone: Kill stops
-// the pane's process and records the stop, and the monitor's own status read
-// happens a probe earlier than the pane check, so a kill landing in that gap
-// arrives here looking exactly like a crash. Inside quickResumeFailWindow that
-// misreading would respawn an agent the user just asked to stop.
+// The already-stopped case has to be tested first, and that is why this is a
+// three-way decision rather than the retry test alone: the monitor's status
+// read happens a probe earlier than the pane check, so a kill landing in that
+// gap arrives looking exactly like a crash — and inside quickResumeFailWindow
+// that misreading would respawn an agent the user just asked to stop.
 func classifyPaneDeath(s *Session, now time.Time) paneDeathOutcome {
 	switch {
 	case s.Status == StatusStopped:
@@ -2922,13 +2677,13 @@ func classifyPaneDeath(s *Session, now time.Time) paneDeathOutcome {
 	}
 }
 
-// handlePaneDeath resolves a pane the monitor has just found dead: exit
-// quietly when someone else already recorded the stop, retry a resume that
-// failed on startup, or record the stop itself. Reports whether the monitor
-// should exit — false means the agent is back up and worth watching.
+// handlePaneDeath resolves a pane the monitor has just found dead: exit quietly
+// when someone else already recorded the stop, retry a resume that failed on
+// startup, or record the stop itself. Reports whether the monitor should exit —
+// false means the agent is back up and worth watching.
 //
 // Split out of captureOutputTmux's loop so the decision can be driven without
-// waiting out the 10s ticker; the loop keeps the polling and the target.
+// waiting out the 10s ticker.
 func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) (stop bool) {
 	m.mu.Lock()
 	// Exit without saving if session was already deleted
@@ -2980,13 +2735,12 @@ func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) 
 			return true
 		}
 		if respawned {
-			// The retry is only allowed to publish an agent nobody stopped
-			// meanwhile. A kill that landed during the respawn means the user
-			// asked for this session to be down, so undo the revival rather
-			// than hand back a running agent they did not ask for. The window
-			// name is deliberately withheld from the undo: this path leaves
-			// the session's tmux fields as they are, so tearing the inner
-			// session down here would strand them pointing at nothing.
+			// The retry may only publish an agent nobody stopped meanwhile:
+			// a kill that landed during the respawn means the user asked for
+			// this session to be down. The window name is deliberately
+			// withheld from the undo — this path leaves the session's tmux
+			// fields as they are, so tearing the inner session down here
+			// would strand them pointing at nothing.
 			if session.killSeq != killSeqBefore {
 				tc := m.tmuxClient
 				m.mu.Unlock()
@@ -3075,15 +2829,11 @@ func (m *Manager) captureOutputTmux(session *Session) {
 			}
 		}
 
-		// Fallback: if the session has been in "running" since a fresh start and no
-		// hook has arrived within hookIdleTimeout, assume Claude is idle and waiting
-		// for input. This handles the case where Claude Code does not fire Stop or
-		// idle_prompt during initial startup.
-		//
-		// StartedAt is json:"-" (runtime-only) so it is always zero after a daemon
-		// restart. The !startedAt.IsZero() guard ensures this fallback never fires
-		// for daemon-recovered sessions (preventing false idle transitions while a
-		// task is still running).
+		// Fallback: a session that has been "running" since a fresh start with no
+		// hook for hookIdleTimeout is assumed idle and waiting for input, which
+		// covers agents that fire neither Stop nor idle_prompt during startup.
+		// StartedAt is json:"-", so the !IsZero() guard keeps this from firing for
+		// daemon-recovered sessions while their task is still running.
 		m.mu.RLock()
 		fbStatus := session.Status
 		fbLastOutput := session.LastOutputTime
@@ -3110,12 +2860,10 @@ func (m *Manager) captureOutputTmux(session *Session) {
 
 // markIdleFallbackLocked applies captureOutputTmux's idle-fallback transition
 // (Running with no hook for hookIdleTimeout -> Idle) if the session still
-// qualifies, and returns a copy to persist plus whether the transition
-// happened. Re-checks existence and Status against live state rather than
-// trusting the caller's RLock snapshot, since a session can be deleted or
-// moved off Running between that snapshot and this call — applying the
-// transition (and saving) unconditionally would resurrect a just-deleted
-// session's file. Caller must hold m.mu.
+// qualifies, and returns a copy to persist plus whether it happened. It
+// re-checks existence and Status against live state rather than trusting the
+// caller's RLock snapshot: applying unconditionally would resurrect a
+// just-deleted session's file. Caller must hold m.mu.
 func (m *Manager) markIdleFallbackLocked(id string) (Session, bool) {
 	session, exists := m.sessions[id]
 	if !exists || session.Status != StatusRunning {
@@ -3204,20 +2952,15 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 	// event.
 	cwdPersistable := isPersistableWorkDir(cwd)
 
-	// Settled here for the same reason, and for a sharper one: rejectAgentSessionID
-	// calls into the adapter, and this function holds m.mu without a deferred
-	// unlock. An adapter whose predicate blocked or panicked under the lock would
-	// not cost one event, it would wedge the daemon — and adapters are an
-	// extension surface, so "it is a cheap pure function today" is a property of
-	// the three that ship, not of the interface. Every other adapter call on this
-	// path (StatusSource().Interpret, above) is already made outside the lock; the
-	// answer only depends on the event, so keeping that rule costs nothing.
+	// Settled here because rejectAgentSessionID calls into the adapter and this
+	// function holds m.mu without a deferred unlock. An adapter whose predicate
+	// blocked or panicked under the lock would not cost one event, it would wedge
+	// the daemon — and adapters are an extension surface, so "it is a cheap pure
+	// function today" is a property of the three that ship, not of the interface.
 	//
 	// Computed unconditionally rather than only for an id that differs from the
 	// record: the comparison needs the lock, and taking it to decide whether to
-	// do work outside it is the wrong way round. The scan is bounded by
-	// maxAgentSessionIDLen, and an empty id is refused without reaching the
-	// adapter.
+	// do work outside it is the wrong way round.
 	rekeyRefusal := rejectAgentSessionID(ag, agentSessionID)
 
 	m.mu.Lock()
@@ -3225,25 +2968,22 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 	sessionID := session.ID
 	sessionName := session.Description
 
-	// Update AgentSessionID if it changed (adapter may re-key it, e.g. CC
-	// assigns its own UUID when we started with an empty one). This write is
-	// the one place a value from outside jind-ai becomes a session's identity,
-	// so it is gated — the id arrives in a hook payload, and anything that can
-	// reach the daemon socket or run `jin hook` with JIN_SESSION_ID set can
-	// choose it, for any session, not only its own.
+	// Update AgentSessionID if it changed (an adapter may re-key it, e.g. CC
+	// assigns its own UUID when we started with an empty one). This write is the
+	// one place a value from outside jind-ai becomes a session's identity, so it
+	// is gated: the id arrives in a hook payload, and anything that can reach the
+	// daemon socket or run `jin hook` with JIN_SESSION_ID set can choose it, for
+	// any session, not only its own.
 	//
 	// A rejection drops the WRITE and nothing else. The event keeps its status
-	// verdict, its CWD tracking and its SessionStart bookkeeping, and the id
-	// already recorded is left in place rather than cleared. Dropping the whole
-	// event instead would hand the same payload a second power — send one with
-	// a malformed id and status tracking stops — which turns the defence into
-	// the outage it was meant to prevent.
+	// verdict, its CWD tracking and its SessionStart bookkeeping. Dropping the
+	// whole event instead would hand the same payload a second power — send one
+	// with a malformed id and status tracking stops.
 	//
-	// The verdict was reached before the lock (see rekeyRefusal). The
-	// agentSessionID != "" test is kept even though safeAgentSessionID refuses
-	// "" on its own: it is what makes "the agent said nothing about its id"
-	// distinct from "the agent reported an id we would not take", and only the
-	// second is worth a log line.
+	// The agentSessionID != "" test is kept even though safeAgentSessionID
+	// refuses "" on its own: it separates "the agent said nothing about its id"
+	// from "the agent reported an id we would not take", and only the second is
+	// worth a log line.
 	if agentSessionID != "" && session.AgentSessionID != agentSessionID {
 		if rekeyRefusal != "" {
 			debugLog("[HOOK] Session %s: refusing the reported agent session id (%s): %s",
@@ -3273,35 +3013,27 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 	}
 
 	// The same observation applied to a second field: an agent that just
-	// announced it started is not stopped, so SessionStart clears a stale
-	// stop — and clears nothing else. (Why a stale stop is there to clear,
-	// and what it costs while it lasts, is in docs/gotchas.md under Hook.)
+	// announced it started is not stopped, so SessionStart clears a stale stop —
+	// and clears nothing else. (docs/gotchas.md, under Hook, has why a stale stop
+	// is there to clear and what it costs while it lasts.)
 	//
 	// The narrowness is the point. SessionStart is not only fired at startup:
-	// Claude Code raises it for resume, /clear and /compact too, and the
-	// generated hooks file carries no matcher, so every one of them arrives
-	// here. A verdict that set a status unconditionally would drop a session
-	// to idle in the middle of a turn the moment an auto-compaction ran,
-	// opening SendPrompt's idle gate on a working agent — the same class of
-	// wrong-and-quiet answer this is fixing, pointed the other way. "The
-	// process is alive" contradicts exactly one status, so exactly one is
-	// touched.
+	// Claude Code raises it for resume, /clear and /compact too, and the generated
+	// hooks file carries no matcher, so every one of them arrives here. A verdict
+	// that set a status unconditionally would drop a session to idle in the middle
+	// of a turn the moment an auto-compaction ran, opening SendPrompt's idle gate
+	// on a working agent. "The process is alive" contradicts exactly one status,
+	// so exactly one is touched.
 	//
-	// It is Manager's rather than an adapter's for the same reason the
-	// bookkeeping above is: the premise is process liveness, which no
-	// vocabulary owns. An adapter could carry it — a conditional verdict has
-	// a route through StatusSignal.Payload, which is how persisted_status
-	// reaches interpretRecover — but Interpret runs before m.mu is taken, so
-	// the status such a verdict reasoned about may already be gone by the
-	// time it lands, and the monitor writes StatusStopped from its own
-	// goroutine. Recovery affords that gap because applyRecovery revalidates;
-	// this path has no such stage. Reading and writing Status in one critical
-	// section is what makes the rule safe.
+	// It is Manager's rather than an adapter's because the premise is process
+	// liveness, which no vocabulary owns — and because Interpret runs before m.mu
+	// is taken, so a verdict reasoning about the status may be acting on one that
+	// is already gone. Reading and writing Status in one critical section is what
+	// makes the rule safe.
 	//
-	// No plugin status_changed event fires for the correction: dispatch below
-	// is gated on updOK, and this is not a verdict. That is deliberate and
-	// matches every other non-verdict status write in this file — a
-	// correction of a stale record is not something that just happened.
+	// No plugin status_changed event fires for the correction: dispatch below is
+	// gated on updOK, and a correction of a stale record is not something that
+	// just happened.
 	if eventName == "SessionStart" && session.Status == StatusStopped {
 		session.Status = StatusIdle
 	}
@@ -3320,30 +3052,25 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 		return
 	}
 
-	// A liveness verdict reports that the agent is alive, not that a turn
-	// began, so it does not apply to a session sitting idle. It still applies
-	// everywhere else: recovering a session from permission once the user
-	// answers a prompt, and contradicting a stale stop, both run through it.
+	// A liveness verdict reports that the agent is alive, not that a turn began,
+	// so it does not apply to a session sitting idle. It still applies everywhere
+	// else: recovering a session from permission once the user answers, and
+	// contradicting a stale stop, both run through it.
 	//
-	// The whole verdict is withheld, not just its Status. ClearError means
-	// "the agent took a new turn" (see the Claude Code adapter's invariant),
-	// which is exactly the claim being rejected — and since nothing downstream
-	// saves a record whose status did not move, clearing the message here
-	// would drop it from memory while the session file kept it.
+	// The whole verdict is withheld, not just its Status. ClearError means "the
+	// agent took a new turn", which is exactly the claim being rejected — and
+	// since nothing downstream saves a record whose status did not move, clearing
+	// the message here would drop it from memory while the session file kept it.
 	//
-	// It is enforced here, under m.mu, rather than in the adapter, for the
-	// reason the SessionStart correction above gives: Interpret runs before
-	// the lock is taken, so a verdict that reasoned about the current status
-	// would be reasoning about a value that may already be gone.
+	// Enforced here under m.mu rather than in the adapter, for the reason the
+	// SessionStart correction above gives.
 	//
-	// What this gives up, deliberately: a turn whose UserPromptSubmit hook
-	// never arrives is no longer rescued by the tool hooks that follow it, and
-	// reads idle while it runs — the same lie this fixes, pointed the other
-	// way. Nothing here distinguishes which writer produced the idle, so a
-	// recovery verdict's idle and the stale-stop correction 40 lines above
-	// lose the rescue too. All of it stays unguarded on purpose; the
-	// alternative is a threshold fitted to a handful of observations. The
-	// measurements behind that trade are in docs/gotchas.md ("Hook").
+	// What this gives up, deliberately: a turn whose UserPromptSubmit hook never
+	// arrives is no longer rescued by the tool hooks that follow it, and reads
+	// idle while it runs. Nothing here distinguishes which writer produced the
+	// idle, so a recovery verdict's idle loses the rescue too. It stays unguarded
+	// on purpose; the alternative is a threshold fitted to a handful of
+	// observations. The measurements are in docs/gotchas.md ("Hook").
 	suppressed := updOK && upd.Liveness && session.Status == StatusIdle
 
 	// Fold in the adapter's status verdict. A missing verdict (updOK=false)
@@ -3371,12 +3098,11 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 		session.LastOutputTime = time.Now()
 	}
 
-	// saved is the single point-in-time snapshot the post-unlock code reads
-	// from — both for Store.Save and for the fields the plugin event below
-	// needs (reading session.* after Unlock would race with concurrent
-	// mutators). updateGitBranch below only touches
-	// CurrentBranch/IsGitRepo/IsWorktree (all json:"-"), so saved not
-	// reflecting its result doesn't affect what gets persisted.
+	// saved is the single point-in-time snapshot the post-unlock code reads from
+	// — for Store.Save and for the fields the plugin event below needs, since
+	// reading session.* after Unlock would race with concurrent mutators.
+	// updateGitBranch below only touches json:"-" fields, so saved not reflecting
+	// its result does not affect what gets persisted.
 	pluginDisp := m.pluginDisp
 	saved := m.snapshotAndUnlock(session)
 
@@ -3417,24 +3143,20 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 		})
 	}
 
-	// Layer C: opportunistically upgrade the description. Runs on three events
-	// that each expose a different signal source:
+	// Layer C: opportunistically upgrade the description, on three events that
+	// each expose a different signal source:
 	//
-	//   - SessionStart is the earliest hook; the transcript is still empty but
-	//     the agent may already have written a session-name file (Claude Code
-	//     2.x populates ~/.claude/sessions/<PID>.json by then). The enhancer
-	//     returns LayerAgentName here.
-	//   - UserPromptSubmit races Claude Code's transcript flush by ~10ms, so
-	//     it sometimes still sees an empty jsonl but is our fastest chance at
-	//     a LayerTranscript win.
-	//   - Stop fires after the assistant response completes, by which point
-	//     the transcript is guaranteed to be flushed. It is the reliable
-	//     upgrade path to LayerTranscript.
+	//   - SessionStart is the earliest hook; the transcript is still empty but the
+	//     agent may already have written a session-name file (Claude Code 2.x
+	//     populates ~/.claude/sessions/<PID>.json by then) — LayerAgentName.
+	//   - UserPromptSubmit races Claude Code's transcript flush by ~10ms, so it
+	//     sometimes still sees an empty jsonl but is the fastest chance at a
+	//     LayerTranscript win.
+	//   - Stop fires after the assistant response completes, by which point the
+	//     transcript is guaranteed flushed. The reliable path to LayerTranscript.
 	//
-	// TryUpgradeDescription self-limits via the monotonic-layer guard, so
-	// calling it on all three events at most produces one write per layer per
-	// session. Agents that can't produce a description (Description() == nil)
-	// simply skip the upgrade.
+	// TryUpgradeDescription self-limits via the monotonic-layer guard, so calling
+	// it on all three produces at most one write per layer per session.
 	if eventName == "SessionStart" || eventName == "UserPromptSubmit" || eventName == "Stop" {
 		if enh := ag.Description(); enh != nil {
 			m.TryUpgradeDescription(sessionID, enh)
@@ -3465,11 +3187,10 @@ func (m *Manager) HandleAgentSignal(jinSessionID, kind string, payload map[strin
 
 const (
 	// paneTerminatePoll / paneTerminateTries bound how long Kill waits for a
-	// pane's process to go away after the hangup before falling back to
-	// kill-pane. A pane observably dies within a few milliseconds of its
-	// direct child exiting, so ten 50ms probes (450ms) is generous for a slow
-	// machine while staying short enough that a kill request never feels
-	// stalled when the fallback is the one that has to do the work.
+	// pane's process to go away after the hangup before falling back to kill-pane.
+	// A pane observably dies within a few milliseconds of its direct child
+	// exiting, so ten 50ms probes is generous for a slow machine while staying
+	// short enough that a kill request never feels stalled.
 	paneTerminatePoll  = 50 * time.Millisecond
 	paneTerminateTries = 10
 )
@@ -3491,17 +3212,14 @@ func waitPaneDead(tc tmux.Runner, target string) bool {
 // stopAgentPane stops the agent running in a session's tmux pane and reports
 // whether the session's tmux references survived. Keeping them is what
 // preserves the rest of the window: the inner tmux session stays up, every
-// other pane in it (plugin splits, shells the user opened) keeps running, and
-// the dead pane holds the agent's slot in the layout so a later start revives
-// it in place via RespawnPane rather than rebuilding the window from scratch.
+// other pane in it keeps running, and the dead pane holds the agent's slot in
+// the layout so a later start revives it in place via RespawnPane.
 //
 // True means TmuxPaneID / TmuxWindowName still address something real and the
-// caller must keep them. False means the window is gone — either it was torn
-// down here or it never existed — and the caller must clear both.
+// caller must keep them. False means the window is gone and both must be cleared.
 //
 // Takes no lock and touches no Session: the caller snapshots the fields under
-// m.mu, runs this, and re-validates before applying the result — the tmux
-// round-trips here (and the wait above) must not hold up the whole daemon.
+// m.mu, runs this, and re-validates before applying the result.
 func stopAgentPane(tc tmux.Runner, paneID, windowName string) (keepTmuxRefs bool) {
 	switch {
 	case tc == nil:
@@ -3519,13 +3237,11 @@ func stopAgentPane(tc tmux.Runner, paneID, windowName string) (keepTmuxRefs bool
 		if err := tc.TerminatePaneProcess(paneID); err == nil && waitPaneDead(tc, paneID) {
 			return true
 		}
-		// The signal never landed (unreadable pid) or the process sat through
-		// it. A kill that leaves the agent running is not a kill, so destroy
-		// the pane outright — the old behaviour, now the fallback. The window
-		// goes with it: kill-pane spares a window that still has other panes,
-		// and the caller is about to forget its name, which would leave the
-		// inner session with no owner to reclaim it. Losing those panes is
-		// the price of an agent that would not stop.
+		// The signal never landed (unreadable pid) or the process sat through it.
+		// A kill that leaves the agent running is not a kill, so destroy the pane
+		// outright. The window goes with it: kill-pane spares a window that still
+		// has other panes, and the caller is about to forget its name, which would
+		// leave the inner session with no owner to reclaim it.
 		_ = tc.KillPane(paneID)
 		if windowName != "" {
 			_ = tc.KillSession(windowName)
@@ -3542,15 +3258,14 @@ func stopAgentPane(tc tmux.Runner, paneID, windowName string) (keepTmuxRefs bool
 
 // Kill stops a session's agent. The session's inner tmux window survives
 // whenever the agent's pane can be stopped without destroying it, so kill is
-// "stop the agent", not "tear the session's tmux state down" — that is
-// delete's job. This matches what already happened when an agent died on its
-// own (see captureOutputTmux's pane-death branch and recoverPaneDead), so a
-// user-requested stop and a crash now leave a session in the same shape.
+// "stop the agent", not "tear the session's tmux state down" — that is delete's
+// job. It matches what already happened when an agent died on its own, so a
+// user-requested stop and a crash leave a session in the same shape.
 //
 // The tmux work runs between two lock sections rather than inside one: it
 // signals a process and then waits on it, and holding m.mu across that would
-// stall every List, hook and delete for the duration. The second section
-// therefore re-validates before writing, the same way applyRecovery does.
+// stall every List, hook and delete. The second section re-validates before
+// writing, the same way applyRecovery does.
 func (m *Manager) Kill(id string) error {
 	m.mu.Lock()
 	session, ok := m.sessions[id]
@@ -3569,12 +3284,11 @@ func (m *Manager) Kill(id string) error {
 	windowName := session.TmuxWindowName
 	startedAt := session.StartedAt
 
-	// Record the stop before dropping the lock, not after the tmux work: for
-	// the length of that work the agent is on its way out, and a session that
-	// still reads as running in the meantime is one StartBackground would
-	// treat as needing no start at all — a restart request silently doing
-	// nothing. killSeq goes up with it, so anyone else who dropped m.mu
-	// (recovery's probes, the monitor's resume retry) can see a kill landed.
+	// Record the stop before dropping the lock, not after the tmux work: for the
+	// length of that work the agent is on its way out, and a session that still
+	// reads as running is one StartBackground would treat as needing no start at
+	// all — a restart request silently doing nothing. killSeq goes up with it, so
+	// anyone else who dropped m.mu can see that a kill landed.
 	session.killSeq++
 	killSeq := session.killSeq
 	session.Status = StatusStopped
@@ -3626,12 +3340,9 @@ func (m *Manager) Kill(id string) error {
 }
 
 // DeleteRequest carries the resolved intent for a delete after PreCheckDelete
-// has run its synchronous checks. It is passed from MarkDeleting into
-// DeleteFinalize so the async goroutine has everything it needs without
-// re-taking the manager lock to re-read the session record.
-//
-// Fields other than ID/RemoveWorktree/ForceRemoveWorktree are populated by
-// PreCheckDelete and treated as opaque snapshot by callers.
+// has run its synchronous checks, so the async goroutine has everything it
+// needs without re-taking the manager lock. Fields other than
+// ID/RemoveWorktree/ForceRemoveWorktree are an opaque snapshot to callers.
 type DeleteRequest struct {
 	ID                  string
 	RemoveWorktree      bool
@@ -3653,21 +3364,18 @@ type DeleteRequest struct {
 	previousStatus Status
 }
 
-// PreCheckDelete runs the synchronous checks a delete request must pass
-// before the daemon can accept it and defer the rest to a background
-// goroutine: session existence, worktree resolution, and (when the caller
-// asked to remove the worktree without force) a dirty-tree probe.
+// PreCheckDelete runs the synchronous checks a delete request must pass before
+// the daemon can accept it and defer the rest to a background goroutine:
+// session existence, worktree resolution, and (when the caller asked to remove
+// the worktree without force) a dirty-tree probe.
 //
-// On success it returns a DeleteRequest carrying the resolved worktree path
-// and tmux window name, so the caller can pass it directly to MarkDeleting
-// + DeleteFinalize without another lock pass. On failure the caller should
-// surface the error to the client synchronously — no state has been touched.
+// On success it returns a DeleteRequest carrying the resolved worktree path and
+// tmux window name, ready for MarkDeleting + DeleteFinalize. On failure no
+// state has been touched and the caller reports the error synchronously.
 //
 // The dirty probe runs synchronously on purpose: it costs a `git status
-// --porcelain` on a checkout the user is asking to delete, which is fast on
-// clean trees and only slow on trees so large the removal itself would take
-// minutes. Reporting dirty synchronously preserves the TUI's confirm-force
-// UX (the CLI's `--force` decision must be made at that same moment).
+// --porcelain` on a checkout the user is asking to delete, and reporting dirty
+// synchronously is what preserves the confirm-force UX in the TUI and the CLI.
 func (m *Manager) PreCheckDelete(id string, removeWorktree, forceRemoveWorktree bool) (DeleteRequest, error) {
 	// Defense-in-depth: the CLI validates the same combination, but non-CLI
 	// callers (TUI, integration tests, future clients) reach Manager directly.
@@ -3683,11 +3391,8 @@ func (m *Manager) PreCheckDelete(id string, removeWorktree, forceRemoveWorktree 
 	}
 	// Reject in-flight duplicates up front. Without this, a second
 	// PreCheckDelete would still resolve workDir and run `git status` on a
-	// checkout the first request is already rm -rf'ing (spurious
-	// ErrNotWorktree / ErrWorktreeDirty). It also blocks a stale-snapshot
-	// path where the second request captures previousStatus=Deleting.
-	// MarkDeleting is where the CAS actually lands (and where
-	// previousStatus is snapshotted) — this is the pre-check version.
+	// checkout the first request is already rm -rf'ing. MarkDeleting is where the
+	// CAS actually lands; this is the pre-check version.
 	if session.Status == StatusDeleting {
 		m.mu.RUnlock()
 		return DeleteRequest{}, ErrDeleteInFlight
@@ -3716,13 +3421,11 @@ func (m *Manager) PreCheckDelete(id string, removeWorktree, forceRemoveWorktree 
 		return req, nil
 	}
 
-	// Directory already gone (manual `rm -rf`, prior partial delete):
-	// skip the worktree + dirty probes and let DeleteFinalize's
-	// removeGitWorktree short-circuit on its own os.IsNotExist branch. The
-	// old sync Delete relied on that idempotency to succeed here; a
-	// synchronous ErrNotWorktree from IsGitWorktreeDir would be a
-	// regression against callers that reasonably expect delete-with-missing
-	// -worktree to still drop the session.
+	// Directory already gone (manual `rm -rf`, prior partial delete): skip the
+	// worktree and dirty probes and let DeleteFinalize's removeGitWorktree
+	// short-circuit on its own os.IsNotExist branch. A synchronous ErrNotWorktree
+	// here would regress callers that reasonably expect delete-with-missing-
+	// worktree to still drop the session.
 	if _, err := os.Stat(workDir); os.IsNotExist(err) {
 		return req, nil
 	}
@@ -3753,24 +3456,17 @@ func (m *Manager) PreCheckDelete(id string, removeWorktree, forceRemoveWorktree 
 // on `removeGitWorktree` / `KillSession` / `store.Delete`.
 var ErrDeleteInFlight = errors.New("delete already in progress for this session")
 
-// MarkDeleting flips a session's Status to StatusDeleting under the write
-// lock and captures the pre-flip Status into req.previousStatus in the
-// same critical section. Acts as a compare-and-set: returns
-// ErrDeleteInFlight if the session is already StatusDeleting, so
-// concurrent delete requests serialize on the state flip. Returns a plain
-// error if the session is missing.
+// MarkDeleting flips a session's Status to StatusDeleting under the write lock
+// and captures the pre-flip Status into req.previousStatus in the same critical
+// section. It acts as a compare-and-set: ErrDeleteInFlight when the session is
+// already StatusDeleting, so concurrent delete requests serialize on the flip.
 //
-// The atomicity of "snapshot previousStatus and flip Status" matters:
-// PreCheckDelete runs under a separate RLock and cannot own the
-// previousStatus reliably — if it did, a Status change between pre-check
-// and flip would let a subsequent MarkDeletionFailed restore to a stale
-// value (in the extreme, StatusDeleting itself, leaving the record
-// permanently stuck). Snapshotting here closes that window.
+// The atomicity matters: PreCheckDelete runs under a separate RLock and cannot
+// own previousStatus reliably — a Status change between pre-check and flip would
+// let a subsequent MarkDeletionFailed restore a stale value, in the extreme
+// StatusDeleting itself, leaving the record permanently stuck.
 //
-// req.tmuxWindowName is refreshed here for the same reason: PreCheckDelete
-// took its snapshot under an RLock that a Kill/Start could have raced,
-// leaving DeleteFinalize with a stale name. Re-reading under the write
-// lock hands the goroutine the freshest value.
+// req.tmuxWindowName is refreshed here for the same reason.
 func (m *Manager) MarkDeleting(req *DeleteRequest) error {
 	m.mu.Lock()
 	session, ok := m.sessions[req.ID]
@@ -3793,15 +3489,12 @@ func (m *Manager) MarkDeleting(req *DeleteRequest) error {
 	return nil
 }
 
-// MarkDeletionFailed rolls back a MarkDeleting flip when DeleteFinalize
-// errors: Status returns to the value req.previousStatus captured before
-// the flip (idle/running/thinking/permission survive intact so a
-// pane-alive session stays attach-usable), and ErrorMessage records err.
-// The record is preserved so the client sees the failure through `get`.
-// Idempotent — safe on missing sessions.
+// MarkDeletionFailed rolls back a MarkDeleting flip when DeleteFinalize errors:
+// Status returns to the value req.previousStatus captured before the flip, so a
+// pane-alive session stays attach-usable, and ErrorMessage records err. The
+// record is preserved so the client sees the failure through `get`. Idempotent.
 //
-// The store.Save is fire-and-forget (same reasoning as MarkCreationFailed):
-// log on failure so an unreachable filesystem is diagnosable.
+// The store.Save is fire-and-forget, same reasoning as MarkCreationFailed.
 func (m *Manager) MarkDeletionFailed(req DeleteRequest, err error) {
 	m.mu.Lock()
 	session, ok := m.sessions[req.ID]
@@ -3827,8 +3520,7 @@ func (m *Manager) MarkDeletionFailed(req DeleteRequest, err error) {
 
 // DeleteFinalize runs the destructive tail of delete (worktree removal, tmux
 // kill, store delete, map drop) using the resolved DeleteRequest from
-// PreCheckDelete. It runs entirely outside the request/response window: the
-// daemon handler goroutine calls it after acknowledging the client, and any
+// PreCheckDelete. It runs entirely outside the request/response window, so any
 // failure is reported through MarkDeletionFailed rather than a return error
 // that no one is waiting for.
 func (m *Manager) DeleteFinalize(req DeleteRequest) error {
@@ -3853,15 +3545,13 @@ func (m *Manager) DeleteFinalize(req DeleteRequest) error {
 	return nil
 }
 
-// Delete removes a session completely, synchronously. It is a thin
-// composition of PreCheckDelete + MarkDeleting + DeleteFinalize, preserved
-// for tests and helpers that want a linear return-when-done contract.
+// Delete removes a session completely, synchronously. It is a thin composition
+// of PreCheckDelete + MarkDeleting + DeleteFinalize, preserved for tests and
+// helpers that want a linear return-when-done contract.
 //
-// Semantics match the historical contract: worktree removal failures are
-// fatal to the delete, and the session record is kept so the caller can
-// retry after fixing the cause. Async callers (the daemon's `delete`
-// handler) use PreCheckDelete + MarkDeleting + `go DeleteFinalize` +
-// MarkDeletionFailed instead, so the wait moves off the request path.
+// Worktree removal failures are fatal to the delete and the record is kept so
+// the caller can retry after fixing the cause. The daemon's `delete` handler
+// uses the async form instead, so the wait moves off the request path.
 func (m *Manager) Delete(id string, removeWorktree, forceRemoveWorktree bool) error {
 	req, err := m.PreCheckDelete(id, removeWorktree, forceRemoveWorktree)
 	if err != nil {
@@ -3877,17 +3567,15 @@ func (m *Manager) Delete(id string, removeWorktree, forceRemoveWorktree bool) er
 	return nil
 }
 
-// removeGitWorktree removes a git worktree at the given path.
-// Returns ErrWorktreeDirty if the worktree has uncommitted changes and force
-// is false. Returns ErrNotWorktree if workDir is not a git worktree. Any other
-// failure (permissions, filesystem, git exec) is wrapped with the worktree path
-// and the way out, since this error is what the CLI and TUI show verbatim.
+// removeGitWorktree removes a git worktree at the given path. Returns
+// ErrWorktreeDirty if it has uncommitted changes and force is false, and
+// ErrNotWorktree if workDir is not a git worktree. Any other failure is wrapped
+// with the worktree path and the way out, since this error is what the CLI and
+// TUI show verbatim.
 //
 // The static wrapper text must not contain the ErrWorktreeDirty /
 // ErrNotWorktree messages: the daemon client restores those sentinels from the
-// error string across IPC, and a collision would misreport an unrelated
-// failure as dirty. The interpolated path and git's own output are outside
-// that guarantee; only structured error codes over IPC would close the gap.
+// error string across IPC, and a collision would misreport an unrelated failure.
 func (m *Manager) removeGitWorktree(workDir string, force bool) error {
 	err := m.gitClient.RemoveWorktree(workDir, force)
 	switch {

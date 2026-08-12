@@ -9,12 +9,10 @@ import (
 	"github.com/takaaki-s/jind-ai/internal/exitcode"
 )
 
-// docsListPayload is the `--json` shape of `jin docs list`.
-//
-// The list is wrapped in an object rather than returned as a bare array so
-// later additions (a schema version, say) do not have to break every caller's
-// jq expression, and so an empty set serialises as {"docs":[]} rather than
-// null.
+// docsListPayload is the `--json` shape of `jin docs list`. The list is wrapped
+// in an object rather than returned as a bare array so later additions (a schema
+// version, say) do not have to break every caller's jq expression, and so an
+// empty set serialises as {"docs":[]} rather than null.
 type docsListPayload struct {
 	Docs []agentdocs.Doc `json:"docs"`
 }
@@ -76,11 +74,9 @@ func runDocsList(cmd *cobra.Command) error {
 }
 
 // renderDocsList writes the human-readable listing: each name on its own line
-// with its description indented under it.
-//
-// Descriptions are a sentence long, so a two-column table would either wrap
-// them mid-word or force a terminal wider than most. One entry per pair of
-// lines stays readable at any width.
+// with its description indented under it. Descriptions are a sentence long, so
+// a two-column table would either wrap them mid-word or force a terminal wider
+// than most.
 func renderDocsList(w io.Writer, docs []agentdocs.Doc) {
 	for _, d := range docs {
 		fmt.Fprintf(w, "%s\n    %s\n", d.Name, d.Description)

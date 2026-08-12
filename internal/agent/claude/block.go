@@ -13,9 +13,8 @@ import (
 // that prompt accepts. Those lines are what DetectBlock matches, because they
 // were measured to appear only while the prompt is live.
 //
-// Measured on Claude Code 2.1.226, sampling the visible pane at five points
-// per round (idle before the prompt, mid-turn before the dialog, dialog live,
-// immediately after answering, turn settled), three rounds of each dialog:
+// Measured on Claude Code 2.1.226, sampling the visible pane at five points per
+// round, three rounds of each dialog:
 //
 //	state                     tool-permission hint   question hint
 //	idle                      0/3                    0/3
@@ -25,31 +24,27 @@ import (
 //	turn settled              0/3                    0/3
 //
 // Every round ran on top of the previous rounds' output, so each capture still
-// showed earlier menus — their option rows were on the VISIBLE screen, not
-// scrolled away, which is what makes the 6/6 mean anything: CapturePane reads
-// the visible pane only, so a menu that had scrolled off would prove nothing.
-// That is the property the whole approach rests on. The OPTIONS of a finished
-// menu stay on screen, so matching those would confuse a menu that is over
-// with one that is waiting; the hint line goes when the dialog goes.
+// showed earlier menus with their option rows on the VISIBLE screen — which is
+// what makes the counts mean anything, since CapturePane reads only the visible
+// pane. That is what the approach rests on: a finished menu's OPTIONS stay on
+// screen, so matching those would confuse a menu that is over with one that is
+// waiting; the hint line goes when the dialog goes.
 const (
 	// hintPermission marks a tool-approval dialog.
 	//
 	// "ctrl+e to explain" and not the fuller "Esc to cancel · Tab to amend ·
 	// ctrl+e to explain", because that line is not fixed while the dialog is
-	// up: measured against a live dialog, "Tab to amend" is drawn for options
-	// 1 and 3 and NOT for option 2, so an anchor containing it stops matching
-	// the moment the cursor moves. That was found by answering a real dialog
-	// rather than by reading — the fixtures had only ever captured the
-	// cursor-on-first-option state, where the fuller line is present.
+	// up: measured against a live dialog, "Tab to amend" is drawn for options 1
+	// and 3 and NOT for option 2, so an anchor containing it stops matching the
+	// moment the cursor moves.
 	//
-	// "Esc to cancel" alone would be wrong in the other direction: the
-	// question dialogs below print it too, and this anchor is tested before
-	// theirs, so it would swallow them.
+	// "Esc to cancel" alone would be wrong in the other direction: the question
+	// dialogs below print it too, and this anchor is tested before theirs.
 	//
 	// Present for all three cursor positions (3/3) and gone once the dialog
-	// closes, along with every other fragment of the line (4/4 checked). What
-	// is NOT measured is whether every tool's approval dialog offers "explain"
-	// at all; one that does not would read as no dialog, which costs a refusal
+	// closes, along with every other fragment of the line (4/4 checked). What is
+	// NOT measured is whether every tool's approval dialog offers "explain" at
+	// all; one that does not would read as no dialog, which costs a refusal
 	// rather than a keystroke.
 	hintPermission = "ctrl+e to explain"
 	// hintQuestion marks a single question. It is also a PREFIX of the
@@ -68,12 +63,10 @@ const (
 	// anchorSubmit marks the confirmation screen a multi-question form shows
 	// once every question is answered.
 	//
-	// This one is not a hint line, because that screen has none at all
-	// (grepped for every hint above: 0 hits). It is body text, so unlike the
-	// others it is not known to disappear when the screen does — that was
-	// not measured. The consequence of it lingering is a refusal to answer a
-	// prompt that could have been answered, which is the direction this file
-	// errs in everywhere else too.
+	// Not a hint line, because that screen has none at all (grepped for every
+	// hint above: 0 hits). It is body text, so unlike the others it is NOT known
+	// to disappear when the screen does — that was not measured. Lingering costs
+	// a refusal to answer a prompt that could have been answered.
 	anchorSubmit = "Ready to submit your answers?"
 	// freeTextLabel is the option Claude Code appends to a question when it
 	// will accept free text. Measured to stay in English while the question
@@ -100,17 +93,14 @@ func anchor(needle string, kind session.BlockKind) blockAnchor {
 // blockAnchors is scanned in order, and the order is the safety property.
 //
 // Two facts force it. Claude Code's multi-question hint CONTAINS the
-// single-question hint, so a scan that tested the single-question anchor
-// first would call a multi-question form a single question. And the two
-// forms take different keys: on a single question a digit selects and
-// commits outright, while on the preview-bearing multi-question form the
-// same digit only moves the cursor (2/2 each). Mistaking one for the other
-// is therefore not a cosmetic error — it is jin typing into a form it cannot
-// finish.
+// single-question hint, so a scan that tested the single-question anchor first
+// would call a multi-question form a single question. And the two forms take
+// different keys: on a single question a digit selects and commits outright,
+// while on the preview-bearing multi-question form the same digit only moves
+// the cursor (2/2 each). Mistaking one for the other is jin typing into a form
+// it cannot finish.
 //
-// So every kind that cannot be answered is ruled out before any kind that
-// can. Uncertainty then costs a refusal instead of keys in the pane, which
-// is the same direction session.BlockKind's doc comment describes.
+// So every kind that cannot be answered is ruled out before any kind that can.
 var blockAnchors = []blockAnchor{
 	anchor(anchorSubmit, session.BlockQuestionSubmit),
 	anchor(hintMultiTab, session.BlockQuestionMulti),
@@ -138,12 +128,12 @@ func (a *Agent) DetectBlock(capture string) agent.BlockKind {
 //
 // The two answerable kinds are driven the same way because Claude Code draws
 // them the same way: a numbered list where the number is an absolute address.
-// Measured on the tool-approval dialog, with the cursor deliberately moved
-// away from the target first — pressing "1" while the cursor sat on option 3
-// ran the tool, and pressing "3" while it sat on option 2 declined it (2/2).
-// Out-of-range digits do nothing at all and leave the dialog standing (2/2,
-// "7" and "0"), which is why no range check happens here: the miss surfaces
-// as the block failing to clear, and that error already says the right thing.
+// Measured on the tool-approval dialog with the cursor deliberately moved away
+// from the target first — pressing "1" while the cursor sat on option 3 ran the
+// tool, and "3" while it sat on option 2 declined it (2/2). Out-of-range digits
+// do nothing at all and leave the dialog standing (2/2, "7" and "0"), which is
+// why no range check happens here: the miss surfaces as the block failing to
+// clear, and that error already says the right thing.
 func (a *Agent) AnswerBlockKeys(kind agent.BlockKind, capture string, ans agent.BlockAnswer) ([]agent.KeyStep, error) {
 	switch kind {
 	case session.BlockQuestionMulti:
@@ -173,11 +163,10 @@ func (a *Agent) AnswerBlockKeys(kind agent.BlockKind, capture string, ans agent.
 	}
 	// Bounded here as well as at the daemon's edge, and not as belt-and-braces:
 	// "an answer is one keystroke" is a fact about THIS agent, so this is the
-	// layer that owns it. RespondToBlock is an ordinary exported method and the
-	// daemon handler is merely its only caller today; a second one would
-	// otherwise reach the keyboard with the check left behind. Unbounded, an
-	// Option of 12 goes out as "1" then "2" — and the "1" selects and commits
-	// an answer on its own.
+	// layer that owns it. The daemon handler is merely the only caller today; a
+	// second would otherwise reach the keyboard with the check left behind.
+	// Unbounded, an Option of 12 goes out as "1" then "2" — and the "1" selects
+	// and commits an answer on its own.
 	if ans.Option < 1 || ans.Option > session.MaxAnswerOption {
 		return nil, fmt.Errorf("option %d cannot be selected: an answer is sent as a single "+
 			"keystroke, so only 1-%d are addressable", ans.Option, session.MaxAnswerOption)
@@ -196,11 +185,9 @@ func (a *Agent) AnswerBlockKeys(kind agent.BlockKind, capture string, ans agent.
 // ("❯ 4. ZZTOP"), with Enter submitting that text (1/1).
 //
 // That single observation is why the middle step carries Verify. Typing is
-// drawn here and nowhere else in this file, so the sequence can check that
-// the first step did what it is supposed to before pressing the Enter that
-// commits. If the text is not on screen, Manager abandons the sequence and no
-// Enter is sent — the same shape as DismissOverlayKeys re-checking that the
-// prompt survived before committing it.
+// drawn here and nowhere else in this file, so the sequence can check the first
+// step landed before pressing the Enter that commits; if the text is not on
+// screen, Manager abandons the sequence and no Enter is sent.
 func (a *Agent) freeTextKeys(kind agent.BlockKind, capture, text string) ([]agent.KeyStep, error) {
 	if kind != session.BlockQuestion {
 		return nil, fmt.Errorf("this prompt takes a numbered choice, not free text: " +
@@ -234,10 +221,9 @@ func (a *Agent) freeTextKeys(kind agent.BlockKind, capture, text string) ([]agen
 // freeTextOption returns the on-screen number of the free-text entry.
 //
 // It scans from the BOTTOM of the capture upwards and takes the first match,
-// because a pane can hold the options of earlier, finished menus above the
-// live one — those keep their own numbering, and answering with it would
-// select something else entirely. Scanning up from the end reaches the live
-// menu first, since it is the one nearest the hint line that got us here.
+// because a pane can hold the options of earlier, finished menus above the live
+// one — those keep their own numbering, and answering with it would select
+// something else entirely.
 func freeTextOption(capture string) (int, bool) {
 	lines := strings.Split(capture, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -249,17 +235,15 @@ func freeTextOption(capture string) (int, bool) {
 }
 
 // numberedLabel parses a rendered option row of the form "❯ 4. Type
-// something." and returns its number when the label matches.
+// something." and returns its number when the label matches. The comparison is
+// normalized on both sides so the leading cursor glyph and the indentation
+// Claude Code varies with selection state stop mattering.
 //
-// The comparison is normalized on both sides so the leading cursor glyph and
-// the indentation Claude Code varies with selection state stop mattering.
-//
-// It is NOT wrap-tolerant, and that is worth stating because DetectBlock
-// above is: DetectBlock normalizes the whole capture, so a hint line broken
-// across two rows rejoins, while this sees one line at a time and a wrapped
-// row cannot be put back together. A wrapped free-text row therefore reads as
-// absent — which costs a refusal, not a wrong keystroke, and the caller is
-// told jin could not FIND the entry rather than that none exists.
+// It is NOT wrap-tolerant, unlike DetectBlock above: DetectBlock normalizes the
+// whole capture so a hint line broken across two rows rejoins, while this sees
+// one line at a time. A wrapped free-text row therefore reads as absent — which
+// costs a refusal, not a wrong keystroke, and the caller is told jin could not
+// FIND the entry rather than that none exists.
 func numberedLabel(line, label string) (int, bool) {
 	norm := session.NormalizeForVerify(line)
 	dot := strings.Index(norm, ".")

@@ -154,12 +154,10 @@ func renderConversation(out, errOut io.Writer, msgs []transcript.Message, jsonOu
 }
 
 // transcriptWorkDir picks the directory to feed to the transcript reader.
-// CurrentWorkDir (tracked by daemon polling) reflects where the agent
-// actually is right now — after `cd` into a subdir or worktree — while
-// WorkDir is the directory the session was launched in. Claude Code writes
-// its JSONL under a projects/<encoded-workdir>/ tree, so the two can point
-// at different files. We prefer CurrentWorkDir; the transcript reader's
-// glob fallback covers the rest.
+// CurrentWorkDir (tracked by daemon polling) reflects where the agent actually
+// is right now — after `cd` into a subdir or worktree — while WorkDir is the
+// directory the session was launched in. Claude Code writes its JSONL under a
+// projects/<encoded-workdir>/ tree, so the two can point at different files.
 func transcriptWorkDir(info *session.Info) string {
 	if info.CurrentWorkDir != "" {
 		return info.CurrentWorkDir

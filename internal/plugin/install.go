@@ -26,8 +26,7 @@ import (
 //
 // The manifest's declared name — not srcDir's basename — decides the install
 // path, because a linked plugin is authoritative about its own name. Link is
-// fail-closed: an unloadable manifest or a jin compat mismatch aborts before
-// anything is written.
+// fail-closed: an unloadable manifest or a jin compat mismatch aborts first.
 func Link(srcDir, pluginsDir, stateDir string) (*manifest.Manifest, error) {
 	absSrc, err := filepath.Abs(srcDir)
 	if err != nil {
@@ -80,12 +79,10 @@ func Link(srcDir, pluginsDir, stateDir string) (*manifest.Manifest, error) {
 // lock entry. For a linked plugin the symlink is deleted with os.Remove, which
 // never follows the link, so the source tree is left untouched.
 //
-// The lock entry is cleared even when the on-disk directory is already gone,
-// so Remove doubles as a repair for a plugin whose files vanished but whose
-// lock record lingered. The converse repair also works: a directory with no
-// lock entry (an install whose lock write failed) is still deleted, since
-// otherwise it would block both re-install and remove with no way out short
-// of hand-deleting files.
+// Both repairs work. The lock entry is cleared even when the on-disk directory
+// is already gone, and a directory with no lock entry (an install whose lock
+// write failed) is still deleted — otherwise it would block re-install and
+// remove alike, with no way out short of hand-deleting files.
 func Remove(name, pluginsDir, stateDir string) error {
 	// The orphan branch below deletes whatever filepath.Join resolves to, so
 	// name must never smuggle path separators or ".." out of pluginsDir.
@@ -139,9 +136,8 @@ type Source struct {
 //
 // A trailing "@<ref>" is recognised only when the '@' falls after the last '/',
 // so the '@' in an scp-style URL (git@github.com:o/r) is never mistaken for a
-// ref separator. The clone URL is then taken as-is when it already carries a
-// scheme ("://") or is scp-style ("git@..."); otherwise a bare host/owner/repo
-// is prefixed with "https://".
+// ref separator. A URL that already carries a scheme or is scp-style is taken
+// as-is; a bare host/owner/repo is prefixed with "https://".
 func ParseSource(arg string) (Source, error) {
 	if arg == "" {
 		return Source{}, errors.New("plugin source is empty")
@@ -277,12 +273,10 @@ func Fetch(src Source, pluginsDir, stateDir string, opts FetchOptions) (*Install
 
 // FetchUpdate re-clones an installed plugin so the update can be validated
 // before the current version is touched. By default it re-clones the locked
-// source at the locked ref (which is what a pinned entry needs); a caller
-// who wants to move to a different release resolves the new source
-// externally and passes it via opts.UpdateSource. Linked plugins have no
-// clone to update and are rejected. The updated manifest must keep the same
-// name so the atomic swap in Commit targets the right directory. Jin compat
-// handling follows the same rules as Fetch (see FetchOptions).
+// source at the locked ref; a caller who wants a different release resolves it
+// externally and passes opts.UpdateSource. Linked plugins have no clone and are
+// rejected. The updated manifest must keep the same name so Commit's atomic
+// swap targets the right directory. Jin compat follows Fetch (see FetchOptions).
 func FetchUpdate(name, pluginsDir, stateDir string, opts FetchOptions) (*InstallPlan, error) {
 	lock, err := LoadLock(stateDir)
 	if err != nil {
@@ -467,11 +461,9 @@ func gitHeadSHA(repoDir string) (string, error) {
 
 // GitLatestSemverTag lists the tags at cloneURL via `git ls-remote --tags`,
 // keeps the ones that parse as strict semver (optional leading "v"), and
-// returns the highest. Peeled tag refs ("^{}") are skipped — the semver
-// ordering only cares about the tag name, not the SHA it resolves to. An
-// empty return with a nil error means "the remote advertised no
-// semver-shaped tags"; callers decide whether to fall back to the default
-// branch or to fail.
+// returns the highest. Peeled tag refs ("^{}") are skipped. An empty return
+// with a nil error means "the remote advertised no semver-shaped tags";
+// callers decide whether to fall back to the default branch or to fail.
 func GitLatestSemverTag(cloneURL string) (string, error) {
 	out, err := exec.Command("git", "ls-remote", "--tags", cloneURL).Output()
 	if err != nil {

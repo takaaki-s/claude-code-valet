@@ -24,9 +24,9 @@ import (
 // per caller: where it runs, how long it may take, and where its output goes.
 //
 // Everything the outcome depends on — the environment, the shell, the process
-// group, whether the deadline covers one step or all of them — is fixed inside
-// RunBuilds and deliberately has no option here. A knob for any of those is how
-// the two callers drifted apart in the first place.
+// group, what the deadline covers — is fixed inside RunBuilds and deliberately
+// has no option here. A knob for any of those is how the two callers drifted
+// apart in the first place.
 type BuildOptions struct {
 	// Dir is the working directory every step runs in: the staging clone for
 	// an install, the plugin's own directory for a validate.
@@ -49,12 +49,10 @@ type BuildOptions struct {
 // supply-chain guard the author can override inside their own build command).
 // It is not the caller's environment, and that is the point: a build that only
 // succeeds because the author had some toolchain variable exported has to fail
-// here, rather than pass the author's check and fail on the installing user's
-// machine.
+// here rather than on the installing user's machine.
 //
-// opts.Timeout bounds the entire sequence, so a wedged step cannot outlive the
-// caller-supplied window. Each step gets its own process group so the escalated
-// SIGKILL sweeps whatever the step's script started.
+// opts.Timeout bounds the entire sequence, and each step gets its own process
+// group so the escalated SIGKILL sweeps whatever that step's script started.
 func RunBuilds(cmds []string, opts BuildOptions) error {
 	out := opts.Out
 	if out == nil {

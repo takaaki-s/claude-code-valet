@@ -1,11 +1,7 @@
-# `version` below is the CONFIG SCHEMA version, not the tool version. It only
-# moves when golangci-lint makes a breaking change to the config format. The
-# tool version is pinned in Makefile's GOLANGCI_LINT_VERSION and in the
-# `version:` input of golangci-lint-action in .github/workflows/{ci,release}.yml;
-# all three move together.
-#
-# Both exclusions below restore what v1 silenced by default — 40 errcheck and 6
-# staticcheck issues — on code that has not changed.
+# `version` below is the CONFIG SCHEMA version, not the tool version. The tool
+# version is pinned in Makefile's GOLANGCI_LINT_VERSION and in the `version:`
+# input of golangci-lint-action in .github/workflows/{ci,release}.yml; all three
+# move together.
 version: "2"
 
 run:
@@ -16,36 +12,12 @@ run:
   # at all from any test, so `go vet -tags "render e2e" ./...` is how to look for
   # one before adding a third tag.
   #
-  # The two below both belong here, for reasons that are not the same one.
-  #
-  # `render` is internal/tui/model_render_test.go, the in-process View() harness
-  # that exists so a layout change never has to be eyeballed by starting `jin
-  # ui` against the user's real tmux server. It skips itself unless pointed at
-  # an isolated daemon, so no target RUNS it — but a tagged file no target even
-  # COMPILES rots, and the one it rots under is the person told not to use `jin
-  # ui`. Listing it here type-checks it on every lint, which is the only bound
-  # it needs.
-  #
-  # `e2e` is the opposite case. `make test-e2e` and the e2e CI job both compile
-  # and run that suite, so it needs no help staying valid, and this entry used
-  # to be absent for exactly that reason. But "it gets compiled and run" answers
-  # the question `render` asks, not this one: beyond the vet subset `go test`
-  # runs on its own, nothing was holding e2e code to the rules the rest of the
-  # tree is held to, and the errcheck it had drifted into went unreported for as
-  # long as that lasted.
-  #
-  # That errcheck is not the whole of it. The exclusions rule that scopes
-  # forbidigo to internal/procgroup already says why a test that starts a
-  # process is no special case; that reasoning covers this suite, and it cannot
-  # reach a file no linter reads.
-  #
-  # Both could be tag-carrying check lines in a Makefile target instead, and
-  # `test-e2e` is one CI actually runs — though not the same line for each:
-  # `render` needs only type-checking, which `go vet -tags render` gives, while
-  # `e2e` needs the linters, which `go vet` does not run. Either way it buys a
-  # second place deciding what gets checked, free to disagree with this one,
-  # while the lint CI job — golangci-lint-action, which never runs `make lint`
-  # — would go on reading only this file.
+  # Both are here because no linter otherwise reads them. `render` is
+  # internal/tui/model_render_test.go, which skips itself unless pointed at an
+  # isolated daemon, so no target runs it and a tagged file no target compiles
+  # rots. `e2e` is compiled and run by `make test-e2e`, but beyond the vet subset
+  # `go test` runs on its own nothing held it to the rules the rest of the tree
+  # is held to, and an errcheck it had drifted into went unreported.
   build-tags:
     - render
     - e2e
@@ -64,22 +36,15 @@ linters:
         # statements. internal/procgroup.CommandContext is the same call with
         # the process group wired up.
         #
-        # This is a linter rather than a note in docs/conventions.md because
-        # the note was already there and did not hold: procgroup began as a
-        # KillOnCancel you were meant to remember after building the command,
-        # and a call site was missed for a release — forgetting it produces a
+        # A linter rather than a note in docs/conventions.md because the note
+        # was already there and did not hold: forgetting the wiring produces a
         # process that works, so nothing failed until someone went looking.
         #
-        # It also makes the audit decidable. Grepping for exec.CommandContext
-        # used to hit every correct site too, so each one had to be read
-        # forward a few lines; now any hit outside internal/procgroup is the
-        # finding.
-        # The sibling rule for JIN_DEBUG is not here, and the reason is worth
-        # recording: forbidigo matches the function expression only, so
-        # `^os\.Getenv$` is the finest pattern available and it would forbid
-        # every environment read in the project. Measured by putting the
-        # violation back — a pattern carrying the argument matches nothing at
-        # all, which is indistinguishable from a clean tree. That rule lives in
+        # The sibling rule for JIN_DEBUG is not here: forbidigo matches the
+        # function expression only, so `^os\.Getenv$` is the finest pattern
+        # available and would forbid every environment read in the project. A
+        # pattern carrying the argument was measured to match nothing at all,
+        # which is indistinguishable from a clean tree. That rule lives in
         # internal/debug's tests instead.
         - pattern: '^exec\.CommandContext$'
           msg: use procgroup.CommandContext, which puts the child in its own process group
@@ -90,28 +55,24 @@ linters:
       # errcheck on `(os.)?std(out|err).*`, `.*Close`, `.*Flush`,
       # `os.Remove(All)?`, `.*print(f|ln)?` and `os.(Un)?Setenv`.
       #
-      # errcheck matches on message text, so this cannot spare the one case
-      # that must stay checked — a `defer f.Close()` that is the only thing
-      # flushing what you wrote. That rule lives in docs/conventions.md, which
-      # also covers what is safe to leave unchecked and why.
+      # errcheck matches on message text, so this cannot spare the one case that
+      # must stay checked — a `defer f.Close()` that is the only thing flushing
+      # what you wrote. That rule lives in docs/conventions.md.
       - std-error-handling
 
     rules:
-      # internal/procgroup is where the sanctioned call lives, and its own
-      # tests have to build a bare command to have something to compare
-      # against — a negative control that went through the constructor would
-      # prove nothing. Scoped to this one package: anywhere else, a test that
-      # starts a process leaks it exactly like production would.
+      # internal/procgroup is where the sanctioned call lives, and its own tests
+      # have to build a bare command to have something to compare against.
+      # Scoped to this one package: anywhere else, a test that starts a process
+      # leaks it exactly like production would.
       - linters:
           - forbidigo
         path: 'internal/procgroup/'
 
       # staticcheck's QF ("quickfix") checks are refactoring suggestions, not
-      # defect detection, and we do not gate CI on them anywhere in the repo.
-      # v1 never ran them; v2 folded gosimple, stylecheck and quickfix into the
-      # staticcheck linter, which turned them on. Excluding the family rather
-      # than naming individual checks keeps this stable as upstream adds new
-      # QF checks.
+      # defect detection, and CI is not gated on them anywhere in the repo.
+      # Excluding the family rather than naming individual checks keeps this
+      # stable as upstream adds new QF checks.
       #
       # Doing this through linters.settings.staticcheck.checks instead would
       # REPLACE upstream's default check list and silently re-enable ST1000

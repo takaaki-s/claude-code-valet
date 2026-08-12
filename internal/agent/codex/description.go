@@ -14,19 +14,15 @@ const descriptionMaxBytes = 60
 // first genuine user prompt from the Codex rollout JSONL and promoting it to
 // Layer C-transcript.
 //
-// Codex is the first adapter that reaches for Layer C-transcript. Claude Code
-// stops at Layer C-name because CC produces its own topic-derived aiTitle;
-// Codex 0.144.1 stores `title` in ~/.codex/state_5.sqlite `threads.title`,
-// but empirically it is always identical to `first_user_message` — the CLI
-// does not run the AI-summary job the Mac app appears to. Extracting the
-// first user prompt straight from the rollout gives the same value with no
-// new dependency. See "Session Description Model" in docs/architecture.md
-// for the full Layer C write-up.
+// Codex is the first adapter that reaches for that layer. Codex 0.144.1 stores
+// `title` in ~/.codex/state_5.sqlite `threads.title`, but empirically it is
+// always identical to `first_user_message` — the CLI does not run the AI-summary
+// job the Mac app appears to — so reading the rollout gives the same value with
+// no new dependency. See "Session Description Model" in docs/architecture.md.
 //
-// The enhancer holds a Locator so it can be built once at Agent construction
-// and reused for every TryGenerate call. Safe for concurrent use. Agent hands
-// it the same Locator instance used by the TranscriptReader it builds for
-// Transcript(), so a path either one resolves is cached for both.
+// It holds a Locator so it can be built once at Agent construction. Safe for
+// concurrent use, and it shares that Locator with the TranscriptReader, so a
+// path either one resolves is cached for both.
 type DescriptionEnhancer struct {
 	locator *Locator
 }
@@ -43,14 +39,12 @@ func NewDescriptionEnhancer(loc *Locator) *DescriptionEnhancer {
 //
 //   - sess is nil
 //   - sess.AgentSessionID is empty (pre-SessionStart write-back)
-//   - the locator cannot find a rollout for the UUID (still queued, or
-//     the UUID belongs to a session on another machine)
-//   - the rollout has no genuine user turn yet (env_context and developer
-//     rows only)
+//   - the locator cannot find a rollout for the UUID (still queued, or the
+//     UUID belongs to a session on another machine)
+//   - the rollout has no genuine user turn yet
 //
 // On success, returns the truncated first user prompt and
-// DescriptionLayerTranscript so Manager's strict-greater layer guard treats
-// it as the strong Layer C signal for the codex adapter.
+// DescriptionLayerTranscript, the strong Layer C signal for this adapter.
 func (e *DescriptionEnhancer) TryGenerate(sess *session.Session) (string, session.DescriptionLayer, bool) {
 	if sess == nil || sess.AgentSessionID == "" {
 		return "", 0, false

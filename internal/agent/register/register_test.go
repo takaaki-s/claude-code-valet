@@ -64,12 +64,10 @@ func TestRegisterInit_LookupOpencode(t *testing.T) {
 // TestRegisterInit_TranscriptWiring guards the three one-line methods that
 // decide what `jin session result` answers for each kind.
 //
-// Every other part of that path is covered from both sides — the daemon test
-// proves the handler asks the session's own adapter, and the codex reader's
-// tests prove the parsing — but the methods joining them were not, and each
-// one is a single return statement. Rewriting claude's to return nil makes
-// `session result` fail for every Claude Code session, and before this test
-// the whole suite stayed green.
+// Every other part of that path is covered from both sides, but the methods
+// joining them were not, and each one is a single return statement. Rewriting
+// claude's to return nil makes `session result` fail for every Claude Code
+// session, and before this test the whole suite stayed green.
 func TestRegisterInit_TranscriptWiring(t *testing.T) {
 	tests := []struct {
 		kind     string
@@ -114,10 +112,10 @@ func TestRegisterInit_ClaudeReturnsTheSharedReader(t *testing.T) {
 // on a timer.
 //
 // Manager.AttachLastMessages decorates every row of `session list`, which the
-// TUI refreshes on a timer, so it must skip a reader that spawns a process.
-// The opencode reader does: it runs `opencode export`, which on a list of
-// opencode rows would be one process per row per refresh, permanently. Neither `session result` nor the
-// preview is wrong on its own, so nothing else would catch this.
+// TUI refreshes on a timer, so it must skip a reader that spawns a process. The
+// opencode reader does: on a list of opencode rows that would be one process
+// per row per refresh, permanently. Neither `session result` nor the preview is
+// wrong on its own, so nothing else would catch this.
 func TestRegisterInit_PollableWiring(t *testing.T) {
 	tests := []struct {
 		kind     string
@@ -166,18 +164,14 @@ var hostileSessionIDs = []string{
 // It is written over agent.Kinds() rather than per adapter, and that is the
 // whole point. Manager validates an id before recording it, but validation and
 // this rule defend different things: a record written by an older jind-ai, or
-// edited by hand, reaches SpawnCommand having passed no gate. An adapter that
-// writes `cmd += " --resume " + opts.AgentSessionID` compiles, and a per-package
-// test cannot fail for a package that does not exist yet — so a fourth adapter
+// edited by hand, reaches SpawnCommand having passed no gate. A per-package
+// test cannot fail for a package that does not exist yet, so a fourth adapter
 // would reintroduce the defect with nothing to catch it. Registering a kind is
 // what enrols it here.
 //
-// This lives in register_test because package register_test imports both
-// internal/agent and internal/session, so it can reach every adapter at once.
-// An adapter's own package cannot: internal/agent imports internal/session, so
-// the Manager-side half of the proof (that an ExtraEnv value is not interpreted
-// — see TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted) cannot be imported
-// into it.
+// It lives in register_test because that package imports both internal/agent
+// and internal/session, so it can reach every adapter at once. An adapter's own
+// package cannot: internal/agent imports internal/session.
 func TestSpawnCommand_NoAdapterPutsTheSessionIDInTheCommand(t *testing.T) {
 	for _, kind := range agent.Kinds() {
 		a, err := agent.Lookup(kind)
@@ -241,41 +235,30 @@ func TestRecognizesSessionID_NoAdapterAcceptsEverything(t *testing.T) {
 // SpawnOptions it is handed, and carries nothing between calls (see the
 // contract on session.SpawnOptions.StateDir).
 //
-// It is the inverse of the check it replaces. That one demanded the LAST Setup
-// decide the spawn, which is the best a shared field can do; the registry holds
-// one adapter instance per kind for the whole process while these paths belong
-// to the Manager starting one session, so whoever wrote last answered for
-// everyone. Now the paths arrive with the spawn, and the older directory is the
-// correct answer when that is what the caller asks for — which a field cannot
-// give however carefully it is locked. Measured by putting the field back in
-// all three adapters, with SpawnOptions left as it is: every kind's subtest
-// fails, and each adapter's own field fails only its own kind. (Reverting the
-// struct as well is not the same experiment and cannot be run — a SpawnOptions
-// without these fields does not compile against this test.)
+// Measured by putting the field back in all three adapters, with SpawnOptions
+// left as it is: every kind's subtest fails, and each adapter's own field fails
+// only its own kind. (Reverting the struct as well is not the same experiment
+// and cannot be run — a SpawnOptions without these fields does not compile
+// against this test.)
 //
-// Written over agent.Kinds() for the same reason as the checks above, and it is
-// the reason this test is not merely a duplicate of the per-adapter ones. A
+// Written over agent.Kinds() for the same reason as the checks above: a
 // per-package test cannot fail for a package that does not exist yet, so a
 // fourth adapter that quietly cached its first Setup would reintroduce the
-// defect with nothing to catch it. Registering a kind is what enrols it here.
-// Measured rather than assumed: a fourth adapter doing exactly that survives
-// the whole unit suite with this test removed, and is killed by it.
+// defect. Measured rather than assumed — such an adapter survives the whole
+// unit suite with this test removed, and is killed by it.
 //
 // Both directions are asserted, and the second is what makes the first mean
 // anything: an adapter that carries nothing at all out of its options would
 // satisfy "the other directory is absent" vacuously. It therefore fails here,
-// which is the intended cost — an adapter that needs neither path is a claim
-// worth making in this file rather than by silence.
+// which is the intended cost.
 //
 // ExtraEnv is searched beside Command because an adapter may carry either path
 // through either: the opencode adapter exposes its directory only as
 // OPENCODE_CONFIG_DIR, and a check reading Command alone would pass it blind.
-//
 // Setup still runs for both directories, in the order a process would see them,
-// because the adapters answer out of what Setup left on disk — the Claude Code
-// adapter reads back its hooks file and the opencode adapter looks for its
-// plugin. Preparing only one would leave the assertion unable to tell "follows
-// its options" from "found nothing anywhere".
+// because the adapters answer out of what Setup left on disk — preparing only
+// one would leave the assertion unable to tell "follows its options" from
+// "found nothing anywhere".
 func TestSpawnCommand_EveryAdapterFollowsItsOptionsNotItsLastSetup(t *testing.T) {
 	// The Claude Code adapter's Setup records trust for WorkDir in
 	// ~/.claude.json, so hand the whole test a home of its own.

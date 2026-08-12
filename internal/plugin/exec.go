@@ -47,20 +47,17 @@ type ActionContext struct {
 }
 
 // ExecOptions configures a single plugin run. Timeout is display-only: the real
-// deadline is carried by the ctx passed to ExecPlugin, matching the worktreehook
-// convention where the caller owns cancellation and the option only shapes the
-// error message.
+// deadline is carried by the ctx passed to ExecPlugin, matching the
+// worktreehook convention where the caller owns cancellation and the option
+// only shapes the error message.
 //
-// PopupWidth / PopupHeight carry the pre-resolved popup size (already in tmux
-// notation, e.g. "70%") for the plugin's `jin pane popup --here` invocations.
-// Empty strings mean "no size hint" — buildEnv skips the corresponding env var
-// so the CLI falls through to its own fallback chain (flag > env > empty).
+// PopupWidth / PopupHeight carry the pre-resolved popup size, already in tmux
+// notation. Empty strings mean "no size hint" — buildEnv skips the env var so
+// the CLI falls through to its own chain (flag > env > empty).
 //
 // ActionID is the manifest action being run, exported as JIN_ACTION_ID so a
 // shared entrypoint script can tell which of its plugin's actions invoked it.
-//
-// Identity is which jin dispatched the run — the daemon to reach, the binary to
-// re-enter, whether to record.
+// Identity is which jin dispatched the run.
 type ExecOptions struct {
 	PluginDir   string
 	Run         string
@@ -84,19 +81,18 @@ func LogPath(stateDir, pluginName string) string {
 
 // ExecPlugin runs opts.Run once via `bash -c` in opts.PluginDir with a curated
 // environment and the event marshalled to stdin as JSON. stdout/stderr are
-// appended to opts.LogPath (each run prefixed by a separator header), and teed
+// appended to opts.LogPath (each run prefixed by a separator header) and teed
 // to the caller's stderr when JIN_DEBUG=1. On timeout the returned error names
-// the timeout so callers can surface a friendlier message than raw exit text.
+// the timeout, so callers can surface something friendlier than raw exit text.
 //
 // Teardown on ctx cancellation is procgroup.KillOnCancel's: SIGTERM to the
 // run's whole process group, then SIGKILL to the same group after
-// procgroup.GracePeriod, so a run that ignores SIGTERM cannot outlive the
-// escalation. cmd.WaitDelay alone would not do — it reaches only the leader PID
-// and leaves grandchildren alive — but it is set as well, and that is a
-// behaviour change worth knowing here: under JIN_DEBUG the output goes through
-// an io.MultiWriter rather than a plain file, so os/exec pipes it, and a
-// descendant that escapes the group while holding that pipe now ends the wait
-// with exec.ErrWaitDelay instead of blocking for good.
+// procgroup.GracePeriod. cmd.WaitDelay alone would not do — it reaches only the
+// leader PID — but it is set as well, and that is a behaviour change worth
+// knowing here: under JIN_DEBUG the output goes through an io.MultiWriter
+// rather than a plain file, so os/exec pipes it, and a descendant that escapes
+// the group while holding that pipe ends the wait with exec.ErrWaitDelay
+// instead of blocking for good.
 func ExecPlugin(ctx context.Context, opts ExecOptions) error {
 	if err := os.MkdirAll(filepath.Dir(opts.LogPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir plugin log dir: %w", err)

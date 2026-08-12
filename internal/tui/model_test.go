@@ -789,9 +789,9 @@ func plainModel() Model {
 // whole list spans 1+2n lines.
 //
 // Height 18+2: the pane holds 18 rows, of which the list header takes 2 and the
-// detail pane 8, leaving listAreaLines() = 8 — above the minListLines threshold,
-// so these models exercise the full three-region layout, and small enough to
-// watch the viewport move. Pane rows map to regions as:
+// detail pane 8, leaving listAreaLines() = 8 — above minListLines, so these
+// models exercise the full three-region layout, and small enough to watch the
+// viewport move. Pane rows map to regions as:
 //
 //	rows 0..1    list header      (noticeLines() + headerLines() = 2)
 //	rows 2..9    list area        (listAreaLines() = 8)
@@ -800,13 +800,8 @@ func plainModel() Model {
 // Inside the list area row 2 is the fleet header, so session i occupies pane
 // rows 3+2i and 4+2i.
 //
-// Every geometry test below is calibrated to those numbers — if the row height
-// or the region budget changes, the hand-computed constants move together. The
-// height went 17 → 20 when the row height doubled: two of the three extra rows
-// pay for the detail pane's second message row and the rule above " ? help",
-// and the last one keeps the list an even 8 rows, so a whole number of sessions
-// fits and the scroll assertions below are about the viewport rather than about
-// a half-drawn bottom row.
+// Every geometry test below is calibrated to those numbers: if the row height or
+// the region budget changes, the hand-computed constants move together.
 func cardListModel(n int) Model {
 	m := plainModel()
 	m.sessions = make([]session.Info, n)
@@ -1329,16 +1324,11 @@ func TestHandleMouseLeftClick(t *testing.T) {
 
 // TestHandleMouseLeftClick_TwoStage pins the split between looking and acting:
 // the first tap on a row only moves the cursor, and only a tap on the row the
-// cursor is already on reaches handleSelectSession. The reason is that this
-// list is driven by a fingertip over SSH, where a mis-tap that merely
-// re-targets the detail pane costs one more tap, while a mis-tap that switched
-// sessions costs a switch back — and the detail pane exists precisely so a
-// session can be read without being switched to.
+// cursor is already on reaches handleSelectSession. handleMouse has why.
 //
 // A session in StatusCreating is what makes the act path observable without a
 // tmux client: handleSelectSession refuses it and records an error, which no
-// other branch of handleMouse does. It is the one side effect of "we got as far
-// as the selection" that a nil-client Model can produce.
+// other branch of handleMouse does.
 func TestHandleMouseLeftClick_TwoStage(t *testing.T) {
 	newModel := func() Model {
 		m := cardListModel(3)
@@ -2020,14 +2010,12 @@ func TestRenderListHeader(t *testing.T) {
 		// The line is built by accumulating widths, and the lead in front of a
 		// group is 5 columns for the first ("  /  ") and 3 for the rest. Charge
 		// the wrong one and the header outgrows the pane at some widths and not
-		// others — which is why this sweeps rather than sampling. Nothing above
-		// catches it: those cases pick widths where the two happen to agree.
+		// others — which is why this sweeps rather than sampling.
 		//
-		// Overflow here is not a cosmetic ragged edge. A header one column too
+		// Overflow here is not a cosmetic ragged edge: a header one column too
 		// wide wraps, listHeaderLines(2) becomes 3 in fact but not in the
 		// arithmetic, the whole list shifts down a row, and every
-		// sessionIndexAtRow answer below it is off by one while View() clips the
-		// bottom without a word.
+		// sessionIndexAtRow answer below it is off by one.
 		all := sessions(map[session.Status]int{
 			session.StatusPermission: 3,
 			session.StatusThinking:   4,
@@ -2236,18 +2224,10 @@ func TestRenderSession_NarrowWidths(t *testing.T) {
 // --- one ruler ---
 
 // TestOneRuler_TruncationBoundsRenderedWidth is the regression for the defect
-// that made the whole row geometry a lie: strings were cut with go-runewidth
-// but the composed line was measured with lipgloss, and the two disagree.
-//
-// Two independent ways they disagree, both reachable in production:
-//
-//   - Variation-Selector-16 emoji ("✔️", "⚠️" — how an agent routinely ends a
-//     message) are 1 cell to runewidth and 2 to lipgloss. A name cut to N
-//     runewidth cells could emit 2N real columns, wrap the row, and make one
-//     session occupy two physical rows.
-//   - go-runewidth reads the East-Asian ambiguous-width table from the process
-//     locale at init, so "○ ■ ▶" are 2 cells under LANG=ja_JP.UTF-8 and 1
-//     under C.UTF-8, while lipgloss never follows the locale.
+// that made the whole row geometry a lie: strings were cut with go-runewidth but
+// the composed line was measured with lipgloss, and the two disagree in two ways
+// that both reach production — see the ruler note at the foot of model.go and
+// the init in styles.go.
 //
 // Asserting through lipgloss.Width is the point: it is the ruler that decides
 // whether a line fits the terminal, so it must be the ruler that bounds it.
@@ -2634,16 +2614,8 @@ func TestRenderDetailPane_MessageRows(t *testing.T) {
 }
 
 // TestRenderDetailPane_AssistantTailSurvivesAnOddBudget is the regression for
-// the -(detailMsgLines-1) in the assistant message's truncation budget.
-//
-// A wrap may only break in front of a grapheme cluster, so a two-column cluster
-// straddling the edge leaves its row one column unspent — and with an ODD
-// msgAvail, full-width text does that on every row. Cutting the message to
-// msgAvail*detailMsgLines columns therefore hands the wrap one column more than
-// its rows can hold, and the overflow is cut from the LAST row with an ellipsis:
-// the tail the assistant message was truncated from its end to keep is exactly
-// what disappears. Handing back one column per row boundary makes the budget fit
-// any text.
+// the -(detailMsgLines-1) in the assistant message's truncation budget; the
+// comment at that line has why it is not slack.
 //
 // The pane is 35 columns wide here because that is where the arithmetic bites:
 // avail 34, msgAvail 31, and full-width text spends 30 of those 31 per row.
@@ -2689,24 +2661,19 @@ func TestRenderDetailPane_AssistantTailSurvivesAnOddBudget(t *testing.T) {
 }
 
 // TestSessionName_ControlCharactersKeepTheRowCount is the regression for text
-// that carries its own line breaks. A newline is free in display width, so every
-// truncation here keeps it and then splits the "one line" it was just measured
-// as — which breaks sessionRowHeight in the list and detailPaneLines in the
-// pane, the two numbers all the scroll and hit-test arithmetic treats as fact.
-// The failure is invisible from inside a renderer: View() clips the overflow
-// from the bottom, so the symptom is a missing last row and no error at all.
+// that carries its own line breaks; sanitizeRowText has what a newline does to
+// the row count and why View() hides the symptom.
 //
 // Names come from whatever the IPC caller sent (`jin session rename`, the
 // agents' own rename hook) and the messages from whatever the agent wrote into
 // its transcript, so both are reachable input rather than hypotheticals — hence
 // the same hostile string in every field a row or a pane draws.
 //
-// The repo/branch row is in here too, and its working-directory variant is the
-// one that needs no agent to misbehave at all: git forbids a control character
-// in a refname, but POSIX allows a newline in a directory name, and a session
-// outside a git repo draws its working directory in the repo's place. That row
-// is now on every list row rather than on the one under the cursor, so a break
-// there costs the whole list's hit-testing, not one pane's last line.
+// The repo/branch row is in here too, and its working-directory variant needs no
+// agent to misbehave at all: git forbids a control character in a refname, but
+// POSIX allows a newline in a directory name, and a session outside a git repo
+// draws its working directory in the repo's place — on every list row, so a
+// break there costs the whole list's hit-testing.
 func TestSessionName_ControlCharactersKeepTheRowCount(t *testing.T) {
 	m := plainModel()
 	const width = 38
@@ -2778,16 +2745,12 @@ func TestSessionName_ControlCharactersKeepTheRowCount(t *testing.T) {
 }
 
 // TestWrapFixedLines covers the wrap itself, with no session and no marker in
-// the way. sessionNameLines is now one of two callers — renderDetailPane wraps
-// the last user and assistant messages through the same function — so the
-// contract belongs to the wrap rather than to names, and the cases below are
-// the ones a name never reaches: an empty marker, a marker that is not "*", and
-// a row budget of zero.
+// the way. The cases below are the ones a name never reaches: an empty marker, a
+// marker that is not "*", and a row budget of zero.
 //
-// What the wrap does NOT do is sanitize. Escape sequences would make it draw
-// the same text on every row (see sanitizeRowText), and both callers pay that
-// debt before calling in; there is no case for it here, because pinning the
-// behaviour would pin the bug.
+// What the wrap does NOT do is sanitize — both callers pay that debt before
+// calling in — so there is no case for it here, because pinning the behaviour
+// would pin the bug.
 func TestWrapFixedLines(t *testing.T) {
 	t.Run("returns exactly the rows it was asked for, none wider than its budget", func(t *testing.T) {
 		texts := []string{
@@ -3100,18 +3063,14 @@ func TestDetailPaneNameNeverMovesTheList(t *testing.T) {
 	})
 }
 
-// TestRenderSession_BranchPriority pins the width fight on the repo/branch
-// pair: several sessions on one repo is the main use, and there the repo name is
-// identical on every row while the branch is the only thing telling them apart.
+// TestRenderSession_BranchPriority pins the width fight on the repo/branch pair;
+// renderRepoBranch has why the branch wins.
 //
 // The pair used to live in the detail pane and now sits on the second line of
-// every list row, which is what makes the fight matter more than it did: the
-// row's avail is four columns narrower than the pane's was (sessionRowLead
-// against detailIndentWidth), and it is drawn for every session at once rather
-// than for the one under the cursor.
-//
-// Widths are given as the columns the PAIR gets rather than as pane widths, so
-// the arithmetic in each case reads against what renderRepoBranch is deciding.
+// every list row, so the row's avail is four columns narrower than the pane's
+// was, and it is drawn for every session at once. Widths are given as the columns
+// the PAIR gets rather than as pane widths, so the arithmetic in each case reads
+// against what renderRepoBranch is deciding.
 func TestRenderSession_BranchPriority(t *testing.T) {
 	m := plainModel()
 	sess := session.Info{
