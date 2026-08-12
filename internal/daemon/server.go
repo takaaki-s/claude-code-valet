@@ -397,6 +397,7 @@ type NewRequest struct {
 	Start       bool   `json:"start"`
 	Fleet       string `json:"fleet"`                // Fleet name for session grouping
 	AgentKind   string `json:"agent_kind,omitempty"` // Adapter identifier; daemon defaults to config default_agent when empty
+	Model       string `json:"model,omitempty"`      // Agent model in the CLI's own spelling; passed through unvalidated (see handleNew)
 
 	Worktree       bool   `json:"worktree,omitempty"`        // Create a git worktree for this session
 	WorktreeName   string `json:"worktree_name,omitempty"`   // Override auto-generated worktree name
@@ -430,11 +431,22 @@ func (s *Server) handleNew(data json.RawMessage) Response {
 		return Response{Success: false, Error: err.Error()}
 	}
 
+	// Model gets no equivalent gate: there is no registry to check it against,
+	// and each agent's catalogue moves faster than a jind-ai release, so an
+	// allowlist would reject valid new models.
+	//
+	// Nor does an agent necessarily reject one, and they do not behave alike:
+	// Claude Code starts and warns inside the pane (3/3 measured), which is what
+	// its modelOverrides setting is for; opencode starts and says nothing at all
+	// (3/3). Either way a typo produces a session jind-ai reports as running.
+	// That is the cost of the pass-through, and it is paid knowingly rather than
+	// papered over with a list that would go stale.
 	opts := session.CreateOptions{
 		Description:    req.Description,
 		WorkDir:        req.WorkDir,
 		Fleet:          req.Fleet,
 		AgentKind:      req.AgentKind,
+		Model:          req.Model,
 		Worktree:       req.Worktree,
 		WorktreeName:   req.WorktreeName,
 		WorktreeBranch: req.WorktreeBranch,

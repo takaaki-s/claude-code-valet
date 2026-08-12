@@ -41,6 +41,17 @@ type SpawnOptions struct {
 	// WorkDir is the absolute directory the agent should start in (~ is
 	// already expanded).
 	WorkDir string
+	// Model is the model the operator picked for this session, in whatever
+	// spelling the agent's own CLI takes — jind-ai does not normalise it, and
+	// the three CLIs do not agree (opencode wants `provider/model`, Claude
+	// Code takes an alias like `opus`). Empty means no model was named: emit
+	// no flag at all rather than an empty one.
+	//
+	// It is persisted, so every resume replays whatever was stored — a record
+	// written by an older jind-ai, or edited by hand, reaches SpawnCommand
+	// having passed no gate. Treat it the way the adapters treat session ids:
+	// SpawnPlan's shell-safety contract applies, so it belongs in ExtraEnv.
+	Model string
 	// CustomEnv carries user-configured env vars from config.yaml. The
 	// Manager forwards them to the shell command; adapters may also read
 	// them if they need to.

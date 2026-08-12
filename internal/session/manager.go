@@ -518,6 +518,7 @@ type CreateOptions struct {
 	Description string // Human-readable session description (empty = auto-generated)
 	Fleet       string // Fleet name for session grouping; defaults to DefaultFleet if empty
 	AgentKind   string // Adapter identifier; defaults to "claude" if empty
+	Model       string // Agent model in the CLI's own spelling; empty = the agent's own default
 
 	Worktree       bool   // Create a git worktree for this session
 	NoHook         bool   // Skip the worktree post-create hook (worktree path only)
@@ -743,6 +744,7 @@ func (m *Manager) ReserveCreation(opts CreateOptions) (*Session, Info, error) {
 		Status:            StatusCreating,
 		AgentKind:         agentKind,
 		AgentSessionID:    uuid.New().String(),
+		Model:             opts.Model,
 		Fleet:             opts.Fleet,
 		// Set IsWorktree immediately so the TUI delete modal offers the
 		// worktree removal option without waiting for the 10s
@@ -2345,6 +2347,7 @@ type spawnSnapshot struct {
 	AgentKind           string
 	AgentSessionID      string
 	AgentSessionStarted bool
+	Model               string
 	StartDir            string // pre-tmux shell workdir (may be ~-prefixed)
 	ExpandedWorkDir     string // absolute, ~-expanded workdir handed to Setup()
 }
@@ -2358,6 +2361,7 @@ func snapshotForSpawn(session *Session, startDir, expandedWorkDir string) spawnS
 		AgentKind:           session.AgentKind,
 		AgentSessionID:      session.AgentSessionID,
 		AgentSessionStarted: session.AgentSessionStarted,
+		Model:               session.Model,
 		StartDir:            startDir,
 		ExpandedWorkDir:     expandedWorkDir,
 	}
@@ -2413,6 +2417,7 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 		AgentSessionID:      snap.AgentSessionID,
 		AgentSessionStarted: snap.AgentSessionStarted,
 		WorkDir:             snap.ExpandedWorkDir,
+		Model:               snap.Model,
 		CustomEnv:           m.configMgr.GetEnv(),
 	})
 

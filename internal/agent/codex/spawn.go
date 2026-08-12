@@ -16,6 +16,10 @@ import (
 // edited by hand — reaches SpawnCommand having passed no gate.
 const sessionArgEnv = "JIN_CODEX_SESSION"
 
+// modelArgEnv keeps the model out of Command for the reason sessionArgEnv keeps
+// the id out; SpawnOptions.Model states it.
+const modelArgEnv = "JIN_CODEX_MODEL"
+
 // configArgs returns the `-c` overrides jind-ai forces on every spawned Codex.
 // They are passed per spawn — the user's own Codex config is never rewritten,
 // so a Codex started outside jind-ai keeps its normal behaviour.
@@ -67,6 +71,8 @@ func isResume(opts agent.SpawnOptions) bool {
 //     defensive glob check up front. The UUID travels in ExtraEnv.
 //   - Hook injection via `--enable hooks` + one `-c 'hooks.X=[...]'` per
 //     managedEvent (see hook_args.go), plus the overrides in configArgs.
+//   - `--model "$JIN_CODEX_MODEL"` on both lines alike when the session names
+//     one. Omitted entirely when it does not, so Codex picks its own default.
 //
 // UnsetEnv clears three Codex sandbox markers so a jind-ai session spawned
 // from inside a Codex-created sandbox does not inherit that state.
@@ -82,6 +88,15 @@ func SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 		extraEnv = map[string]string{sessionArgEnv: opts.AgentSessionID}
 	}
 	args := configArgs()
+	if opts.Model != "" {
+		// Appended to the shared args rather than to `base`, which is what puts
+		// it on the resume line too — `codex resume` takes --model as well.
+		args = append(args, "--model", `"$`+modelArgEnv+`"`)
+		if extraEnv == nil {
+			extraEnv = map[string]string{}
+		}
+		extraEnv[modelArgEnv] = opts.Model
+	}
 	// Straight from the options rather than from anything Setup kept — this
 	// adapter carries nothing between the two calls (see the type's doc, which
 	// also names the rollout cache it does keep, for its own unrelated reason).

@@ -51,6 +51,7 @@ Session (persisted)
 ├─ AgentKind             string    // Adapter identifier ("claude" etc.); always non-empty in persisted form
 ├─ AgentSessionID        string    // Adapter-side persistent id (CC --session-id / --resume value)
 ├─ AgentSessionStarted   bool      // Flipped once the agent has spawned; drives adapter's fresh-vs-resume branch
+├─ Model                 string    // Agent model in that CLI's own spelling; empty = the agent's default
 ├─ TmuxWindowName        string    // Inner tmux session name; kept across a kill (see Kill below)
 └─ TmuxPaneID            string    // Agent pane ID (e.g., "%42"); kept across a kill
 
