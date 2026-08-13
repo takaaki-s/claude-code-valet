@@ -769,10 +769,10 @@ actions:
     popup: { width: 60, height: 30 }
 ```
 
-Existing v1 manifests (`schema_version: 1` with top-level `entrypoint` /
-`on` / `timeout` / `popup`) keep working: they are normalised at parse
-time into a single-action shape, so no author-side migration is required.
-Write new manifests as v2.
+Existing v1 manifests (`schema_version: 1` with `install.source.entrypoint`
+plus top-level `on` / `timeout` / `popup`) keep working: they are normalised
+at parse time into a single-action shape, so no author-side migration is
+required. Write new manifests as v2.
 
 | Field | Required | Description |
 |-------|----------|--------------|
