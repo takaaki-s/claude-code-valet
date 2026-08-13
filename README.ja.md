@@ -623,17 +623,16 @@ description: Desktop notifications for jin sessions
 license: MIT
 homepage: https://github.com/foo/notifier
 jin: ">=0.8.0"
+timeout: 30s                                         # action 単位ではなくプラグイン単位
 install:
   source:
     build:
       - go build -o bin/notifier ./cmd/notifier
-    entrypoint: ./bin/notifier
 actions:
   - id: default                                      # actions[0] が暗黙の default
     entrypoint: ./bin/notifier notify
     on: ["status_changed:idle", "status_changed:permission"]
     label: "Desktop notification"
-    timeout: 30s
   - id: send-dm                                      # `jin plugin run notifier send-dm`
     entrypoint: ./bin/notifier send-dm
     on: []                                           # action 専用（イベント購読なし）
@@ -641,7 +640,7 @@ actions:
     popup: { width: 60, height: 30 }
 ```
 
-既存の v1 マニフェスト（`schema_version: 1` + top-level `entrypoint` / `on` / `timeout` / `popup`）はそのまま動きます。parse 時に単一 action 形式へ normalize されるため、プラグイン作者側の対応は不要です。新規は v2 で書いてください。
+既存の v1 マニフェスト（`schema_version: 1` + `install.source.entrypoint` および top-level `on` / `timeout` / `popup`）はそのまま動きます。parse 時に単一 action 形式へ normalize されるため、プラグイン作者側の対応は不要です。新規は v2 で書いてください。
 
 | フィールド | 必須 | 説明 |
 |-----------|------|------|
@@ -652,17 +651,17 @@ actions:
 | `license` / `homepage` | なし | 任意メタデータ。レジストリエントリに載る |
 | `jin` | あり | jin バイナリに対する semver 制約（`">=0.8.0"`、`"^0.8"`、`">=0.8 <0.10"`）。install 時と毎 dispatch 時にチェック |
 | `install.source.build` | なし | ビルドコマンド配列（各要素が独立の `bash -c`。要素をまたぐパイプは不可） — [言語別ガイド](#言語別ガイド) を参照。直接実行可能な entrypoint を同梱するプラグイン（shell script、リポジトリに commit した prebuilt バイナリ等）では省略可 |
-| `install.source.entrypoint` | 条件付き | 個々の action が entrypoint を宣言しなかった時に使われるデフォルト entrypoint。`install.source` 使用時は必須 |
+| `install.source.entrypoint` | v1 のみ | ディスパッチャーが実行するデフォルト entrypoint。v2 では禁止（validate エラー）—— v2 は action ごとに entrypoint を宣言する |
 | `install.release_asset.pattern` | 条件付き | `install.source` の代替。最新 GitHub Release から prebuilt asset をダウンロード。プレースホルダ: `{os}` / `{arch}` |
-| `actions[]` | v2 のみ | プラグインが公開する action のリスト。`actions[0]` が暗黙の default。各要素が `id` / `entrypoint` / `on` / `label` / `timeout` / `popup` を持つ（以下の行を参照） |
-| `actions[].id` | あり | `[a-z][a-z0-9-]{0,63}`。プラグイン内で unique。パレット / keybindings / `jin plugin run` すべてが ID で action を参照するため、明示 ID を強く推奨 |
-| `actions[].entrypoint` | 条件付き | この action の実行パス（プラグインディレクトリ相対）。`install.source.entrypoint` でカバーされる場合は省略可 |
+| `actions[]` | v2 のみ | プラグインが公開する action のリスト。`actions[0]` が暗黙の default。各要素が `id` / `entrypoint` / `on` / `label` / `popup` を持つ（以下の行を参照） |
+| `actions[].id` | あり | `[a-z][a-z0-9-]{0,31}`（最大 32 文字。ID は CLI の引数トークンにもなるため `name` より意図的に狭い）。プラグイン内で unique。パレット / keybindings / `jin plugin run` すべてが ID で action を参照するため、明示 ID を強く推奨 |
+| `actions[].entrypoint` | あり | この action の実行パス（プラグインディレクトリ相対）。すべての action が自前で持つ必要がある —— v2 にマニフェスト単位のフォールバックは無い |
 | `actions[].on` | なし | この action の `status_changed` マッチャー。v1 の top-level `on` と同じ構文。空または省略時は action 専用。match / debounce は action 単位で独立 |
 | `actions[].label` | なし | パレット / help popup に表示される人間可読ラベル。空の場合パレットは `<plugin>:<action-id>` を表示（default action の ID が `default` のときは plugin 名のみ） |
-| `actions[].timeout` | なし | この action 個別の `timeout` 上書き。デフォルト `30s` |
+| `timeout`（top-level） | なし | このプラグインの action が実行できる時間。デフォルト `30s`。**action 単位の上書きは存在せず**、ディスパッチャーはこの 1 つの値を全 action に適用する |
 | `actions[].popup.width` / `.height` | なし | `jin pane popup --here` の action 単位のサイズヒント（1–100、%） |
 | `actions[].listener` | なし | この action を「イベント購読専用」とマーク。`on:` にマッチしたときは通常通り発火するが、ユーザー向けサーフェス（パレット / help popup / shell 補完）からは非表示になる。`jin plugin run <plugin> <action>` による直接起動は debug 目的で許可されたまま。`on:` 非空必須（listener with no events は無意味） |
-| `on` / `timeout` / `popup`（top-level） | v1 のみ | v1 レガシーフィールド。v2 では validate エラーになるため `actions[]` 側に書く |
+| `on` / `popup`（top-level） | v1 のみ | v1 レガシーフィールド。v2 では validate エラーになるため `actions[]` 側に書く。top-level の `timeout` は**この仲間ではなく**、v2 でも有効（上の行）|
 
 `install.source` と `install.release_asset` は排他です。
 
