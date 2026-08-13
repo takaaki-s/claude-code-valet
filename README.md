@@ -752,17 +752,16 @@ description: Desktop notifications for jin sessions
 license: MIT
 homepage: https://github.com/foo/notifier
 jin: ">=0.8.0"
+timeout: 30s                                         # per plugin, not per action
 install:
   source:
     build:
       - go build -o bin/notifier ./cmd/notifier
-    entrypoint: ./bin/notifier
 actions:
   - id: default                                      # actions[0] is the implicit default
     entrypoint: ./bin/notifier notify
     on: ["status_changed:idle", "status_changed:permission"]
     label: "Desktop notification"
-    timeout: 30s
   - id: send-dm                                      # `jin plugin run notifier send-dm`
     entrypoint: ./bin/notifier send-dm
     on: []                                           # action-only (no event subscription)
@@ -784,17 +783,17 @@ Write new manifests as v2.
 | `license` / `homepage` | No | Optional metadata carried into the registry entry |
 | `jin` | Yes | Semver constraint on the jin binary (`">=0.8.0"`, `"^0.8"`, `">=0.8 <0.10"`). Checked at install and at every dispatch |
 | `install.source.build` | No | Ordered list of build commands (each element runs in its own `bash -c`, no piping across elements) — see [Language-specific guidance](#language-specific-guidance). Omit for plugins that ship a directly-executable entrypoint (shell scripts, prebuilt binaries in the repo) |
-| `install.source.entrypoint` | Conditional | Default entrypoint the dispatcher executes if a specific action does not declare its own. Required when `install.source` is used |
+| `install.source.entrypoint` | v1 only | Default entrypoint the dispatcher executes. Forbidden in v2 (validation error) — v2 declares entrypoints per action instead |
 | `install.release_asset.pattern` | Conditional | Alternative to `install.source`. Downloads a prebuilt asset from the latest GitHub Release. Placeholders: `{os}`, `{arch}` |
-| `actions[]` | v2 only | List of actions the plugin exposes. `actions[0]` is the implicit default. Each element carries `id` / `entrypoint` / `on` / `label` / `timeout` / `popup` (fields below) |
-| `actions[].id` | Yes | `[a-z][a-z0-9-]{0,63}`; unique within the plugin. Explicit IDs are strongly recommended — palette, keybindings, and `jin plugin run` all reference actions by ID |
-| `actions[].entrypoint` | Conditional | Path (relative to the plugin dir) executed for this action. May be omitted when `install.source.entrypoint` covers it |
+| `actions[]` | v2 only | List of actions the plugin exposes. `actions[0]` is the implicit default. Each element carries `id` / `entrypoint` / `on` / `label` / `popup` (fields below) |
+| `actions[].id` | Yes | `[a-z][a-z0-9-]{0,31}` (32 chars max — deliberately narrower than `name`, since ids are also CLI arg tokens); unique within the plugin. Explicit IDs are strongly recommended — palette, keybindings, and `jin plugin run` all reference actions by ID |
+| `actions[].entrypoint` | Yes | Path (relative to the plugin dir) executed for this action. Every action needs its own — v2 has no manifest-level fallback |
 | `actions[].on` | No | Per-action `status_changed` matchers, same syntax as v1's top-level `on`. Empty or omitted = action-only. Matching / debouncing is independent per action |
 | `actions[].label` | No | Human-readable label shown in the palette and help popup. When empty, the palette displays `<plugin>:<action-id>` (or just `<plugin>` when the default action's ID is `default`) |
-| `actions[].timeout` | No | Per-action override for `timeout`; default `30s` |
+| `timeout` (top-level) | No | How long any of this plugin's actions may run; default `30s`. There is no per-action override — the dispatcher applies this one value to every action |
 | `actions[].popup.width` / `.height` | No | Per-action manifest hint for `jin pane popup --here` size (1–100, percent of terminal) |
 | `actions[].listener` | No | Marks the action as an event-only endpoint. It still fires on matching `on:` events, but is hidden from every user-facing surface (palette, help popup, shell completion). Direct invocation via `jin plugin run <plugin> <action>` remains available for debugging. Requires a non-empty `on:` — a listener with no events has no runtime purpose |
-| `on` / `timeout` / `popup` (top-level) | v1 only | Legacy v1 fields; forbidden in v2 (validation error). Put them under `actions[]` instead |
+| `on` / `popup` (top-level) | v1 only | Legacy v1 fields; forbidden in v2 (validation error). Put them under `actions[]` instead. Top-level `timeout` is **not** in this group — it stays valid in v2 (row above) |
 
 `install.source` and `install.release_asset` are mutually exclusive.
 
