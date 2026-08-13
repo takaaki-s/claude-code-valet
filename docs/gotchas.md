@@ -1546,6 +1546,58 @@ Common pitfalls and caveats that agents tend to fall into.
 
 ## opencode adapter
 
+- **An opencode the agent starts for itself used to report against the agent's
+  own jind-ai session, and the plugin now marks such children so they stay
+  quiet.** opencode is the one adapter whose hooks reach it through the
+  environment: Claude Code and Codex are told about theirs on the command line
+  (`--settings <path>`, `-c 'hooks.X=[...]'`), which a child cannot inherit,
+  while opencode is told through `OPENCODE_CONFIG_DIR`, which every descendant
+  does inherit — `JIN_SESSION_ID` along with it.
+
+  Left alone, such a child loads this plugin from the inherited directory and
+  reports its own fresh root session against the parent's id. Measured with the
+  nested process started from the agent's own environment: the parent's
+  `AgentSessionID` was re-keyed to the nested `ses_` id in **3 of 3** runs, 0 of
+  3 in a control that started nothing, and the parent's status was driven
+  through `UserPromptSubmit` and `Stop` by a session it never ran. Claude Code
+  and Codex were 0 of 3 in both arms with their own hooks firing throughout, so
+  the difference is the wiring rather than the agent.
+
+  The `parentID` allow-list cannot catch this. It is sound for the task tool's
+  children, which are sessions inside the same opencode server; a separate
+  process has a root session of its own and is indistinguishable from the real
+  one by that test.
+
+  So the guard is a mark rather than a classification: `shell.env` sets
+  `JIN_OPENCODE_NESTED` on everything the agent starts, and `server()` returns
+  an empty hook set when it finds that variable already set.
+
+  - **Withholding `OPENCODE_CONFIG_DIR` instead would have been the smaller
+    change, and it is not safe.** Blanking it does stop the child loading the
+    plugin — the directory list is built with a truthy test — but not every
+    read of that variable is one. The `config` entry of opencode's global paths
+    is `OPENCODE_CONFIG_DIR ?? <default>`, and `??` passes an empty string
+    through where a truthy test rejects it. What a global
+    config path of `""` then does downstream was not measured. Deleting the key
+    rather than blanking it does nothing at all: opencode merges what
+    `shell.env` returns over the ambient environment
+    (`{...process.env, ...output.env}`), so a removed key is inherited.
+  - **Every spawn clears the mark, and that is load-bearing rather than tidy.**
+    It reaches jind-ai's own processes as soon as an agent runs
+    `jin daemon start`, which the orchestration docs tell it to do: the daemon
+    inherits the agent's whole environment, and the tmux server it forks
+    inherits the daemon's. A pane started from such a server would run an
+    opencode that reports no status for any session and says nothing about why —
+    the same silent class of failure the mark exists to close.
+  - **The mark only reaches children opencode starts on the agent's behalf** —
+    the shell tool, the bash tool, and the pty API all trigger `shell.env`.
+    LSP servers and MCP stdio servers are started without it, so a nested
+    opencode launched from one of those is still unmarked.
+  - **`JIN_SESSION_ID` is still passed** by the same hook. That is belt and
+    braces rather than the contract: the pane already exports it, and the
+    plugin sets it again only in case opencode ever narrows the environment it
+    hands to children.
+
 - **`OPENCODE_CONFIG_DIR` is additive, not a replacement.** opencode's
   `ConfigPaths.directories()` returns
   `unique([~/.config/opencode, …project .opencode dirs, $OPENCODE_CONFIG_DIR])`,

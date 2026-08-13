@@ -48,6 +48,17 @@ const sessionArgEnv = "JIN_OPENCODE_SESSION"
 // above keep the id out; SpawnOptions.Model states it.
 const modelArgEnv = "JIN_OPENCODE_MODEL"
 
+// nestedEnv is the mark the plugin sets on everything the agent starts, so it
+// can decline to report from inside such a process. Spelled here as well as in
+// the plugin because a spawn must clear it, and pinned to the plugin's own
+// spelling by a test in this package.
+//
+// Clearing it is not housekeeping: an agent that runs `jin daemon start` hands
+// the mark to jind-ai's own processes, and a pane that inherited it would run an
+// opencode reporting no status for any session and no error either. The path it
+// travels is in docs/gotchas.md.
+const nestedEnv = "JIN_OPENCODE_NESTED"
+
 // SpawnCommand builds the `opencode ...` command line the daemon splices into
 // its fixed shell wrapper. Manager owns cwd, JIN_SESSION_ID and the
 // unconditional `env -u TMUX`; this owns the agent-specific pieces:
@@ -71,6 +82,8 @@ const modelArgEnv = "JIN_OPENCODE_MODEL"
 // model included. Same fail-open
 // posture the Codex adapter takes when it has no executable path to build hook
 // arguments from.
+//
+// UnsetEnv clears the plugin's nested mark; see nestedEnv for why a spawn must.
 func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
 	resuming := opts.AgentSessionStarted && hasSessionIDPrefix(opts.AgentSessionID)
 
@@ -104,5 +117,6 @@ func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
 	if len(plan.ExtraEnv) == 0 {
 		plan.ExtraEnv = nil
 	}
+	plan.UnsetEnv = []string{nestedEnv}
 	return plan
 }

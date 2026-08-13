@@ -120,14 +120,30 @@ func TestSpawnCommand_ConfigDirWithSpaces_NotPreEscaped(t *testing.T) {
 	}
 }
 
-// UnsetEnv is empty today; opencode ships no "already inside a sandbox"
-// marker equivalent to CODEX_SANDBOX. Asserting it keeps a future addition
-// deliberate rather than accidental.
-func TestSpawnCommand_NoUnsetEnv(t *testing.T) {
-	plan := SpawnCommand(agent.SpawnOptions{}, testConfigDir)
+// Every spawn clears the plugin's nested mark, including the one that failed
+// open with no config dir — a pane inheriting it would run an opencode that
+// reports no status for any session and says nothing about why (see nestedEnv).
+//
+// Compared exactly rather than by presence: what belongs here is one name, and
+// an entry arriving by accident is the thing the previous version of this test
+// existed to catch.
+func TestSpawnCommand_ClearsTheNestedMark(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		opts      agent.SpawnOptions
+		configDir string
+	}{
+		{"fresh", agent.SpawnOptions{}, testConfigDir},
+		{"resume", agent.SpawnOptions{AgentSessionID: realSessionID, AgentSessionStarted: true}, testConfigDir},
+		{"no config dir", agent.SpawnOptions{}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := SpawnCommand(tc.opts, tc.configDir)
 
-	if len(plan.UnsetEnv) != 0 {
-		t.Errorf("UnsetEnv = %v, want empty", plan.UnsetEnv)
+			if !reflect.DeepEqual(plan.UnsetEnv, []string{nestedEnv}) {
+				t.Errorf("UnsetEnv = %v, want exactly [%s]", plan.UnsetEnv, nestedEnv)
+			}
+		})
 	}
 }
 

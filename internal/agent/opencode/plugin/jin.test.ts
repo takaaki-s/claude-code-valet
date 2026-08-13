@@ -297,6 +297,57 @@ test("shell.env propagates the jind-ai session id", async () => {
   await hooks["shell.env"]({}, {})
 })
 
+/**
+ * The nested guard, tested as a round trip rather than as two halves: what
+ * shell.env writes is fed back through the environment server() reads. Checked
+ * apart, the mark and the check can drift — writing "yes" while testing for
+ * "1" passes both halves and silences nothing in production.
+ *
+ * Run against a resumed parent and a fresh one, because each is the whole story
+ * for a different failure: only a resumed parent has an id a nested session
+ * could destroy, and only a fresh one covers the first spawn of every session.
+ * Fixing one of these tests to the other's environment leaves that half blind.
+ */
+const withNestedEnv = async (
+  opts: { root?: string; extra?: Record<string, string> },
+  body: () => Promise<void>,
+) => {
+  process.env["JIN_SESSION_ID"] = "jin-test-session"
+  if (opts.root) process.env["JIN_OPENCODE_ROOT_SESSION"] = opts.root
+  else delete process.env["JIN_OPENCODE_ROOT_SESSION"]
+  delete process.env["JIN_OPENCODE_NESTED"]
+  Object.assign(process.env, opts.extra ?? {})
+  try {
+    await body()
+  } finally {
+    delete process.env["JIN_OPENCODE_NESTED"]
+    delete process.env["JIN_OPENCODE_ROOT_SESSION"]
+  }
+}
+
+for (const root of [undefined, "ses_parent"]) {
+  const parent = root ? "a resumed parent" : "a fresh parent"
+
+  test(`the mark shell.env writes is one server() refuses to run under (${parent})`, async () => {
+    await withNestedEnv({ root }, async () => {
+      const mod = await import(modulePath)
+      const output: { env: Record<string, string> } = { env: {} }
+      await (await mod.server({}))["shell.env"]({}, output)
+
+      // Exactly what the child receives, mark included — or not, if none was set.
+      Object.assign(process.env, output.env)
+      expect(Object.keys(await mod.server({}))).toEqual([])
+    })
+  })
+
+  test(`any truthy mark silences the plugin, not only the one it writes (${parent})`, async () => {
+    await withNestedEnv({ root, extra: { JIN_OPENCODE_NESTED: "yes" } }, async () => {
+      const mod = await import(modulePath)
+      expect(Object.keys(await mod.server({}))).toEqual([])
+    })
+  })
+}
+
 test("session.deleted forgets the session", async () => {
   // Without cleanup the allow-list and suppression cache grow for the life
   // of the opencode process.

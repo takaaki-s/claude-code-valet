@@ -562,3 +562,17 @@ func TestWriteAgentContext_WriteOrder(t *testing.T) {
 		t.Error("opencode.json was written even though the file its instructions name could not be")
 	}
 }
+
+// The mark is spelled once in Go, for SpawnCommand's UnsetEnv, and once in
+// TypeScript, where the plugin sets and reads it. Nothing makes the two agree,
+// and disagreement is silent in both directions: a spawn that clears the wrong
+// name lets the mark through, and a plugin that sets a name no spawn clears
+// turns one stray variable into a permanent status blackout.
+//
+// The Bun tests own whether the guard behaves; this owns only the spelling,
+// which is the part they cannot see.
+func TestPluginSpellsTheNestedMarkTheWaySpawnDoes(t *testing.T) {
+	if !strings.Contains(pluginSource, `const NESTED_ENV = "`+nestedEnv+`"`) {
+		t.Errorf("plugin source does not define NESTED_ENV as %q; SpawnCommand clears a name the plugin no longer uses", nestedEnv)
+	}
+}

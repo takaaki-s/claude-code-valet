@@ -312,3 +312,37 @@ func TestBuildAgentShellCmd_ConfiguredDebugValueWinsOverThePropagatedOne(t *test
 		t.Errorf("the configured value is applied before the propagated one, so it loses\ncommand: %s", cmd)
 	}
 }
+
+// TestBuildAgentShellCmd_ClearsWhatTheAdapterAsksToClear pins the wire from
+// SpawnPlan.UnsetEnv to the `env -u` prefix the agent starts under. Nothing
+// covered it: emptying the loop that renders those flags left the whole suite
+// green, in this package and in the e2e list alike. Every adapter that asks for
+// a variable to be cleared depends on this one line — Claude Code so a spawned
+// CC does not think it is already inside one, Codex for its sandbox markers,
+// opencode so its plugin's nested mark cannot reach a pane jind-ai owns and
+// silence status reporting for every session.
+//
+// The name is this test's own rather than any adapter's: what belongs here is
+// that the mechanism works, and which variables matter is each adapter's to
+// state and to test.
+func TestBuildAgentShellCmd_ClearsWhatTheAdapterAsksToClear(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	mgr.SetAgentResolver(&fakeAgentResolver{agents: map[string]Agent{
+		"probe": &fakeAgent{spawnFn: func(SpawnOptions) SpawnPlan {
+			return SpawnPlan{Command: "true", UnsetEnv: []string{"JIN_PROBE_MARK"}}
+		}},
+	}})
+
+	cmd, err := mgr.buildAgentShellCmd(spawnSnapshot{
+		JinSessionID: "probe-session",
+		AgentKind:    "probe",
+		StartDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("buildAgentShellCmd: %v", err)
+	}
+
+	if !strings.Contains(cmd, "-u JIN_PROBE_MARK") {
+		t.Errorf("the adapter asked for JIN_PROBE_MARK to be cleared and the agent inherits it anyway\ncommand: %s", cmd)
+	}
+}
