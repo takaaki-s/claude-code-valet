@@ -5,7 +5,7 @@ attaches them to the corresponding [GitHub Release](https://github.com/takaaki-s
 This file is the curated overview — highlights per release, not a per-commit
 log.
 
-## Unreleased
+## 0.10.0
 
 ### Features
 
