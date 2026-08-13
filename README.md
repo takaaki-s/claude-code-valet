@@ -12,7 +12,7 @@
 Runs on tmux, so your config carries over — and over SSH you come back to the
 same screen.
 
-![Eight agent sessions in one list. The cursor moves down it and the pane below follows, describing each session without switching to it; the one waiting on a permission prompt is marked, and its prompt is open on the right.](https://github.com/takaaki-s/jind-ai/releases/download/v0.9.0/demo.gif)
+![Eight agent sessions in one list. The cursor moves down it and the pane below follows, describing each session without switching to it; the one waiting on a permission prompt is marked, and its prompt is open on the right.](https://github.com/takaaki-s/jind-ai/releases/download/v0.10.0/demo.gif)
 
 ## Installation
 
