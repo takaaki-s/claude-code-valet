@@ -33,7 +33,7 @@ on: ["status_changed:idle", "status_changed:permission"]
 timeout: 30s
 ```
 
-See the ["Plugins → Manifest" section in the top-level README](../README.md#manifest-jind-ai-pluginyaml)
+See the ["Manifest" section in the plugin guide](plugins.md#manifest-jind-ai-pluginyaml)
 for the full field reference; every field there is honoured identically by the
 registry crawler. Two publish-specific notes:
 
@@ -194,7 +194,7 @@ through the same code path `jin plugin install` uses, so the conditions the
 build gets are the install's, not your session's:
 
 - **The environment is filtered the way an install filters it** — see
-  [the build environment](../README.md#language-specific-guidance) for the
+  [the build environment](plugins.md#language-specific-guidance) for the
   allowlist. A build needing anything outside it fails here, which is the
   point.
 - **The budget is the default `plugins.build_timeout` (300s), covering the
@@ -230,7 +230,7 @@ Concretely for plugin authors, this means:
 - Expect to re-test your plugin on every jin minor bump during pre-1.0. When
   a bump lands, the CHANGELOG's Features section will call out any changes
   that affect plugins.
-- Follow the [compatibility contract](../README.md#compatibility) in the
+- Follow the [compatibility contract](plugins.md#compatibility) in the
   README: treat unknown env vars / JSON fields / CLI flags as ignorable —
   that's what makes minor bumps survivable, and it also documents the
   `schema_version` window jind-ai supports.
