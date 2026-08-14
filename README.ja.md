@@ -13,6 +13,13 @@ tmux の上で動くので、既存の設定はそのまま。SSH 越しでも�
 
 ![8 つのエージェントセッションが 1 つの一覧に並ぶ。カーソルを下へ動かすと下のペインが追随して各セッションを説明し、切り替えは起きない。許可待ちのセッションには印が付き、その許可ダイアログが右に開いている。](https://github.com/takaaki-s/jind-ai/releases/download/v0.10.0/demo.gif)
 
+> **For AI agents（AI エージェントの方へ）。** jin のエージェント向けリファレンスは
+> このファイルではなくバイナリに同梱されており、インストール済みのバージョンと必ず
+> 一致します。`jin docs list` で topic の一覧、`jin docs show <name>` で本文が読め、
+> どちらも daemon を必要としません。リポジトリしか手元にない場合、同じ文書は
+> [`internal/agentdocs/docs/`](internal/agentdocs/docs/) にあります（英語）。まずは
+> [orchestration](internal/agentdocs/docs/orchestration.md) から。
+
 ## インストール
 
 ### GitHub Releases からダウンロード
