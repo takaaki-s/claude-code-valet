@@ -66,6 +66,17 @@ import { spawn } from "node:child_process"
 const JIN_BIN = __JIN_BIN__
 
 /**
+ * Marks an opencode that the agent started for itself, so this plugin can
+ * decline to report from inside it. Set on the way out, in shell.env, and read
+ * on the way in, at the top of server().
+ *
+ * jind-ai's own spawns clear it, and must: see the adapter's nestedEnv. Why a
+ * mark at all, rather than withholding the config dir the nested process loads
+ * this file from, is in docs/gotchas.md.
+ */
+const NESTED_ENV = "JIN_OPENCODE_NESTED"
+
+/**
  * How long to wait for `jin hook` before killing it. The command connects
  * to the daemon socket and returns, so this is a backstop against a daemon
  * that accepts but never answers: without it one stuck invocation would
@@ -162,6 +173,11 @@ function sendHook(sessionID: string, event: CanonicalEvent): Promise<boolean> {
 
 export const server = async (input?: { client?: any }) => {
   const client = input?.client
+  // Started by the agent rather than by jind-ai. It has JIN_SESSION_ID and the
+  // config dir by inheritance, and a root session of its own that the parentID
+  // allow-list cannot recognise as foreign — so without this it would report
+  // the parent's session as started, thinking, and idle on its own schedule.
+  if (process.env[NESTED_ENV]) return {}
   const jinSessionID = process.env["JIN_SESSION_ID"]
   // Not a jind-ai managed session: contribute nothing at all. Users who run
   // opencode themselves must not have their process touched by this plugin,
@@ -267,6 +283,9 @@ export const server = async (input?: { client?: any }) => {
       // The pane already exports JIN_SESSION_ID, so this is belt-and-braces
       // against opencode narrowing the env it hands to child processes.
       output.env["JIN_SESSION_ID"] = jinSessionID
+      // Anything the agent starts is, by definition, not the session pane's
+      // own opencode — so mark it. See NESTED_ENV and docs/gotchas.md.
+      output.env[NESTED_ENV] = "1"
     },
 
     event: async ({ event }: { event: { type: string; properties?: any } }) => {

@@ -5,6 +5,30 @@ attaches them to the corresponding [GitHub Release](https://github.com/takaaki-s
 This file is the curated overview — highlights per release, not a per-commit
 log.
 
+## Unreleased
+
+### Fixes
+
+- **An opencode session is no longer rewritten by an opencode the agent starts
+  for itself.** opencode is the one supported agent told about its hooks
+  through the environment rather than the command line, so everything the agent
+  runs inherits both the plugin directory and `JIN_SESSION_ID`. A nested
+  opencode therefore loaded jind-ai's status plugin and reported its own new
+  session against the parent's: measured with the child started from the
+  agent's own environment, the parent's recorded agent-session id was replaced
+  by the child's in 3 of 3 runs — which is the id a later `opencode --session`
+  reopens — and the parent was reported as started, then working, then finished
+  for a turn it never ran.
+  Claude Code and Codex were unaffected in the same test (0 of 3 in both arms,
+  with their own hooks firing throughout).
+
+  The plugin now marks whatever the agent starts and declines to report from
+  inside a marked process. Children opencode starts on the agent's behalf — the
+  shell tool, the bash tool, the pty API — are all covered; a nested opencode
+  launched from an LSP or MCP server is not, because those are started without
+  the hook the mark travels on. See
+  [docs/gotchas.md](docs/gotchas.md#opencode-adapter).
+
 ## 0.10.0
 
 ### Features
