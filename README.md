@@ -14,6 +14,13 @@ same screen.
 
 ![Eight agent sessions in one list. The cursor moves down it and the pane below follows, describing each session without switching to it; the one waiting on a permission prompt is marked, and its prompt is open on the right.](https://github.com/takaaki-s/jind-ai/releases/download/v0.10.0/demo.gif)
 
+> **For AI agents.** jin's reference material for agents is not in this file — it
+> is compiled into the binary, so it always matches the version installed.
+> `jin docs list` names the topics, `jin docs show <name>` reads one, and
+> neither needs the daemon. With only the repository in front of you, the same
+> documents are [`internal/agentdocs/docs/`](internal/agentdocs/docs/); start
+> with [orchestration](internal/agentdocs/docs/orchestration.md).
+
 ## Installation
 
 ### Download from GitHub Releases
