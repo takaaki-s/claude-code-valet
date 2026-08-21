@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -305,7 +307,6 @@ func TestRunner_Run_EnvVars(t *testing.T) {
 		Branch:       "wip/jin-abcd1234",
 		Base:         "main",
 		SessionID:    "sess-uuid-1",
-		SessionName:  "test-session",
 		LogPath:      logPath,
 	})
 	if err != nil {
@@ -323,7 +324,6 @@ func TestRunner_Run_EnvVars(t *testing.T) {
 		"JIN_WORKTREE_BRANCH=wip/jin-abcd1234",
 		"JIN_WORKTREE_BASE=main",
 		"JIN_SESSION_ID=sess-uuid-1",
-		"JIN_SESSION_NAME=test-session",
 		"JIN_REPO_ROOT=/tmp/fake-repo",
 		"PWD=" + workDir,
 	}
@@ -383,5 +383,26 @@ func TestBuildEnv_ForwardsTheInheritedAllowlist(t *testing.T) {
 
 	if !strings.Contains(env, "PATH=/pinned/by/the/test") {
 		t.Errorf("the hook is not given the inherited PATH; env:\n%s", env)
+	}
+}
+
+func TestBuildEnv_CarriesExactlyTheDocumentedJinVariables(t *testing.T) {
+	var got []string
+	for _, kv := range buildEnv(RunOptions{}) {
+		if key, _, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(key, "JIN_") {
+			got = append(got, key)
+		}
+	}
+	sort.Strings(got)
+
+	want := []string{
+		"JIN_REPO_ROOT",
+		"JIN_SESSION_ID",
+		"JIN_WORKTREE_BASE",
+		"JIN_WORKTREE_BRANCH",
+		"JIN_WORKTREE_PATH",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("hook env JIN_* = %v, want %v", got, want)
 	}
 }

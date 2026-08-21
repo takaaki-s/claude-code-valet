@@ -669,7 +669,6 @@ func (m *Manager) provisionWorktree(sessionID string, opts CreateOptions) (workt
 					Branch:       branch,
 					Base:         base,
 					SessionID:    sessionID,
-					SessionName:  opts.Description,
 					LogPath:      logPath,
 					Timeout:      timeout,
 				})

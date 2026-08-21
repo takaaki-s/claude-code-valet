@@ -473,7 +473,7 @@ Template variables:
 
 | Placeholder | Expands to |
 |-------------|------------|
-| `{name}` | Worktree name (e.g. `jin-abcd1234`, or the `--name` you passed) |
+| `{name}` | Worktree name (e.g. `jin-abcd1234`, or the `--worktree-name` you passed) |
 | `{repo}` | Basename of the original repository |
 | `${VAR}` | Environment variable (`os.ExpandEnv` semantics) |
 
@@ -622,9 +622,8 @@ pnpm install
 |----------|--------------|
 | `JIN_WORKTREE_PATH` | Absolute path of the newly created worktree |
 | `JIN_WORKTREE_BRANCH` | Branch checked out in the worktree |
-| `JIN_WORKTREE_BASE` | Base branch the worktree was created from |
+| `JIN_WORKTREE_BASE` | Base branch name — the worktree is cut from `origin/<this>` |
 | `JIN_SESSION_ID` | UUID of the session being created |
-| `JIN_SESSION_NAME` | Session name, if one was given via `--name` (empty otherwise — the auto-derived name isn't assigned until after the hook runs) |
 | `JIN_REPO_ROOT` | Absolute path of the original repository |
 
 ### Security: allowlist

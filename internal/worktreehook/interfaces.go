@@ -33,7 +33,6 @@ type RunOptions struct {
 	Branch       string
 	Base         string
 	SessionID    string
-	SessionName  string // may be empty if the session name is unset at hook time
 	LogPath      string
 	// Timeout is used only for error message formatting ("hook timed out
 	// after 5m0s"). The actual cancellation deadline must be set on ctx by
