@@ -146,7 +146,6 @@ func buildEnv(opts RunOptions) []string {
 		"JIN_WORKTREE_BRANCH="+opts.Branch,
 		"JIN_WORKTREE_BASE="+opts.Base,
 		"JIN_SESSION_ID="+opts.SessionID,
-		"JIN_SESSION_NAME="+opts.SessionName,
 		"JIN_REPO_ROOT="+opts.RepoRoot,
 	)
 	return env

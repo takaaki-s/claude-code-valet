@@ -431,7 +431,7 @@ worktree:
 
 | 変数 | 展開結果 |
 |------|----------|
-| `{name}` | worktree 名（例: `jin-abcd1234` / `--name` で指定した名前） |
+| `{name}` | worktree 名（例: `jin-abcd1234` / `--worktree-name` で指定した名前） |
 | `{repo}` | 元リポジトリのベース名 |
 | `${VAR}` | 環境変数（`os.ExpandEnv` に準拠） |
 
@@ -557,9 +557,8 @@ pnpm install
 |------|------|
 | `JIN_WORKTREE_PATH` | 作成された worktree の絶対パス |
 | `JIN_WORKTREE_BRANCH` | worktree でチェックアウトされているブランチ |
-| `JIN_WORKTREE_BASE` | worktree の起点となったベースブランチ |
+| `JIN_WORKTREE_BASE` | ベースブランチ名 —— worktree は `origin/<この名前>` から切られる |
 | `JIN_SESSION_ID` | 作成中セッションの UUID |
-| `JIN_SESSION_NAME` | `--name` で指定されたセッション名（省略時は空。自動導出名は hook 実行後に確定するため） |
 | `JIN_REPO_ROOT` | 元リポジトリの絶対パス |
 
 ### セキュリティ: allowlist
