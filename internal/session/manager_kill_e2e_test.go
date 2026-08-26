@@ -218,8 +218,8 @@ func TestE2E_KillRightAfterStartStaysStopped(t *testing.T) {
 	if err := mgr.Kill(sess.ID); err != nil {
 		t.Fatalf("Kill: %v", err)
 	}
-	// The monitor polls every 10s; give it a tick plus slack to misbehave in.
-	time.Sleep(12 * time.Second)
+	// A tick plus slack for the monitor to misbehave in.
+	time.Sleep(paneMonitorInterval + 2*time.Second)
 
 	got, _ := mgr.Get(sess.ID)
 	if got.Status != StatusStopped {

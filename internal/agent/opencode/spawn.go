@@ -94,7 +94,7 @@ func SpawnCommand(opts agent.SpawnOptions, configDir string) agent.SpawnPlan {
 		cmd = "opencode --session \"$" + sessionArgEnv + "\""
 	}
 
-	plan := agent.SpawnPlan{Command: cmd, ExtraEnv: map[string]string{}}
+	plan := agent.SpawnPlan{Command: cmd, ExtraEnv: map[string]string{}, Resumed: resuming}
 	if resuming {
 		// Set whatever else is true: the command above names this variable, so
 		// leaving it out would resume nothing. On a fresh spawn AgentSessionID

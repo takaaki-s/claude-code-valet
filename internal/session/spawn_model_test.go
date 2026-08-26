@@ -28,7 +28,7 @@ func TestBuildAgentShellCmd_HandsTheAdapterTheSessionsModel(t *testing.T) {
 
 	dir := t.TempDir()
 	sess := &Session{ID: "s1", AgentKind: "probe", WorkDir: dir, Model: "opus"}
-	if _, err := mgr.buildAgentShellCmd(snapshotForSpawn(sess, dir, dir)); err != nil {
+	if _, _, err := mgr.buildAgentShellCmd(snapshotForSpawn(sess, dir, dir)); err != nil {
 		t.Fatalf("buildAgentShellCmd: %v", err)
 	}
 

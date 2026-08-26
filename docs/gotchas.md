@@ -226,10 +226,10 @@ Common pitfalls and caveats that agents tend to fall into.
   runtime-only: a session the daemon recovered after a restart is left
   outside the fallback on purpose and waits on a real hook.
 
-  **The crossing lands on a 10s tick, and that is where the 42s comes
-  from.** The check runs on the capture loop's tick, created a few lines
-  after the clock is set, so a start with no hooks at all crosses on the 30s
-  tick. A normal Claude Code start is not that: its `SessionStart` hook
+  **The crossing lands on a capture-loop tick, and that is where the 42s
+  comes from.** The check runs on that loop's tick — `paneMonitorInterval`,
+  10s as this is written — created a few lines after the clock is set, so a
+  start with no hooks at all crosses on the 30s tick. A normal Claude Code start is not that: its `SessionStart` hook
   lands inside the first tick and moves `LastOutputTime` without moving the
   status, pushing the crossing out to the 40s tick — which is the 42s
   above, read through `session wait`'s own 2s poll.
@@ -660,9 +660,10 @@ Common pitfalls and caveats that agents tend to fall into.
   window never closes. `AgentSessionStarted` does **not** discriminate — it is
   set at spawn (`manager.go`, "commit the started-once invariant"), not on
   hook arrival, so moving the early return onto it relocates the window rather
-  than closing it. Closing it properly means recording whether the ID has been
-  re-keyed, which is a persisted-field change; until then the ambiguity is
-  stated in the agent-facing `gotchas` doc so an orchestrator does not read
+  than closing it. `Session.AgentSessionIDConfirmed` does discriminate — it is
+  written only when a hook reports the id — but `handleResult` does not read it
+  yet. The window is therefore still open, and the ambiguity is still stated in
+  the agent-facing `gotchas` doc so an orchestrator does not read
   empty-and-successful as "the child did nothing".
 
   **opencode has the same window, for the same reason** — no `--session-id`, so
@@ -1071,6 +1072,11 @@ Common pitfalls and caveats that agents tend to fall into.
   **The gate narrows the value, not which session an event may speak for.** A
   well-formed payload still drives another session's status: a `SessionEnd`
   stops it, a `SessionStart` clears a stale stop and sets `AgentSessionStarted`.
+  An accepted id also sets `AgentSessionIDConfirmed`, which is what decides
+  whether the next Codex spawn resumes — and that write happens even when the
+  reported id equals the one on record, where no log line is emitted (both the
+  refusal and the update lines are inside `session.AgentSessionID !=
+  agentSessionID`).
   Nor can `RecognizesSessionID` tell one live session's id from another's of the
   same kind — it answers a question about shape. Authenticating the hook channel
   is a separate problem and is not addressed.
@@ -1528,11 +1534,19 @@ Common pitfalls and caveats that agents tend to fall into.
   `--session-id` equivalent (openai/codex#13242). jind-ai spawns fresh
   `codex` on first start, ignores the pre-minted UUID it created for the
   Session record, and lets the `SessionStart` hook's stdin JSON carry the
-  real Codex UUID back — the existing re-key path
-  (`manager.go:1231-1234`) latches it without any daemon change. On
-  resume, `codex resume <UUID>` fast-fails in a few seconds for unknown
-  IDs, so the existing 10-second quick-fail auto-recovery covers the
-  "session removed by hand" edge case without a defensive pre-glob.
+  real Codex UUID back — `Manager.HandleHookEvent`'s re-key path latches
+  it without any daemon change.
+
+  **A resume needs `Session.AgentSessionIDConfirmed`, not just
+  `AgentSessionStarted`** (`isResume` in `internal/agent/codex/spawn.go`).
+  The latter is set at spawn, so a session no hook has reached — every
+  session while Codex's hook-trust gate goes unanswered, since untrusted
+  hooks never run — keeps the pre-minted UUID with that flag true.
+  Measured on Codex 0.149.1:
+  `ERROR: No saved session found with ID <uuid>`, exit 1, under a second.
+  A record written before the field existed is backfilled to confirmed by
+  `migrateSessionJSON`, so it keeps the old behaviour: it tries the resume,
+  and a stale id falls to the quick-fail retry.
 
 - **`Layer C-transcript` reads the rollout JSONL.** The Codex enhancer
   extracts the first `role: "user"` message that is not a
@@ -1637,8 +1651,9 @@ Common pitfalls and caveats that agents tend to fall into.
   because `startSessionTmux` sets that flag before the process is even
   spawned — without the prefix test a pre-minted UUID would be passed to
   `--session`. For genuinely stale ids, `opencode --session <unknown>`
-  exits 1 with `Session not found` in about a second, well inside the 10 s
-  quick-fail auto-recovery window.
+  exits 1 with `Session not found` in about a second, and the prefix test
+  is what keeps that from repeating on every start — the quick-fail retry
+  fires at most once per monitor.
 
 - **Every export in `plugin/jin.ts` must be a function.** The file has no
   default export, so opencode falls back to `getLegacyPlugins()`, which

@@ -23,6 +23,9 @@ func TestSpawnCommand_FreshSessionUsesSessionIDFlag(t *testing.T) {
 	if strings.Contains(plan.Command, "--resume") {
 		t.Errorf("Command = %q, must not contain --resume on a fresh spawn", plan.Command)
 	}
+	if plan.Resumed {
+		t.Error("Resumed = true on a fresh spawn")
+	}
 	if got := plan.ExtraEnv[sessionArgEnv]; got != realSessionID {
 		t.Errorf("%s = %q, want %q", sessionArgEnv, got, realSessionID)
 	}
@@ -39,6 +42,9 @@ func TestSpawnCommand_StartedSessionUsesResumeFlag(t *testing.T) {
 	}
 	if strings.Contains(plan.Command, "--session-id") {
 		t.Errorf("Command = %q, must not carry --session-id when resuming", plan.Command)
+	}
+	if !plan.Resumed {
+		t.Error("Resumed = false while --resume is on the command line")
 	}
 	if got := plan.ExtraEnv[sessionArgEnv]; got != realSessionID {
 		t.Errorf("%s = %q, want %q", sessionArgEnv, got, realSessionID)
@@ -67,6 +73,9 @@ func TestSpawnCommand_EmptyAgentSessionIDOmitsBothFlags(t *testing.T) {
 	plan := a.SpawnCommand(agent.SpawnOptions{AgentSessionID: ""})
 	if strings.Contains(plan.Command, "--session-id") || strings.Contains(plan.Command, "--resume") {
 		t.Errorf("Command = %q, should be plain `claude` when no AgentSessionID is given", plan.Command)
+	}
+	if plan.Resumed {
+		t.Error("Resumed = true with no id to resume")
 	}
 	// The variable and the flag that names it are one decision: exporting an
 	// empty JIN_CLAUDE_SESSION for a command that never mentions it would be

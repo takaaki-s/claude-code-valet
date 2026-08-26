@@ -64,6 +64,17 @@ type Session struct {
 	// once with AgentSessionID; adapters use it to switch between "start" and
 	// "resume" command lines.
 	AgentSessionStarted bool `json:"agent_session_started,omitempty"`
+	// AgentSessionIDConfirmed is true once the agent itself named
+	// AgentSessionID in a hook payload. Until then the value is the UUID
+	// jind-ai minted when the record was created, which only an agent taking
+	// its id on the command line (Claude Code's --session-id) can be resumed
+	// with — Codex and opencode mint their own and have never heard of it.
+	//
+	// Set by HandleHookEvent and cleared by the quick-fail retry, never at
+	// spawn. Written without omitempty so a missing key means "record predates
+	// the field" rather than "false" — migrateSessionJSON reads that
+	// distinction.
+	AgentSessionIDConfirmed bool `json:"agent_session_id_confirmed"`
 	// Model is the agent model this session was created with, in the agent
 	// CLI's own spelling (see SpawnOptions.Model). Persisted because every
 	// respawn — quick-fail retry, revive, daemon-restart recovery — rebuilds
@@ -92,6 +103,10 @@ type Session struct {
 	// Kill is the only writer. A stop observed from elsewhere — a hook, the
 	// monitor finding the pane dead — is a session that stopped by itself.
 	killSeq uint64
+
+	// spawnResumed carries SpawnPlan.Resumed from the last spawn; classifyPaneDeath
+	// is what reads it.
+	spawnResumed bool
 
 	// Tracked runtime fields (CurrentWorkDir is persisted so worktree/subdir
 	// context survives daemon restarts and enables resume in the last known dir).

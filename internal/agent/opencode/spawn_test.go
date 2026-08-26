@@ -38,6 +38,9 @@ func TestSpawnCommand_DoesNotResume(t *testing.T) {
 			if plan.Command != "opencode" {
 				t.Errorf("Command = %q, want bare %q", plan.Command, "opencode")
 			}
+			if plan.Resumed {
+				t.Error("Resumed = true on a fresh spawn")
+			}
 			if strings.Contains(plan.Command, tc.opts.AgentSessionID) && tc.opts.AgentSessionID != "" {
 				t.Errorf("session id leaked into command: %q", plan.Command)
 			}
@@ -70,6 +73,9 @@ func TestSpawnCommand_Resume(t *testing.T) {
 	}
 	if strings.Contains(plan.Command, id) {
 		t.Errorf("Command still carries the id verbatim: %q", plan.Command)
+	}
+	if !plan.Resumed {
+		t.Error("Resumed = false while --session is on the command line")
 	}
 }
 

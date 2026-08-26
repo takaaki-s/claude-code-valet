@@ -14,6 +14,7 @@ type Runner interface {
 	NewSessionWithCmdInDir(name string, width, height int, dir, cmd string) error
 	GetPaneID(sessionName string) (string, error)
 	IsPaneDead(target string) bool
+	PaneDeath(target string) (dead bool, status int)
 	TagManagedPane(paneID string) error
 	SetupAutoCleanDeadPanes() error
 	TerminatePaneProcess(target string) error

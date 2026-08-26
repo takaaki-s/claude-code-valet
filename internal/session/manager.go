@@ -500,7 +500,7 @@ func NewManager(sessionsDir, stateDir string, identity jinenv.Identity, configMg
 		}
 		// IsWorktree is json:"-" so it's lost on restart; recover it from
 		// disk so the TUI's delete modal shows the worktree option
-		// immediately, without waiting for the 10s captureOutputTmux poll.
+		// immediately, without waiting for the next captureOutputTmux poll.
 		s.IsWorktree = git.IsGitWorktreeDir(s.WorkDir)
 		// Same story for RepoName, and it matters more for stopped sessions:
 		// they never reach captureOutputTmux at all, so the poll would never
@@ -747,7 +747,7 @@ func (m *Manager) ReserveCreation(opts CreateOptions) (*Session, Info, error) {
 		Model:             opts.Model,
 		Fleet:             opts.Fleet,
 		// Set IsWorktree immediately so the TUI delete modal offers the
-		// worktree removal option without waiting for the 10s
+		// worktree removal option without waiting for the next
 		// captureOutputTmux poll cycle. `opts.Worktree` reflects "we will
 		// create a worktree"; also check the WorkDir for cases where the
 		// user pointed at an existing worktree directly.
@@ -2331,11 +2331,17 @@ func workDirForShell(dir string) string {
 	return dir
 }
 
+// paneMonitorInterval is how often captureOutputTmux looks at a session's pane.
+const paneMonitorInterval = 10 * time.Second
+
 // quickResumeFailWindow bounds "how long after startup does a pane death
 // still count as a resume failure worth retrying with a fresh session id".
-// Set to 10s: shorter would miss slow-machine resumes, longer would treat a
-// deliberate quick exit as a resume failure.
-const quickResumeFailWindow = 10 * time.Second
+//
+// It is expressed against paneMonitorInterval because it has to outlast it:
+// the monitor's first look at a pane lands one whole interval after StartedAt,
+// so a window equal to the interval is already shut when the only observation
+// that could open it arrives. Measured at 10.034s against a 10s window, 2 of 2.
+const quickResumeFailWindow = paneMonitorInterval + 5*time.Second
 
 // spawnSnapshot is a value-typed snapshot of the session fields
 // buildAgentShellCmd needs. Callers copy the fields they care about while
@@ -2343,13 +2349,14 @@ const quickResumeFailWindow = 10 * time.Second
 // makes buildAgentShellCmd safe to run concurrently with HandleHookEvent /
 // List / Get, which mutate the source session under lock.
 type spawnSnapshot struct {
-	JinSessionID        string
-	AgentKind           string
-	AgentSessionID      string
-	AgentSessionStarted bool
-	Model               string
-	StartDir            string // pre-tmux shell workdir (may be ~-prefixed)
-	ExpandedWorkDir     string // absolute, ~-expanded workdir handed to Setup()
+	JinSessionID            string
+	AgentKind               string
+	AgentSessionID          string
+	AgentSessionStarted     bool
+	AgentSessionIDConfirmed bool
+	Model                   string
+	StartDir                string // pre-tmux shell workdir (may be ~-prefixed)
+	ExpandedWorkDir         string // absolute, ~-expanded workdir handed to Setup()
 }
 
 // snapshotForSpawn takes the fields buildAgentShellCmd depends on. Callers
@@ -2357,13 +2364,14 @@ type spawnSnapshot struct {
 // writes the daemon performs elsewhere.
 func snapshotForSpawn(session *Session, startDir, expandedWorkDir string) spawnSnapshot {
 	return spawnSnapshot{
-		JinSessionID:        session.ID,
-		AgentKind:           session.AgentKind,
-		AgentSessionID:      session.AgentSessionID,
-		AgentSessionStarted: session.AgentSessionStarted,
-		Model:               session.Model,
-		StartDir:            startDir,
-		ExpandedWorkDir:     expandedWorkDir,
+		JinSessionID:            session.ID,
+		AgentKind:               session.AgentKind,
+		AgentSessionID:          session.AgentSessionID,
+		AgentSessionStarted:     session.AgentSessionStarted,
+		AgentSessionIDConfirmed: session.AgentSessionIDConfirmed,
+		Model:                   session.Model,
+		StartDir:                startDir,
+		ExpandedWorkDir:         expandedWorkDir,
 	}
 }
 
@@ -2386,13 +2394,13 @@ func snapshotForSpawn(session *Session, startDir, expandedWorkDir string) spawnS
 // writes. Callers own the "started once" invariant, and the read side too —
 // the value-typed snapshot is what lets captureOutputTmux's retry path call
 // this after m.mu.Unlock() without racing HandleHookEvent's writes.
-func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
+func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (shellCmd string, resumed bool, err error) {
 	if m.agentResolver == nil {
-		return "", fmt.Errorf("agent resolver not configured")
+		return "", false, fmt.Errorf("agent resolver not configured")
 	}
 	ag, err := m.agentResolver.Resolve(snap.AgentKind)
 	if err != nil {
-		return "", fmt.Errorf("resolve agent %q: %w", snap.AgentKind, err)
+		return "", false, fmt.Errorf("resolve agent %q: %w", snap.AgentKind, err)
 	}
 
 	// Passing the identity's binary to every adapter's Setup is what makes the
@@ -2411,15 +2419,19 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	// what lets no adapter carry state from one call to the other — see
 	// SpawnOptions.StateDir.
 	plan := ag.SpawnCommand(SpawnOptions{
-		StateDir:            m.stateDir,
-		ExecPath:            m.identity.BinPath,
-		JinSessionID:        snap.JinSessionID,
-		AgentSessionID:      snap.AgentSessionID,
-		AgentSessionStarted: snap.AgentSessionStarted,
-		WorkDir:             snap.ExpandedWorkDir,
-		Model:               snap.Model,
-		CustomEnv:           m.configMgr.GetEnv(),
+		StateDir:                m.stateDir,
+		ExecPath:                m.identity.BinPath,
+		JinSessionID:            snap.JinSessionID,
+		AgentSessionID:          snap.AgentSessionID,
+		AgentSessionStarted:     snap.AgentSessionStarted,
+		AgentSessionIDConfirmed: snap.AgentSessionIDConfirmed,
+		WorkDir:                 snap.ExpandedWorkDir,
+		Model:                   snap.Model,
+		CustomEnv:               m.configMgr.GetEnv(),
 	})
+
+	debugLog("[AGENT] Session %s spawning %s (resuming=%v, id confirmed=%v)",
+		snap.JinSessionID, snap.AgentKind, plan.Resumed, snap.AgentSessionIDConfirmed)
 
 	shellDir := workDirForShell(snap.StartDir)
 	customEnv := buildEnvString(m.configMgr.GetEnv())
@@ -2459,14 +2471,14 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 		// value is single-quoted so any adapter output survives the outer
 		// -ic 'cmd' wrapping.
 		if !validEnvKeyPattern.MatchString(k) {
-			return "", fmt.Errorf("agent %q returned invalid ExtraEnv key %q", snap.AgentKind, k)
+			return "", false, fmt.Errorf("agent %q returned invalid ExtraEnv key %q", snap.AgentKind, k)
 		}
 		envVars += fmt.Sprintf(" %s=%s", k, shellEscape(v))
 	}
 	unsetFlags := " -u TMUX -u TMUX_PANE"
 	for _, k := range plan.UnsetEnv {
 		if !validEnvKeyPattern.MatchString(k) {
-			return "", fmt.Errorf("agent %q returned invalid UnsetEnv name %q", snap.AgentKind, k)
+			return "", false, fmt.Errorf("agent %q returned invalid UnsetEnv name %q", snap.AgentKind, k)
 		}
 		unsetFlags += " -u " + k
 	}
@@ -2475,9 +2487,9 @@ func (m *Manager) buildAgentShellCmd(snap spawnSnapshot) (string, error) {
 	// escapes any single quote that slipped through — so a malformed
 	// adapter can't break out of the wrapper into the parent shell.
 	safeCmd := strings.ReplaceAll(plan.Command, "'", `'\''`)
-	shellCmd := fmt.Sprintf("cd \"%s\" 2>/dev/null; env%s %s %s -ic '%s'",
+	shellCmd = fmt.Sprintf("cd \"%s\" 2>/dev/null; env%s %s %s -ic '%s'",
 		shellDir, unsetFlags, envVars, m.configMgr.GetShell(), safeCmd)
-	return shellCmd, nil
+	return shellCmd, plan.Resumed, nil
 }
 
 // startSessionTmux starts a session in a tmux window.
@@ -2504,10 +2516,11 @@ func (m *Manager) startSessionTmux(session *Session) error {
 	// Snapshot the session fields buildAgentShellCmd needs. Reading here is
 	// safe: startSessionTmux runs under StartBackground's m.mu.Lock(), so no
 	// other goroutine can mutate the session under us.
-	shellCmd, err := m.buildAgentShellCmd(snapshotForSpawn(session, startDir, expandedWorkDir))
+	shellCmd, resumed, err := m.buildAgentShellCmd(snapshotForSpawn(session, startDir, expandedWorkDir))
 	if err != nil {
 		return err
 	}
+	session.spawnResumed = resumed
 
 	// Commit the "started once" invariant: from this point a subsequent
 	// resume must take the --resume branch even if SessionStart never fires
@@ -2656,26 +2669,36 @@ const (
 	// paneDeathAlreadyStopped: someone already recorded a stop for this
 	// session, so the dead pane is the aftermath of their work, not news.
 	paneDeathAlreadyStopped paneDeathOutcome = iota
-	// paneDeathQuickResumeRetry: the pane died so soon after starting that a
-	// failed resume is the likeliest cause; retry with a fresh agent session.
+	// paneDeathQuickResumeRetry: the pane died soon after starting, having
+	// asked for a resume, and exited non-zero; retry with a fresh agent session.
 	paneDeathQuickResumeRetry
 	// paneDeathRecordStop: an ordinary death; record the session as stopped.
 	paneDeathRecordStop
 )
 
 // classifyPaneDeath decides what the monitor should do about a pane it has just
-// found dead. Caller must hold m.mu.
+// found dead, given the status that pane's process exited with. Caller must
+// hold m.mu.
 //
 // The already-stopped case has to be tested first, and that is why this is a
 // three-way decision rather than the retry test alone: the monitor's status
 // read happens a probe earlier than the pane check, so a kill landing in that
 // gap arrives looking exactly like a crash — and inside quickResumeFailWindow
 // that misreading would respawn an agent the user just asked to stop.
-func classifyPaneDeath(s *Session, now time.Time) paneDeathOutcome {
+//
+// The retry answers one question — did the resume this spawn asked for fail —
+// and two things have to hold before a young death is read as that answer.
+// spawnResumed, because a fresh spawn resumed nothing. And deadStatus, because
+// Codex and opencode emit no session-end event: a user who quits inside the
+// pane leaves a record a crash is indistinguishable from by anything else here.
+// Quitting exits 0; a resume against an id the agent does not know exits
+// non-zero (all three CLIs, measured — see "Codex adapter" in docs/gotchas.md).
+// A process killed by a signal reads as a clean exit; tmux.PaneDeath says why.
+func classifyPaneDeath(s *Session, now time.Time, deadStatus int) paneDeathOutcome {
 	switch {
 	case s.Status == StatusStopped:
 		return paneDeathAlreadyStopped
-	case s.AgentSessionStarted && now.Sub(s.StartedAt) < quickResumeFailWindow:
+	case s.spawnResumed && deadStatus != 0 && now.Sub(s.StartedAt) < quickResumeFailWindow:
 		return paneDeathQuickResumeRetry
 	default:
 		return paneDeathRecordStop
@@ -2688,8 +2711,8 @@ func classifyPaneDeath(s *Session, now time.Time) paneDeathOutcome {
 // false means the agent is back up and worth watching.
 //
 // Split out of captureOutputTmux's loop so the decision can be driven without
-// waiting out the 10s ticker.
-func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) (stop bool) {
+// waiting out the poll interval.
+func (m *Manager) handlePaneDeath(session *Session, target, sessionName string, deadStatus int) (stop bool) {
 	m.mu.Lock()
 	// Exit without saving if session was already deleted
 	if _, exists := m.sessions[session.ID]; !exists {
@@ -2698,22 +2721,28 @@ func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) 
 		return true
 	}
 
-	outcome := classifyPaneDeath(session, time.Now())
+	outcome := classifyPaneDeath(session, time.Now(), deadStatus)
 	if outcome == paneDeathAlreadyStopped {
 		m.mu.Unlock()
 		debugLog("[TMUX] Session %s pane dead with a stop already recorded, monitor exiting", sessionName)
 		return true
 	}
 
-	// If the agent's --resume fails immediately (within 10 seconds of
-	// startup), auto-restart with a fresh session ID by going back
+	// If the agent's --resume fails immediately (within quickResumeFailWindow
+	// of startup), auto-restart with a fresh session ID by going back
 	// through the adapter's SpawnCommand (this way agents without a
 	// --resume concept still get sensible retry semantics).
 	if outcome == paneDeathQuickResumeRetry {
-		debugLog("[TMUX] Session %s pane died quickly (resume likely failed), retrying with fresh agent session", session.Description)
 		newSessionID := uuid.New().String()
+		debugLog("[TMUX] Session %s pane died quickly (resume likely failed), retrying with a fresh agent session (dropping %s for %s)",
+			session.Description, session.AgentSessionID, newSessionID)
 		session.AgentSessionStarted = false
 		session.AgentSessionID = newSessionID
+		// No agent has reported this one yet, and the record is about to be
+		// saved: leaving it set would let the next spawn resume an id nothing
+		// has ever written.
+		session.AgentSessionIDConfirmed = false
+		session.spawnResumed = false
 		// Snapshot every field buildAgentShellCmd needs BEFORE
 		// releasing m.mu. Without this the retry runs the builder
 		// with lock-free reads of session.WorkDir /
@@ -2726,7 +2755,7 @@ func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) 
 		_ = m.store.Save(m.snapshotAndUnlock(session))
 
 		respawned := false
-		if shellCmd, buildErr := m.buildAgentShellCmd(retrySnap); buildErr != nil {
+		if shellCmd, _, buildErr := m.buildAgentShellCmd(retrySnap); buildErr != nil {
 			debugLog("[TMUX] Session %s: cannot build retry cmd: %v", sessionName, buildErr)
 		} else if err := m.tmuxClient.RespawnPane(target, shellCmd, nil); err != nil {
 			debugLog("[TMUX] Session %s respawn failed after quick death", sessionName)
@@ -2761,7 +2790,7 @@ func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) 
 			debugLog("[TMUX] Session %s restarted with fresh agent session (id: %s)", sessionName, newSessionID)
 			return false
 		}
-		// Retry exhausted; fall through to record the stop.
+		// Respawn did not happen; fall through to record the stop.
 	}
 
 	session.Status = StatusStopped
@@ -2773,13 +2802,24 @@ func (m *Manager) handlePaneDeath(session *Session, target, sessionName string) 
 	return true
 }
 
-// captureOutputTmux polls a session's tmux pane every 10 seconds: it detects
-// pane death (retrying a quick resume failure once), tracks the agent's
+// pollPaneDeath asks tmux about the pane and, when it is dead, resolves what
+// that means. Split out so which status reaches classifyPaneDeath is a seam a
+// test can drive: waiting out paneMonitorInterval is the only other way in.
+func (m *Manager) pollPaneDeath(session *Session, target, sessionName string) (dead, stop bool) {
+	dead, deadStatus := m.tmuxClient.PaneDeath(target)
+	if !dead {
+		return false, false
+	}
+	return true, m.handlePaneDeath(session, target, sessionName, deadStatus)
+}
+
+// captureOutputTmux polls a session's tmux pane every paneMonitorInterval: it
+// detects pane death (retrying a resume that failed on startup), tracks the agent's
 // working directory and git branch, and falls back to "idle" when no hook
 // arrives after a fresh start. One goroutine per monitored session; it exits
 // when the session stops or is deleted.
 func (m *Manager) captureOutputTmux(session *Session) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(paneMonitorInterval)
 	defer ticker.Stop()
 
 	// Use pane ID (%N) when available (stable across join-pane reordering),
@@ -2803,8 +2843,8 @@ func (m *Manager) captureOutputTmux(session *Session) {
 		m.mu.RUnlock()
 
 		// Check if pane process has exited
-		if m.tmuxClient.IsPaneDead(target) {
-			if m.handlePaneDeath(session, target, sessionName) {
+		if dead, stop := m.pollPaneDeath(session, target, sessionName); dead {
+			if stop {
 				return
 			}
 			continue
@@ -2989,13 +3029,23 @@ func (m *Manager) HandleHookEvent(agentSessionID, jinSessionID, eventName, notif
 	// refuses "" on its own: it separates "the agent said nothing about its id"
 	// from "the agent reported an id we would not take", and only the second is
 	// worth a log line.
-	if agentSessionID != "" && session.AgentSessionID != agentSessionID {
-		if rekeyRefusal != "" {
-			debugLog("[HOOK] Session %s: refusing the reported agent session id (%s): %s",
-				sessionName, rekeyRefusal, debug.Untrusted(agentSessionID, maxAgentSessionIDLen))
-		} else {
-			debugLog("[HOOK] Updating AgentSessionID for %s: %s -> %s", sessionName, session.AgentSessionID, agentSessionID)
-			session.AgentSessionID = agentSessionID
+	if agentSessionID != "" {
+		switch {
+		case rekeyRefusal != "":
+			if session.AgentSessionID != agentSessionID {
+				debugLog("[HOOK] Session %s: refusing the reported agent session id (%s): %s",
+					sessionName, rekeyRefusal, debug.Untrusted(agentSessionID, maxAgentSessionIDLen))
+			}
+		default:
+			if session.AgentSessionID != agentSessionID {
+				debugLog("[HOOK] Updating AgentSessionID for %s: %s -> %s", sessionName, session.AgentSessionID, agentSessionID)
+				session.AgentSessionID = agentSessionID
+			}
+			// The agent named this id itself, which is the whole of what
+			// AgentSessionIDConfirmed asserts — including when it names the one
+			// jind-ai already holds, as an agent taking its id on the command
+			// line does.
+			session.AgentSessionIDConfirmed = true
 		}
 	}
 

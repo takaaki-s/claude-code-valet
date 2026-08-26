@@ -135,7 +135,7 @@ func hasTmuxSession(name string) bool {
 // useful barrier: startSessionTmux creates the inner tmux session first and only
 // then flips the status, so "running" implies the tmux session exists — while
 // still leaving a following hasTmuxSession check meaningful rather than
-// tautological. The status holds for at least captureOutputTmux's 10s tick, so
+// tautological. The status holds for at least one captureOutputTmux tick, so
 // a poll cannot miss the window.
 //
 // Do not wait with time.Sleep instead. A fixed 500ms was what made the

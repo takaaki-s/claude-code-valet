@@ -38,6 +38,13 @@ type SpawnOptions struct {
 	// least once with AgentSessionID; adapters use it to decide between a
 	// "new session" and a "resume" command line.
 	AgentSessionStarted bool
+	// AgentSessionIDConfirmed is true when the agent itself reported
+	// AgentSessionID. No adapter may resume on AgentSessionStarted alone: that
+	// flag is set at spawn, so it cannot say the agent ever minted the id. The
+	// Codex adapter satisfies this with the flag; opencode gets the same answer
+	// from the `ses_` prefix, which only a reported id carries; Claude Code
+	// hands its own id in on the command line, so the pre-minted one is real.
+	AgentSessionIDConfirmed bool
 	// WorkDir is the absolute directory the agent should start in (~ is
 	// already expanded).
 	WorkDir string
@@ -98,6 +105,11 @@ type SpawnPlan struct {
 	// adapters add their own (Claude Code needs CLAUDECODE unset so
 	// nested invocations work).
 	UnsetEnv []string
+	// Resumed reports that Command continues an existing agent session rather
+	// than starting one. Manager keeps it to tell a failed resume from a fresh
+	// start that died: only the first is worth retrying with a new id. It does
+	// not say why the process ended — see classifyPaneDeath for what does.
+	Resumed bool
 }
 
 // StatusSignal is the raw event an agent adapter interprets to decide the

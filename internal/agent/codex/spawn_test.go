@@ -41,9 +41,10 @@ const resumeBase = `codex resume "$` + sessionArgEnv + `"`
 func TestSpawnCommand_Resume(t *testing.T) {
 	uuid := "01900000-0000-7000-8000-000000000abc"
 	plan := SpawnCommand(agent.SpawnOptions{
-		AgentSessionID:      uuid,
-		AgentSessionStarted: true,
-		ExecPath:            testExecPath,
+		AgentSessionID:          uuid,
+		AgentSessionStarted:     true,
+		AgentSessionIDConfirmed: true,
+		ExecPath:                testExecPath,
 	})
 
 	if !strings.HasPrefix(plan.Command, resumeBase+" ") {
@@ -134,9 +135,10 @@ func TestSpawnCommand_ConfigArgs(t *testing.T) {
 	}{
 		{"fresh", agent.SpawnOptions{AgentSessionStarted: false, ExecPath: testExecPath}},
 		{"resume", agent.SpawnOptions{
-			AgentSessionID:      "01900000-0000-7000-8000-000000000abc",
-			AgentSessionStarted: true,
-			ExecPath:            testExecPath,
+			AgentSessionID:          "01900000-0000-7000-8000-000000000abc",
+			AgentSessionStarted:     true,
+			AgentSessionIDConfirmed: true,
+			ExecPath:                testExecPath,
 		}},
 	}
 	for _, tc := range cases {
@@ -157,9 +159,10 @@ func TestSpawnCommand_ConfigArgs(t *testing.T) {
 func TestSpawnCommand_ConfigArgsFollowBase(t *testing.T) {
 	uuid := "01900000-0000-7000-8000-000000000abc"
 	plan := SpawnCommand(agent.SpawnOptions{
-		AgentSessionID:      uuid,
-		AgentSessionStarted: true,
-		ExecPath:            testExecPath,
+		AgentSessionID:          uuid,
+		AgentSessionStarted:     true,
+		AgentSessionIDConfirmed: true,
+		ExecPath:                testExecPath,
 	})
 
 	resumeIdx := strings.Index(plan.Command, resumeBase)
@@ -224,9 +227,10 @@ func TestSpawnCommand_ResumePlusHooks(t *testing.T) {
 	// args after — Codex parses positional args left-to-right).
 	uuid := "01900000-0000-7000-8000-000000000def"
 	plan := SpawnCommand(agent.SpawnOptions{
-		AgentSessionID:      uuid,
-		AgentSessionStarted: true,
-		ExecPath:            testExecPath,
+		AgentSessionID:          uuid,
+		AgentSessionStarted:     true,
+		AgentSessionIDConfirmed: true,
+		ExecPath:                testExecPath,
 	})
 
 	resumeIdx := strings.Index(plan.Command, resumeBase)
@@ -258,10 +262,11 @@ func TestSpawnCommand_ModelNamesEnvNeverText(t *testing.T) {
 	}{
 		{"fresh", agent.SpawnOptions{ExecPath: testExecPath, Model: hostileModel}},
 		{"resume", agent.SpawnOptions{
-			AgentSessionID:      "01900000-0000-7000-8000-000000000abc",
-			AgentSessionStarted: true,
-			ExecPath:            testExecPath,
-			Model:               hostileModel,
+			AgentSessionID:          "01900000-0000-7000-8000-000000000abc",
+			AgentSessionStarted:     true,
+			AgentSessionIDConfirmed: true,
+			ExecPath:                testExecPath,
+			Model:                   hostileModel,
 		}},
 		// No ExecPath: HookArgs contributes nothing, so this is the one case
 		// where the model is the only thing appended to configArgs.

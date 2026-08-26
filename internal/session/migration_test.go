@@ -17,6 +17,7 @@ func TestMigrateSessionJSON(t *testing.T) {
 		wantAgentKind  string
 		wantAgentID    string
 		wantAgentStart bool
+		wantConfirmed  bool
 		wantCCAbsent   bool // claude_session_id / claude_session_started must be gone
 	}{
 		{
@@ -57,12 +58,14 @@ func TestMigrateSessionJSON(t *testing.T) {
 			wantAgentKind:  "claude",
 			wantAgentID:    "cc-uuid",
 			wantAgentStart: true,
+			wantConfirmed:  true,
 			wantCCAbsent:   true,
 		},
 		{
-			name:           "v3 schema (already migrated) is untouched",
+			name:           "v3 schema gets agent_session_id_confirmed backfilled",
 			input:          `{"id":"abc","description":"d","description_locked":true,"work_dir":"/tmp/x","agent_kind":"claude","agent_session_id":"uuid","agent_session_started":true}`,
-			wantChanged:    false,
+			wantConfirmed:  true,
+			wantChanged:    true,
 			wantDesc:       "d",
 			wantLocked:     true,
 			wantAgentKind:  "claude",
@@ -87,6 +90,35 @@ func TestMigrateSessionJSON(t *testing.T) {
 			wantDesc:      "d",
 			wantAgentKind: "codex",
 			wantAgentID:   "cx-uuid",
+			wantCCAbsent:  true,
+		},
+		{
+			// The pre-field records are the ones the backfill is for. A record
+			// this jind-ai wrote carries the key at either value, so a false
+			// one must survive: flipping it back would resume an id no agent
+			// has ever named.
+			name:           "v4 schema with the confirmation false is untouched",
+			input:          `{"id":"abc","description":"d","description_locked":true,"work_dir":"/tmp/x","agent_kind":"codex","agent_session_id":"uuid","agent_session_started":true,"agent_session_id_confirmed":false}`,
+			wantChanged:    false,
+			wantDesc:       "d",
+			wantLocked:     true,
+			wantAgentKind:  "codex",
+			wantAgentID:    "uuid",
+			wantAgentStart: true,
+			wantConfirmed:  false,
+			wantCCAbsent:   true,
+		},
+		{
+			// Nothing was ever started, so there is no id an agent could have
+			// reported and nothing to backfill.
+			name:          "a record that never started an agent is untouched",
+			input:         `{"id":"abc","description":"d","description_locked":true,"work_dir":"/tmp/x","agent_kind":"codex","agent_session_id":"uuid"}`,
+			wantChanged:   false,
+			wantDesc:      "d",
+			wantLocked:    true,
+			wantAgentKind: "codex",
+			wantAgentID:   "uuid",
+			wantConfirmed: false,
 			wantCCAbsent:  true,
 		},
 		{
@@ -134,6 +166,9 @@ func TestMigrateSessionJSON(t *testing.T) {
 			}
 			if id, _ := got["agent_session_id"].(string); id != tc.wantAgentID {
 				t.Errorf("agent_session_id = %q, want %q", id, tc.wantAgentID)
+			}
+			if confirmed, _ := got["agent_session_id_confirmed"].(bool); confirmed != tc.wantConfirmed {
+				t.Errorf("agent_session_id_confirmed = %v, want %v", confirmed, tc.wantConfirmed)
 			}
 			if started, _ := got["agent_session_started"].(bool); started != tc.wantAgentStart {
 				t.Errorf("agent_session_started = %v, want %v", started, tc.wantAgentStart)

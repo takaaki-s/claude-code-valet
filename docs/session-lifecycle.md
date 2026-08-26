@@ -50,7 +50,9 @@ Session (persisted)
 ├─ ErrorMessage          string    // Error message (e.g., on startup failure)
 ├─ AgentKind             string    // Adapter identifier ("claude" etc.); always non-empty in persisted form
 ├─ AgentSessionID        string    // Adapter-side persistent id (CC --session-id / --resume value)
-├─ AgentSessionStarted   bool      // Flipped once the agent has spawned; drives adapter's fresh-vs-resume branch
+├─ AgentSessionStarted   bool      // Flipped once the agent has spawned (at spawn, not on hook arrival)
+├─ AgentSessionIDConfirmed
+│                        bool      // True once a hook reported AgentSessionID; each adapter decides what it needs to resume
 ├─ Model                 string    // Agent model in that CLI's own spelling; empty = the agent's default
 ├─ TmuxWindowName        string    // Inner tmux session name; kept across a kill (see Kill below)
 └─ TmuxPaneID            string    // Agent pane ID (e.g., "%42"); kept across a kill
@@ -214,11 +216,31 @@ until it is restarted or deleted.
 
 ## Auto-Recovery on Resume Failure
 
-Inside `captureOutputTmux()`, detects pane death within 10 seconds of startup:
+Inside `captureOutputTmux()`, detects pane death within `quickResumeFailWindow`
+of startup:
 1. Determines that the adapter's `--resume` path (or equivalent) has failed
-2. Mints a fresh AgentSessionID and flips AgentSessionStarted = false
+2. Mints a fresh AgentSessionID and clears AgentSessionStarted,
+   AgentSessionIDConfirmed and the runtime spawnResumed
 3. Rebuilds the shell command via `Agent.SpawnCommand` (fresh-session branch) and respawns the pane
 4. If successful, continues as a new session
+
+A stop already on record short-circuits all of this — see `classifyPaneDeath`.
+Past that, three bounds decide whether the retry runs.
+
+- The spawn must have been a resume (`SpawnPlan.Resumed`). A fresh start that
+  died resumed nothing.
+- The pane's process must have exited non-zero — quitting exits 0, a failed
+  resume does not. See `classifyPaneDeath` for why nothing else here separates
+  the two, and `tmux.PaneDeath` for the one case that reads as a clean exit
+  without being one.
+- The window must outlast `paneMonitorInterval`, because the monitor's first
+  look at a pane lands one whole interval after startup: set equal, the window
+  is shut before anything can open it.
+
+The retry clears `AgentSessionIDConfirmed` and `spawnResumed` along with the
+id, so what it starts is a fresh spawn by the first bound above: an agent that
+cannot come up at all is recorded stopped on its second death rather than
+respawned once per poll for as long as the session lives.
 
 ## Status Detection via Agent Adapters
 

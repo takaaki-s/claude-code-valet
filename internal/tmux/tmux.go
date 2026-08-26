@@ -899,8 +899,45 @@ func (c *Client) ListPaneIDs(target string) ([]string, error) {
 
 // IsPaneDead checks if a pane's process has exited.
 func (c *Client) IsPaneDead(target string) bool {
-	out, _ := c.run("display-message", "-t", target, "-p", "#{pane_dead}")
-	return out == "1"
+	dead, _ := c.PaneDeath(target)
+	return dead
+}
+
+// PaneDeath reports whether the pane's process has exited and, when it has, the
+// status it exited with. Both come from one tmux call so the status cannot
+// describe a different process than the death did.
+//
+// status is 0 whenever tmux does not name one. The case that actually happens
+// is a process killed by a signal: tmux fills `pane_dead_signal` and leaves
+// `pane_dead_status` empty (measured on 3.5a, 3/3 across SIGINT, SIGTERM and
+// send-keys C-c). An agent killed from outside therefore reads as a clean exit
+// here. Callers read a non-zero status as "this process failed", and answering
+// 0 on a doubt keeps the doubt from being read as failure: the caller that has
+// one restarts the agent, and doing that to a process the user shut down costs
+// them the session they were reading.
+func (c *Client) PaneDeath(target string) (dead bool, status int) {
+	out, _ := c.run("display-message", "-t", target, "-p", "#{pane_dead} #{pane_dead_status}")
+	return parsePaneDeath(out)
+}
+
+// parsePaneDeath reads the two-field format PaneDeath asks tmux for. Split out
+// because every way the pair can be incomplete resolves the same direction and
+// a test can say so; what it cannot check is that the format string still names
+// the fields tmux knows — nor that `remain-on-exit` is on, without which tmux
+// destroys the pane instead of holding it dead.
+func parsePaneDeath(out string) (dead bool, status int) {
+	fields := strings.Fields(out)
+	if len(fields) == 0 || fields[0] != "1" {
+		return false, 0
+	}
+	if len(fields) < 2 {
+		return true, 0
+	}
+	n, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return true, 0
+	}
+	return true, n
 }
 
 // GetPaneID returns the unique pane ID (e.g., "%42") for a target.
