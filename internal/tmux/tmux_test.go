@@ -861,3 +861,34 @@ func TestBuildLoadBufferArgs_ReadsStdin(t *testing.T) {
 		t.Error(`last arg must be "-" so the payload arrives on stdin, not in argv`)
 	}
 }
+
+// TestParsePaneDeath covers the readings PaneDeath's caller acts on. The
+// unknown-status rows are the ones that matter: a caller reads a non-zero
+// status as "this process failed" and restarts the agent, so a doubt answered
+// as non-zero would restart one the user shut down cleanly.
+func TestParsePaneDeath(t *testing.T) {
+	tests := []struct {
+		name       string
+		out        string
+		wantDead   bool
+		wantStatus int
+	}{
+		{"alive", "0 0", false, 0},
+		{"alive, no status field", "0", false, 0},
+		{"dead, exited clean", "1 0", true, 0},
+		{"dead, exited non-zero", "1 1", true, 1},
+		{"dead, signalled", "1 130", true, 130},
+		{"dead, killed by a signal (tmux fills pane_dead_signal instead)", "1", true, 0},
+		{"dead, status not a number", "1 ?", true, 0},
+		{"tmux said nothing", "", false, 0},
+		{"extra field", "1 7 8", true, 7},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dead, status := parsePaneDeath(tt.out)
+			if dead != tt.wantDead || status != tt.wantStatus {
+				t.Errorf("parsePaneDeath(%q) = (%v, %d), want (%v, %d)", tt.out, dead, status, tt.wantDead, tt.wantStatus)
+			}
+		})
+	}
+}

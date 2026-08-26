@@ -31,11 +31,15 @@ type captureFailure struct {
 // goroutines; direct map writes from the test body would still race.
 type mockTmuxRunner struct {
 	mu        sync.Mutex
-	sessions  map[string]bool   // session existence (HasSession return value)
-	deadPanes map[string]bool   // pane dead status (IsPaneDead return value)
-	paneIDs   map[string]string // session name -> pane ID (GetPaneID return value)
-	panePaths map[string]string // target -> current path (GetPaneCurrentPath return value)
-	captured  map[string]string // target -> content (CapturePane return value)
+	sessions  map[string]bool // session existence (HasSession return value)
+	deadPanes map[string]bool // pane dead status (IsPaneDead return value)
+	// deadStatus is the exit status PaneDeath reports for a dead pane. Unset
+	// means 0, which classifyPaneDeath reads as a clean exit — a test driving
+	// the quick-fail retry has to name a non-zero one.
+	deadStatus map[string]int
+	paneIDs    map[string]string // session name -> pane ID (GetPaneID return value)
+	panePaths  map[string]string // target -> current path (GetPaneCurrentPath return value)
+	captured   map[string]string // target -> content (CapturePane return value)
 
 	// splitPaneIDs overrides the pane ID SplitPane returns for a given
 	// target; unset targets get "%99". namedPanes maps a slot name to the
@@ -203,6 +207,7 @@ func newMockTmuxRunner() *mockTmuxRunner {
 	return &mockTmuxRunner{
 		sessions:           make(map[string]bool),
 		deadPanes:          make(map[string]bool),
+		deadStatus:         make(map[string]int),
 		paneIDs:            make(map[string]string),
 		panePaths:          make(map[string]string),
 		captured:           make(map[string]string),
@@ -300,7 +305,16 @@ func (m *mockTmuxRunner) GetPaneID(sessionName string) (string, error) {
 func (m *mockTmuxRunner) IsPaneDead(target string) bool {
 	m.mu.Lock()
 	m.record("IsPaneDead", target)
+	m.mu.Unlock()
+	dead, _ := m.PaneDeath(target)
+	return dead
+}
+
+func (m *mockTmuxRunner) PaneDeath(target string) (bool, int) {
+	m.mu.Lock()
+	m.record("PaneDeath", target)
 	dead := m.deadPanes[target]
+	status := m.deadStatus[target]
 	cb := takeHook(&m.onIsPaneDead)
 	m.mu.Unlock()
 	if cb != nil {
@@ -308,7 +322,10 @@ func (m *mockTmuxRunner) IsPaneDead(target string) bool {
 		// cannot rewrite the reading this call already committed to.
 		cb(target)
 	}
-	return dead
+	if !dead {
+		return false, 0
+	}
+	return true, status
 }
 
 func (m *mockTmuxRunner) TagManagedPane(paneID string) error {

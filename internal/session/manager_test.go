@@ -1519,10 +1519,11 @@ func TestManager_HandlePaneDeath_StoppedSessionDoesNotRespawn(t *testing.T) {
 	sess.TmuxPaneID = "%42"
 	sess.Status = StatusStopped // Kill got here first
 	sess.AgentSessionStarted = true
+	sess.spawnResumed = true
 	sess.StartedAt = time.Now() // inside quickResumeFailWindow
 	mgr.mu.Unlock()
 
-	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description); !stop {
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description, 1); !stop {
 		t.Error("handlePaneDeath = false, want the monitor to exit on an already-recorded stop")
 	}
 	if mock.hasCalledWith("RespawnPane", "%42") {
@@ -1547,10 +1548,12 @@ func TestManager_HandlePaneDeath_QuickResumeRetries(t *testing.T) {
 	sess.TmuxPaneID = "%42"
 	sess.Status = StatusRunning
 	sess.AgentSessionStarted = true
+	sess.AgentSessionIDConfirmed = true
+	sess.spawnResumed = true
 	sess.StartedAt = time.Now()
 	mgr.mu.Unlock()
 
-	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description); stop {
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description, 1); stop {
 		t.Error("handlePaneDeath = true, want the monitor to keep watching a retried session")
 	}
 	if !mock.hasCalledWith("RespawnPane", "%42") {
@@ -1559,6 +1562,78 @@ func TestManager_HandlePaneDeath_QuickResumeRetries(t *testing.T) {
 	got, _ := mgr.Get(sess.ID)
 	if got.Status != StatusRunning {
 		t.Errorf("Status = %q, want %q after a successful retry", got.Status, StatusRunning)
+	}
+	mgr.mu.RLock()
+	confirmed := sess.AgentSessionIDConfirmed
+	mgr.mu.RUnlock()
+	if confirmed {
+		t.Error("AgentSessionIDConfirmed = true after the retry minted an id no agent has reported")
+	}
+}
+
+// TestStartSessionTmux_CarriesResumedFromThePlan pins the wiring
+// classifyPaneDeath reads. Whether a spawn resumed is the adapter's answer and
+// Manager is the only thing that carries it to the monitor, so a start that
+// dropped it would leave every session looking like a fresh spawn.
+func TestStartSessionTmux_CarriesResumedFromThePlan(t *testing.T) {
+	for _, resumed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("resumed=%v", resumed), func(t *testing.T) {
+			mgr, _, _ := newTestManager(t)
+			fakeClaudeAgent(t, mgr).spawnFn = func(SpawnOptions) SpawnPlan {
+				return SpawnPlan{Command: "claude", Resumed: resumed}
+			}
+
+			sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: t.TempDir(), Description: "spawn-resumed"})
+			if err != nil {
+				t.Fatalf("create failed: %v", err)
+			}
+			if err := mgr.StartBackground(sess.ID); err != nil {
+				t.Fatalf("StartBackground: %v", err)
+			}
+
+			mgr.mu.RLock()
+			got := sess.spawnResumed
+			mgr.mu.RUnlock()
+			if got != resumed {
+				t.Errorf("spawnResumed = %v, want %v", got, resumed)
+			}
+		})
+	}
+}
+
+// TestManager_HandlePaneDeath_RetryDropsResumed pins what the retry leaves
+// behind. It mints an id no agent has reported, so the spawn it builds is a
+// fresh start whatever the adapter says: carrying the dead spawn's answer
+// forward would tell the monitor a fresh agent was resumed.
+func TestManager_HandlePaneDeath_RetryDropsResumed(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	// An adapter that calls every spawn a resume, so the assertion below can
+	// only pass on what the retry does to the record.
+	fakeClaudeAgent(t, mgr).spawnFn = func(SpawnOptions) SpawnPlan {
+		return SpawnPlan{Command: "claude", Resumed: true}
+	}
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: t.TempDir(), Description: "pd-retry-resumed"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	mgr.mu.Lock()
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusRunning
+	sess.AgentSessionStarted = true
+	sess.spawnResumed = true // the spawn that just died was a resume
+	sess.StartedAt = time.Now()
+	mgr.mu.Unlock()
+
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description, 1); stop {
+		t.Fatal("handlePaneDeath = true, want the retry to run")
+	}
+
+	mgr.mu.RLock()
+	got := sess.spawnResumed
+	mgr.mu.RUnlock()
+	if got {
+		t.Error("spawnResumed = true after a retry that minted an id no agent has reported")
 	}
 }
 
@@ -1578,6 +1653,7 @@ func TestManager_HandlePaneDeath_KillDuringRetryWins(t *testing.T) {
 	sess.TmuxPaneID = "%42"
 	sess.Status = StatusRunning
 	sess.AgentSessionStarted = true
+	sess.spawnResumed = true
 	sess.StartedAt = time.Now()
 	mgr.mu.Unlock()
 
@@ -1587,7 +1663,7 @@ func TestManager_HandlePaneDeath_KillDuringRetryWins(t *testing.T) {
 		}
 	}
 
-	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description); !stop {
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description, 1); !stop {
 		t.Error("handlePaneDeath = false, want the monitor to exit after the session was killed")
 	}
 	got, _ := mgr.Get(sess.ID)
@@ -1603,42 +1679,111 @@ func TestManager_HandlePaneDeath_KillDuringRetryWins(t *testing.T) {
 func TestClassifyPaneDeath(t *testing.T) {
 	now := time.Now()
 	tests := []struct {
-		name string
-		sess Session
-		want paneDeathOutcome
+		name       string
+		sess       Session
+		deadStatus int
+		want       paneDeathOutcome
 	}{
 		{
-			name: "killed inside the quick-resume window",
-			sess: Session{Status: StatusStopped, AgentSessionStarted: true, StartedAt: now.Add(-time.Second)},
-			want: paneDeathAlreadyStopped,
+			name:       "killed inside the quick-resume window",
+			sess:       Session{Status: StatusStopped, AgentSessionStarted: true, spawnResumed: true, StartedAt: now.Add(-time.Second)},
+			deadStatus: 1,
+			want:       paneDeathAlreadyStopped,
 		},
 		{
-			name: "killed outside the quick-resume window",
-			sess: Session{Status: StatusStopped, AgentSessionStarted: true, StartedAt: now.Add(-time.Hour)},
-			want: paneDeathAlreadyStopped,
+			name:       "killed outside the quick-resume window",
+			sess:       Session{Status: StatusStopped, AgentSessionStarted: true, spawnResumed: true, StartedAt: now.Add(-time.Hour)},
+			deadStatus: 1,
+			want:       paneDeathAlreadyStopped,
 		},
 		{
-			name: "resume failed right after start",
-			sess: Session{Status: StatusRunning, AgentSessionStarted: true, StartedAt: now.Add(-time.Second)},
-			want: paneDeathQuickResumeRetry,
+			name:       "resume failed right after start",
+			sess:       Session{Status: StatusRunning, AgentSessionStarted: true, spawnResumed: true, StartedAt: now.Add(-time.Second)},
+			deadStatus: 1,
+			want:       paneDeathQuickResumeRetry,
 		},
 		{
-			name: "died long after start",
-			sess: Session{Status: StatusIdle, AgentSessionStarted: true, StartedAt: now.Add(-time.Hour)},
-			want: paneDeathRecordStop,
+			// The monitor never looks sooner than this — see quickResumeFailWindow.
+			name:       "resume failed, seen at the first poll one interval later",
+			sess:       Session{Status: StatusRunning, AgentSessionStarted: true, spawnResumed: true, StartedAt: now.Add(-paneMonitorInterval - 50*time.Millisecond)},
+			deadStatus: 1,
+			want:       paneDeathQuickResumeRetry,
 		},
 		{
-			name: "never spawned an agent",
-			sess: Session{Status: StatusRunning, AgentSessionStarted: false, StartedAt: now.Add(-time.Second)},
-			want: paneDeathRecordStop,
+			name:       "a fresh spawn died young",
+			sess:       Session{Status: StatusRunning, AgentSessionStarted: true, spawnResumed: false, StartedAt: now.Add(-time.Second)},
+			deadStatus: 1,
+			want:       paneDeathRecordStop,
+		},
+		{
+			name:       "a resumed session the user quit cleanly",
+			sess:       Session{Status: StatusRunning, AgentSessionStarted: true, spawnResumed: true, StartedAt: now.Add(-time.Second)},
+			deadStatus: 0,
+			want:       paneDeathRecordStop,
+		},
+		{
+			name:       "died long after start",
+			sess:       Session{Status: StatusIdle, AgentSessionStarted: true, spawnResumed: true, StartedAt: now.Add(-time.Hour)},
+			deadStatus: 1,
+			want:       paneDeathRecordStop,
+		},
+		{
+			name:       "never spawned an agent",
+			sess:       Session{Status: StatusRunning, AgentSessionStarted: false, StartedAt: now.Add(-time.Second)},
+			deadStatus: 1,
+			want:       paneDeathRecordStop,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := classifyPaneDeath(&tt.sess, now); got != tt.want {
+			if got := classifyPaneDeath(&tt.sess, now, tt.deadStatus); got != tt.want {
 				t.Errorf("classifyPaneDeath = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestManager_HandlePaneDeath_SecondDeathStops drives the death of the agent
+// the retry just started. The retry mints an id no agent has reported, so what
+// it spawned is a fresh start — and a fresh start that dies is not a failed
+// resume. Without that reset an agent that cannot come up at all is respawned
+// once per poll for as long as the session lives.
+func TestManager_HandlePaneDeath_SecondDeathStops(t *testing.T) {
+	mgr, mock, _ := newTestManager(t)
+
+	sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: t.TempDir(), Description: "pd-second"})
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	mgr.mu.Lock()
+	sess.TmuxPaneID = "%42"
+	sess.Status = StatusRunning
+	sess.AgentSessionStarted = true
+	sess.spawnResumed = true
+	sess.StartedAt = time.Now()
+	mgr.mu.Unlock()
+
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description, 1); stop {
+		t.Fatal("handlePaneDeath = true on the first death, want the monitor to keep watching")
+	}
+	spent := len(mock.respawnedPanes())
+
+	// Same window, same non-zero exit: only what the retry did to the record
+	// can tell this death from the one before it.
+	mgr.mu.Lock()
+	sess.Status = StatusRunning
+	sess.StartedAt = time.Now()
+	mgr.mu.Unlock()
+
+	if stop := mgr.handlePaneDeath(sess, "%42", sess.Description, 1); !stop {
+		t.Error("handlePaneDeath = false, want the monitor to exit on the retry's own death")
+	}
+	if got := len(mock.respawnedPanes()); got != spent {
+		t.Errorf("respawns = %d, want it left at %d", got, spent)
+	}
+	got, _ := mgr.Get(sess.ID)
+	if got.Status != StatusStopped {
+		t.Errorf("Status = %q, want %q", got.Status, StatusStopped)
 	}
 }
 
@@ -4252,7 +4397,7 @@ func TestBuildAgentShellCmd_SnapshotIsolatesFromConcurrentWrites(t *testing.T) {
 		snap := snapshotForSpawn(sess, sess.WorkDir, sess.WorkDir)
 		mgr.mu.Unlock()
 
-		if _, err := mgr.buildAgentShellCmd(snap); err != nil {
+		if _, _, err := mgr.buildAgentShellCmd(snap); err != nil {
 			t.Fatalf("build failed at iter %d: %v", i, err)
 		}
 	}
@@ -6088,7 +6233,7 @@ func TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted(t *testing.T) {
 		}},
 	}})
 
-	shellCmd, err := mgr.buildAgentShellCmd(spawnSnapshot{
+	shellCmd, _, err := mgr.buildAgentShellCmd(spawnSnapshot{
 		JinSessionID: "probe-session",
 		AgentKind:    "probe",
 		StartDir:     t.TempDir(),
@@ -6119,5 +6264,50 @@ func TestBuildAgentShellCmd_ExtraEnvIsNotInterpreted(t *testing.T) {
 	}
 	if _, err := os.Stat(canary); err == nil {
 		t.Error("a substitution inside an ExtraEnv value was executed by the inner shell")
+	}
+}
+
+// TestManager_PollPaneDeath_CarriesTheExitStatus pins the wiring between the
+// tmux probe and the decision it feeds. A poll that handed classifyPaneDeath a
+// constant would either retry every quit or never retry at all, and waiting out
+// paneMonitorInterval is the only other way to reach that argument.
+func TestManager_PollPaneDeath_CarriesTheExitStatus(t *testing.T) {
+	tests := []struct {
+		name        string
+		deadStatus  int
+		wantRespawn bool
+	}{
+		{"a resume that failed", 1, true},
+		{"a process that exited clean", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, mock, _ := newTestManager(t)
+
+			sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: t.TempDir(), Description: "poll-status"})
+			if err != nil {
+				t.Fatalf("create failed: %v", err)
+			}
+			mgr.mu.Lock()
+			sess.TmuxPaneID = "%42"
+			sess.Status = StatusRunning
+			sess.AgentSessionStarted = true
+			sess.spawnResumed = true
+			sess.StartedAt = time.Now()
+			mgr.mu.Unlock()
+
+			mock.mu.Lock()
+			mock.deadPanes["%42"] = true
+			mock.deadStatus["%42"] = tt.deadStatus
+			mock.mu.Unlock()
+
+			dead, _ := mgr.pollPaneDeath(sess, "%42", sess.Description)
+			if !dead {
+				t.Fatal("pollPaneDeath reported a live pane, want it to read the mock's dead one")
+			}
+			if got := len(mock.respawnedPanes()) > 0; got != tt.wantRespawn {
+				t.Errorf("respawned = %v, want %v", got, tt.wantRespawn)
+			}
+		})
 	}
 }

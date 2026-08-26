@@ -54,9 +54,9 @@ func (a *Agent) Kind() string { return "codex" }
 // --session-id equivalent, so the real id only ever arrives through the
 // SessionStart hook payload, and this predicate is what stands between that
 // payload and the record. Refusing a genuine id leaves the pre-minted UUID in
-// place, which `codex resume` rejects within seconds — the quick-fail retry
-// then starts fresh, so the cost is a visible restart rather than a session
-// that quietly turns out to be empty.
+// place, and Session.AgentSessionIDConfirmed stays false, so the next spawn
+// starts fresh — the cost is a session that starts over rather than one that
+// quietly turns out to be empty.
 func (a *Agent) RecognizesSessionID(id string) bool { return agent.LooksLikeUUID(id) }
 
 // Setup does nothing, and this adapter is the one where that is the whole

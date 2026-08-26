@@ -474,3 +474,51 @@ func TestStore_Save_TempPatternMatchesReclaimGlob(t *testing.T) {
 		t.Fatalf("Stat: %v", statErr)
 	}
 }
+
+// TestStore_KeepsAnUnconfirmedIDUnconfirmed pins what migrateSessionJSON reads
+// to tell a record that predates AgentSessionIDConfirmed from one that simply
+// has it false. Give the field omitempty and a false one is written as an
+// absent key, which the v3→v4 backfill then reads as "predates the field" and
+// flips to true — the session goes on to resume an id no agent has named, which
+// is the whole of what the field exists to prevent.
+func TestStore_KeepsAnUnconfirmedIDUnconfirmed(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	sess := Session{
+		ID:                  "unconfirmed-probe",
+		Description:         "unconfirmed",
+		WorkDir:             dir,
+		AgentKind:           "codex",
+		AgentSessionID:      "an-id-no-agent-reported",
+		AgentSessionStarted: true,
+		// left false on purpose
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// The key has to be on disk: its absence is the migration's signal.
+	raw, err := os.ReadFile(filepath.Join(dir, sess.ID+".json"))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var onDisk map[string]any
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, ok := onDisk["agent_session_id_confirmed"]; !ok {
+		t.Error("agent_session_id_confirmed is absent from the saved JSON; migrateSessionJSON reads absence as an older record and backfills true")
+	}
+
+	loaded, err := store.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.AgentSessionIDConfirmed {
+		t.Error("AgentSessionIDConfirmed = true after a save/load round trip, want it left false")
+	}
+}

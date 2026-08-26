@@ -336,3 +336,33 @@ func TestSpawnCommand_EveryAdapterFollowsItsOptionsNotItsLastSetup(t *testing.T)
 		})
 	}
 }
+
+// TestSpawnCommand_NoAdapterResumesWithoutAnID pins the half of
+// SpawnPlan.Resumed that holds for every kind: with no id there is nothing to
+// continue, so nothing may report that it did. Manager reads the flag to tell a
+// failed resume from a fresh start that died, and a kind that answered true
+// here would hand its own fresh spawns the retry meant for stale ids.
+//
+// It lives in register_test for the reason the test above does: only this
+// package can reach every registered adapter at once.
+func TestSpawnCommand_NoAdapterResumesWithoutAnID(t *testing.T) {
+	for _, kind := range agent.Kinds() {
+		a, err := agent.Lookup(kind)
+		if err != nil {
+			t.Fatalf("Lookup(%s): %v", kind, err)
+		}
+		for _, started := range []bool{false, true} {
+			for _, confirmed := range []bool{false, true} {
+				plan := a.SpawnCommand(session.SpawnOptions{
+					AgentSessionStarted:     started,
+					AgentSessionIDConfirmed: confirmed,
+					WorkDir:                 t.TempDir(),
+				})
+				if plan.Resumed {
+					t.Errorf("%s.SpawnCommand(started=%v, confirmed=%v) reports Resumed with an empty AgentSessionID: %q",
+						kind, started, confirmed, plan.Command)
+				}
+			}
+		}
+	}
+}

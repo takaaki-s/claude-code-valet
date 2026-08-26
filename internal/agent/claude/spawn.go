@@ -48,10 +48,12 @@ func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 		cmd = fmt.Sprintf("claude --settings %s", hooksPath)
 	}
 
+	resuming := opts.AgentSessionID != "" && opts.AgentSessionStarted
+
 	var extraEnv map[string]string
 	if opts.AgentSessionID != "" {
 		flag := "--session-id"
-		if opts.AgentSessionStarted {
+		if resuming {
 			flag = "--resume"
 		}
 		// The id goes through the environment, never into this string, and
@@ -71,6 +73,7 @@ func (a *Agent) SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 	return agent.SpawnPlan{
 		Command:  cmd,
 		ExtraEnv: extraEnv,
+		Resumed:  resuming,
 		// Every Claude Code var that leaks in from a CC-parent environment is
 		// cleared here, so the spawned CC starts as a top-level session with a
 		// fresh transcript. Not just cosmetic: with CLAUDE_CODE_CHILD_SESSION=1,

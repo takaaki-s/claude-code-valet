@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +21,7 @@ func probeShellCmd(t *testing.T, mgr *Manager) string {
 			return SpawnPlan{Command: "true"}
 		}},
 	}})
-	cmd, err := mgr.buildAgentShellCmd(spawnSnapshot{
+	cmd, _, err := mgr.buildAgentShellCmd(spawnSnapshot{
 		JinSessionID: "probe-session",
 		AgentKind:    "probe",
 		StartDir:     t.TempDir(),
@@ -100,7 +101,7 @@ func TestBuildAgentShellCmd_TellsTheAdapterTheSameBinary(t *testing.T) {
 			setupFn: func(ctx SetupContext) error { seen = ctx; return nil },
 		},
 	}})
-	if _, err := mgr.buildAgentShellCmd(spawnSnapshot{
+	if _, _, err := mgr.buildAgentShellCmd(spawnSnapshot{
 		JinSessionID: "probe-session",
 		AgentKind:    "probe",
 		StartDir:     t.TempDir(),
@@ -148,11 +149,15 @@ func TestBuildAgentShellCmd_TellsTheAdapterOneStory(t *testing.T) {
 			},
 		},
 	}})
-	if _, err := mgr.buildAgentShellCmd(spawnSnapshot{
-		JinSessionID:    "probe-session",
-		AgentKind:       "probe",
-		StartDir:        t.TempDir(),
-		ExpandedWorkDir: workDir,
+	const probeID = "probe-agent-session-id"
+	if _, _, err := mgr.buildAgentShellCmd(spawnSnapshot{
+		JinSessionID:            "probe-session",
+		AgentKind:               "probe",
+		AgentSessionID:          probeID,
+		AgentSessionStarted:     true,
+		AgentSessionIDConfirmed: true,
+		StartDir:                t.TempDir(),
+		ExpandedWorkDir:         workDir,
 	}); err != nil {
 		t.Fatalf("buildAgentShellCmd: %v", err)
 	}
@@ -173,6 +178,19 @@ func TestBuildAgentShellCmd_TellsTheAdapterOneStory(t *testing.T) {
 	}
 	if spawn.ExecPath != stable {
 		t.Errorf("SpawnOptions.ExecPath = %q, want the identity's binary %q", spawn.ExecPath, stable)
+	}
+	// The three fields every adapter reads to choose between starting and
+	// resuming. Each is compared against the snapshot's own value: a builder
+	// that hard-coded any of them would leave the adapters agreeing on a story
+	// the session record never told.
+	if spawn.AgentSessionID != probeID {
+		t.Errorf("SpawnOptions.AgentSessionID = %q, want the snapshot's %q", spawn.AgentSessionID, probeID)
+	}
+	if !spawn.AgentSessionStarted {
+		t.Error("SpawnOptions.AgentSessionStarted = false, want the snapshot's true")
+	}
+	if !spawn.AgentSessionIDConfirmed {
+		t.Error("SpawnOptions.AgentSessionIDConfirmed = false, want the snapshot's true")
 	}
 	if setup.StateDir != spawn.StateDir {
 		t.Errorf("Setup was pointed at %q while the spawn was built for %q; whatever Setup wrote, "+
@@ -333,7 +351,7 @@ func TestBuildAgentShellCmd_ClearsWhatTheAdapterAsksToClear(t *testing.T) {
 		}},
 	}})
 
-	cmd, err := mgr.buildAgentShellCmd(spawnSnapshot{
+	cmd, _, err := mgr.buildAgentShellCmd(spawnSnapshot{
 		JinSessionID: "probe-session",
 		AgentKind:    "probe",
 		StartDir:     t.TempDir(),
@@ -344,5 +362,50 @@ func TestBuildAgentShellCmd_ClearsWhatTheAdapterAsksToClear(t *testing.T) {
 
 	if !strings.Contains(cmd, "-u JIN_PROBE_MARK") {
 		t.Errorf("the adapter asked for JIN_PROBE_MARK to be cleared and the agent inherits it anyway\ncommand: %s", cmd)
+	}
+}
+
+// TestBuildAgentShellCmd_CarriesTheSessionIdentity walks both hops between the
+// session record and the adapter — snapshotForSpawn, then SpawnOptions — with
+// the confirmation at each value. One hop hard-coded passes the other's test,
+// and neither failure is visible: false makes Codex never resume, true brings
+// back resuming an id no agent has ever named.
+func TestBuildAgentShellCmd_CarriesTheSessionIdentity(t *testing.T) {
+	for _, confirmed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("confirmed=%v", confirmed), func(t *testing.T) {
+			mgr, _, _ := newTestManager(t)
+			var spawn SpawnOptions
+			fakeClaudeAgent(t, mgr).spawnFn = func(opts SpawnOptions) SpawnPlan {
+				spawn = opts
+				return SpawnPlan{Command: "true"}
+			}
+
+			dir := t.TempDir()
+			sess, _, err := mgr.CreateWithOptions(CreateOptions{WorkDir: dir, Description: "identity"})
+			if err != nil {
+				t.Fatalf("create failed: %v", err)
+			}
+			const wantID = "identity-probe"
+			mgr.mu.Lock()
+			sess.AgentSessionID = wantID
+			sess.AgentSessionStarted = true
+			sess.AgentSessionIDConfirmed = confirmed
+			snap := snapshotForSpawn(sess, dir, dir)
+			mgr.mu.Unlock()
+
+			if _, _, err := mgr.buildAgentShellCmd(snap); err != nil {
+				t.Fatalf("buildAgentShellCmd: %v", err)
+			}
+
+			if spawn.AgentSessionID != wantID {
+				t.Errorf("AgentSessionID = %q, want the record's %q", spawn.AgentSessionID, wantID)
+			}
+			if !spawn.AgentSessionStarted {
+				t.Error("AgentSessionStarted = false, want the record's true")
+			}
+			if spawn.AgentSessionIDConfirmed != confirmed {
+				t.Errorf("AgentSessionIDConfirmed = %v, want the record's %v", spawn.AgentSessionIDConfirmed, confirmed)
+			}
+		})
 	}
 }

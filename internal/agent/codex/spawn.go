@@ -11,9 +11,9 @@ import (
 // shell-safety contract on session.SpawnPlan; this is one adapter obeying it.
 //
 // Codex has the weakest claim of the three adapters to trust this value: with
-// no --session-id equivalent, every id it resumes arrived from a hook payload
-// rather than from jind-ai, and a record written by an older jind-ai — or
-// edited by hand — reaches SpawnCommand having passed no gate.
+// no --session-id equivalent, it has no way to make an id its own, and a record
+// written by an older jind-ai — or edited by hand — reaches SpawnCommand having
+// passed no gate.
 const sessionArgEnv = "JIN_CODEX_SESSION"
 
 // modelArgEnv keeps the model out of Command for the reason sessionArgEnv keeps
@@ -49,11 +49,14 @@ func configArgs() []string {
 
 // isResume reports whether opts calls for `codex resume <UUID>` rather than a
 // fresh `codex` spawn — see SpawnCommand's doc comment for the two cases.
-// Exported as its own predicate rather than inlined so Agent.SpawnCommand
-// (agent.go) can check the identical condition without the two silently
-// drifting apart.
+//
+// AgentSessionIDConfirmed carries the weight: AgentSessionStarted is set at
+// spawn, so on its own it says only that the id was carried into a spawn, not
+// that Codex ever minted it. A session no hook has reached still holds the UUID
+// jind-ai pre-minted, and `codex resume` rejects that one — see "Codex adapter"
+// in docs/gotchas.md.
 func isResume(opts agent.SpawnOptions) bool {
-	return opts.AgentSessionID != "" && opts.AgentSessionStarted
+	return opts.AgentSessionID != "" && opts.AgentSessionStarted && opts.AgentSessionIDConfirmed
 }
 
 // SpawnCommand builds the `codex ...` command line the daemon splices into its
@@ -64,11 +67,9 @@ func isResume(opts agent.SpawnOptions) bool {
 //     we spawn fresh and let SessionStart's hook stdin write the actual UUID
 //     back into Session.AgentSessionID. The pre-minted UUID is intentionally
 //     ignored here; see "Codex adapter" in docs/gotchas.md for why.
-//   - `codex resume "$JIN_CODEX_SESSION"` once AgentSessionStarted is true and
-//     AgentSessionID has been re-keyed to the real Codex UUID. `codex resume`
-//     fails fast on an unknown UUID (~3s in Codex 0.144.1, well within the 10s
-//     quick-fail auto-recovery window), so a stale UUID does not require a
-//     defensive glob check up front. The UUID travels in ExtraEnv.
+//   - `codex resume "$JIN_CODEX_SESSION"` once AgentSessionID has been re-keyed
+//     to the real Codex UUID and confirmed — see isResume. The UUID travels in
+//     ExtraEnv.
 //   - Hook injection via `--enable hooks` + one `-c 'hooks.X=[...]'` per
 //     managedEvent (see hook_args.go), plus the overrides in configArgs.
 //   - `--model "$JIN_CODEX_MODEL"` on both lines alike when the session names
@@ -110,6 +111,7 @@ func SpawnCommand(opts agent.SpawnOptions) agent.SpawnPlan {
 	return agent.SpawnPlan{
 		Command:  cmd,
 		ExtraEnv: extraEnv,
+		Resumed:  isResume(opts),
 		UnsetEnv: []string{
 			"CODEX_SANDBOX",
 			"CODEX_SANDBOX_NETWORK_DISABLED",

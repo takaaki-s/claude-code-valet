@@ -224,3 +224,51 @@ func TestHandleHookEvent_EmptyIDNeverReKeys(t *testing.T) {
 		t.Errorf("RecognizesSessionID called %d times for an empty id, want 0", calls)
 	}
 }
+
+// TestHandleHookEvent_ConfirmsTheID covers the flag the adapters read to tell a
+// pre-minted UUID from one the agent minted itself. All three rows go through
+// the same gate as the id write, but only two of them change AgentSessionID:
+// an agent that takes its id on the command line reports the one jind-ai
+// already holds, and that is still the agent naming it.
+func TestHandleHookEvent_ConfirmsTheID(t *testing.T) {
+	tests := []struct {
+		name      string
+		reported  func(pre string) string
+		recognize func(string) bool
+		want      bool
+	}{
+		{
+			name:      "a new id the agent minted",
+			reported:  func(string) string { return rekeyValidID },
+			recognize: func(id string) bool { return id == rekeyValidID },
+			want:      true,
+		},
+		{
+			name:      "the id jind-ai pre-minted, reported back",
+			reported:  func(pre string) string { return pre },
+			recognize: func(string) bool { return true },
+			want:      true,
+		},
+		{
+			name:      "an id the adapter refuses",
+			reported:  func(string) string { return rekeyForeignID },
+			recognize: func(string) bool { return false },
+			want:      false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, _, _ := newTestManager(t)
+			fakeClaudeAgent(t, mgr).recognizesFn = tt.recognize
+			sess := newRekeySession(t, mgr, "rekey-confirm")
+			pre := sess.AgentSessionID
+
+			mgr.HandleHookEvent(tt.reported(pre), sess.ID, "SessionStart", "", "", "")
+
+			got, _ := mgr.Get(sess.ID)
+			if got.AgentSessionIDConfirmed != tt.want {
+				t.Errorf("AgentSessionIDConfirmed = %v, want %v", got.AgentSessionIDConfirmed, tt.want)
+			}
+		})
+	}
+}

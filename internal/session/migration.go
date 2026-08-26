@@ -10,6 +10,11 @@ import "encoding/json"
 //   - v2 → v3: "claude_session_id" / "claude_session_started" → their
 //     agent-agnostic names, and backfill "agent_kind" with "claude" — records
 //     predating the agent split are by definition Claude Code sessions.
+//   - v3 → v4: backfill "agent_session_id_confirmed" for records that had
+//     already started an agent. The jind-ai that wrote them asked no more than
+//     "agent_session_started" of a Codex resume, so those ids had every chance
+//     to be re-keyed by a hook; reading them as unconfirmed would start each of
+//     those conversations over instead.
 func migrateSessionJSON(raw []byte) ([]byte, bool, error) {
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -55,6 +60,15 @@ func migrateSessionJSON(raw []byte) ([]byte, bool, error) {
 		}
 		delete(m, "claude_session_started")
 		changed = true
+	}
+
+	// v3 → v4. Session writes the field without omitempty, so a record that
+	// carries the key — at either value — is one this jind-ai already wrote.
+	if _, ok := m["agent_session_id_confirmed"]; !ok {
+		if started, _ := m["agent_session_started"].(bool); started {
+			m["agent_session_id_confirmed"] = true
+			changed = true
+		}
 	}
 
 	if !changed {

@@ -152,7 +152,11 @@ func TestAgent_SpawnCommand_CacheInvalidation(t *testing.T) {
 				t.Fatalf("warm-up Find = false, want true")
 			}
 
-			a.SpawnCommand(agent.SpawnOptions{AgentSessionID: basicUUID, AgentSessionStarted: tt.started})
+			a.SpawnCommand(agent.SpawnOptions{
+				AgentSessionID:          basicUUID,
+				AgentSessionStarted:     tt.started,
+				AgentSessionIDConfirmed: tt.started,
+			})
 
 			a.locator.mu.Lock()
 			_, cached := a.locator.cache[basicUUID]
@@ -169,4 +173,39 @@ func TestAgent_ImplementsInterface(t *testing.T) {
 	// register.go can hand it to agent.Register().
 	var _ session.Agent = (*Agent)(nil)
 	var _ session.Agent = New()
+}
+
+// TestSpawnCommand_ResumeNeedsConfirmedID is the regression test for a Codex
+// session that died before its first hook ever fired: the record still holds
+// the UUID jind-ai pre-minted, AgentSessionStarted was set at spawn and nothing
+// unsets it, and `codex resume` exits 1 on that id every time it is offered.
+func TestSpawnCommand_ResumeNeedsConfirmedID(t *testing.T) {
+	tests := []struct {
+		name       string
+		confirmed  bool
+		wantResume bool
+	}{
+		{"an id the agent reported resumes", true, true},
+		{"a pre-minted id spawns fresh", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := SpawnCommand(agent.SpawnOptions{
+				AgentSessionID:          basicUUID,
+				AgentSessionStarted:     true,
+				AgentSessionIDConfirmed: tt.confirmed,
+				ExecPath:                testExecPath,
+			})
+
+			if got := strings.HasPrefix(plan.Command, "codex resume"); got != tt.wantResume {
+				t.Errorf("resume = %v, want %v; Command = %q", got, tt.wantResume, plan.Command)
+			}
+			if _, ok := plan.ExtraEnv[sessionArgEnv]; ok != tt.wantResume {
+				t.Errorf("%s present = %v, want %v", sessionArgEnv, ok, tt.wantResume)
+			}
+			if plan.Resumed != tt.wantResume {
+				t.Errorf("Resumed = %v, want %v", plan.Resumed, tt.wantResume)
+			}
+		})
+	}
 }
