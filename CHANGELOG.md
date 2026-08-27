@@ -5,9 +5,32 @@ attaches them to the corresponding [GitHub Release](https://github.com/takaaki-s
 This file is the curated overview — highlights per release, not a per-commit
 log.
 
-## Unreleased
+## 0.11.0
 
 ### Fixes
+
+- **A Codex session that died before its first hook can be started again.**
+  jind-ai pre-mints a session UUID when it creates the record and marks the
+  agent session started at spawn, so a session whose hooks never ran kept that
+  pre-minted id with the flag already true. Every start from then on ran
+  `codex resume <uuid>` against an id no agent had ever reported, which exits 1
+  within a second. Codex 0.149.1 made this the ordinary path rather than an
+  edge case: its hook-trust gate means untrusted hooks never run, so the first
+  hook never arrives.
+
+  The auto-recovery written for exactly this could not fire. The quick-resume
+  failure window was 10s and the pane monitor's poll interval was also 10s, so
+  the first observation of a dead pane landed just outside the window —
+  measured at 10.034s, twice out of twice. That retry branch had never run in
+  production. The window is now defined against the interval, so the two cannot
+  drift back into equality.
+
+  A session record now carries whether the agent itself named the id, and the
+  Codex adapter requires that before resuming. Records written by earlier
+  versions are backfilled by a schema migration and go on resuming as they did.
+  A failed resume is retried as a fresh start; an agent you quit inside the pane
+  is not, because quitting exits 0 and a failed resume does not. See
+  [docs/gotchas.md](docs/gotchas.md#codex-adapter).
 
 - **An opencode session is no longer rewritten by an opencode the agent starts
   for itself.** opencode is the one supported agent told about its hooks
@@ -28,6 +51,25 @@ log.
   launched from an LSP or MCP server is not, because those are started without
   the hook the mark travels on. See
   [docs/gotchas.md](docs/gotchas.md#opencode-adapter).
+
+### Breaking changes
+
+- **`JIN_SESSION_NAME` is no longer passed to `.jin/worktree-post-create.sh`.**
+  It was documented as the session name given via `--name`, but no such flag
+  exists: the value came from `-d/--description`, and with `-d` omitted — the
+  default — the hook received an empty string every time. A human-readable
+  label is also not what the hook is for; it runs inside the creation
+  transaction, before the agent starts and before the description is settled.
+  `JIN_SESSION_ID` remains as the stable key to namespace side effects by.
+
+  A hook that reads the variable under `set -u` now exits non-zero, and a
+  failing hook rolls back the worktree and its branch. Drop the reference, or
+  guard it as `${JIN_SESSION_NAME:-}`.
+
+  Two documentation errors went with it: the `{name}` placeholder rows named
+  the same non-existent `--name` (they mean `--worktree-name`), and
+  `JIN_WORKTREE_BASE` carries the bare branch name while the worktree is cut
+  from `origin/<name>`.
 
 ## 0.10.0
 
