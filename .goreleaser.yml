@@ -30,20 +30,23 @@ checksum:
 changelog:
   sort: asc
   filters:
+    # Commits carry no scope (see AGENTS.md), but history holds 50 of them and
+    # a slip is silent until the release is already published. Every type
+    # pattern therefore tolerates an optional scope and a breaking-change `!`.
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^ci:"
-      - "^chore:"
-      - "^style:"
+      - '^docs(\([^)]*\))?!?:'
+      - '^test(\([^)]*\))?!?:'
+      - '^ci(\([^)]*\))?!?:'
+      - '^chore(\([^)]*\))?!?:'
+      - '^style(\([^)]*\))?!?:'
       - "^Merge pull request"
       - "^Merge branch"
       - "^Merge remote-tracking"
   groups:
     - title: Features
-      regexp: '^feat'
+      regexp: '^feat(\([^)]*\))?!?:'
     - title: Bug Fixes
-      regexp: '^fix'
+      regexp: '^fix(\([^)]*\))?!?:'
     - title: Others
       order: 999
 
