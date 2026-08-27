@@ -82,13 +82,23 @@ See the "Claude Code Hooks" section in README.md for details.
 
 ## Commit Convention
 
-Commit messages follow Conventional Commits format (used by goreleaser for changelog generation):
+Commit messages follow Conventional Commits format. goreleaser builds the
+release notes from the **commit subject**, not the PR title, and merge commits
+are filtered out — so every commit in a PR needs its own prefix.
+
 - `feat:` New feature
 - `fix:` Bug fix
 - `refactor:` Refactoring
 - `docs:` Documentation
 - `test:` Tests
 - `chore:` Other (CI, dependencies, etc.)
+
+**Use the bare prefix — no scope.** Write `docs: fix the worktree table in the
+README`, not `docs(readme): fix the worktree table`. No tool reads the scope,
+and the vocabulary never cohered: 50 distinct scopes accumulated, with one area
+spelled both `codex` and `agent/codex`, and three commits resorting to a comma
+because nothing fit. Name the area in the subject, where a reader sees it
+anyway. Existing history keeps its scopes; this applies from here on.
 
 ## Testing
 
