@@ -192,6 +192,12 @@ Session states are detected via Claude Code [hooks](https://docs.anthropic.com/e
 | `idle` | ○ | `Stop` hook, or a 30s no-hook fallback | Waiting for input |
 | `stopped` | ■ | Process death detection | Stopped |
 
+The TUI list carries one more column to the left of this one. An orange ● there
+is **not a status**: it means the session has a completed turn you have not
+acknowledged yet (see [Completed turns](#completed-turns)). Clear it from the
+action palette (`M-p` → "mark completion seen") or with
+`jin session seen <selector>`.
+
 ## CLI Commands
 
 ### Daemon management
@@ -249,6 +255,9 @@ jin session output <session-name>
 # Get the last N conversation pairs
 jin session output <session-name> --last 3
 
+# Acknowledge a session's completed turn (clears its TUI dot)
+jin session seen <session-name>
+
 # Kill a session
 jin session kill <session-name>
 
@@ -261,6 +270,40 @@ jin cleanup stopped --dry-run   # Preview what will be deleted
 ```
 
 > **Aliases**: `session` can be shortened to `sess` (e.g., `jin sess list`). `list` to `ls`, `delete` to `rm`.
+
+#### Completed turns
+
+A session's status says what its agent is doing right now. That is a poor way
+to find the session that finished while you were reading another one: it went
+`idle`, and so did every session that has been sitting there all afternoon.
+
+So a finished turn also leaves a receipt. The TUI marks the session with an
+orange dot and floats it to the top of its fleet. Clear it from the action
+palette (`M-p` → "mark completion seen") or with `jin session seen <selector>`.
+Nothing clears it on its own — not moving the cursor, not attaching, not
+sending the next prompt — because the point is that you decided you had looked.
+
+The receipt says a turn ended without an error. It says nothing about whether
+the work is any good.
+
+Every command whose `--json` prints a session — `list`, `info`, `new`, `wait`,
+`seen` — carries it:
+
+```json
+{
+  "attention": {
+    "state": "done",
+    "generation": 4,
+    "seen_generation": 3,
+    "unseen": true
+  }
+}
+```
+
+`unseen` is `generation > seen_generation`. A session with no `attention` object
+has nothing to acknowledge. The counters exist so that a turn finishing while
+you acknowledge the previous one cannot be lost: acknowledging generation 3
+leaves generation 4 unseen.
 
 ### Agent-facing documentation
 
